@@ -2,6 +2,7 @@
 #include "set_cuda_default_device_from_local_rank.h"
 #include <cuda_runtime.h>
 #include <mpi.h>
+#include <omp.h>
 #include <stdlib.h>
 
 static int get_local_rank_noncollective(void)
@@ -48,6 +49,7 @@ int set_cuda_default_device_from_local_rank()
     if (deviceCount > 0) {
         dev = local_rank % deviceCount;
         wait_cudafunc(cudaSetDevice(dev));
+        omp_set_default_device(dev);
     }
 
     MPI_Comm_free(&shmcomm);
@@ -67,6 +69,7 @@ int set_cuda_default_device_from_local_rank_noncollective(void)
         local_rank = get_local_rank_noncollective();
         dev = local_rank % deviceCount;
         wait_cudafunc(cudaSetDevice(dev));
+        omp_set_default_device(dev);
     }
 
     return dev;

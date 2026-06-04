@@ -4091,17 +4091,34 @@ int  cusolver_Syevdx_Complex_openacc(dcomplex * A, double * W, int m, int MaxN);
     }
 
 #define wait_cudafunc(call)                                                                                            \
-    while (true) {                                                                                                     \
-        if (cudaSuccess == call) {                                                                                     \
-            break;                                                                                                     \
+    do {                                                                                                               \
+        int wait_cudafunc_status;                                                                                      \
+        int wait_cudafunc_retry = 0;                                                                                   \
+        while (true) {                                                                                                 \
+            wait_cudafunc_status = (int)(call);                                                                        \
+            if ((int)cudaSuccess == wait_cudafunc_status) {                                                            \
+                break;                                                                                                 \
+            }                                                                                                          \
+            if (1000 <= wait_cudafunc_retry++) {                                                                       \
+                int wait_cudafunc_mpi_initialized = 0;                                                                 \
+                fprintf(stderr,                                                                                        \
+                        "CUDA/HIP call failed after retries:\nFile = %s\nLine = %d\nCall = %s\nStatus = %d\n",        \
+                        __FILE__, __LINE__, #call, wait_cudafunc_status);                                             \
+                fflush(stderr);                                                                                        \
+                MPI_Initialized(&wait_cudafunc_mpi_initialized);                                                       \
+                if (wait_cudafunc_mpi_initialized) {                                                                   \
+                    MPI_Abort(MPI_COMM_WORLD, 1);                                                                      \
+                }                                                                                                      \
+                exit(1);                                                                                               \
+            }                                                                                                          \
+            double wait_time    = drand48() * WAITTIME;                                                                \
+            double start_time   = MPI_Wtime();                                                                         \
+            double current_time = start_time;                                                                          \
+            while ((current_time - start_time) < wait_time) {                                                          \
+                current_time = MPI_Wtime();                                                                            \
+            }                                                                                                          \
         }                                                                                                              \
-        double wait_time    = drand48() * WAITTIME;                                                                    \
-        double start_time   = MPI_Wtime();                                                                             \
-        double current_time = start_time;                                                                              \
-        while ((current_time - start_time) < wait_time) {                                                              \
-            current_time = MPI_Wtime();                                                                                \
-        }                                                                                                              \
-    }
+    } while (0)
 
 void my_cublasDgemm(cublasOperation_t transa, cublasOperation_t transb, int m, int n, int k, double const * A,
                     double const * B, double * C);

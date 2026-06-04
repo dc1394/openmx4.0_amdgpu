@@ -90,7 +90,7 @@ CXX = $(CPPLANG) -O3 $(MPI_CFLAGS) $(CPPFLAGS_COMMON) $(OMP_OFFLOAD)
 FC = $(FLANG) -O2 $(MPI_FCFLAGS) -mtune=native -march=native -fopenmp
 
 MPI_LIBDIR ?= /home/kawai/opt/openmpi-rocmclang/lib
-RPATHS = -Wl,-rpath,$(ROCM_LLVM_LIB) -Wl,-rpath,$(ROCM_LIB) -Wl,-rpath,$(MPI_LIBDIR)
+RPATHS = -Wl,--disable-new-dtags -Wl,-rpath,$(ROCM_LLVM_LIB) -Wl,-rpath,$(ROCM_LIB) -Wl,-rpath,$(MPI_LIBDIR)
 ROCM_GPU_LIBS := -L$(ROCM_LIB) -lamd_smi -lhipsolver -lrocsolver -lhipblas -lhipblaslt -lrocblas -lamdhip64
 FLANG_RTL_LIBS := -L$(ROCM_LLVM_LIB) -lflang_rt.runtime -lflang_rt.quadmath -lquadmath
 AOCL_LIB ?= /opt/AMD/aocl/aocl-linux-aocc-5.2.0/aocc/lib

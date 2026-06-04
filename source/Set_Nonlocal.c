@@ -544,13 +544,13 @@ static void SetNonlocal_CalcDSNL_OpenACC(double ******DS_NL,
 
       sum_valid_elems = (size_t)(Lmax_Four_Int + 1)*(size_t)combo_count;
       if (0 < combo_count){
-        double *NLRF_BesselCache_so = NLRF_BesselCache[so];
-
-#pragma omp target teams distribute parallel for collapse(2)                                                        \
-    map(to: Normk_grid[0:grid_dim], RF_BesselCache[0:rf_cache_elems],                                               \
-            NLRF_BesselCache_so[0:nlrf_cache_elems], SphB[0:sph_valid_elems], SphBp[0:sph_valid_elems],             \
-            combo_rf_offset[0:combo_count], combo_nlrf_offset[0:combo_count])                                       \
-    map(from: sum_cache0[0:sum_valid_elems], sum_cache1[0:sum_valid_elems])
+#pragma acc data copyin(Normk_grid[0:grid_dim], RF_BesselCache[0:rf_cache_elems], \
+                        NLRF_BesselCache[so][0:nlrf_cache_elems], SphB[0:sph_valid_elems], \
+                        SphBp[0:sph_valid_elems], combo_rf_offset[0:combo_count], \
+                        combo_nlrf_offset[0:combo_count]) \
+                 copyout(sum_cache0[0:sum_valid_elems], sum_cache1[0:sum_valid_elems])
+        {
+#pragma acc parallel loop collapse(2)
           for (LL=0; LL<=Lmax_Four_Int; LL++){
             for (combo=0; combo<combo_count; combo++){
               double local_sum0,local_sumr;
@@ -561,7 +561,7 @@ static void SetNonlocal_CalcDSNL_OpenACC(double ******DS_NL,
               rf_offset = combo_rf_offset[combo];
               nlrf_offset = combo_nlrf_offset[combo];
 
-#pragma omp simd reduction(+:local_sum0,local_sumr)
+#pragma acc loop vector reduction(+:local_sum0,local_sumr)
               for (i=0; i<grid_dim; i++){
                 if (i==0 || i==(grid_dim-1)) coe0 = 0.50;
                 else                         coe0 = 1.00;
@@ -573,7 +573,7 @@ static void SetNonlocal_CalcDSNL_OpenACC(double ******DS_NL,
                 tmp0 = coe0*grid_h*Normk*Normk*Bessel_Pro0;
                 tmp1 = tmp0*sj;
                 tmp2 = tmp0*Normk*sjp;
-                Bessel_Pro1 = NLRF_BesselCache_so[nlrf_offset + i];
+                Bessel_Pro1 = NLRF_BesselCache[so][nlrf_offset + i];
                 tmp3 = tmp1*Bessel_Pro1;
                 tmp4 = tmp2*Bessel_Pro1;
                 local_sum0 += tmp3;
@@ -588,6 +588,7 @@ static void SetNonlocal_CalcDSNL_OpenACC(double ******DS_NL,
               sum_cache1[LL*combo_count + combo] = local_sumr;
             }
           }
+        }
       }
 
       for (LL=0; LL<=Lmax_Four_Int; LL++){

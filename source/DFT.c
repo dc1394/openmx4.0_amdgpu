@@ -76,6 +76,7 @@ static void DFT_GPU_DeviceInit(int basis_count)
     if (cuda_err == cudaSuccess && cuda_device_count > 0) {
         cuda_device = local_rank % cuda_device_count;
         if (cudaSetDevice(cuda_device) == cudaSuccess) {
+            omp_set_default_device(cuda_device);
             cuda_ok = 1;
         }
     }

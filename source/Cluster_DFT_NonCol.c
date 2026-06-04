@@ -629,8 +629,7 @@ double Cluster_DFT_NonCol_ScatterCuSolverCachedEVec(int n2, int *is2, int *ie2, 
 
     if (myid == Host_ID) {
         valid = (ClusterNonCol_CachedCuSolverDenseEVec != NULL &&
-                 ClusterNonCol_CachedCuSolverDenseN2 == n2 &&
-                 ClusterNonCol_CachedCuSolverDenseOnDevice);
+                 ClusterNonCol_CachedCuSolverDenseN2 == n2);
     }
     MPI_Bcast(&valid, 1, MPI_INT, Host_ID, mpi_comm_level1);
 
@@ -648,36 +647,13 @@ double Cluster_DFT_NonCol_ScatterCuSolverCachedEVec(int n2, int *is2, int *ie2, 
 static void ClusterNonCol_GEMMul8Dgemm_OpenACC(cublasOperation_t transa, cublasOperation_t transb, int m, int n,
                                                int k, double const * A, double const * B, double * C)
 {
-    cublasHandle_t handle;
-    wait_cudafunc(cublasCreate(&handle));
-
-#pragma acc data      present(A[0 : m * k], B[0 : k * n], C[0 : m * n])
-#pragma acc host_data use_device(A, B, C)
-    {
-        double const alpha = 1.0;
-        double const beta  = 0.0;
-
-        wait_cudafunc(openmx_gemmul8Dgemm(handle, transa, transb, m, n, k, &alpha, A, m, B, k, &beta, C, m));
-        wait_cudafunc(cublasDestroy(handle));
-    }
+    my_cublasDgemm(transa, transb, m, n, k, A, B, C);
 }
 
 static void ClusterNonCol_GEMMul8Zgemm_OpenACC(cublasOperation_t transa, cublasOperation_t transb, int m, int n,
                                                int k, dcomplex const * A, dcomplex const * B, dcomplex * C)
 {
-    cublasHandle_t handle;
-    wait_cudafunc(cublasCreate(&handle));
-
-#pragma acc data      present(A[0 : m * k], B[0 : k * n], C[0 : m * n])
-#pragma acc host_data use_device(A, B, C)
-    {
-        cuDoubleComplex const alpha = make_cuDoubleComplex(1.0, 0.0);
-        cuDoubleComplex const beta  = make_cuDoubleComplex(0.0, 0.0);
-
-        wait_cudafunc(openmx_gemmul8Zgemm(handle, transa, transb, m, n, k, &alpha, (cuDoubleComplex const *)A, m,
-                                          (cuDoubleComplex const *)B, k, &beta, (cuDoubleComplex *)C, m));
-        wait_cudafunc(cublasDestroy(handle));
-    }
+    my_cublasZgemm(transa, transb, m, n, k, A, B, C);
 }
 
 static void ClusterNonCol_CuSolver_DenseDsyevx(double *A, double *Z, double *ko, int n, int maxn,
@@ -1290,7 +1266,8 @@ static void ClusterNonCol_CuSolverRootDensePath(int SCF_iter, double *ko, double
 
         if (owns_dense) {
 #pragma acc enter data create(ko[0 : n2 + 1])
-            Eigen_cusolver_x_openacc2(S, ko, n, n);
+            ClusterNonCol_CuSolver_DenseDsyevx(S, NULL, ko, n, n,
+                                               "Cluster_DFT_NonCol root overlap");
 
 #pragma acc parallel loop present(ko[0 : n2 + 1])
             for (int l = 1; l <= n; l++) {
@@ -1425,7 +1402,8 @@ static void ClusterNonCol_CuSolverRootDensePath(int SCF_iter, double *ko, double
 #pragma acc exit data delete(rHs11[0 : n * n], rHs12[0 : n * n], rHs22[0 : n * n], \
                              iHs11[0 : n * n], iHs12[0 : n * n], iHs22[0 : n * n])
 
-        EigenBand_lapack_openacc(Hs2, ko, n2, MaxN);
+        ClusterNonCol_CuSolver_DenseZheevx(Hs2, NULL, ko, n2, MaxN,
+                                           "Cluster_DFT_NonCol root Hamiltonian");
 
 #pragma acc enter data copyin(cached_Ss2[0 : n2 * n2])
 #pragma acc enter data create(dense_evec[0 : n2 * n2])
@@ -1436,7 +1414,7 @@ static void ClusterNonCol_CuSolverRootDensePath(int SCF_iter, double *ko, double
 #pragma acc exit data delete(Hs2[0 : n2 * n2], cached_Ss2[0 : n2 * n2], ko[0 : n2 + 1])
 
         *dense_evec_out = dense_evec;
-        *dense_evec_on_device_out = 1;
+        *dense_evec_on_device_out = 0;
     }
 
     MPI_Bcast(ko, n2 + 1, MPI_DOUBLE, Host_ID, mpi_comm_level1);
@@ -2410,12 +2388,7 @@ double Cluster_DFT_NonCol(
 
     if (measure_time) dtime(&stime);
 
-    if (use_cusolver_direct_cluster_dm){
-
-      if (myid==Host_ID && !cusolver_direct_evec_on_device){
-        ClusterNonCol_AbortWithMessage("CuSOLVER device eigenvectors are not available in Cluster_DFT_NonCol.c.");
-      }
-
+    if (use_cusolver_direct_cluster_dm && cusolver_direct_evec_on_device){
       time6 += ClusterNonCol_CalcDMRootDense_OpenACC(myid,size_H1,MP,n,n2,MaxN,CDM,iDM[0],EDM,ko,
                                                      cusolver_dense_evec,(Cnt_switch==1));
 
@@ -2425,6 +2398,11 @@ double Cluster_DFT_NonCol(
       ClusterNonCol_StashCuSolverDenseEVec(myid,n2,&cusolver_dense_evec,&cusolver_direct_evec_on_device);
     }
     else {
+      if (use_cusolver_direct_cluster_dm){
+        time6 += ClusterNonCol_ScatterDenseEVecToLocal(myid, numprocs, n2, is2, ie2,
+                                                       cusolver_dense_evec, EVec1);
+        ClusterNonCol_StashCuSolverDenseEVec(myid,n2,&cusolver_dense_evec,&cusolver_direct_evec_on_device);
+      }
 
       /* DM */
 

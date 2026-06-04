@@ -19,12 +19,14 @@ typedef enum {
     HIPBLAS_OP_C = 113
 } cublasOperation_t;
 typedef enum {
-    HIPBLAS_FILL_MODE_LOWER = 0,
-    HIPBLAS_FILL_MODE_UPPER = 1
+    HIPBLAS_FILL_MODE_UPPER = 121,
+    HIPBLAS_FILL_MODE_LOWER = 122,
+    HIPBLAS_FILL_MODE_FULL = 123
 } cublasFillMode_t;
 typedef enum {
-    HIPBLAS_SIDE_LEFT = 0,
-    HIPBLAS_SIDE_RIGHT = 1
+    HIPBLAS_SIDE_LEFT = 141,
+    HIPBLAS_SIDE_RIGHT = 142,
+    HIPBLAS_SIDE_BOTH = 143
 } cublasSideMode_t;
 enum {
     HIPBLAS_STATUS_SUCCESS = 0,
