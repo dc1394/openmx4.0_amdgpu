@@ -4066,6 +4066,7 @@ void Eigen_lapack(double **a, double *ko, int n, int EVmax);
 void Eigen_lapack2(double *a, int csize, double *ko, int n, int EVmax);
 void Eigen_lapack3(double *a, double *ko, int n, int EVmax);
 void EigenBand_lapack(dcomplex **A, double *W, int N0, int MaxN, int ev_flag);
+void EigenBand_lapack_openacc(dcomplex *A, double *W, int N0, int MaxN);
 
 /* GPU eigensolver prototypes (added by H.Kawai, February 2024) */
 void Eigen_cusolver_d(double ** a, double * ko, int n, int EVmax);

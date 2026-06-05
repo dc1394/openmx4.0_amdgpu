@@ -27,6 +27,11 @@
 
 #define  measure_time   0
 
+extern int ClusterNonCol_CalcDMRootDense_HIP(int entry_count, int size_H1, int n, int n2, int nk_occ,
+                                             int calc_edm, const int *basis0, const int *basis1,
+                                             const double *occ, const double *occ_e,
+                                             const dcomplex *dense_evec, double *dm_buffer);
+
 static void ClusterNonCol_AbortWithMessage(const char *message)
 {
     fprintf(stderr, "%s\n", message);
@@ -65,6 +70,358 @@ static void *ClusterNonCol_MallocArray(size_t count, size_t elem_size, const cha
         ClusterNonCol_AbortWithMessage(msg);
     }
     return ptr;
+}
+
+static const char *ClusterNonCol_CublasStatusName(cublasStatus_t status)
+{
+    switch (status) {
+    case CUBLAS_STATUS_SUCCESS:
+        return "CUBLAS_STATUS_SUCCESS";
+    case CUBLAS_STATUS_NOT_INITIALIZED:
+        return "CUBLAS_STATUS_NOT_INITIALIZED";
+    case CUBLAS_STATUS_ALLOC_FAILED:
+        return "CUBLAS_STATUS_ALLOC_FAILED";
+    case CUBLAS_STATUS_INVALID_VALUE:
+        return "CUBLAS_STATUS_INVALID_VALUE";
+    case CUBLAS_STATUS_ARCH_MISMATCH:
+        return "CUBLAS_STATUS_ARCH_MISMATCH";
+    case CUBLAS_STATUS_MAPPING_ERROR:
+        return "CUBLAS_STATUS_MAPPING_ERROR";
+    case CUBLAS_STATUS_EXECUTION_FAILED:
+        return "CUBLAS_STATUS_EXECUTION_FAILED";
+    case CUBLAS_STATUS_INTERNAL_ERROR:
+        return "CUBLAS_STATUS_INTERNAL_ERROR";
+    case CUBLAS_STATUS_NOT_SUPPORTED:
+        return "CUBLAS_STATUS_NOT_SUPPORTED";
+    default:
+        return "CUBLAS_STATUS_UNKNOWN";
+    }
+}
+
+static int ClusterNonCol_MpiRankForLog(void)
+{
+    int initialized = 0;
+    int rank = -1;
+
+    MPI_Initialized(&initialized);
+    if (initialized) {
+        MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+    }
+
+    return rank;
+}
+
+static void ClusterNonCol_RequireOpenMPTargetDevice(const char *where)
+{
+    int devices = omp_get_num_devices();
+
+    if (devices <= 0) {
+        fprintf(stderr,
+                "<Cluster> rank %d: %s requires an OpenMP GPU target, but omp_get_num_devices() returned %d.\n",
+                ClusterNonCol_MpiRankForLog(), where, devices);
+        fflush(stderr);
+        ClusterNonCol_AbortWithMessage("Cluster_DFT_NonCol GPU path cannot continue without an OpenMP target device.");
+    }
+}
+
+static char ClusterNonCol_DgemmOpChar(cublasOperation_t op)
+{
+    return (op == CUBLAS_OP_N) ? 'N' : 'T';
+}
+
+static char ClusterNonCol_ZgemmOpChar(cublasOperation_t op)
+{
+    if (op == CUBLAS_OP_C) return 'C';
+    return (op == CUBLAS_OP_N) ? 'N' : 'T';
+}
+
+static void ClusterNonCol_DgemmCPU(cublasOperation_t transa, cublasOperation_t transb, int m, int n, int k,
+                                   const double *A, const double *B, double *C)
+{
+    char ta = ClusterNonCol_DgemmOpChar(transa);
+    char tb = ClusterNonCol_DgemmOpChar(transb);
+    INTEGER mi = m, ni = n, ki = k, lda = m, ldb = k, ldc = m;
+    double alpha = 1.0, beta = 0.0;
+
+    F77_NAME(dgemm, DGEMM)(&ta, &tb, &mi, &ni, &ki, &alpha, (double *)A, &lda, (double *)B, &ldb, &beta, C, &ldc);
+}
+
+static void ClusterNonCol_ZgemmCPU(cublasOperation_t transa, cublasOperation_t transb, int m, int n, int k,
+                                   const dcomplex *A, const dcomplex *B, dcomplex *C)
+{
+    char ta = ClusterNonCol_ZgemmOpChar(transa);
+    char tb = ClusterNonCol_ZgemmOpChar(transb);
+    INTEGER mi = m, ni = n, ki = k, lda = m, ldb = k, ldc = m;
+    dcomplex alpha = {1.0, 0.0};
+    dcomplex beta = {0.0, 0.0};
+
+    F77_NAME(zgemm, ZGEMM)(&ta, &tb, &mi, &ni, &ki, &alpha, (dcomplex *)A, &lda, (dcomplex *)B, &ldb, &beta, C,
+                           &ldc);
+}
+
+static void ClusterNonCol_LogGemmul8Retry(const char *where, const char *kind, cublasStatus_t status, int m, int n,
+                                          int k)
+{
+    fprintf(stderr,
+            "<GEMM> rank %d: GEMMul8 failed in %s for %sGEMM(m=%d,n=%d,k=%d): %s (%d). "
+            "Retrying with native cuBLAS/hipBLAS.\n",
+            ClusterNonCol_MpiRankForLog(), where, kind, m, n, k, ClusterNonCol_CublasStatusName(status),
+            (int)status);
+    fflush(stderr);
+}
+
+static void ClusterNonCol_LogGemmCpuFallback(const char *where, const char *kind, const char *backend,
+                                             cublasStatus_t status, int m, int n, int k)
+{
+    fprintf(stderr,
+            "<GEMM> rank %d: %s failed in %s for %sGEMM(m=%d,n=%d,k=%d): %s (%d). "
+            "Falling back to CPU BLAS for this GEMM.\n",
+            ClusterNonCol_MpiRankForLog(), backend, where, kind, m, n, k, ClusterNonCol_CublasStatusName(status),
+            (int)status);
+    fflush(stderr);
+}
+
+static void ClusterNonCol_LogCudaCpuFallback(const char *where, const char *kind, cudaError_t status, int m, int n,
+                                             int k)
+{
+    fprintf(stderr,
+            "<GEMM> rank %d: GPU setup/transfer failed in %s for %sGEMM(m=%d,n=%d,k=%d): %s (%d). "
+            "Falling back to CPU BLAS for this GEMM.\n",
+            ClusterNonCol_MpiRankForLog(), where, kind, m, n, k, cudaGetErrorString(status), (int)status);
+    fflush(stderr);
+}
+
+static void ClusterNonCol_LogGemmBackendOnce(const char *kind, const char *backend, int m, int n, int k)
+{
+    static int logged_d_gemmul8 = 0;
+    static int logged_d_native = 0;
+    static int logged_z_gemmul8 = 0;
+    static int logged_z_native = 0;
+    int rank = ClusterNonCol_MpiRankForLog();
+    int *logged;
+
+    if (rank != 0) return;
+
+    if (kind[0] == 'D') {
+        logged = (backend[0] == 'G') ? &logged_d_gemmul8 : &logged_d_native;
+    }
+    else {
+        logged = (backend[0] == 'G') ? &logged_z_gemmul8 : &logged_z_native;
+    }
+
+    if (*logged) return;
+
+    fprintf(stderr,
+            "<GEMM> rank %d: using %s for %sGEMM(m=%d,n=%d,k=%d). "
+            "If it fails, OpenMX retries native cuBLAS/hipBLAS and then CPU BLAS.\n",
+            rank, backend, kind, m, n, k);
+    fflush(stderr);
+    *logged = 1;
+}
+
+static cublasStatus_t ClusterNonCol_TryDeviceDgemm(cublasHandle_t handle, cublasOperation_t transa,
+                                                   cublasOperation_t transb, int m, int n, int k, const double *A,
+                                                   const double *B, double *C, const char *where)
+{
+    const double alpha = 1.0;
+    const double beta = 0.0;
+    cublasStatus_t status;
+
+    status = openmx_gemmul8Dgemm(handle, transa, transb, m, n, k, &alpha, A, m, B, k, &beta, C, m);
+    if (status == CUBLAS_STATUS_SUCCESS) {
+        ClusterNonCol_LogGemmBackendOnce("D", "GEMMul8", m, n, k);
+        return status;
+    }
+
+    ClusterNonCol_LogGemmul8Retry(where, "D", status, m, n, k);
+    status = cublasDgemm(handle, transa, transb, m, n, k, &alpha, A, m, B, k, &beta, C, m);
+    if (status == CUBLAS_STATUS_SUCCESS) {
+        ClusterNonCol_LogGemmBackendOnce("D", "native cuBLAS/hipBLAS", m, n, k);
+    }
+    return status;
+}
+
+static cublasStatus_t ClusterNonCol_TryDeviceZgemm(cublasHandle_t handle, cublasOperation_t transa,
+                                                   cublasOperation_t transb, int m, int n, int k,
+                                                   const dcomplex *A, const dcomplex *B, dcomplex *C,
+                                                   const char *where)
+{
+    const cuDoubleComplex alpha = make_cuDoubleComplex(1.0, 0.0);
+    const cuDoubleComplex beta = make_cuDoubleComplex(0.0, 0.0);
+    cublasStatus_t status;
+
+    status = openmx_gemmul8Zgemm(handle, transa, transb, m, n, k, &alpha, (const cuDoubleComplex *)A, m,
+                                 (const cuDoubleComplex *)B, k, &beta, (cuDoubleComplex *)C, m);
+    if (status == CUBLAS_STATUS_SUCCESS) {
+        ClusterNonCol_LogGemmBackendOnce("Z", "GEMMul8", m, n, k);
+        return status;
+    }
+
+    ClusterNonCol_LogGemmul8Retry(where, "Z", status, m, n, k);
+    status = cublasZgemm(handle, transa, transb, m, n, k, &alpha, (const cuDoubleComplex *)A, m,
+                         (const cuDoubleComplex *)B, k, &beta, (cuDoubleComplex *)C, m);
+    if (status == CUBLAS_STATUS_SUCCESS) {
+        ClusterNonCol_LogGemmBackendOnce("Z", "native cuBLAS/hipBLAS", m, n, k);
+    }
+    return status;
+}
+
+static void ClusterNonCol_TransformRealDenseMatricesGPU(int n, const double *S, double **matrices, int matrix_count,
+                                                        double *work)
+{
+    cublasHandle_t handle = NULL;
+    double *d_S = NULL;
+    double *d_A = NULL;
+    double *d_C = NULL;
+    size_t bytes = ClusterNonCol_CheckedMulCount((size_t)n * (size_t)n, sizeof(double), "real GEMM bytes");
+    cudaError_t cuda_status;
+    cublasStatus_t blas_status;
+
+    blas_status = cublasCreate(&handle);
+    if (blas_status != CUBLAS_STATUS_SUCCESS) {
+        for (int i = 0; i < matrix_count; i++) {
+            ClusterNonCol_LogGemmCpuFallback("ClusterNonCol_TransformRealDenseMatricesGPU:create", "D",
+                                             "native cuBLAS/hipBLAS", blas_status, n, n, n);
+            ClusterNonCol_DgemmCPU(CUBLAS_OP_N, CUBLAS_OP_N, n, n, n, matrices[i], S, work);
+            ClusterNonCol_DgemmCPU(CUBLAS_OP_T, CUBLAS_OP_N, n, n, n, S, work, matrices[i]);
+        }
+        return;
+    }
+
+    cuda_status = cudaMalloc((void **)&d_S, bytes);
+    if (cuda_status != cudaSuccess) goto setup_failed;
+    cuda_status = cudaMalloc((void **)&d_A, bytes);
+    if (cuda_status != cudaSuccess) goto setup_failed;
+    cuda_status = cudaMalloc((void **)&d_C, bytes);
+    if (cuda_status != cudaSuccess) goto setup_failed;
+    cuda_status = cudaMemcpy(d_S, S, bytes, cudaMemcpyHostToDevice);
+    if (cuda_status != cudaSuccess) goto setup_failed;
+
+    for (int i = 0; i < matrix_count; i++) {
+        int use_cpu = 0;
+
+        cuda_status = cudaMemcpy(d_A, matrices[i], bytes, cudaMemcpyHostToDevice);
+        if (cuda_status != cudaSuccess) {
+            ClusterNonCol_LogCudaCpuFallback("ClusterNonCol_TransformRealDenseMatricesGPU:copyin", "D",
+                                             cuda_status, n, n, n);
+            use_cpu = 1;
+        }
+
+        if (!use_cpu) {
+            blas_status = ClusterNonCol_TryDeviceDgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N, n, n, n,
+                                                       d_A, d_S, d_C,
+                                                       "ClusterNonCol_TransformRealDenseMatricesGPU:H*S");
+            if (blas_status != CUBLAS_STATUS_SUCCESS) {
+                ClusterNonCol_LogGemmCpuFallback("ClusterNonCol_TransformRealDenseMatricesGPU:H*S", "D",
+                                                 "native cuBLAS/hipBLAS", blas_status, n, n, n);
+                use_cpu = 1;
+            }
+        }
+
+        if (!use_cpu) {
+            blas_status = ClusterNonCol_TryDeviceDgemm(handle, CUBLAS_OP_T, CUBLAS_OP_N, n, n, n,
+                                                       d_S, d_C, d_A,
+                                                       "ClusterNonCol_TransformRealDenseMatricesGPU:S^T*(H*S)");
+            if (blas_status != CUBLAS_STATUS_SUCCESS) {
+                ClusterNonCol_LogGemmCpuFallback("ClusterNonCol_TransformRealDenseMatricesGPU:S^T*(H*S)", "D",
+                                                 "native cuBLAS/hipBLAS", blas_status, n, n, n);
+                use_cpu = 1;
+            }
+        }
+
+        if (!use_cpu) {
+            cuda_status = cudaMemcpy(matrices[i], d_A, bytes, cudaMemcpyDeviceToHost);
+            if (cuda_status != cudaSuccess) {
+                ClusterNonCol_LogCudaCpuFallback("ClusterNonCol_TransformRealDenseMatricesGPU:copyout", "D",
+                                                 cuda_status, n, n, n);
+                use_cpu = 1;
+            }
+        }
+
+        if (use_cpu) {
+            ClusterNonCol_DgemmCPU(CUBLAS_OP_N, CUBLAS_OP_N, n, n, n, matrices[i], S, work);
+            ClusterNonCol_DgemmCPU(CUBLAS_OP_T, CUBLAS_OP_N, n, n, n, S, work, matrices[i]);
+        }
+    }
+
+    if (d_C != NULL) wait_cudafunc(cudaFree(d_C));
+    if (d_A != NULL) wait_cudafunc(cudaFree(d_A));
+    if (d_S != NULL) wait_cudafunc(cudaFree(d_S));
+    wait_cudafunc(cublasDestroy(handle));
+    return;
+
+setup_failed:
+    ClusterNonCol_LogCudaCpuFallback("ClusterNonCol_TransformRealDenseMatricesGPU:setup", "D", cuda_status, n, n, n);
+    if (d_C != NULL) cudaFree(d_C);
+    if (d_A != NULL) cudaFree(d_A);
+    if (d_S != NULL) cudaFree(d_S);
+    if (handle != NULL) cublasDestroy(handle);
+    for (int i = 0; i < matrix_count; i++) {
+        ClusterNonCol_DgemmCPU(CUBLAS_OP_N, CUBLAS_OP_N, n, n, n, matrices[i], S, work);
+        ClusterNonCol_DgemmCPU(CUBLAS_OP_T, CUBLAS_OP_N, n, n, n, S, work, matrices[i]);
+    }
+}
+
+static void ClusterNonCol_BackTransformDenseEVecGPU(int n2, const dcomplex *evec_transformed,
+                                                    const dcomplex *ss2, dcomplex *dense_evec)
+{
+    cublasHandle_t handle = NULL;
+    dcomplex *d_A = NULL;
+    dcomplex *d_B = NULL;
+    dcomplex *d_C = NULL;
+    size_t bytes = ClusterNonCol_CheckedMulCount((size_t)n2 * (size_t)n2, sizeof(dcomplex), "complex GEMM bytes");
+    cudaError_t cuda_status;
+    cublasStatus_t blas_status;
+
+    blas_status = cublasCreate(&handle);
+    if (blas_status != CUBLAS_STATUS_SUCCESS) {
+        ClusterNonCol_LogGemmCpuFallback("ClusterNonCol_BackTransformDenseEVecGPU:create", "Z",
+                                         "native cuBLAS/hipBLAS", blas_status, n2, n2, n2);
+        ClusterNonCol_ZgemmCPU(CUBLAS_OP_T, CUBLAS_OP_T, n2, n2, n2, evec_transformed, ss2, dense_evec);
+        return;
+    }
+
+    cuda_status = cudaMalloc((void **)&d_A, bytes);
+    if (cuda_status != cudaSuccess) goto setup_failed;
+    cuda_status = cudaMalloc((void **)&d_B, bytes);
+    if (cuda_status != cudaSuccess) goto setup_failed;
+    cuda_status = cudaMalloc((void **)&d_C, bytes);
+    if (cuda_status != cudaSuccess) goto setup_failed;
+    cuda_status = cudaMemcpy(d_A, evec_transformed, bytes, cudaMemcpyHostToDevice);
+    if (cuda_status != cudaSuccess) goto setup_failed;
+    cuda_status = cudaMemcpy(d_B, ss2, bytes, cudaMemcpyHostToDevice);
+    if (cuda_status != cudaSuccess) goto setup_failed;
+
+    blas_status = ClusterNonCol_TryDeviceZgemm(handle, CUBLAS_OP_T, CUBLAS_OP_T, n2, n2, n2,
+                                               d_A, d_B, d_C,
+                                               "ClusterNonCol_BackTransformDenseEVecGPU");
+    if (blas_status != CUBLAS_STATUS_SUCCESS) {
+        ClusterNonCol_LogGemmCpuFallback("ClusterNonCol_BackTransformDenseEVecGPU", "Z",
+                                         "native cuBLAS/hipBLAS", blas_status, n2, n2, n2);
+        goto cpu_fallback;
+    }
+
+    cuda_status = cudaMemcpy(dense_evec, d_C, bytes, cudaMemcpyDeviceToHost);
+    if (cuda_status != cudaSuccess) {
+        ClusterNonCol_LogCudaCpuFallback("ClusterNonCol_BackTransformDenseEVecGPU:copyout", "Z",
+                                         cuda_status, n2, n2, n2);
+        goto cpu_fallback;
+    }
+
+    if (d_C != NULL) wait_cudafunc(cudaFree(d_C));
+    if (d_B != NULL) wait_cudafunc(cudaFree(d_B));
+    if (d_A != NULL) wait_cudafunc(cudaFree(d_A));
+    wait_cudafunc(cublasDestroy(handle));
+    return;
+
+setup_failed:
+    ClusterNonCol_LogCudaCpuFallback("ClusterNonCol_BackTransformDenseEVecGPU:setup", "Z", cuda_status, n2, n2, n2);
+cpu_fallback:
+    if (d_C != NULL) cudaFree(d_C);
+    if (d_B != NULL) cudaFree(d_B);
+    if (d_A != NULL) cudaFree(d_A);
+    if (handle != NULL) cublasDestroy(handle);
+    ClusterNonCol_ZgemmCPU(CUBLAS_OP_T, CUBLAS_OP_T, n2, n2, n2, evec_transformed, ss2, dense_evec);
 }
 
 typedef struct
@@ -326,7 +683,7 @@ static double ClusterNonCol_CalcDMRootDense_OpenACC(int myid, int size_H1, int *
         ClusterNonCol_AbortWithMessage("Root DM buffer exceeds MPI count limit in Cluster_DFT_NonCol.c.");
     }
 
-    ClusterNonCol_RootDMWorkspace_Ensure(max_state, dm_elems);
+    ClusterNonCol_RootDMWorkspace_Ensure((myid == Host_ID) ? max_state : 0, dm_elems);
 
     dtime(&stime);
     memset(ws->dm_buffer, 0, sizeof(double) * dm_elems);
@@ -368,138 +725,26 @@ static double ClusterNonCol_CalcDMRootDense_OpenACC(int myid, int size_H1, int *
         iEDM12 = ws->dm_buffer + (size_t)size_H1 * 9;
 
         if (0 < nk_occ) {
-#pragma acc data present(dense_evec[0 : evec_count]) copyin(occ[0 : nk_occ])
-            {
-                if (calc_edm) {
-#pragma acc data copyin(occ_e[0 : nk_occ])
-                    {
-                        for (int offset = 0; offset < cache->entry_count; offset += dm_chunk_size) {
-                            const int chunk_count =
-                                (cache->entry_count - offset < dm_chunk_size) ? (cache->entry_count - offset) : dm_chunk_size;
-                            const int *basis0_chunk = cache->basis0 + offset;
-                            const int *basis1_chunk = cache->basis1 + offset;
-                            double *rDM11_chunk = rDM11 + offset;
-                            double *rDM22_chunk = rDM22 + offset;
-                            double *rDM12_chunk = rDM12 + offset;
-                            double *iDM12_chunk = iDM12 + offset;
-                            double *iDM11_chunk = iDM11 + offset;
-                            double *iDM22_chunk = iDM22 + offset;
-                            double *rEDM11_chunk = rEDM11 + offset;
-                            double *rEDM22_chunk = rEDM22 + offset;
-                            double *rEDM12_chunk = rEDM12 + offset;
-                            double *iEDM12_chunk = iEDM12 + offset;
+            static int logged_dm_gpu = 0;
 
-#pragma acc data copyin(basis0_chunk[0 : chunk_count], basis1_chunk[0 : chunk_count]) \
-    copyout(rDM11_chunk[0 : chunk_count], rDM22_chunk[0 : chunk_count], rDM12_chunk[0 : chunk_count], \
-            iDM12_chunk[0 : chunk_count], iDM11_chunk[0 : chunk_count], iDM22_chunk[0 : chunk_count], \
-            rEDM11_chunk[0 : chunk_count], rEDM22_chunk[0 : chunk_count], rEDM12_chunk[0 : chunk_count], \
-            iEDM12_chunk[0 : chunk_count])
-                            {
-#pragma acc parallel loop gang present(dense_evec[0 : evec_count], occ[0 : nk_occ], occ_e[0 : nk_occ])
-                                for (int p = 0; p < chunk_count; p++) {
-                                    const int ia = basis0_chunk[p];
-                                    const int ib = basis1_chunk[p];
-                                    double dm11_r = 0.0, dm22_r = 0.0, dm12_r = 0.0, dm12_i = 0.0;
-                                    double dm11_i = 0.0, dm22_i = 0.0;
-                                    double edm11_r = 0.0, edm22_r = 0.0, edm12_r = 0.0, edm12_i = 0.0;
+            if (!logged_dm_gpu) {
+                fprintf(stderr,
+                        "<Cluster> rank %d: density matrix generation uses a HIP GPU kernel on the selected rank only "
+                        "(entries=%d, occupied states=%d%s).\n",
+                        Host_ID, cache->entry_count, nk_occ, calc_edm ? ", with EDM" : "");
+                fflush(stderr);
+                logged_dm_gpu = 1;
+            }
 
-#pragma acc loop seq
-                                    for (int k = 0; k < nk_occ; k++) {
-                                        const double w  = occ[k];
-                                        const double ew = occ_e[k];
-                                        const dcomplex va_up = dense_evec[(size_t)ia * (size_t)n2 + (size_t)k];
-                                        const dcomplex vb_up = dense_evec[(size_t)ib * (size_t)n2 + (size_t)k];
-                                        const dcomplex va_dn = dense_evec[(size_t)(ia + n) * (size_t)n2 + (size_t)k];
-                                        const dcomplex vb_dn = dense_evec[(size_t)(ib + n) * (size_t)n2 + (size_t)k];
-                                        const double re11 = va_up.r * vb_up.r + va_up.i * vb_up.i;
-                                        const double im11 = va_up.r * vb_up.i - va_up.i * vb_up.r;
-                                        const double re22 = va_dn.r * vb_dn.r + va_dn.i * vb_dn.i;
-                                        const double im22 = va_dn.r * vb_dn.i - va_dn.i * vb_dn.r;
-                                        const double re12 = va_up.r * vb_dn.r + va_up.i * vb_dn.i;
-                                        const double im12 = va_up.r * vb_dn.i - va_up.i * vb_dn.r;
-
-                                        dm11_r  += w  * re11;
-                                        dm22_r  += w  * re22;
-                                        dm12_r  += w  * re12;
-                                        dm12_i  += w  * im12;
-                                        dm11_i  += w  * im11;
-                                        dm22_i  += w  * im22;
-                                        edm11_r += ew * re11;
-                                        edm22_r += ew * re22;
-                                        edm12_r += ew * re12;
-                                        edm12_i += ew * im12;
-                                    }
-
-                                    rDM11_chunk[p]  = dm11_r;
-                                    rDM22_chunk[p]  = dm22_r;
-                                    rDM12_chunk[p]  = dm12_r;
-                                    iDM12_chunk[p]  = dm12_i;
-                                    iDM11_chunk[p]  = dm11_i;
-                                    iDM22_chunk[p]  = dm22_i;
-                                    rEDM11_chunk[p] = edm11_r;
-                                    rEDM22_chunk[p] = edm22_r;
-                                    rEDM12_chunk[p] = edm12_r;
-                                    iEDM12_chunk[p] = edm12_i;
-                                }
-                            }
-                        }
-                    }
-                }
-                else {
-                    for (int offset = 0; offset < cache->entry_count; offset += dm_chunk_size) {
-                        const int chunk_count =
-                            (cache->entry_count - offset < dm_chunk_size) ? (cache->entry_count - offset) : dm_chunk_size;
-                        const int *basis0_chunk = cache->basis0 + offset;
-                        const int *basis1_chunk = cache->basis1 + offset;
-                        double *rDM11_chunk = rDM11 + offset;
-                        double *rDM22_chunk = rDM22 + offset;
-                        double *rDM12_chunk = rDM12 + offset;
-                        double *iDM12_chunk = iDM12 + offset;
-                        double *iDM11_chunk = iDM11 + offset;
-                        double *iDM22_chunk = iDM22 + offset;
-
-#pragma acc data copyin(basis0_chunk[0 : chunk_count], basis1_chunk[0 : chunk_count]) \
-    copyout(rDM11_chunk[0 : chunk_count], rDM22_chunk[0 : chunk_count], rDM12_chunk[0 : chunk_count], \
-            iDM12_chunk[0 : chunk_count], iDM11_chunk[0 : chunk_count], iDM22_chunk[0 : chunk_count])
-                        {
-#pragma acc parallel loop gang present(dense_evec[0 : evec_count], occ[0 : nk_occ])
-                            for (int p = 0; p < chunk_count; p++) {
-                                const int ia = basis0_chunk[p];
-                                const int ib = basis1_chunk[p];
-                                double dm11_r = 0.0, dm22_r = 0.0, dm12_r = 0.0, dm12_i = 0.0;
-                                double dm11_i = 0.0, dm22_i = 0.0;
-
-#pragma acc loop seq
-                                for (int k = 0; k < nk_occ; k++) {
-                                    const double w = occ[k];
-                                    const dcomplex va_up = dense_evec[(size_t)ia * (size_t)n2 + (size_t)k];
-                                    const dcomplex vb_up = dense_evec[(size_t)ib * (size_t)n2 + (size_t)k];
-                                    const dcomplex va_dn = dense_evec[(size_t)(ia + n) * (size_t)n2 + (size_t)k];
-                                    const dcomplex vb_dn = dense_evec[(size_t)(ib + n) * (size_t)n2 + (size_t)k];
-
-                                    dm11_r += w * (va_up.r * vb_up.r + va_up.i * vb_up.i);
-                                    dm22_r += w * (va_dn.r * vb_dn.r + va_dn.i * vb_dn.i);
-                                    dm12_r += w * (va_up.r * vb_dn.r + va_up.i * vb_dn.i);
-                                    dm12_i += w * (va_up.r * vb_dn.i - va_up.i * vb_dn.r);
-                                    dm11_i += w * (va_up.r * vb_up.i - va_up.i * vb_up.r);
-                                    dm22_i += w * (va_dn.r * vb_dn.i - va_dn.i * vb_dn.r);
-                                }
-
-                                rDM11_chunk[p] = dm11_r;
-                                rDM22_chunk[p] = dm22_r;
-                                rDM12_chunk[p] = dm12_r;
-                                iDM12_chunk[p] = dm12_i;
-                                iDM11_chunk[p] = dm11_i;
-                                iDM22_chunk[p] = dm22_i;
-                            }
-                        }
-                    }
-                }
+            if (ClusterNonCol_CalcDMRootDense_HIP(cache->entry_count, size_H1, n, n2, nk_occ, calc_edm,
+                                                  cache->basis0, cache->basis1, occ, occ_e,
+                                                  dense_evec, ws->dm_buffer) != 0) {
+                ClusterNonCol_AbortWithMessage("Cluster_DFT_NonCol HIP density-matrix generation failed.");
             }
         }
     }
 
-    MPI_Allreduce(MPI_IN_PLACE, ws->dm_buffer, (int)dm_elems, MPI_DOUBLE, MPI_SUM, mpi_comm_level1);
+    MPI_Bcast(ws->dm_buffer, (int)dm_elems, MPI_DOUBLE, Host_ID, mpi_comm_level1);
     ClusterNonCol_StoreDMBuffer(myid, size_H1, MP, CDM, iDM0, ws->dm_buffer);
 
     if (calc_edm) {
@@ -529,8 +774,6 @@ static double ClusterNonCol_ScatterDenseEVecToLocal(int myid, int numprocs, int 
     if (myid == Host_ID) {
         size_t evec_count = (size_t)n2 * (size_t)n2;
         size_t max_send_count = (size_t)max_local_states * (size_t)n2;
-
-#pragma acc update self(dense_evec[0 : evec_count])
 
         if (0 < max_send_count) {
             if (max_send_count > (size_t)INT_MAX / 2u) {
@@ -629,7 +872,8 @@ double Cluster_DFT_NonCol_ScatterCuSolverCachedEVec(int n2, int *is2, int *ie2, 
 
     if (myid == Host_ID) {
         valid = (ClusterNonCol_CachedCuSolverDenseEVec != NULL &&
-                 ClusterNonCol_CachedCuSolverDenseN2 == n2);
+                 ClusterNonCol_CachedCuSolverDenseN2 == n2 &&
+                 ClusterNonCol_CachedCuSolverDenseOnDevice);
     }
     MPI_Bcast(&valid, 1, MPI_INT, Host_ID, mpi_comm_level1);
 
@@ -647,13 +891,13 @@ double Cluster_DFT_NonCol_ScatterCuSolverCachedEVec(int n2, int *is2, int *ie2, 
 static void ClusterNonCol_GEMMul8Dgemm_OpenACC(cublasOperation_t transa, cublasOperation_t transb, int m, int n,
                                                int k, double const * A, double const * B, double * C)
 {
-    my_cublasDgemm(transa, transb, m, n, k, A, B, C);
+    my_cublasDgemm_openacc(transa, transb, m, n, k, A, B, C);
 }
 
 static void ClusterNonCol_GEMMul8Zgemm_OpenACC(cublasOperation_t transa, cublasOperation_t transb, int m, int n,
                                                int k, dcomplex const * A, dcomplex const * B, dcomplex * C)
 {
-    my_cublasZgemm(transa, transb, m, n, k, A, B, C);
+    my_cublasZgemm_openacc(transa, transb, m, n, k, A, B, C);
 }
 
 static void ClusterNonCol_CuSolver_DenseDsyevx(double *A, double *Z, double *ko, int n, int maxn,
@@ -1021,20 +1265,40 @@ static void ClusterNonCol_BuildDeviceDenseFromGathered(const double *H1, const i
                                                        int tnum, int n, double *H)
 {
     size_t nn = ClusterNonCol_CheckedMulCount((size_t)n, (size_t)n, "device dense H");
+    long long nn_ll;
+    static int logged_dense_build = 0;
 
-#pragma acc enter data copyin(H1[0 : tnum], dense_index[0 : tnum])
-#pragma acc parallel loop present(H[0 : nn])
-    for (size_t p = 0; p < nn; p++) {
+    if ((size_t)LLONG_MAX < nn) {
+        ClusterNonCol_AbortWithMessage("Dense matrix size exceeds OpenMP loop limit in Cluster_DFT_NonCol.c.");
+    }
+    nn_ll = (long long)nn;
+
+    ClusterNonCol_RequireOpenMPTargetDevice("dense matrix generation");
+    if (!logged_dense_build && ClusterNonCol_MpiRankForLog() == Host_ID) {
+        fprintf(stderr,
+                "<Cluster> rank %d: dense matrix generation uses OpenMP target GPU on the selected rank only "
+                "(n=%d, packed entries=%d).\n",
+                Host_ID, n, tnum);
+        fflush(stderr);
+        logged_dense_build = 1;
+    }
+
+#pragma omp target data map(to: H1[0 : tnum], dense_index[0 : tnum]) map(alloc: H[0 : nn])
+    {
+#pragma omp target teams distribute parallel for
+    for (long long p = 0; p < nn_ll; p++) {
         H[p] = 0.0;
     }
 
-#pragma acc parallel loop present(H[0 : nn], H1[0 : tnum], dense_index[0 : tnum])
+#pragma omp target teams distribute parallel for
     for (int p = 0; p < tnum; p++) {
         int idx = dense_index[p];
-#pragma acc atomic update
+#pragma omp atomic update
         H[idx] += H1[p];
     }
-#pragma acc exit data delete(H1[0 : tnum], dense_index[0 : tnum])
+
+#pragma omp target update from(H[0 : nn])
+    }
 }
 
 static void ClusterNonCol_LoadDeviceDenseFromSetHamCache(const double *H1, int *MP, int n, double *H)
@@ -1185,9 +1449,9 @@ static void ClusterNonCol_CuSolverRootDensePath(int SCF_iter, double *ko, double
     static double *cached_S = NULL;
     static dcomplex *cached_Ss2 = NULL;
     const int owns_dense = (myid == Host_ID);
-    const int use_setham_packed_cache =
-        (Set_Hamiltonian_CuSolver_Packed_CacheReady() &&
-         Set_Hamiltonian_CuSolver_Packed_OrderMode() == 1);
+    const int cache_ready = Set_Hamiltonian_CuSolver_Packed_CacheReady();
+    const int cache_order = Set_Hamiltonian_CuSolver_Packed_OrderMode();
+    const int use_setham_packed_cache = (cache_ready && cache_order == 1);
     int rebuild_s = (SCF_iter == 1 || !transformed_s_valid || cached_n != n || cached_n2 != n2);
     double *S = NULL;
     double *Cs = NULL;
@@ -1197,13 +1461,37 @@ static void ClusterNonCol_CuSolverRootDensePath(int SCF_iter, double *ko, double
     dcomplex *dense_evec = NULL;
     size_t nn = 0;
     size_t n2n2 = 0;
+    double *transform_mats[6];
 
     *dense_evec_out = NULL;
     *dense_evec_on_device_out = 0;
 
-    if (use_setham_packed_cache) {
-        Set_Hamiltonian_CuSolver_SetMP(MP);
+    if (!use_setham_packed_cache) {
+        if (myid == Host_ID) {
+            fprintf(stderr,
+                    "<Cluster> rank %d: CuSOLVER dense GPU path requires the Set_Hamiltonian packed cache "
+                    "(cache_ready=%d, order_mode=%d). Refusing the old 32-rank dense fallback.\n",
+                    Host_ID, cache_ready, cache_order);
+            fflush(stderr);
+        }
+        ClusterNonCol_AbortWithMessage("Cluster_DFT_NonCol CuSOLVER dense GPU path is missing its packed cache.");
     }
+
+    Set_Hamiltonian_CuSolver_SetMP(MP);
+
+    if (myid == Host_ID) {
+        static int logged_root_dense = 0;
+
+        if (!logged_root_dense) {
+            fprintf(stderr,
+                    "<Cluster> rank %d: CuSOLVER dense GPU path uses one selected rank for dense matrix generation, "
+                    "GEMM, eigensolver, and density-matrix generation (n=%d, n2=%d).\n",
+                    Host_ID, n, n2);
+            fflush(stderr);
+            logged_root_dense = 1;
+        }
+    }
+
     if (Set_Hamiltonian_OpenACC_Rank_Is_Selected()) {
         set_cuda_default_device_from_local_rank_noncollective();
         set_openacc_nvidia_device_from_local_rank_noncollective();
@@ -1249,41 +1537,26 @@ static void ClusterNonCol_CuSolverRootDensePath(int SCF_iter, double *ko, double
 
     if (rebuild_s) {
         if (owns_dense) {
-#pragma acc enter data create(S[0 : n * n])
-        }
-
-        if (use_setham_packed_cache) {
-            if (owns_dense) {
-                if (!Set_Hamiltonian_CuSolver_Packed_OwnsCache()) {
-                    ClusterNonCol_AbortWithMessage("Set_Hamiltonian packed overlap cache is not owned by this rank.");
-                }
-                ClusterNonCol_LoadDeviceDenseFromSetHamCache(Set_Hamiltonian_CuSolver_Packed_Overlap(), MP, n, S);
+            if (!Set_Hamiltonian_CuSolver_Packed_OwnsCache()) {
+                ClusterNonCol_AbortWithMessage("Set_Hamiltonian packed overlap cache is not owned by this rank.");
             }
-        }
-        else {
-            Patch2Device_Cluster_NonCol_Owner(CntOLP, S, MP, owns_dense, n);
+            ClusterNonCol_LoadDeviceDenseFromSetHamCache(Set_Hamiltonian_CuSolver_Packed_Overlap(), MP, n, S);
         }
 
         if (owns_dense) {
-#pragma acc enter data create(ko[0 : n2 + 1])
             ClusterNonCol_CuSolver_DenseDsyevx(S, NULL, ko, n, n,
                                                "Cluster_DFT_NonCol root overlap");
-
-#pragma acc parallel loop present(ko[0 : n2 + 1])
             for (int l = 1; l <= n; l++) {
                 if (ko[l] < 1.0e-10) ko[l] = 1.0e-10;
                 ko[l] = 1.0 / sqrt(ko[l]);
             }
 
-#pragma acc parallel loop collapse(2) present(S[0 : n * n], ko[0 : n2 + 1])
             for (int col = 0; col < n; col++) {
+                double scale = ko[col + 1];
                 for (int row = 0; row < n; row++) {
-                    S[(size_t)row + (size_t)col * (size_t)n] *= ko[col + 1];
+                    S[(size_t)row + (size_t)col * (size_t)n] *= scale;
                 }
             }
-
-#pragma acc update self(S[0 : n * n])
-#pragma acc exit data delete(S[0 : n * n], ko[0 : n2 + 1])
 
             ClusterNonCol_BuildDenseSs2(n, n2, S, cached_Ss2);
             transformed_s_valid = 1;
@@ -1291,89 +1564,31 @@ static void ClusterNonCol_CuSolverRootDensePath(int SCF_iter, double *ko, double
     }
 
     if (owns_dense) {
-#pragma acc enter data create(rHs11[0 : n * n], rHs12[0 : n * n], rHs22[0 : n * n], \
-                              iHs11[0 : n * n], iHs12[0 : n * n], iHs22[0 : n * n], Cs[0 : n * n])
-    }
-
-    if (use_setham_packed_cache) {
-        if (owns_dense) {
-            if (!Set_Hamiltonian_CuSolver_Packed_OwnsCache()) {
-                ClusterNonCol_AbortWithMessage("Set_Hamiltonian packed Hamiltonian cache is not owned by this rank.");
-            }
-            ClusterNonCol_LoadDeviceDenseFromSetHamCache(Set_Hamiltonian_CuSolver_Packed_H(0), MP, n, rHs11);
-            ClusterNonCol_LoadDeviceDenseFromSetHamCache(Set_Hamiltonian_CuSolver_Packed_H(1), MP, n, rHs22);
-            ClusterNonCol_LoadDeviceDenseFromSetHamCache(Set_Hamiltonian_CuSolver_Packed_H(2), MP, n, rHs12);
-            ClusterNonCol_LoadDeviceDenseFromSetHamCache(Set_Hamiltonian_CuSolver_Packed_H(3), MP, n, iHs12);
-            ClusterNonCol_LoadDeviceDenseFromSetHamCache(Set_Hamiltonian_CuSolver_Packed_ImNL(0), MP, n, iHs11);
-            ClusterNonCol_LoadDeviceDenseFromSetHamCache(Set_Hamiltonian_CuSolver_Packed_ImNL(1), MP, n, iHs22);
-            ClusterNonCol_LoadDeviceDenseFromSetHamCache(Set_Hamiltonian_CuSolver_Packed_ImNL(2), MP, n, Cs);
+        if (!Set_Hamiltonian_CuSolver_Packed_OwnsCache()) {
+            ClusterNonCol_AbortWithMessage("Set_Hamiltonian packed Hamiltonian cache is not owned by this rank.");
         }
-    }
-    else {
-        Patch2Device_Cluster_NonCol_Owner(nh[0],   rHs11, MP, owns_dense, n);
-        Patch2Device_Cluster_NonCol_Owner(nh[1],   rHs22, MP, owns_dense, n);
-        Patch2Device_Cluster_NonCol_Owner(nh[2],   rHs12, MP, owns_dense, n);
-        Patch2Device_Cluster_NonCol_Owner(nh[3],   iHs12, MP, owns_dense, n);
-        Patch2Device_Cluster_NonCol_Owner(ImNL[0], iHs11, MP, owns_dense, n);
-        Patch2Device_Cluster_NonCol_Owner(ImNL[1], iHs22, MP, owns_dense, n);
-        Patch2Device_Cluster_NonCol_Owner(ImNL[2], Cs,    MP, owns_dense, n);
+        ClusterNonCol_LoadDeviceDenseFromSetHamCache(Set_Hamiltonian_CuSolver_Packed_H(0), MP, n, rHs11);
+        ClusterNonCol_LoadDeviceDenseFromSetHamCache(Set_Hamiltonian_CuSolver_Packed_H(1), MP, n, rHs22);
+        ClusterNonCol_LoadDeviceDenseFromSetHamCache(Set_Hamiltonian_CuSolver_Packed_H(2), MP, n, rHs12);
+        ClusterNonCol_LoadDeviceDenseFromSetHamCache(Set_Hamiltonian_CuSolver_Packed_H(3), MP, n, iHs12);
+        ClusterNonCol_LoadDeviceDenseFromSetHamCache(Set_Hamiltonian_CuSolver_Packed_ImNL(0), MP, n, iHs11);
+        ClusterNonCol_LoadDeviceDenseFromSetHamCache(Set_Hamiltonian_CuSolver_Packed_ImNL(1), MP, n, iHs22);
+        ClusterNonCol_LoadDeviceDenseFromSetHamCache(Set_Hamiltonian_CuSolver_Packed_ImNL(2), MP, n, Cs);
     }
 
     if (owns_dense) {
-#pragma acc parallel loop present(iHs12[0 : n * n], Cs[0 : n * n])
         for (size_t i = 0; i < nn; i++) {
             iHs12[i] += Cs[i];
         }
 
-#pragma acc enter data copyin(S[0 : n * n])
+        transform_mats[0] = rHs11;
+        transform_mats[1] = rHs12;
+        transform_mats[2] = rHs22;
+        transform_mats[3] = iHs11;
+        transform_mats[4] = iHs12;
+        transform_mats[5] = iHs22;
+        ClusterNonCol_TransformRealDenseMatricesGPU(n, S, transform_mats, 6, Cs);
 
-#pragma acc parallel loop present(Cs[0 : n * n])
-        for (int i = 0; i < n * n; i++) Cs[i] = 0.0;
-        ClusterNonCol_GEMMul8Dgemm_OpenACC(CUBLAS_OP_N, CUBLAS_OP_N, n, n, n, rHs11, S, Cs);
-#pragma acc parallel loop present(rHs11[0 : n * n])
-        for (int i = 0; i < n * n; i++) rHs11[i] = 0.0;
-        ClusterNonCol_GEMMul8Dgemm_OpenACC(CUBLAS_OP_T, CUBLAS_OP_N, n, n, n, S, Cs, rHs11);
-
-#pragma acc parallel loop present(Cs[0 : n * n])
-        for (int i = 0; i < n * n; i++) Cs[i] = 0.0;
-        ClusterNonCol_GEMMul8Dgemm_OpenACC(CUBLAS_OP_N, CUBLAS_OP_N, n, n, n, rHs12, S, Cs);
-#pragma acc parallel loop present(rHs12[0 : n * n])
-        for (int i = 0; i < n * n; i++) rHs12[i] = 0.0;
-        ClusterNonCol_GEMMul8Dgemm_OpenACC(CUBLAS_OP_T, CUBLAS_OP_N, n, n, n, S, Cs, rHs12);
-
-#pragma acc parallel loop present(Cs[0 : n * n])
-        for (int i = 0; i < n * n; i++) Cs[i] = 0.0;
-        ClusterNonCol_GEMMul8Dgemm_OpenACC(CUBLAS_OP_N, CUBLAS_OP_N, n, n, n, rHs22, S, Cs);
-#pragma acc parallel loop present(rHs22[0 : n * n])
-        for (int i = 0; i < n * n; i++) rHs22[i] = 0.0;
-        ClusterNonCol_GEMMul8Dgemm_OpenACC(CUBLAS_OP_T, CUBLAS_OP_N, n, n, n, S, Cs, rHs22);
-
-#pragma acc parallel loop present(Cs[0 : n * n])
-        for (int i = 0; i < n * n; i++) Cs[i] = 0.0;
-        ClusterNonCol_GEMMul8Dgemm_OpenACC(CUBLAS_OP_N, CUBLAS_OP_N, n, n, n, iHs11, S, Cs);
-#pragma acc parallel loop present(iHs11[0 : n * n])
-        for (int i = 0; i < n * n; i++) iHs11[i] = 0.0;
-        ClusterNonCol_GEMMul8Dgemm_OpenACC(CUBLAS_OP_T, CUBLAS_OP_N, n, n, n, S, Cs, iHs11);
-
-#pragma acc parallel loop present(Cs[0 : n * n])
-        for (int i = 0; i < n * n; i++) Cs[i] = 0.0;
-        ClusterNonCol_GEMMul8Dgemm_OpenACC(CUBLAS_OP_N, CUBLAS_OP_N, n, n, n, iHs12, S, Cs);
-#pragma acc parallel loop present(iHs12[0 : n * n])
-        for (int i = 0; i < n * n; i++) iHs12[i] = 0.0;
-        ClusterNonCol_GEMMul8Dgemm_OpenACC(CUBLAS_OP_T, CUBLAS_OP_N, n, n, n, S, Cs, iHs12);
-
-#pragma acc parallel loop present(Cs[0 : n * n])
-        for (int i = 0; i < n * n; i++) Cs[i] = 0.0;
-        ClusterNonCol_GEMMul8Dgemm_OpenACC(CUBLAS_OP_N, CUBLAS_OP_N, n, n, n, iHs22, S, Cs);
-#pragma acc parallel loop present(iHs22[0 : n * n])
-        for (int i = 0; i < n * n; i++) iHs22[i] = 0.0;
-        ClusterNonCol_GEMMul8Dgemm_OpenACC(CUBLAS_OP_T, CUBLAS_OP_N, n, n, n, S, Cs, iHs22);
-
-#pragma acc exit data delete(S[0 : n * n], Cs[0 : n * n])
-#pragma acc enter data create(Hs2[0 : n2 * n2], ko[0 : n2 + 1])
-
-#pragma acc parallel loop collapse(2) present(Hs2[0 : n2 * n2], rHs11[0 : n * n], rHs12[0 : n * n], rHs22[0 : n * n], \
-                                             iHs11[0 : n * n], iHs12[0 : n * n], iHs22[0 : n * n])
         for (int col = 0; col < n2; col++) {
             for (int row = 0; row < n2; row++) {
                 if (row < n && col < n) {
@@ -1399,22 +1614,12 @@ static void ClusterNonCol_CuSolverRootDensePath(int SCF_iter, double *ko, double
             }
         }
 
-#pragma acc exit data delete(rHs11[0 : n * n], rHs12[0 : n * n], rHs22[0 : n * n], \
-                             iHs11[0 : n * n], iHs12[0 : n * n], iHs22[0 : n * n])
-
         ClusterNonCol_CuSolver_DenseZheevx(Hs2, NULL, ko, n2, MaxN,
                                            "Cluster_DFT_NonCol root Hamiltonian");
-
-#pragma acc enter data copyin(cached_Ss2[0 : n2 * n2])
-#pragma acc enter data create(dense_evec[0 : n2 * n2])
-
-        ClusterNonCol_GEMMul8Zgemm_OpenACC(CUBLAS_OP_T, CUBLAS_OP_T, n2, n2, n2, Hs2, cached_Ss2, dense_evec);
-
-#pragma acc update self(ko[0 : n2 + 1])
-#pragma acc exit data delete(Hs2[0 : n2 * n2], cached_Ss2[0 : n2 * n2], ko[0 : n2 + 1])
+        ClusterNonCol_BackTransformDenseEVecGPU(n2, Hs2, cached_Ss2, dense_evec);
 
         *dense_evec_out = dense_evec;
-        *dense_evec_on_device_out = 0;
+        *dense_evec_on_device_out = 1;
     }
 
     MPI_Bcast(ko, n2 + 1, MPI_DOUBLE, Host_ID, mpi_comm_level1);
@@ -2388,7 +2593,12 @@ double Cluster_DFT_NonCol(
 
     if (measure_time) dtime(&stime);
 
-    if (use_cusolver_direct_cluster_dm && cusolver_direct_evec_on_device){
+    if (use_cusolver_direct_cluster_dm){
+
+      if (myid==Host_ID && !cusolver_direct_evec_on_device){
+        ClusterNonCol_AbortWithMessage("CuSOLVER device eigenvectors are not available in Cluster_DFT_NonCol.c.");
+      }
+
       time6 += ClusterNonCol_CalcDMRootDense_OpenACC(myid,size_H1,MP,n,n2,MaxN,CDM,iDM[0],EDM,ko,
                                                      cusolver_dense_evec,(Cnt_switch==1));
 
@@ -2398,12 +2608,6 @@ double Cluster_DFT_NonCol(
       ClusterNonCol_StashCuSolverDenseEVec(myid,n2,&cusolver_dense_evec,&cusolver_direct_evec_on_device);
     }
     else {
-      if (use_cusolver_direct_cluster_dm){
-        time6 += ClusterNonCol_ScatterDenseEVecToLocal(myid, numprocs, n2, is2, ie2,
-                                                       cusolver_dense_evec, EVec1);
-        ClusterNonCol_StashCuSolverDenseEVec(myid,n2,&cusolver_dense_evec,&cusolver_direct_evec_on_device);
-      }
-
       /* DM */
 
       time6 += Calc_DM_Cluster_non_collinear_ScaLAPACK( 1, myid, numprocs, size_H1, is2, ie2, MP, n, n2,
