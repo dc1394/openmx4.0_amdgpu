@@ -129,7 +129,7 @@ OBJS    = openmx.o openmx_common.o Input_std.o Inputtools.o init.o LU_inverse.o 
           Hamiltonian_Band_NC.o Hamiltonian_Cluster_SO.o Get_OneD_HS_Col.o \
           SetPara_DFT.o XC_Ceperly_Alder.o XC_CA_LSDA.o \
           XC_PW92C.o XC_PBE.o XC_EX.o DFT.o Mixing_DM.o Mixing_H.o Mixing_V.o Force.o Stress.o Poisson.o Poisson_ESM.o \
-          Cluster_DFT_Col.o Cluster_DFT_NonCol.o Cluster_DFT_NonCol_dm_hip.o Cluster_DFT_Dosout.o Cluster_DFT_ON2.o Cluster_DFT_Col_LNO.o \
+          Cluster_DFT_Col.o Cluster_DFT_Col_dm_hip.o Cluster_DFT_NonCol.o Cluster_DFT_NonCol_dm_hip.o Cluster_DFT_Dosout.o Cluster_DFT_ON2.o Cluster_DFT_Col_LNO.o \
           Band_DFT_Col.o Band_DFT_NonCol.o Band_DFT_NonCol_GB.o Band_DFT_kpath.o Band_DFT_kpath_LNO.o Band_DFT_MO.o \
           Cluster_DFT_Col_CWF.o Cluster_DFT_NonCol_CWF.o Band_DFT_Col_CWF.o Band_DFT_NonCol_CWF.o \
           Unfolding_Bands.o Band_DFT_Dosout.o Set_Density_Grid.o Set_Orbitals_Grid.o Set_Aden_Grid.o \
@@ -373,6 +373,8 @@ DFT.o: DFT.c openmx_common.h tran_prototypes.h
 	$(CC) -c DFT.c
 Cluster_DFT_Col.o: Cluster_DFT_Col.c openmx_common.h
 	$(CC) -c Cluster_DFT_Col.c
+Cluster_DFT_Col_dm_hip.o: Cluster_DFT_Col_dm_hip.cu
+	$(HIPCC) $(HIPCC_GEMMUL8_FLAGS) -c Cluster_DFT_Col_dm_hip.cu -o Cluster_DFT_Col_dm_hip.o
 Cluster_DFT_NonCol.o: Cluster_DFT_NonCol.c openmx_common.h
 	$(CC) -c Cluster_DFT_NonCol.c
 Cluster_DFT_NonCol_dm_hip.o: Cluster_DFT_NonCol_dm_hip.cu
