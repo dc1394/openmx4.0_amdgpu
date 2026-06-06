@@ -38,6 +38,7 @@ extern int ClusterCol_BuildDeviceDenseFromPacked_HIP(const double *H1, const int
                                                      int tnum, int n, double *d_H);
 extern void ClusterCol_HIPDetailTimer_Reset(void);
 extern void ClusterCol_HIPDetailTimer_Get(double *dense_build_kernel, double *dm_kernel);
+extern int openmx_magma_dsyevdx_gpu(int n, int maxn, double *d_A, double *w, int *mout);
 
 typedef struct {
     int valid;
@@ -82,26 +83,19 @@ typedef struct {
 
 static ClusterColDetailTimers ClusterCol_detail_timers = {0};
 
-/* GPU CuSolver context (added by H.Kawai, ported from 3.9.9 GPU) */
+/* Dense GPU context (added by H.Kawai, ported from 3.9.9 GPU) */
 typedef struct {
     int                initialized;
     int                device_id;
     int                matrix_dim;
     int                transformed_s_valid;
     int                transformed_s_dim;
-    int                d_lwork;
-    size_t             d_work_bytes;
-    size_t             h_work_bytes;
     cudaStream_t       stream;
     cublasHandle_t     cublas;
-    cusolverDnHandle_t cusolver;
     double *           d_S;
     double *           d_H;
     double *           d_tmp;
     double *           d_W;
-    int32_t *          d_info;
-    void *             d_work;
-    void *             h_work;
 } ClusterColCuSolverCtx;
 
 static ClusterColCuSolverCtx ClusterCol_cusolver_ctx = {0};
@@ -173,39 +167,11 @@ static void ClusterCol_DetailTimer_Add(double *slot, double stime)
 
 static void ClusterCol_DetailTimer_Report(int myid0, int myid1)
 {
-    double dense_build_kernel = 0.0;
-    double dm_kernel = 0.0;
-
     if (myid1 != 0 || !ClusterCol_detail_timers.active) {
         return;
     }
 
-    ClusterCol_HIPDetailTimer_Get(&dense_build_kernel, &dm_kernel);
-
-    fprintf(stderr,
-            "<ClusterTimer> rank %d SCF=%d n=%d maxn=%d: "
-            "dense_build %.6f s (HIP kernel %.6f s, calls=%d), "
-            "overlap_eig %.6f s, overlap_scale %.6f s, "
-            "H_transform_GEMM %.6f s, syevdx %.6f s, "
-            "backtransform %.6f s, evec_copyout %.6f s, "
-            "DM_total %.6f s (HIP kernel %.6f s).\n",
-            myid0,
-            ClusterCol_detail_timers.scf_iter,
-            ClusterCol_detail_timers.n,
-            ClusterCol_detail_timers.maxn,
-            ClusterCol_detail_timers.dense_build,
-            dense_build_kernel,
-            ClusterCol_detail_timers.dense_build_count,
-            ClusterCol_detail_timers.overlap_eig,
-            ClusterCol_detail_timers.overlap_scale,
-            ClusterCol_detail_timers.h_transform_gemm,
-            ClusterCol_detail_timers.syevdx,
-            ClusterCol_detail_timers.backtransform,
-            ClusterCol_detail_timers.evec_copyout,
-            ClusterCol_detail_timers.dm_total,
-            dm_kernel);
-    fflush(stderr);
-
+    (void)myid0;
     ClusterCol_detail_timers.active = 0;
 }
 
@@ -468,10 +434,6 @@ static void ClusterCol_CuSolver_Destroy(void)
     if (ctx->d_H != NULL)        wait_cudafunc(cudaFree(ctx->d_H));
     if (ctx->d_tmp != NULL)      wait_cudafunc(cudaFree(ctx->d_tmp));
     if (ctx->d_W != NULL)        wait_cudafunc(cudaFree(ctx->d_W));
-    if (ctx->d_info != NULL)     wait_cudafunc(cudaFree(ctx->d_info));
-    if (ctx->d_work != NULL)     wait_cudafunc(cudaFree(ctx->d_work));
-    if (ctx->h_work != NULL)     free(ctx->h_work);
-    if (ctx->cusolver != NULL)   wait_cudafunc(hipsolverDnDestroy(ctx->cusolver));
     if (ctx->cublas != NULL)     wait_cudafunc(cublasDestroy(ctx->cublas));
     if (ctx->stream != NULL)     wait_cudafunc(cudaStreamDestroy(ctx->stream));
 
@@ -491,9 +453,7 @@ static void ClusterCol_CuSolver_Init(void)
 
     wait_cudafunc(cudaStreamCreateWithFlags(&ctx->stream, cudaStreamNonBlocking));
     wait_cudafunc(cublasCreate(&ctx->cublas));
-    wait_cudafunc(hipsolverDnCreate(&ctx->cusolver));
     wait_cudafunc(cublasSetStream(ctx->cublas, ctx->stream));
-    wait_cudafunc(hipsolverDnSetStream(ctx->cusolver, ctx->stream));
 
     ctx->initialized = 1;
     ctx->device_id   = current_device;
@@ -518,99 +478,51 @@ static void ClusterCol_CuSolver_EnsureMatrixCapacity(int n)
     if (ctx->d_H != NULL)    wait_cudafunc(cudaFree(ctx->d_H));
     if (ctx->d_tmp != NULL)  wait_cudafunc(cudaFree(ctx->d_tmp));
     if (ctx->d_W != NULL)    wait_cudafunc(cudaFree(ctx->d_W));
-    if (ctx->d_info != NULL) wait_cudafunc(cudaFree(ctx->d_info));
 
-    dense_count = ClusterCol_CheckedMulCount((size_t)n,(size_t)n,"CuSolver dense matrix");
-    matrix_bytes = ClusterCol_CheckedMulCount(dense_count,sizeof(double),"CuSolver dense matrix bytes");
-    vector_bytes = ClusterCol_CheckedMulCount((size_t)n,sizeof(double),"CuSolver eigenvalue bytes");
+    dense_count = ClusterCol_CheckedMulCount((size_t)n,(size_t)n,"dense GPU matrix");
+    matrix_bytes = ClusterCol_CheckedMulCount(dense_count,sizeof(double),"dense GPU matrix bytes");
+    vector_bytes = ClusterCol_CheckedMulCount((size_t)n,sizeof(double),"dense GPU eigenvalue bytes");
 
     wait_cudafunc(cudaMalloc((void**)&ctx->d_S,matrix_bytes));
     wait_cudafunc(cudaMalloc((void**)&ctx->d_H,matrix_bytes));
     wait_cudafunc(cudaMalloc((void**)&ctx->d_tmp,matrix_bytes));
     wait_cudafunc(cudaMalloc((void**)&ctx->d_W,vector_bytes));
-    wait_cudafunc(cudaMalloc((void**)&ctx->d_info,sizeof(int32_t)));
 
     ctx->matrix_dim = n;
     ctx->transformed_s_valid = 0;
     ctx->transformed_s_dim = 0;
 }
 
-static void ClusterCol_CuSolver_EnsureWorkspace(int n, int maxn, double *d_A)
-{
-    ClusterColCuSolverCtx *ctx = &ClusterCol_cusolver_ctx;
-    cusolverEigMode_t jobz = HIPSOLVER_EIG_MODE_VECTOR;
-    cublasFillMode_t uplo = CUBLAS_FILL_MODE_LOWER;
-    cusolverEigRange_t range;
-    double vl = 0.0;
-    double vu = 0.0;
-    int h_meig = 0;
-    int lwork = 0;
-    size_t d_bytes = 0;
-
-    if (n<=0 || maxn<=0 || n<maxn){
-        ClusterCol_AbortWithMessage("Invalid eigensolver dimensions in Cluster_DFT_Col.c.");
-    }
-
-    ClusterCol_CuSolver_EnsureMatrixCapacity(n);
-    range = (n==maxn) ? HIPSOLVER_EIG_RANGE_ALL : HIPSOLVER_EIG_RANGE_I;
-
-    wait_cudafunc(hipsolverDnDsyevdx_bufferSize(ctx->cusolver,jobz,range,uplo,n,
-                                                d_A,n,vl,vu,1,maxn,&h_meig,
-                                                ctx->d_W,&lwork));
-
-    if (lwork<0){
-        ClusterCol_AbortWithMessage("Invalid hipSOLVER workspace size in Cluster_DFT_Col.c.");
-    }
-
-    d_bytes = ClusterCol_CheckedMulCount((size_t)lwork,sizeof(double),"hipSOLVER syevdx workspace");
-
-    if (ctx->d_lwork<lwork){
-        if (ctx->d_work!=NULL) wait_cudafunc(cudaFree(ctx->d_work));
-        ctx->d_work = NULL;
-        if (0<d_bytes) wait_cudafunc(cudaMalloc((void**)&ctx->d_work,d_bytes));
-        ctx->d_lwork = lwork;
-        ctx->d_work_bytes = d_bytes;
-    }
-
-    if (ctx->h_work!=NULL) free(ctx->h_work);
-    ctx->h_work = NULL;
-    ctx->h_work_bytes = 0;
-}
-
 static void ClusterCol_CuSolver_EigenDevice(double *d_A, int n, int maxn, double *ko, double *detail_slot)
 {
-    ClusterColCuSolverCtx *ctx = &ClusterCol_cusolver_ctx;
-    cusolverEigMode_t jobz = HIPSOLVER_EIG_MODE_VECTOR;
-    cublasFillMode_t uplo = CUBLAS_FILL_MODE_LOWER;
-    cusolverEigRange_t range;
-    double vl = 0.0;
-    double vu = 0.0;
-    int h_meig = 0;
-    int32_t info = 0;
+    int info = 0;
+    int mout = 0;
     char msg[256];
     double stime = 0.0;
 
-    ClusterCol_CuSolver_EnsureWorkspace(n,maxn,d_A);
-    range = (n==maxn) ? HIPSOLVER_EIG_RANGE_ALL : HIPSOLVER_EIG_RANGE_I;
+    if (n<=0 || maxn<=0 || n<maxn){
+        ClusterCol_AbortWithMessage("Invalid MAGMA eigensolver dimensions in Cluster_DFT_Col.c.");
+    }
+
+    ClusterCol_CuSolver_EnsureMatrixCapacity(n);
 
     if (detail_slot != NULL && ClusterCol_detail_timers.active) {
         dtime(&stime);
     }
 
-    wait_cudafunc(hipsolverDnDsyevdx(ctx->cusolver,jobz,range,uplo,n,
-                                     d_A,n,vl,vu,1,maxn,&h_meig,
-                                     ctx->d_W,(double *)ctx->d_work,ctx->d_lwork,
-                                     (int *)ctx->d_info));
-    wait_cudafunc(cudaMemcpyAsync(&info,ctx->d_info,sizeof(int32_t),cudaMemcpyDeviceToHost,ctx->stream));
-    wait_cudafunc(cudaMemcpyAsync(ko,ctx->d_W,sizeof(double)*(size_t)maxn,cudaMemcpyDeviceToHost,ctx->stream));
-    wait_cudafunc(cudaStreamSynchronize(ctx->stream));
+    wait_cudafunc(cudaStreamSynchronize(ClusterCol_cusolver_ctx.stream));
+    info = openmx_magma_dsyevdx_gpu(n,maxn,d_A,ko,&mout);
 
     if (detail_slot != NULL && ClusterCol_detail_timers.active) {
         ClusterCol_DetailTimer_Add(detail_slot, stime);
     }
 
     if (info!=0){
-        snprintf(msg,sizeof(msg),"hipsolverDnDsyevdx failed in Cluster_DFT_Col.c: info=%d",(int)info);
+        snprintf(msg,sizeof(msg),"magma_dsyevdx_gpu failed in Cluster_DFT_Col.c: info=%d",(int)info);
+        ClusterCol_AbortWithMessage(msg);
+    }
+    if (mout!=maxn){
+        snprintf(msg,sizeof(msg),"magma_dsyevdx_gpu returned %d eigenpairs in Cluster_DFT_Col.c, expected %d.",mout,maxn);
         ClusterCol_AbortWithMessage(msg);
     }
 }
@@ -1085,7 +997,7 @@ static void ClusterCol_CuSolverRootDensePath(int SCF_iter, int SpinP_switch, dou
 
         if (!logged_root_dense) {
             fprintf(stderr,
-                    "<Cluster> rank %d: hipSOLVER collinear dense GPU path uses one selected rank for dense matrix generation, "
+                    "<Cluster> rank %d: MAGMA collinear dense GPU path uses one selected rank for dense matrix generation, "
                     "GEMM, eigensolver, and density-matrix generation (n=%d, maxn=%d).\n",
                     myid0, n, MaxN);
             fflush(stderr);

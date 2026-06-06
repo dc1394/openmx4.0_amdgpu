@@ -76,7 +76,7 @@ MPIF90 ?= /home/kawai/opt/openmpi-rocmclang/bin/mpif90
 MPI_CFLAGS  := $(shell $(MPICC) --showme:compile 2>/dev/null)
 MPI_FCFLAGS := $(shell $(MPIF90) --showme:compile 2>/dev/null)
 
-COMMON_INCLUDES = -I. -I$(ROCM)/include -I$(GEMMUL8_DIR)/include -I$(GEMMUL8_DIR)/src
+COMMON_INCLUDES = -I. -I$(ROCM)/include -I$(GEMMUL8_DIR)/include -I$(GEMMUL8_DIR)/src -I$(MAGMA_DIR)/include
 CFLAGS_COMMON = -w -fcommon -Wno-error=implicit-function-declaration -std=c11 -mtune=native -march=native -D__HIP_PLATFORM_AMD__ -DM_PI=3.14159265358979323846264338327950288 $(COMMON_INCLUDES)
 CPPFLAGS_COMMON = -w -fcommon -std=c++20 -mtune=native -march=native -D__HIP_PLATFORM_AMD__ $(COMMON_INCLUDES)
 
@@ -91,7 +91,7 @@ FC = $(FLANG) -O2 $(MPI_FCFLAGS) -mtune=native -march=native -fopenmp
 
 MPI_LIBDIR ?= /home/kawai/opt/openmpi-rocmclang/lib
 RPATHS = -Wl,--disable-new-dtags -Wl,-rpath,$(ROCM_LLVM_LIB) -Wl,-rpath,$(ROCM_LIB) -Wl,-rpath,$(MPI_LIBDIR)
-ROCM_GPU_LIBS := -L$(ROCM_LIB) -lamd_smi -lhipsolver -lrocsolver -lhipblas -lhipblaslt -lrocblas -lamdhip64
+ROCM_GPU_LIBS := -L$(ROCM_LIB) -lamd_smi -lhipsolver -lrocsolver -lhipblas -lhipblaslt -lrocblas -lhipsparse -lamdhip64
 FLANG_RTL_LIBS := -L$(ROCM_LLVM_LIB) -lflang_rt.runtime -lflang_rt.quadmath -lquadmath
 AOCL_LIB ?= /opt/AMD/aocl/aocl-linux-aocc-5.2.0/aocc/lib
 SCALAPACK_LIBS := -L$(AOCL_LIB) -lscalapack
@@ -117,6 +117,13 @@ GEMMUL8_OPENMX_OBJ ?= gemmul8_openmx.o
 GEMMUL8_HIP_PATH ?= $(ROCM)
 GEMMUL8_GPU_ARCH ?= $(ARCH)
 HIPCC_GEMMUL8_FLAGS = -std=c++20 -O3 --offload-arch=$(GEMMUL8_GPU_ARCH) -I. -I$(GEMMUL8_DIR)/include -I$(GEMMUL8_DIR)/src -I$(ROCM)/include -D__HIP_PLATFORM_AMD__ -ffp-contract=off -Wno-unused-result -Wno-unused-command-line-argument -Wno-unused-value -DOCML_BASIC_ROUNDED_OPERATIONS -DGPU_ARCH=$(GEMMUL8_GPU_ARCH)
+MAGMA_VERSION ?= 2.9.0
+MAGMA_URL ?= https://icl.utk.edu/projectsfiles/magma/downloads/magma-$(MAGMA_VERSION).tar.gz
+MAGMA_ARCHIVE ?= /tmp/magma-$(MAGMA_VERSION).tar.gz
+MAGMA_DIR ?= third_party/magma
+MAGMA_LIB ?= $(MAGMA_DIR)/lib/libmagma.a
+MAGMA_GPU_TARGET ?= $(ARCH)
+HIPCC_MAGMA_FLAGS = $(HIPCC_GEMMUL8_FLAGS) -I$(MAGMA_DIR)/include -I$(MAGMA_DIR)/control
 
 CFLAGS  = -g 
 CPPFLAGS =
@@ -145,7 +152,7 @@ OBJS    = openmx.o openmx_common.o Input_std.o Inputtools.o init.o LU_inverse.o 
           Get_Cnt_dOrbitals.o Gaunt.o Find_CGrids.o MD_pac.o \
           RestartFileDFT.o Output_CompTime.o Merge_LogFile.o Make_FracCoord.o \
           Make_InputFile_with_FinalCoord.o Output_Energy_Decomposition.o \
-          Divide_Conquer.o Divide_Conquer_LNO.o my_cublasDgemm.o my_cublasZgemm.o gemmul8_bridge.o Krylov.o \
+          Divide_Conquer.o Divide_Conquer_LNO.o my_cublasDgemm.o my_cublasZgemm.o gemmul8_bridge.o magma_openmx.o Krylov.o \
           Divide_Conquer_Dosout.o EGAC_DFT.o LNO.o Calc_LNAO.o Calc_LNBO.o \
           Eigen_lapack.o cusolver_Syevd.o cusolver_Syevdx.o set_cuda_default_device_from_local_rank.o set_openacc_device_from_local_rank.o Eigen_lapack2.o Eigen_lapack3.o EigenBand_lapack.o \
           Eigen_PReHH.o BroadCast_ReMatrix.o \
@@ -227,7 +234,7 @@ UTIL 	= DosMain cohp jx analysis_example esp polB calB Z2FH bandgnu13 bin2txt cu
 # FFTW3
 #
 
-.PHONY: fftw3 fftw3-clean gemmul8-clean clean
+.PHONY: fftw3 fftw3-clean gemmul8-clean magma-clean clean
 
 fftw3: $(FFTW3_LIB)
 
@@ -272,6 +279,10 @@ fftw3-clean:
 gemmul8-clean:
 	rm -f "$(GEMMUL8_OPENMX_OBJ)" "$(GEMMUL8_LIB)"
 
+magma-clean:
+	$(MAKE) -C "$(MAGMA_DIR)" clean || true
+	rm -f magma_openmx.o
+
 FFTW3_USERS = Poisson.o Stress.o Poisson_ESM.o TRAN_Poisson.o TRAN_CDen_Main.o TRAN_Set_Electrode_Grid.o
 $(FFTW3_USERS): | $(FFTW3_LIB)
 
@@ -281,8 +292,8 @@ $(FFTW3_USERS): | $(FFTW3_LIB)
 
 .DEFAULT_GOAL := openmx
 
-openmx:	$(FFTW3_LIB) $(GEMMUL8_LIB) $(OBJS)
-	$(CC) $(OBJS) $(STACK) $(GEMMUL8_LIB) $(LIB) -lm -o openmx
+openmx:	$(FFTW3_LIB) $(GEMMUL8_LIB) $(MAGMA_LIB) $(OBJS)
+	$(CC) $(OBJS) $(STACK) $(GEMMUL8_LIB) $(MAGMA_LIB) $(LIB) -lm -o openmx
 	
 #
 #
@@ -375,6 +386,8 @@ Cluster_DFT_Col.o: Cluster_DFT_Col.c openmx_common.h
 	$(CC) -c Cluster_DFT_Col.c
 Cluster_DFT_Col_dm_hip.o: Cluster_DFT_Col_dm_hip.cu
 	$(HIPCC) $(HIPCC_GEMMUL8_FLAGS) -c Cluster_DFT_Col_dm_hip.cu -o Cluster_DFT_Col_dm_hip.o
+magma_openmx.o: magma_openmx.cu openmx_common.h $(MAGMA_LIB)
+	$(HIPCC) $(HIPCC_MAGMA_FLAGS) -c magma_openmx.cu -o magma_openmx.o
 Cluster_DFT_NonCol.o: Cluster_DFT_NonCol.c openmx_common.h
 	$(CC) -c Cluster_DFT_NonCol.c
 Cluster_DFT_NonCol_dm_hip.o: Cluster_DFT_NonCol_dm_hip.cu
@@ -676,6 +689,20 @@ $(GEMMUL8_OPENMX_OBJ): gemmul8_openmx.cu $(GEMMUL8_DIR)/Makefile
 $(GEMMUL8_LIB): $(GEMMUL8_OPENMX_OBJ)
 	$(MAKE) -C $(GEMMUL8_DIR) BACKEND=hip HIP_PATH=$(GEMMUL8_HIP_PATH) GPU_ARCH=$(GEMMUL8_GPU_ARCH) lib/libgemmul8.a
 	ar rcs $(GEMMUL8_LIB) $(GEMMUL8_OPENMX_OBJ)
+$(MAGMA_DIR)/Makefile:
+	mkdir -p "$(MAGMA_DIR)"
+	if [ -f "$(MAGMA_ARCHIVE)" ]; then \
+	  tar -xzf "$(MAGMA_ARCHIVE)" -C "$(MAGMA_DIR)" --strip-components=1; \
+	else \
+	  curl -L --fail "$(MAGMA_URL)" -o "$(MAGMA_ARCHIVE)"; \
+	  tar -xzf "$(MAGMA_ARCHIVE)" -C "$(MAGMA_DIR)" --strip-components=1; \
+	fi
+$(MAGMA_DIR)/make.inc:
+	@echo "MAGMA make.inc was not found in $(MAGMA_DIR)."
+	@echo "Restore third_party/magma/make.inc or override MAGMA_DIR with a configured MAGMA source tree."
+	@false
+$(MAGMA_LIB): $(MAGMA_DIR)/Makefile $(MAGMA_DIR)/make.inc
+	$(MAKE) -C "$(MAGMA_DIR)" BACKEND=hip ROCM_PATH="$(ROCM)" GPU_TARGET="$(MAGMA_GPU_TARGET)" lib/libmagma.a
 Divide_Conquer_Dosout.o: Divide_Conquer_Dosout.c openmx_common.h
 	$(CC) -c Divide_Conquer_Dosout.c
 Krylov.o: Krylov.c openmx_common.h
@@ -823,7 +850,7 @@ install: $(PROG)
 #
 #
 
-clean: fftw3-clean gemmul8-clean
+clean: fftw3-clean gemmul8-clean magma-clean
 	rm -f $(PROG) $(OBJS) $(OBJS_jx) $(UTIL) *.o *.mod *.dbg
 
 #
