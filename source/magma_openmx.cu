@@ -17,6 +17,15 @@ magma_int_t  g_lwork = 0;
 magma_int_t *g_iwork = nullptr;
 magma_int_t  g_liwork = 0;
 
+magmaDoubleComplex *g_z_host_matrix = nullptr;
+size_t              g_z_host_matrix_elems = 0;
+magmaDoubleComplex *g_z_work = nullptr;
+magma_int_t         g_z_lwork = 0;
+double             *g_z_rwork = nullptr;
+magma_int_t         g_z_lrwork = 0;
+magma_int_t        *g_z_iwork = nullptr;
+magma_int_t         g_z_liwork = 0;
+
 int ensure_magma_initialized()
 {
     std::call_once(g_magma_once, []() {
@@ -73,6 +82,68 @@ int ensure_work(magma_int_t lwork, magma_int_t liwork)
         }
         g_iwork = new_iwork;
         g_liwork = liwork;
+    }
+
+    return MAGMA_SUCCESS;
+}
+
+int ensure_z_host_matrix(size_t elems)
+{
+    magmaDoubleComplex *new_ptr = nullptr;
+
+    if (elems <= g_z_host_matrix_elems) {
+        return MAGMA_SUCCESS;
+    }
+    if (magma_zmalloc_cpu(&new_ptr, elems) != MAGMA_SUCCESS) {
+        return MAGMA_ERR_HOST_ALLOC;
+    }
+    if (g_z_host_matrix != nullptr) {
+        magma_free_cpu(g_z_host_matrix);
+    }
+    g_z_host_matrix = new_ptr;
+    g_z_host_matrix_elems = elems;
+    return MAGMA_SUCCESS;
+}
+
+int ensure_z_work(magma_int_t lwork, magma_int_t lrwork, magma_int_t liwork)
+{
+    if (lwork > g_z_lwork) {
+        magmaDoubleComplex *new_work = nullptr;
+
+        if (magma_zmalloc_cpu(&new_work, static_cast<size_t>(lwork)) != MAGMA_SUCCESS) {
+            return MAGMA_ERR_HOST_ALLOC;
+        }
+        if (g_z_work != nullptr) {
+            magma_free_cpu(g_z_work);
+        }
+        g_z_work = new_work;
+        g_z_lwork = lwork;
+    }
+
+    if (lrwork > g_z_lrwork) {
+        double *new_rwork = nullptr;
+
+        if (magma_dmalloc_cpu(&new_rwork, static_cast<size_t>(lrwork)) != MAGMA_SUCCESS) {
+            return MAGMA_ERR_HOST_ALLOC;
+        }
+        if (g_z_rwork != nullptr) {
+            magma_free_cpu(g_z_rwork);
+        }
+        g_z_rwork = new_rwork;
+        g_z_lrwork = lrwork;
+    }
+
+    if (liwork > g_z_liwork) {
+        magma_int_t *new_iwork = nullptr;
+
+        if (magma_imalloc_cpu(&new_iwork, static_cast<size_t>(liwork)) != MAGMA_SUCCESS) {
+            return MAGMA_ERR_HOST_ALLOC;
+        }
+        if (g_z_iwork != nullptr) {
+            magma_free_cpu(g_z_iwork);
+        }
+        g_z_iwork = new_iwork;
+        g_z_liwork = liwork;
     }
 
     return MAGMA_SUCCESS;
@@ -144,6 +215,90 @@ extern "C" int openmx_magma_dsyevdx_gpu(int n, int maxn, double *d_A, double *w,
                             0.0, 0.0, il, iu, &mout, w,
                             g_host_matrix, mn,
                             g_work, lwork, g_iwork, liwork, &info);
+    cudaDeviceSynchronize();
+
+    if (mout_out != nullptr) {
+        *mout_out = static_cast<int>(mout);
+    }
+    if (ret != MAGMA_SUCCESS) {
+        return static_cast<int>(ret);
+    }
+    return static_cast<int>(info);
+}
+
+extern "C" int openmx_magma_zheevdx_gpu(int n, int maxn, void *d_A, double *w, int *mout_out)
+{
+    std::lock_guard<std::mutex> lock(g_magma_mutex);
+    magma_int_t mn = static_cast<magma_int_t>(n);
+    magma_int_t mmaxn = static_cast<magma_int_t>(maxn);
+    magma_int_t il = 1;
+    magma_int_t iu = mmaxn;
+    magma_int_t mout = 0;
+    magma_int_t info = 0;
+    magma_range_t range = (n == maxn) ? MagmaRangeAll : MagmaRangeI;
+    magmaDoubleComplex work_query = MAGMA_Z_ZERO;
+    double rwork_query = 0.0;
+    magma_int_t iwork_query = 0;
+    int err;
+
+    if (mout_out != nullptr) {
+        *mout_out = 0;
+    }
+    if (n <= 0 || maxn <= 0 || maxn > n || d_A == nullptr || w == nullptr) {
+        return MAGMA_ERR_ILLEGAL_VALUE;
+    }
+
+    err = ensure_magma_initialized();
+    if (err != MAGMA_SUCCESS) {
+        return err;
+    }
+
+    err = ensure_z_host_matrix(static_cast<size_t>(n) * static_cast<size_t>(n));
+    if (err != MAGMA_SUCCESS) {
+        return err;
+    }
+
+    magma_int_t ret = magma_zheevdx_gpu(MagmaVec, range, MagmaLower,
+                                        mn, reinterpret_cast<magmaDoubleComplex_ptr>(d_A), mn,
+                                        0.0, 0.0, il, iu, &mout, w,
+                                        g_z_host_matrix, mn,
+                                        &work_query, -1,
+                                        &rwork_query, -1,
+                                        &iwork_query, -1, &info);
+    if (ret != MAGMA_SUCCESS) {
+        return static_cast<int>(ret);
+    }
+    if (info != 0) {
+        return static_cast<int>(info);
+    }
+
+    magma_int_t lwork = static_cast<magma_int_t>(MAGMA_Z_REAL(work_query));
+    magma_int_t lrwork = static_cast<magma_int_t>(rwork_query);
+    magma_int_t liwork = iwork_query;
+    if (lwork < 1) {
+        lwork = 1;
+    }
+    if (lrwork < 1) {
+        lrwork = 1;
+    }
+    if (liwork < 1) {
+        liwork = 1;
+    }
+
+    err = ensure_z_work(lwork, lrwork, liwork);
+    if (err != MAGMA_SUCCESS) {
+        return err;
+    }
+
+    mout = 0;
+    info = 0;
+    ret = magma_zheevdx_gpu(MagmaVec, range, MagmaLower,
+                            mn, reinterpret_cast<magmaDoubleComplex_ptr>(d_A), mn,
+                            0.0, 0.0, il, iu, &mout, w,
+                            g_z_host_matrix, mn,
+                            g_z_work, lwork,
+                            g_z_rwork, lrwork,
+                            g_z_iwork, liwork, &info);
     cudaDeviceSynchronize();
 
     if (mout_out != nullptr) {

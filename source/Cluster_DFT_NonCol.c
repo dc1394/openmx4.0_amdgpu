@@ -31,6 +31,8 @@ extern int ClusterNonCol_CalcDMRootDense_HIP(int entry_count, int size_H1, int n
                                              int calc_edm, const int *basis0, const int *basis1,
                                              const double *occ, const double *occ_e,
                                              const dcomplex *dense_evec, double *dm_buffer);
+extern int openmx_magma_dsyevdx_gpu(int n, int maxn, double *d_A, double *w, int *mout);
+extern int openmx_magma_zheevdx_gpu(int n, int maxn, void *d_A, double *w, int *mout);
 
 static void ClusterNonCol_AbortWithMessage(const char *message)
 {
@@ -903,11 +905,23 @@ static void ClusterNonCol_GEMMul8Zgemm_OpenACC(cublasOperation_t transa, cublasO
 static void ClusterNonCol_CuSolver_DenseDsyevx(double *A, double *Z, double *ko, int n, int maxn,
                                                const char *where)
 {
-    int info,l,copy_cols;
+    int info,l,copy_cols,mout;
+    double *d_A = NULL;
+    size_t bytes = ClusterNonCol_CheckedMulCount((size_t)n * (size_t)n, sizeof(double), "MAGMA real eigensolver matrix");
 
-    info = cusolver_Syevdx(A, ko, n, maxn);
+    wait_cudafunc(cudaMalloc((void **)&d_A, bytes));
+    wait_cudafunc(cudaMemcpy(d_A, A, bytes, cudaMemcpyHostToDevice));
+    info = openmx_magma_dsyevdx_gpu(n, maxn, d_A, ko, &mout);
+    wait_cudafunc(cudaMemcpy(A, d_A, bytes, cudaMemcpyDeviceToHost));
+    wait_cudafunc(cudaFree(d_A));
+
     if (info!=0){
-        fprintf(stderr,"%s: cusolver_Syevdx failed, info=%d\n",where,info);
+        fprintf(stderr,"%s: magma_dsyevdx_gpu failed, info=%d\n",where,info);
+        fflush(stderr);
+        MPI_Abort(mpi_comm_level1,1);
+    }
+    if (mout!=maxn){
+        fprintf(stderr,"%s: magma_dsyevdx_gpu returned %d eigenpairs, expected %d\n",where,mout,maxn);
         fflush(stderr);
         MPI_Abort(mpi_comm_level1,1);
     }
@@ -924,11 +938,24 @@ static void ClusterNonCol_CuSolver_DenseDsyevx(double *A, double *Z, double *ko,
 static void ClusterNonCol_CuSolver_DenseZheevx(dcomplex *A, dcomplex *Z, double *ko, int n, int maxn,
                                                const char *where)
 {
-    int info,l,copy_cols;
+    int info,l,copy_cols,mout;
+    void *d_A = NULL;
+    size_t bytes = ClusterNonCol_CheckedMulCount((size_t)n * (size_t)n, sizeof(dcomplex),
+                                                 "MAGMA complex eigensolver matrix");
 
-    info = cusolver_Syevdx_Complex(A, ko, n, maxn);
+    wait_cudafunc(cudaMalloc(&d_A, bytes));
+    wait_cudafunc(cudaMemcpy(d_A, A, bytes, cudaMemcpyHostToDevice));
+    info = openmx_magma_zheevdx_gpu(n, maxn, d_A, ko, &mout);
+    wait_cudafunc(cudaMemcpy(A, d_A, bytes, cudaMemcpyDeviceToHost));
+    wait_cudafunc(cudaFree(d_A));
+
     if (info!=0){
-        fprintf(stderr,"%s: cusolver_Syevdx_Complex failed, info=%d\n",where,info);
+        fprintf(stderr,"%s: magma_zheevdx_gpu failed, info=%d\n",where,info);
+        fflush(stderr);
+        MPI_Abort(mpi_comm_level1,1);
+    }
+    if (mout!=maxn){
+        fprintf(stderr,"%s: magma_zheevdx_gpu returned %d eigenpairs, expected %d\n",where,mout,maxn);
         fflush(stderr);
         MPI_Abort(mpi_comm_level1,1);
     }
@@ -1469,12 +1496,12 @@ static void ClusterNonCol_CuSolverRootDensePath(int SCF_iter, double *ko, double
     if (!use_setham_packed_cache) {
         if (myid == Host_ID) {
             fprintf(stderr,
-                    "<Cluster> rank %d: CuSOLVER dense GPU path requires the Set_Hamiltonian packed cache "
+                    "<Cluster> rank %d: MAGMA dense GPU path requires the Set_Hamiltonian packed cache "
                     "(cache_ready=%d, order_mode=%d). Refusing the old 32-rank dense fallback.\n",
                     Host_ID, cache_ready, cache_order);
             fflush(stderr);
         }
-        ClusterNonCol_AbortWithMessage("Cluster_DFT_NonCol CuSOLVER dense GPU path is missing its packed cache.");
+        ClusterNonCol_AbortWithMessage("Cluster_DFT_NonCol MAGMA dense GPU path is missing its packed cache.");
     }
 
     Set_Hamiltonian_CuSolver_SetMP(MP);
@@ -1484,7 +1511,7 @@ static void ClusterNonCol_CuSolverRootDensePath(int SCF_iter, double *ko, double
 
         if (!logged_root_dense) {
             fprintf(stderr,
-                    "<Cluster> rank %d: CuSOLVER dense GPU path uses one selected rank for dense matrix generation, "
+                    "<Cluster> rank %d: MAGMA dense GPU path uses one selected rank for dense matrix generation, "
                     "GEMM, eigensolver, and density-matrix generation (n=%d, n2=%d).\n",
                     Host_ID, n, n2);
             fflush(stderr);
