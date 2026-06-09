@@ -16,6 +16,7 @@
 #include "set_cuda_default_device_from_local_rank.h"
 #include "set_openacc_device_from_local_rank.h"
 #include "tran_variables.h"
+#include <limits.h>
 #include <math.h>
 #include <openacc.h>
 #include <stdio.h>
@@ -36,6 +37,8 @@ void solve_evp_complex_(int * n1, int * n2, dcomplex * Cs, int * na_rows1, doubl
 void elpa_solve_evp_complex_2stage_double_impl_(int * n, int * MaxN, dcomplex * Hs, int * na_rows1, double * ko,
                                                 dcomplex * Cs, int * na_rows2, int * nblk, int * na_cols1,
                                                 int * mpi_comm_rows_int, int * mpi_comm_cols_int, int * mpiworld);
+
+extern int openmx_magma_zheevdx_gpu(int n, int maxn, void *d_A, double *w, int *mout);
 
 static void Construct_Band_CsHs(int SCF_iter, int all_knum, int * order_GA, int * MP, double * S1, double * H1,
                                 double k1, double k2, double k3, dcomplex * Cs, dcomplex * Hs, int n,
@@ -124,6 +127,16 @@ typedef struct
     int phase_index;
 } BandColConstructEntry;
 
+extern int BandCol_BuildDenseCsHs_HIP(int need_s, int count, int h_count, int phase_count, int n,
+                                      const BandColConstructEntry *entries, const double *phase_r,
+                                      const double *phase_i, const double *H1, const double *S1,
+                                      dcomplex *d_H, dcomplex *d_S);
+extern int BandCol_AccumulateDenseTransposedDM_HIP(int entry_count, int pair_count, int nk, int evec_stride,
+                                                   const int *basis0, const int *basis1, const int *phase_index,
+                                                   const double *phase_r, const double *phase_i,
+                                                   const double *eigen, const double *occ_weight,
+                                                   const dcomplex *evec_device, double *CDM1, double *EDM1);
+
 typedef struct
 {
     int                    valid;
@@ -159,11 +172,24 @@ static void BandCol_AbortWithMessage(const char * msg)
     exit(1);
 }
 
-static int BandCol_SerializeCuSolverGpuTurns(void)
+static int BandCol_MaxConcurrentKGpuTurns(void)
 {
-    const char *value = getenv("OPENMX_CUSOLVER_SERIAL_GPU_TURNS");
+    const char *value = getenv("OPENMX_BAND_GPU_MAX_CONCURRENT_K");
+    long limit;
 
-    return (value != NULL && atoi(value) != 0);
+    if (value != NULL) {
+        char *endp = NULL;
+        limit = strtol(value, &endp, 10);
+        if (endp == value || limit < 1L) {
+            return 1;
+        }
+        if ((long)INT_MAX < limit) {
+            return INT_MAX;
+        }
+        return (int)limit;
+    }
+
+    return 4;
 }
 
 static void BandCol_ConstructCache_Reset(void)
@@ -740,10 +766,10 @@ static void BandCol_AccumulateDenseTransposedDM(int n, int nk, int max_tno, int 
     }
 }
 
-static void BandCol_AccumulateDenseTransposedDM_OpenACC(int n, int nk, int spin, int kloop, double k1, double k2,
-                                                        double k3, const dcomplex *evec_device, int evec_stride, int *MP,
-                                                        int *order_GA, double ***EIGEN, const double *occ_weight,
-                                                        double *CDM1, double *EDM1, int size_H1)
+static void BandCol_AccumulateDenseTransposedDM_Device(int n, int nk, int spin, int kloop, double k1, double k2,
+                                                       double k3, const dcomplex *evec_device, int evec_stride, int *MP,
+                                                       int *order_GA, double ***EIGEN, const double *occ_weight,
+                                                       double *CDM1, double *EDM1, int size_H1)
 {
     BandColDMEntryCache *cache;
     const int *          basis0;
@@ -776,40 +802,10 @@ static void BandCol_AccumulateDenseTransposedDM_OpenACC(int n, int nk, int spin,
     entry_count = cache->entry_count;
     pair_count  = cache->pair_count;
 
-#pragma acc data deviceptr(evec_ptr)                                                                                       \
-    copyin(basis0[0 : entry_count], basis1[0 : entry_count], phase_index[0 : entry_count], phase_r[0 : pair_count],        \
-           phase_i[0 : pair_count], eigen[0 : nk], occ_weight[0 : nk]) copy(CDM1[0 : entry_count], EDM1[0 : entry_count])
-    {
-#pragma acc parallel loop gang
-        for (int p = 0; p < entry_count; p++) {
-            const int ia = basis0[p];
-            const int ib = basis1[p];
-            const int ph = phase_index[p];
-            const double co = phase_r[ph];
-            const double si = phase_i[ph];
-            double d1 = 0.0, d2 = 0.0, d3 = 0.0, d4 = 0.0;
-
-#pragma acc loop seq
-            for (int k = 0; k < nk; k++) {
-                const double w = occ_weight[k];
-                const dcomplex va = evec_ptr[(size_t)ia * (size_t)evec_stride + (size_t)k];
-                const dcomplex vb = evec_ptr[(size_t)ib * (size_t)evec_stride + (size_t)k];
-                const double r0 = va.r * w;
-                const double im0 = va.i * w;
-                const double r1 = vb.r * w;
-                const double im1 = vb.i * w;
-                const double reA = r0 * r1 + im0 * im1;
-                const double imA = r0 * im1 - im0 * r1;
-
-                d1 += reA;
-                d2 += imA;
-                d3 += reA * eigen[k];
-                d4 += imA * eigen[k];
-            }
-
-            CDM1[p] += co * d1 - si * d2;
-            EDM1[p] += co * d3 - si * d4;
-        }
+    if (BandCol_AccumulateDenseTransposedDM_HIP(entry_count, pair_count, nk, evec_stride,
+                                                basis0, basis1, phase_index, phase_r, phase_i,
+                                                eigen, occ_weight, evec_ptr, CDM1, EDM1) != 0) {
+        BandCol_AbortWithMessage("Band_DFT_Col HIP density matrix generation failed.");
     }
 }
 
@@ -884,7 +880,7 @@ static dcomplex *BandCol_CuSolver_SaveDeviceEigenvectors(dcomplex *evec_device, 
     size_t              matrix_count;
 
     if (evec_device == NULL) {
-        BandCol_AbortWithMessage("CuSOLVER device eigenvectors are not available in Band_DFT_Col.c.");
+        BandCol_AbortWithMessage("MAGMA dense device eigenvectors are not available in Band_DFT_Col.c.");
     }
 
     matrix_count = (size_t)n * (size_t)n;
@@ -916,7 +912,7 @@ static dcomplex *BandCol_CuSolver_UploadHostEigenvectors(int n)
         BandCol_AbortWithMessage("Invalid eigenvector dimension in Band_DFT_Col.c.");
     }
     if (ctx->h_evec == NULL || ctx->h_evec_dim < n) {
-        BandCol_AbortWithMessage("CuSOLVER host eigenvectors are not available in Band_DFT_Col.c.");
+        BandCol_AbortWithMessage("MAGMA dense host eigenvectors are not available in Band_DFT_Col.c.");
     }
 
     matrix_count = (size_t)n * (size_t)n;
@@ -1000,7 +996,7 @@ static void BandCol_CuSolver_Init(void)
     }
 
     wait_cudafunc(cublasCreate(&ctx->cublas));
-    wait_cudafunc(cusolverDnCreate(&ctx->cusolver));
+    ctx->cusolver = NULL;
 
     ctx->initialized = 1;
     ctx->device_id   = current_device;
@@ -1050,85 +1046,27 @@ static void BandCol_CuSolver_EnsureMatrixCapacity(int n)
     ctx->transformed_s_dim   = 0;
 }
 
-static void BandCol_CuSolver_EnsureWorkspace(int m, int maxn, dcomplex * d_A)
+static void BandCol_CuSolver_Eigen(dcomplex * d_A, int m, int maxn, double * W_host)
 {
-    BandColCuSolverCtx * ctx  = &BandCol_cusolver_ctx;
-    cusolverEigMode_t    jobz = CUSOLVER_EIG_MODE_VECTOR;
-    cublasFillMode_t     uplo = CUBLAS_FILL_MODE_LOWER;
-    cusolverEigRange_t   range;
-    double               vl      = 0.0;
-    double               vu      = 0.0;
-    int64_t              h_meig  = 0;
-    size_t               d_bytes = 0;
-    size_t               h_bytes = 0;
+    int  info;
+    int  mout = 0;
+    char msg[256];
 
-    if (m <= 0 || maxn <= 0 || maxn > m) {
-        BandCol_AbortWithMessage("Invalid eigensolver dimensions in BandCol_CuSolver_EnsureWorkspace.");
+    if (m <= 0 || maxn <= 0 || maxn > m || d_A == NULL || W_host == NULL) {
+        BandCol_AbortWithMessage("Invalid MAGMA eigensolver dimensions in Band_DFT_Col.c.");
     }
 
     BandCol_CuSolver_EnsureMatrixCapacity(m);
 
-    range = CUSOLVER_EIG_RANGE_I;
-
-    wait_cudafunc(cusolverDnXsyevdx_bufferSize(ctx->cusolver, NULL, jobz, range, uplo, m, CUDA_C_64F,
-                                               (cuDoubleComplex *)d_A, m, &vl, &vu, 1L, maxn, &h_meig, CUDA_R_64F,
-                                               ctx->d_W, CUDA_C_64F, &d_bytes, &h_bytes));
-
-    if (d_bytes > ctx->d_work_bytes) {
-        if (ctx->d_work != NULL)
-            wait_cudafunc(cudaFree(ctx->d_work));
-        ctx->d_work = NULL;
-        if (d_bytes > 0) {
-            wait_cudafunc(cudaMalloc((void **)&ctx->d_work, d_bytes));
-        }
-        ctx->d_work_bytes = d_bytes;
-    }
-
-    if (h_bytes == 0) {
-        if (ctx->h_work != NULL)
-            free(ctx->h_work);
-        ctx->h_work       = NULL;
-        ctx->h_work_bytes = 0;
-    } else if (h_bytes > ctx->h_work_bytes) {
-        if (ctx->h_work != NULL)
-            free(ctx->h_work);
-        ctx->h_work = malloc(h_bytes);
-        if (ctx->h_work == NULL) {
-            BandCol_AbortWithMessage("Failed to allocate host workspace in BandCol_CuSolver_EnsureWorkspace.");
-        }
-        ctx->h_work_bytes = h_bytes;
-    }
-}
-
-static void BandCol_CuSolver_Eigen(dcomplex * d_A, int m, int maxn, double * W_host)
-{
-    BandColCuSolverCtx * ctx  = &BandCol_cusolver_ctx;
-    cusolverEigMode_t    jobz = CUSOLVER_EIG_MODE_VECTOR;
-    cublasFillMode_t     uplo = CUBLAS_FILL_MODE_LOWER;
-    cusolverEigRange_t   range;
-    double               vl     = 0.0;
-    double               vu     = 0.0;
-    int64_t              h_meig = 0;
-    int32_t              info   = 0;
-    char                 msg[256];
-
-    BandCol_CuSolver_EnsureWorkspace(m, maxn, d_A);
-    range = CUSOLVER_EIG_RANGE_I;
-
-    wait_cudafunc(cusolverDnXsyevdx(ctx->cusolver, NULL, jobz, range, uplo, m, CUDA_C_64F, (cuDoubleComplex *)d_A, m,
-                                    &vl, &vu, 1L, maxn, &h_meig, CUDA_R_64F, ctx->d_W, CUDA_C_64F, ctx->d_work,
-                                    ctx->d_work_bytes, ctx->h_work, ctx->h_work_bytes, ctx->d_info));
-
-    wait_cudafunc(cudaMemcpy(W_host, ctx->d_W, sizeof(double) * (size_t)maxn, cudaMemcpyDeviceToHost));
-    wait_cudafunc(cudaMemcpy(&info, ctx->d_info, sizeof(int32_t), cudaMemcpyDeviceToHost));
+    info = openmx_magma_zheevdx_gpu(m, maxn, d_A, W_host, &mout);
 
     if (info != 0) {
-        snprintf(msg, sizeof(msg), "cusolverDnXsyevdx failed in Band_DFT_Col.c: info=%d", (int)info);
+        snprintf(msg, sizeof(msg), "magma_zheevdx_gpu failed in Band_DFT_Col.c: info=%d", info);
         BandCol_AbortWithMessage(msg);
     }
-    if (h_meig != (int64_t)maxn) {
-        snprintf(msg, sizeof(msg), "cusolverDnXsyevdx returned %lld eigenpairs, expected %d in Band_DFT_Col.c.",
-                 (long long)h_meig, maxn);
+    if (mout != maxn) {
+        snprintf(msg, sizeof(msg), "magma_zheevdx_gpu returned %d eigenpairs, expected %d in Band_DFT_Col.c.",
+                 mout, maxn);
         BandCol_AbortWithMessage(msg);
     }
 }
@@ -1214,17 +1152,37 @@ static void BandCol_CuSolver_Zgemm_OpenACC(cublasOperation_t transa, cublasOpera
 
 static void BandCol_CuSolver_EigenHost(dcomplex *A, double *ko, int n, int maxn)
 {
+    dcomplex *d_A = NULL;
+    size_t bytes;
     int info;
+    int mout = 0;
+    char msg[256];
 
-    info = cusolver_Syevdx_Complex(A, ko, n, maxn);
+    if (n <= 0 || maxn <= 0 || maxn > n || A == NULL || ko == NULL) {
+        BandCol_AbortWithMessage("Invalid MAGMA host eigensolver dimensions in Band_DFT_Col.c.");
+    }
+
+    bytes = sizeof(dcomplex) * (size_t)n * (size_t)n;
+    wait_cudafunc(cudaMalloc((void **)&d_A, bytes));
+    wait_cudafunc(cudaMemcpy(d_A, A, bytes, cudaMemcpyHostToDevice));
+
+    info = openmx_magma_zheevdx_gpu(n, maxn, d_A, ko, &mout);
+
+    wait_cudafunc(cudaMemcpy(A, d_A, bytes, cudaMemcpyDeviceToHost));
+    wait_cudafunc(cudaFree(d_A));
+
+    if (info != 0) {
+        snprintf(msg, sizeof(msg), "magma_zheevdx_gpu failed in Band_DFT_Col.c host path: info=%d", info);
+        BandCol_AbortWithMessage(msg);
+    }
+    if (mout != maxn) {
+        snprintf(msg, sizeof(msg), "magma_zheevdx_gpu returned %d eigenpairs, expected %d in Band_DFT_Col.c host path.",
+                 mout, maxn);
+        BandCol_AbortWithMessage(msg);
+    }
 
     for (int i = maxn; i >= 1; i--) {
         ko[i] = ko[i - 1];
-    }
-
-    if (info != 0) {
-        printf("cusolverDnXsyevdx: info=%d\n", info);
-        exit(10);
     }
 }
 
@@ -1296,8 +1254,8 @@ static int BandCol_LastConstructOnDevice(void)
     return BandCol_last_construct_on_device;
 }
 
-static void BandCol_ConstructDenseCsHs_OpenACC(int need_s, int n, double k1, double k2, double k3, const double *S1,
-                                               const double *H1)
+static void BandCol_ConstructDenseCsHs_HIP(int need_s, int n, double k1, double k2, double k3, const double *S1,
+                                           const double *H1)
 {
     BandColConstructCache *cache = &BandCol_construct_cache;
     BandColCuSolverCtx *   ctx = &BandCol_cusolver_ctx;
@@ -1312,7 +1270,6 @@ static void BandCol_ConstructDenseCsHs_OpenACC(int need_s, int n, double k1, dou
     dcomplex *d_S;
 
     BandCol_CuSolver_EnsureMatrixCapacity(n);
-    BandCol_ConstructCache_EnsureDenseDevice();
 
     d_H = ctx->d_H;
     d_S = ctx->d_S;
@@ -1324,95 +1281,15 @@ static void BandCol_ConstructDenseCsHs_OpenACC(int need_s, int n, double k1, dou
         phase_r[p] = cos(2.0 * PI * kRn);
     }
 
-    if (0 < phase_count) {
-#pragma acc update device(phase_r[0 : phase_count], phase_i[0 : phase_count])
+    if ((size_t)LLONG_MAX < (size_t)matrix_count) {
+        BandCol_AbortWithMessage("Dense matrix size exceeds HIP loop limit in Band_DFT_Col.c.");
     }
 
-    if (need_s) {
-#pragma acc parallel loop deviceptr(d_H, d_S)
-        for (long long idx = 0; idx < matrix_count; ++idx) {
-            d_H[idx].r = 0.0;
-            d_H[idx].i = 0.0;
-            d_S[idx].r = 0.0;
-            d_S[idx].i = 0.0;
-        }
-
-#pragma acc data copyin(H1[0 : h_count], S1[0 : h_count]) present(entries[0 : count], phase_r[0 : phase_count], phase_i[0 : phase_count])
-        {
-#pragma acc parallel loop deviceptr(d_H, d_S)
-            for (int idx = 0; idx < count; ++idx) {
-                const int h_index = entries[idx].h_index;
-                const int index0 = entries[idx].index0;
-                const int index1 = entries[idx].index1;
-                const int phase_index = entries[idx].phase_index;
-                const double pr = phase_r[phase_index];
-                const double pi = phase_i[phase_index];
-                const double h_real = H1[h_index] * pr;
-                const double h_imag = H1[h_index] * pi;
-                const double s_real = S1[h_index] * pr;
-                const double s_imag = S1[h_index] * pi;
-
-#pragma acc atomic update
-                d_H[index0].r += h_real;
-#pragma acc atomic update
-                d_H[index0].i += h_imag;
-
-                if (0 <= index1) {
-#pragma acc atomic update
-                    d_H[index1].r += h_real;
-#pragma acc atomic update
-                    d_H[index1].i += -h_imag;
-                }
-
-#pragma acc atomic update
-                d_S[index0].r += s_real;
-#pragma acc atomic update
-                d_S[index0].i += s_imag;
-
-                if (0 <= index1) {
-#pragma acc atomic update
-                    d_S[index1].r += s_real;
-#pragma acc atomic update
-                    d_S[index1].i += -s_imag;
-                }
-            }
-        }
-    } else {
-#pragma acc parallel loop deviceptr(d_H)
-        for (long long idx = 0; idx < matrix_count; ++idx) {
-            d_H[idx].r = 0.0;
-            d_H[idx].i = 0.0;
-        }
-
-#pragma acc data copyin(H1[0 : h_count]) present(entries[0 : count], phase_r[0 : phase_count], phase_i[0 : phase_count])
-        {
-#pragma acc parallel loop deviceptr(d_H)
-            for (int idx = 0; idx < count; ++idx) {
-                const int h_index = entries[idx].h_index;
-                const int index0 = entries[idx].index0;
-                const int index1 = entries[idx].index1;
-                const int phase_index = entries[idx].phase_index;
-                const double pr = phase_r[phase_index];
-                const double pi = phase_i[phase_index];
-                const double h_real = H1[h_index] * pr;
-                const double h_imag = H1[h_index] * pi;
-
-#pragma acc atomic update
-                d_H[index0].r += h_real;
-#pragma acc atomic update
-                d_H[index0].i += h_imag;
-
-                if (0 <= index1) {
-#pragma acc atomic update
-                    d_H[index1].r += h_real;
-#pragma acc atomic update
-                    d_H[index1].i += -h_imag;
-                }
-            }
-        }
+    if (BandCol_BuildDenseCsHs_HIP(need_s, count, h_count, phase_count, n, entries, phase_r, phase_i,
+                                   H1, S1, d_H, d_S) != 0) {
+        BandCol_AbortWithMessage("Band_DFT_Col HIP dense matrix generation failed.");
     }
 
-#pragma acc wait
     BandCol_last_construct_on_device = 1;
 }
 
@@ -1505,6 +1382,7 @@ double Band_DFT_Col(int SCF_iter, int knum_i, int knum_j, int knum_k, int SpinP_
     int *   index_Snd_i, *index_Snd_j, *index_Rcv_i, *index_Rcv_j;
     double *EVec_Snd, *EVec_Rcv;
     int     max_tno;
+    int     owns_dense_k_rank;
     int     owns_global_dense_rank;
     int     transformed_s_ready;
     int     use_cusolver_dense;
@@ -1982,7 +1860,8 @@ double Band_DFT_Col(int SCF_iter, int knum_i, int knum_j, int knum_k, int SpinP_
         all_knum = 0;
     }
 
-    owns_global_dense_rank = (use_cusolver_dense && all_knum == 1 && my_prow == 0 && my_pcol == 0);
+    owns_dense_k_rank = (use_cusolver_dense && Set_Hamiltonian_OpenACC_Rank_Is_Selected());
+    owns_global_dense_rank = (all_knum == 1 && owns_dense_k_rank);
     use_setham_packed_cache =
         (use_cusolver_dense && all_knum == 1 && Set_Hamiltonian_CuSolver_Packed_CacheReady() &&
          Set_Hamiltonian_CuSolver_Packed_OrderMode() == 0);
@@ -2047,11 +1926,7 @@ double Band_DFT_Col(int SCF_iter, int knum_i, int knum_j, int knum_k, int SpinP_
     //     init_cusolvermp(myworld2, MPI_CommWD2, &opts2, &opts3, &opts4);
     // }
 
-    if (all_knum != 1 && use_cusolver_dense) {
-        if (n != na_cols || n != na_rows) {
-            BandCol_AbortWithMessage("CuSOLVER band path requires full dense matrices in Band_DFT_Col.c.");
-        }
-    } else if (!use_cusolver_dense) {
+    if (!use_cusolver_dense) {
         MPI_Comm_split(MPI_CommWD2[myworld2], my_pcol, my_prow, &mpi_comm_rows);
         MPI_Comm_split(MPI_CommWD2[myworld2], my_prow, my_pcol, &mpi_comm_cols);
 
@@ -2302,79 +2177,106 @@ diagonalize1:
     dtime(&SiloopTime);
 
     if (all_knum != 1 && use_cusolver_dense) {
-        for (int kloop0 = 0; kloop0 < num_kloop0; kloop0++) {
-            kloop = S_knum + kloop0;
+        const int max_concurrent_gpu_turns = BandCol_MaxConcurrentKGpuTurns();
+        const int total_gpu_turns = Num_Comm_World1 * T_knum;
 
-            k1 = T_KGrids1[kloop];
-            k2 = T_KGrids2[kloop];
-            k3 = T_KGrids3[kloop];
+        for (int group_first = 0; group_first < total_gpu_turns; group_first += max_concurrent_gpu_turns) {
+            const int group_last =
+                (group_first + max_concurrent_gpu_turns < total_gpu_turns) ?
+                (group_first + max_concurrent_gpu_turns) : total_gpu_turns;
 
-            /* make S and H */
+            MPI_Barrier(mpi_comm_level1);
+
+            for (int gpu_turn = group_first; gpu_turn < group_last; gpu_turn++) {
+                dcomplex *evec_device;
+                int construct_on_device;
+
+                if (!owns_dense_k_rank || gpu_turn / T_knum != spin) {
+                    continue;
+                }
+
+                kloop = gpu_turn % T_knum;
+                if (kloop < S_knum || S_knum + num_kloop0 <= kloop) {
+                    continue;
+                }
+
+                k1 = T_KGrids1[kloop];
+                k2 = T_KGrids2[kloop];
+                k3 = T_KGrids3[kloop];
+
+                /* make S and H */
 
             // #pragma acc kernels
             // #pragma acc loop independent
-            Construct_Band_CsHs(SCF_iter, all_knum, use_setham_packed_cache ? setham_order_GA : order_GA, MP,
-                                use_setham_packed_cache ? setham_S1 : S1,
-                                use_setham_packed_cache ? setham_H1 : H1, k1, k2, k3, Ss, Hs, n,
-                                owns_global_dense_rank);
+                Construct_Band_CsHs(SCF_iter, all_knum, use_setham_packed_cache ? setham_order_GA : order_GA, MP,
+                                    use_setham_packed_cache ? setham_S1 : S1,
+                                    use_setham_packed_cache ? setham_H1 : H1, k1, k2, k3, Ss, Hs, n,
+                                    owns_global_dense_rank);
+                construct_on_device = BandCol_LastConstructOnDevice();
 
-            /* for blas */
+                /* for blas */
 
-            /* diagonalize S */
+                /* diagonalize S */
 
-            if (measure_time)
-                dtime(&Stime);
+                if (measure_time)
+                    dtime(&Stime);
 
-            BandCol_CuSolver_PrepareTransformedS(1, n, Ss, ko, koS);
+                BandCol_CuSolver_PrepareTransformedS(1, n, construct_on_device ? NULL : Ss, ko, koS);
 
-            if (measure_time) {
-                dtime(&Etime);
-                time2 += Etime - Stime;
-            }
-
-            /****************************************************
-             1.0/sqrt(ko[l]) * U^t * H * U * 1.0/sqrt(ko[l])
-            ****************************************************/
-
-            if (measure_time)
-                dtime(&Stime);
-
-            BandCol_CuSolver_SolveHamiltonian(n, MaxN, Hs, ko, NULL);
-
-            if (measure_time) {
-                dtime(&Etime);
-                time3 += Etime - Stime;
-            }
-
-            for (int l = 1; l <= MaxN; l++) {
-                EIGEN[spin][kloop][l] = ko[l];
-            }
-
-            if (3 <= level_stdout && 0 <= kloop) {
-                printf(" myid0=%2d spin=%2d kloop %i, k1 k2 k3 %10.6f %10.6f %10.6f\n", myid0, spin, kloop,
-                       T_KGrids1[kloop], T_KGrids2[kloop], T_KGrids3[kloop]);
-                for (i1 = 1; i1 <= n; i1++) {
-                    if (SpinP_switch == 0)
-                        printf("  Eigenvalues of Kohn-Sham %2d %15.12f %15.12f\n", i1, EIGEN[0][kloop][i1],
-                               EIGEN[0][kloop][i1]);
-                    else
-                        printf("  Eigenvalues of Kohn-Sham %2d %15.12f %15.12f\n", i1, EIGEN[0][kloop][i1],
-                               EIGEN[1][kloop][i1]);
+                if (measure_time) {
+                    dtime(&Etime);
+                    time2 += Etime - Stime;
                 }
-            }
 
-            if (measure_time)
-                dtime(&Stime);
+                /****************************************************
+                 1.0/sqrt(ko[l]) * U^t * H * U * 1.0/sqrt(ko[l])
+                ****************************************************/
 
-            if (measure_time) {
-                dtime(&Etime);
-                time5 += Etime - Stime;
-            }
-        } /* kloop0 */
+                if (measure_time)
+                    dtime(&Stime);
+
+                if (construct_on_device) {
+                    evec_device = BandCol_CuSolver_SolveHamiltonianDeviceInput(n, MaxN, ko);
+                } else {
+                    evec_device = BandCol_CuSolver_SolveHamiltonianDeviceOnly(n, MaxN, Hs, ko);
+                }
+                (void)evec_device;
+                BandCol_CuSolver_ReleaseDeviceMemory();
+
+                if (measure_time) {
+                    dtime(&Etime);
+                    time3 += Etime - Stime;
+                }
+
+                for (int l = 1; l <= MaxN; l++) {
+                    EIGEN[spin][kloop][l] = ko[l];
+                }
+
+                if (3 <= level_stdout && 0 <= kloop) {
+                    printf(" myid0=%2d spin=%2d kloop %i, k1 k2 k3 %10.6f %10.6f %10.6f\n", myid0, spin, kloop,
+                           T_KGrids1[kloop], T_KGrids2[kloop], T_KGrids3[kloop]);
+                    for (i1 = 1; i1 <= n; i1++) {
+                        if (SpinP_switch == 0)
+                            printf("  Eigenvalues of Kohn-Sham %2d %15.12f %15.12f\n", i1, EIGEN[0][kloop][i1],
+                                   EIGEN[0][kloop][i1]);
+                        else
+                            printf("  Eigenvalues of Kohn-Sham %2d %15.12f %15.12f\n", i1, EIGEN[0][kloop][i1],
+                                   EIGEN[1][kloop][i1]);
+                    }
+                }
+
+                if (measure_time)
+                    dtime(&Stime);
+
+                if (measure_time) {
+                    dtime(&Etime);
+                    time5 += Etime - Stime;
+                }
+            } /* gpu_turn */
+        } /* group_first */
     } else {
         for (kloop0 = 0; kloop0 < num_kloop0; kloop0++) {
             if (use_cusolver_dense) {
-                int my_gpu_turn;
                 kloop = S_knum + kloop0;
 
                 k1 = T_KGrids1[kloop];
@@ -2387,18 +2289,9 @@ diagonalize1:
                     dtime(&starttimesh);
                 }
 
-	                my_gpu_turn = spin * T_knum + kloop;
-	                const int serialize_gpu_turns = BandCol_SerializeCuSolverGpuTurns();
-	                const int first_gpu_turn = serialize_gpu_turns ? 0 : my_gpu_turn;
-	                const int last_gpu_turn = serialize_gpu_turns ? Num_Comm_World1 * T_knum : (my_gpu_turn + 1);
-	                for (int gpu_turn = first_gpu_turn; gpu_turn < last_gpu_turn; gpu_turn++) {
-	                    if (serialize_gpu_turns) {
-	                        MPI_Barrier(mpi_comm_level1);
-	                    }
-
-	                    if (owns_global_dense_rank && my_gpu_turn == gpu_turn) {
-	                        dcomplex *evec_device;
-	                        const int build_s = !BandCol_CuSolver_HasHostTransformedS(n);
+                if (owns_global_dense_rank) {
+                    dcomplex *evec_device;
+                    const int build_s = !BandCol_CuSolver_HasHostTransformedS(n);
                         const int construct_scf_iter = build_s ? 1 : SCF_iter;
 
                         Construct_Band_CsHs(construct_scf_iter, all_knum, use_setham_packed_cache ? setham_order_GA : order_GA, MP,
@@ -2478,11 +2371,8 @@ diagonalize1:
                             dtime(&endtime);
                             partmul = endtime - starttime;
                         }
-                    }
                 }
-	                if (!serialize_gpu_turns) {
-	                    MPI_Barrier(mpi_comm_level1);
-	                }
+                MPI_Barrier(mpi_comm_level1);
 
 	            } else {
                 kloop = S_knum + kloop0;
@@ -3152,32 +3042,17 @@ diagonalize1:
                 dtime(&Stime0);
             }
 
-	            {
-	                int my_gpu_turn = spin * T_knum + kloop;
-	                const int serialize_gpu_turns = BandCol_SerializeCuSolverGpuTurns();
-	                const int first_gpu_turn = serialize_gpu_turns ? 0 : my_gpu_turn;
-	                const int last_gpu_turn = serialize_gpu_turns ? Num_Comm_World1 * T_knum : (my_gpu_turn + 1);
+            if (owns_global_dense_rank) {
+                dcomplex *evec_device = BandCol_CuSolver_UploadHostEigenvectors(n);
 
-	                for (int gpu_turn = first_gpu_turn; gpu_turn < last_gpu_turn; gpu_turn++) {
-	                    if (serialize_gpu_turns) {
-	                        MPI_Barrier(mpi_comm_level1);
-	                    }
-
-	                    if (owns_global_dense_rank && my_gpu_turn == gpu_turn) {
-	                        dcomplex *evec_device = BandCol_CuSolver_UploadHostEigenvectors(n);
-
-                        BandCol_AccumulateDenseTransposedDM_OpenACC(n, MaxN, spin, kloop, k1, k2, k3, evec_device, n,
-                                                                    MP, use_setham_packed_cache ? setham_order_GA : order_GA, EIGEN,
-                                                                    BandCol_dm_workspace.OccWeight, CDM1, EDM1,
-                                                                    size_H1);
-                        BandCol_CuSolver_ClearHostEigenvectors();
-	                        BandCol_CuSolver_ReleaseDeviceMemory();
-	                    }
-	                }
-	                if (!serialize_gpu_turns) {
-	                    MPI_Barrier(mpi_comm_level1);
-	                }
-	            }
+                BandCol_AccumulateDenseTransposedDM_Device(n, MaxN, spin, kloop, k1, k2, k3, evec_device, n,
+                                                           MP, use_setham_packed_cache ? setham_order_GA : order_GA, EIGEN,
+                                                           BandCol_dm_workspace.OccWeight, CDM1, EDM1,
+                                                           size_H1);
+                BandCol_CuSolver_ClearHostEigenvectors();
+                BandCol_CuSolver_ReleaseDeviceMemory();
+            }
+            MPI_Barrier(mpi_comm_level1);
 
             if (measure_time) {
                 dtime(&Etime0);
@@ -3582,130 +3457,158 @@ diagonalize1:
         /* for kloop */
 
         if (use_cusolver_dense) {
-            for (int kloop0 = 0; kloop0 < num_kloop0; kloop0++) {
-                int kloop = kloop0 + S_knum;
+            const int max_concurrent_gpu_turns = BandCol_MaxConcurrentKGpuTurns();
+            const int total_gpu_turns = Num_Comm_World1 * T_knum;
 
-                double k1 = T_KGrids1[kloop];
-                double k2 = T_KGrids2[kloop];
-                double k3 = T_KGrids3[kloop];
+            for (int group_first = 0; group_first < total_gpu_turns; group_first += max_concurrent_gpu_turns) {
+                const int group_last =
+                    (group_first + max_concurrent_gpu_turns < total_gpu_turns) ?
+                    (group_first + max_concurrent_gpu_turns) : total_gpu_turns;
 
-                /* make S and H */
+                MPI_Barrier(mpi_comm_level1);
 
-                Construct_Band_CsHs(SCF_iter, all_knum, use_setham_packed_cache ? setham_order_GA : order_GA, MP,
-                                    use_setham_packed_cache ? setham_S1 : S1,
-                                    use_setham_packed_cache ? setham_H1 : H1, k1, k2, k3, Ss, Hs, n,
-                                    owns_global_dense_rank);
+                for (int gpu_turn = group_first; gpu_turn < group_last; gpu_turn++) {
+                    int kloop;
+                    dcomplex *evec_device;
+                    int construct_on_device;
+                    double k1;
+                    double k2;
+                    double k3;
 
-                /* diagonalize S */
-
-                if (measure_time)
-                    dtime(&Stime);
-
-                BandCol_CuSolver_PrepareTransformedS(1, n, Ss, ko, koS);
-
-                if (measure_time) {
-                    dtime(&Etime);
-                    time9 += Etime - Stime;
-                }
-
-                if (3 <= level_stdout) {
-                    printf(" myid0=%2d kloop %2d  k1 k2 k3 %10.6f %10.6f %10.6f\n", myid0, kloop, T_KGrids1[kloop],
-                           T_KGrids2[kloop], T_KGrids3[kloop]);
-                    for (i1 = 1; i1 <= n; i1++) {
-                        printf("  Eigenvalues of OLP  %2d  %15.12f\n", i1, ko[i1]);
+                    if (!owns_dense_k_rank || gpu_turn / T_knum != spin) {
+                        continue;
                     }
-                }
 
-                /****************************************************
-                      1/sqrt(ko) * U^t * H * U * 1/sqrt(ko)
-                ****************************************************/
-
-                if (n != na_rows_max || n != na_cols_max) {
-                    BandCol_AbortWithMessage("CuSOLVER DM path requires full dense matrices in Band_DFT_Col.c.");
-                }
-
-                if (measure_time)
-                    dtime(&Stime);
-
-                BandCol_CuSolver_SolveHamiltonian(n, MaxN, Hs, ko, Cs);
-
-                if (measure_time) {
-                    dtime(&Etime);
-                    time10 += Etime - Stime;
-                }
-
-                if (3 <= level_stdout && 0 <= kloop) {
-                    printf("  kloop %i, k1 k2 k3 %10.6f %10.6f %10.6f\n", kloop, T_KGrids1[kloop], T_KGrids2[kloop],
-                           T_KGrids3[kloop]);
-                    for (i1 = 1; i1 <= n; i1++) {
-                        printf("  Eigenvalues of Kohn-Sham(DM) spin=%2d i1=%2d %15.12f\n", spin, i1, ko[i1]);
+                    kloop = gpu_turn % T_knum;
+                    if (kloop < S_knum || S_knum + num_kloop0 <= kloop) {
+                        continue;
                     }
-                }
 
-                /****************************************************
-                               calculate DM and EDM
-                ****************************************************/
+                    k1 = T_KGrids1[kloop];
+                    k2 = T_KGrids2[kloop];
+                    k3 = T_KGrids3[kloop];
 
-                if (measure_time)
-                    dtime(&Stime);
+                    /* make S and H */
 
-                /* weight of k-point */
+                    Construct_Band_CsHs(SCF_iter, all_knum, use_setham_packed_cache ? setham_order_GA : order_GA, MP,
+                                        use_setham_packed_cache ? setham_S1 : S1,
+                                        use_setham_packed_cache ? setham_H1 : H1, k1, k2, k3, Ss, Hs, n,
+                                        owns_global_dense_rank);
+                    construct_on_device = BandCol_LastConstructOnDevice();
 
-                double kw = (double)T_k_op[kloop];
+                    /* diagonalize S */
 
-                int po   = 0;
-                int kmax = MaxN;
+                    if (measure_time)
+                        dtime(&Stime);
 
-                BandCol_DMWorkspace_Ensure(max_tno, MaxN);
-                double *occ_weight = BandCol_dm_workspace.OccWeight;
+                    BandCol_CuSolver_PrepareTransformedS(1, n, construct_on_device ? NULL : Ss, ko, koS);
 
-                if (measure_time)
-                    dtime(&Stime1);
-
-                for (int k = 1; k <= MaxN; k++) {
-
-                    double eig = EIGEN[spin][kloop][k];
-                    double x;
-
-                    if (xanes_calc == 1)
-                        x = (eig - ChemP_XANES[spin]) * Beta;
-                    else
-                        x = (eig - ChemP) * Beta;
-
-                    if (x <= -x_cut)
-                        x = -x_cut;
-                    if (x_cut <= x)
-                        x = x_cut;
-                    double FermiF = FermiFunc(x, spin, k, &k, &x);
-
-                    occ_weight[k - 1] = sqrt(kw * FermiF);
-
-                    /* find kmax */
-
-                    if (FermiF < FermiEps && po == 0) {
-                        kmax = k;
-                        po   = 1;
+                    if (measure_time) {
+                        dtime(&Etime);
+                        time9 += Etime - Stime;
                     }
-                }
 
-                if (measure_time) {
-                    dtime(&Etime1);
-                    time11A += Etime1 - Stime1;
-                    dtime(&Stime1);
-                }
+                    if (3 <= level_stdout) {
+                        printf(" myid0=%2d kloop %2d  k1 k2 k3 %10.6f %10.6f %10.6f\n", myid0, kloop, T_KGrids1[kloop],
+                               T_KGrids2[kloop], T_KGrids3[kloop]);
+                        for (i1 = 1; i1 <= n; i1++) {
+                            printf("  Eigenvalues of OLP  %2d  %15.12f\n", i1, ko[i1]);
+                        }
+                    }
 
-                BandCol_AccumulateDenseTransposedDM(n, MaxN, max_tno, spin, kloop, k1, k2, k3, Cs, n, MP, EIGEN,
-                                                     occ_weight, CDM1, EDM1);
+                    /****************************************************
+                          1/sqrt(ko) * U^t * H * U * 1/sqrt(ko)
+                    ****************************************************/
 
-                if (measure_time) {
-                    dtime(&Etime1);
-                    time11B += Etime1 - Stime1;
+                    if (measure_time)
+                        dtime(&Stime);
 
-                    dtime(&Etime);
-                    time11 += Etime - Stime;
-                }
+                    if (construct_on_device) {
+                        evec_device = BandCol_CuSolver_SolveHamiltonianDeviceInput(n, MaxN, ko);
+                    } else {
+                        evec_device = BandCol_CuSolver_SolveHamiltonianDeviceOnly(n, MaxN, Hs, ko);
+                    }
 
-            } /* kloop0 */
+                    if (measure_time) {
+                        dtime(&Etime);
+                        time10 += Etime - Stime;
+                    }
+
+                    if (3 <= level_stdout && 0 <= kloop) {
+                        printf("  kloop %i, k1 k2 k3 %10.6f %10.6f %10.6f\n", kloop, T_KGrids1[kloop], T_KGrids2[kloop],
+                               T_KGrids3[kloop]);
+                        for (i1 = 1; i1 <= n; i1++) {
+                            printf("  Eigenvalues of Kohn-Sham(DM) spin=%2d i1=%2d %15.12f\n", spin, i1, ko[i1]);
+                        }
+                    }
+
+                    /****************************************************
+                                   calculate DM and EDM
+                    ****************************************************/
+
+                    if (measure_time)
+                        dtime(&Stime);
+
+                    /* weight of k-point */
+
+                    double kw = (double)T_k_op[kloop];
+
+                    int po   = 0;
+                    int kmax = MaxN;
+
+                    BandCol_DMWorkspace_Ensure(max_tno, MaxN);
+                    double *occ_weight = BandCol_dm_workspace.OccWeight;
+
+                    if (measure_time)
+                        dtime(&Stime1);
+
+                    for (int k = 1; k <= MaxN; k++) {
+
+                        double eig = EIGEN[spin][kloop][k];
+                        double x;
+
+                        if (xanes_calc == 1)
+                            x = (eig - ChemP_XANES[spin]) * Beta;
+                        else
+                            x = (eig - ChemP) * Beta;
+
+                        if (x <= -x_cut)
+                            x = -x_cut;
+                        if (x_cut <= x)
+                            x = x_cut;
+                        double FermiF = FermiFunc(x, spin, k, &k, &x);
+
+                        occ_weight[k - 1] = sqrt(kw * FermiF);
+
+                        /* find kmax */
+
+                        if (FermiF < FermiEps && po == 0) {
+                            kmax = k;
+                            po   = 1;
+                        }
+                    }
+
+                    if (measure_time) {
+                        dtime(&Etime1);
+                        time11A += Etime1 - Stime1;
+                        dtime(&Stime1);
+                    }
+
+                    BandCol_AccumulateDenseTransposedDM_Device(n, MaxN, spin, kloop, k1, k2, k3, evec_device, n,
+                                                               MP, use_setham_packed_cache ? setham_order_GA : order_GA,
+                                                               EIGEN, occ_weight, CDM1, EDM1, size_H1);
+                    BandCol_CuSolver_ReleaseDeviceMemory();
+
+                    if (measure_time) {
+                        dtime(&Etime1);
+                        time11B += Etime1 - Stime1;
+
+                        dtime(&Etime);
+                        time11 += Etime - Stime;
+                    }
+
+                } /* gpu_turn */
+            } /* group_first */
 
         } else {
             for (kloop0 = 0; kloop0 < num_kloop0; kloop0++) {
@@ -4360,18 +4263,21 @@ void Construct_Band_CsHs(int SCF_iter, int all_knum, int * order_GA, int * MP, d
 {
     const int need_s = (SCF_iter == 1 || all_knum != 1);
     const int use_cusolver_dense = (scf_eigen_lib_flag == CuSOLVER && GPU_CPU_SWITCH_NUM <= n);
-    const int dense_cusolver_owner = (use_cusolver_dense && all_knum == 1 && owns_global_dense_rank);
+    const int dense_cusolver_owner =
+        (use_cusolver_dense &&
+         ((all_knum == 1 && owns_global_dense_rank) ||
+          (all_knum != 1 && Set_Hamiltonian_OpenACC_Rank_Is_Selected())));
 
     BandCol_last_construct_on_device = 0;
 
-    if (use_cusolver_dense && all_knum == 1 && !owns_global_dense_rank) {
+    if (use_cusolver_dense && !dense_cusolver_owner) {
         return;
     }
 
     BandCol_ConstructCache_Ensure(order_GA, MP, n);
 
     if (dense_cusolver_owner) {
-        BandCol_ConstructDenseCsHs_OpenACC(need_s, n, k1, k2, k3, S1, H1);
+        BandCol_ConstructDenseCsHs_HIP(need_s, n, k1, k2, k3, S1, H1);
         return;
     }
 

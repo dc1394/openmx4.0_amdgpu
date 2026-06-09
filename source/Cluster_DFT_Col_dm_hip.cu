@@ -111,12 +111,348 @@ cleanup:
     return failed;
 }
 
+typedef struct
+{
+    double r;
+    double i;
+} BandColHipComplex;
+
+typedef struct
+{
+    int h_index;
+    int index0;
+    int index1;
+    int l1;
+    int l2;
+    int l3;
+    int phase_index;
+} BandColHipConstructEntry;
+
+static int BandColReportHipError(const char *where, hipError_t err)
+{
+    if (err == hipSuccess) {
+        return 0;
+    }
+
+    fprintf(stderr, "<Band> HIP collinear dense matrix GPU path failed at %s: %s (%d).\n",
+            where, hipGetErrorString(err), (int)err);
+    fflush(stderr);
+    return 1;
+}
+
+__global__ static void BandColDenseCsHsKernel(int need_s, int count,
+                                              const BandColHipConstructEntry *entries,
+                                              const double *H1, const double *S1,
+                                              const double *phase_r, const double *phase_i,
+                                              BandColHipComplex *d_H, BandColHipComplex *d_S)
+{
+    int idx = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+
+    if (idx < count) {
+        const BandColHipConstructEntry entry = entries[idx];
+        const int h_index = entry.h_index;
+        const int index0 = entry.index0;
+        const int index1 = entry.index1;
+        const int phase_index = entry.phase_index;
+        const double pr = phase_r[phase_index];
+        const double pi = phase_i[phase_index];
+        const double h_real = H1[h_index] * pr;
+        const double h_imag = H1[h_index] * pi;
+
+        atomicAdd(&d_H[index0].r, h_real);
+        atomicAdd(&d_H[index0].i, h_imag);
+
+        if (0 <= index1) {
+            atomicAdd(&d_H[index1].r, h_real);
+            atomicAdd(&d_H[index1].i, -h_imag);
+        }
+
+        if (need_s) {
+            const double s_real = S1[h_index] * pr;
+            const double s_imag = S1[h_index] * pi;
+
+            atomicAdd(&d_S[index0].r, s_real);
+            atomicAdd(&d_S[index0].i, s_imag);
+
+            if (0 <= index1) {
+                atomicAdd(&d_S[index1].r, s_real);
+                atomicAdd(&d_S[index1].i, -s_imag);
+            }
+        }
+    }
+}
+
+extern "C" int BandCol_BuildDenseCsHs_HIP(int need_s, int count, int h_count, int phase_count, int n,
+                                          const BandColHipConstructEntry *entries, const double *phase_r,
+                                          const double *phase_i, const double *H1, const double *S1,
+                                          BandColHipComplex *d_H, BandColHipComplex *d_S)
+{
+    const int block_size = 256;
+    dim3 block(block_size);
+    dim3 grid((unsigned int)((count + block_size - 1) / block_size));
+    BandColHipConstructEntry *d_entries = NULL;
+    double *d_H1 = NULL;
+    double *d_S1 = NULL;
+    double *d_phase_r = NULL;
+    double *d_phase_i = NULL;
+    hipError_t err;
+    size_t entry_bytes = sizeof(BandColHipConstructEntry) * (size_t)count;
+    size_t h_bytes = sizeof(double) * (size_t)h_count;
+    size_t phase_bytes = sizeof(double) * (size_t)phase_count;
+    size_t dense_bytes = sizeof(BandColHipComplex) * (size_t)n * (size_t)n;
+    int failed = 0;
+
+    if (count < 0 || h_count <= 0 || phase_count <= 0 || n <= 0 ||
+        entries == NULL || phase_r == NULL || phase_i == NULL || H1 == NULL || d_H == NULL) {
+        fprintf(stderr, "<Band> HIP dense matrix build received invalid arguments.\n");
+        fflush(stderr);
+        return 1;
+    }
+    if (need_s && (S1 == NULL || d_S == NULL)) {
+        fprintf(stderr, "<Band> HIP dense overlap build received invalid S arguments.\n");
+        fflush(stderr);
+        return 1;
+    }
+
+    err = hipMalloc((void **)&d_entries, entry_bytes);
+    if (BandColReportHipError("hipMalloc(entries)", err)) goto cleanup_failed;
+    err = hipMalloc((void **)&d_H1, h_bytes);
+    if (BandColReportHipError("hipMalloc(H1)", err)) goto cleanup_failed;
+    if (need_s) {
+        err = hipMalloc((void **)&d_S1, h_bytes);
+        if (BandColReportHipError("hipMalloc(S1)", err)) goto cleanup_failed;
+    }
+    err = hipMalloc((void **)&d_phase_r, phase_bytes);
+    if (BandColReportHipError("hipMalloc(phase_r)", err)) goto cleanup_failed;
+    err = hipMalloc((void **)&d_phase_i, phase_bytes);
+    if (BandColReportHipError("hipMalloc(phase_i)", err)) goto cleanup_failed;
+
+    if (0 < count) {
+        err = hipMemcpy(d_entries, entries, entry_bytes, hipMemcpyHostToDevice);
+        if (BandColReportHipError("hipMemcpy(entries)", err)) goto cleanup_failed;
+    }
+    err = hipMemcpy(d_H1, H1, h_bytes, hipMemcpyHostToDevice);
+    if (BandColReportHipError("hipMemcpy(H1)", err)) goto cleanup_failed;
+    if (need_s) {
+        err = hipMemcpy(d_S1, S1, h_bytes, hipMemcpyHostToDevice);
+        if (BandColReportHipError("hipMemcpy(S1)", err)) goto cleanup_failed;
+    }
+    err = hipMemcpy(d_phase_r, phase_r, phase_bytes, hipMemcpyHostToDevice);
+    if (BandColReportHipError("hipMemcpy(phase_r)", err)) goto cleanup_failed;
+    err = hipMemcpy(d_phase_i, phase_i, phase_bytes, hipMemcpyHostToDevice);
+    if (BandColReportHipError("hipMemcpy(phase_i)", err)) goto cleanup_failed;
+
+    err = hipMemset(d_H, 0, dense_bytes);
+    if (BandColReportHipError("hipMemset(H)", err)) goto cleanup_failed;
+    if (need_s) {
+        err = hipMemset(d_S, 0, dense_bytes);
+        if (BandColReportHipError("hipMemset(S)", err)) goto cleanup_failed;
+    }
+
+    if (0 < count) {
+        hipLaunchKernelGGL(BandColDenseCsHsKernel, grid, block, 0, 0,
+                           need_s, count, d_entries, d_H1, d_S1,
+                           d_phase_r, d_phase_i, d_H, d_S);
+        err = hipGetLastError();
+        if (BandColReportHipError("BandColDenseCsHsKernel launch", err)) goto cleanup_failed;
+        err = hipDeviceSynchronize();
+        if (BandColReportHipError("BandColDenseCsHsKernel synchronize", err)) goto cleanup_failed;
+    }
+
+    goto cleanup;
+
+cleanup_failed:
+    failed = 1;
+
+cleanup:
+    if (d_phase_i != NULL) hipFree(d_phase_i);
+    if (d_phase_r != NULL) hipFree(d_phase_r);
+    if (d_S1 != NULL) hipFree(d_S1);
+    if (d_H1 != NULL) hipFree(d_H1);
+    if (d_entries != NULL) hipFree(d_entries);
+    return failed;
+}
+
 __device__ static double ClusterColWarpReduceSum(double value)
 {
     for (int offset = warpSize / 2; 0 < offset; offset >>= 1) {
         value += __shfl_down(value, offset, warpSize);
     }
     return value;
+}
+
+__global__ static void BandColDMKernel(int entry_count, int nk, int evec_stride,
+                                       const int *basis0, const int *basis1, const int *phase_index,
+                                       const double *phase_r, const double *phase_i,
+                                       const double *eigen, const double *occ_weight,
+                                       const BandColHipComplex *evec, double *cdm, double *edm)
+{
+    const int warps_per_block = blockDim.x / warpSize;
+    const int warp_in_block = threadIdx.x / warpSize;
+    const int lane = threadIdx.x - warp_in_block * warpSize;
+    const int p = (int)(blockIdx.x * warps_per_block + warp_in_block);
+
+    if (entry_count <= p) {
+        return;
+    }
+
+    const int ia = basis0[p];
+    const int ib = basis1[p];
+    const int ph = phase_index[p];
+    const double co = phase_r[ph];
+    const double si = phase_i[ph];
+    double d1 = 0.0;
+    double d2 = 0.0;
+    double d3 = 0.0;
+    double d4 = 0.0;
+
+    for (int k = lane; k < nk; k += warpSize) {
+        const double w = occ_weight[k];
+        const BandColHipComplex va = evec[(size_t)ia * (size_t)evec_stride + (size_t)k];
+        const BandColHipComplex vb = evec[(size_t)ib * (size_t)evec_stride + (size_t)k];
+        const double r0 = va.r * w;
+        const double im0 = va.i * w;
+        const double r1 = vb.r * w;
+        const double im1 = vb.i * w;
+        const double reA = r0 * r1 + im0 * im1;
+        const double imA = r0 * im1 - im0 * r1;
+
+        d1 += reA;
+        d2 += imA;
+        d3 += reA * eigen[k];
+        d4 += imA * eigen[k];
+    }
+
+    d1 = ClusterColWarpReduceSum(d1);
+    d2 = ClusterColWarpReduceSum(d2);
+    d3 = ClusterColWarpReduceSum(d3);
+    d4 = ClusterColWarpReduceSum(d4);
+
+    if (lane == 0) {
+        cdm[p] += co * d1 - si * d2;
+        edm[p] += co * d3 - si * d4;
+    }
+}
+
+extern "C" int BandCol_AccumulateDenseTransposedDM_HIP(int entry_count, int pair_count, int nk, int evec_stride,
+                                                       const int *basis0, const int *basis1, const int *phase_index,
+                                                       const double *phase_r, const double *phase_i,
+                                                       const double *eigen, const double *occ_weight,
+                                                       const BandColHipComplex *evec_device,
+                                                       double *CDM1, double *EDM1)
+{
+    const int block_size = 256;
+    int device_id = 0;
+    hipDeviceProp_t prop;
+    int warp_size = 64;
+    int entries_per_block;
+    dim3 block(block_size);
+    dim3 grid;
+    int *d_basis0 = NULL;
+    int *d_basis1 = NULL;
+    int *d_phase_index = NULL;
+    double *d_phase_r = NULL;
+    double *d_phase_i = NULL;
+    double *d_eigen = NULL;
+    double *d_occ_weight = NULL;
+    double *d_cdm = NULL;
+    double *d_edm = NULL;
+    hipError_t err;
+    size_t entry_int_bytes = sizeof(int) * (size_t)entry_count;
+    size_t pair_bytes = sizeof(double) * (size_t)pair_count;
+    size_t state_bytes = sizeof(double) * (size_t)nk;
+    size_t dm_bytes = sizeof(double) * (size_t)entry_count;
+    int failed = 0;
+
+    if (entry_count <= 0 || pair_count <= 0 || nk <= 0 || evec_stride <= 0 ||
+        basis0 == NULL || basis1 == NULL || phase_index == NULL ||
+        phase_r == NULL || phase_i == NULL || eigen == NULL || occ_weight == NULL ||
+        evec_device == NULL || CDM1 == NULL || EDM1 == NULL) {
+        fprintf(stderr, "<Band> HIP density matrix build received invalid arguments.\n");
+        fflush(stderr);
+        return 1;
+    }
+
+    err = hipGetDevice(&device_id);
+    if (BandColReportHipError("hipGetDevice(DM)", err)) goto cleanup_failed;
+    err = hipGetDeviceProperties(&prop, device_id);
+    if (BandColReportHipError("hipGetDeviceProperties(DM)", err)) goto cleanup_failed;
+    if (0 < prop.warpSize) {
+        warp_size = prop.warpSize;
+    }
+    entries_per_block = block_size / warp_size;
+    if (entries_per_block <= 0) {
+        entries_per_block = 1;
+    }
+    grid = dim3((unsigned int)((entry_count + entries_per_block - 1) / entries_per_block));
+
+    err = hipMalloc((void **)&d_basis0, entry_int_bytes);
+    if (BandColReportHipError("hipMalloc(DM basis0)", err)) goto cleanup_failed;
+    err = hipMalloc((void **)&d_basis1, entry_int_bytes);
+    if (BandColReportHipError("hipMalloc(DM basis1)", err)) goto cleanup_failed;
+    err = hipMalloc((void **)&d_phase_index, entry_int_bytes);
+    if (BandColReportHipError("hipMalloc(DM phase_index)", err)) goto cleanup_failed;
+    err = hipMalloc((void **)&d_phase_r, pair_bytes);
+    if (BandColReportHipError("hipMalloc(DM phase_r)", err)) goto cleanup_failed;
+    err = hipMalloc((void **)&d_phase_i, pair_bytes);
+    if (BandColReportHipError("hipMalloc(DM phase_i)", err)) goto cleanup_failed;
+    err = hipMalloc((void **)&d_eigen, state_bytes);
+    if (BandColReportHipError("hipMalloc(DM eigen)", err)) goto cleanup_failed;
+    err = hipMalloc((void **)&d_occ_weight, state_bytes);
+    if (BandColReportHipError("hipMalloc(DM occ)", err)) goto cleanup_failed;
+    err = hipMalloc((void **)&d_cdm, dm_bytes);
+    if (BandColReportHipError("hipMalloc(DM cdm)", err)) goto cleanup_failed;
+    err = hipMalloc((void **)&d_edm, dm_bytes);
+    if (BandColReportHipError("hipMalloc(DM edm)", err)) goto cleanup_failed;
+
+    err = hipMemcpy(d_basis0, basis0, entry_int_bytes, hipMemcpyHostToDevice);
+    if (BandColReportHipError("hipMemcpy(DM basis0)", err)) goto cleanup_failed;
+    err = hipMemcpy(d_basis1, basis1, entry_int_bytes, hipMemcpyHostToDevice);
+    if (BandColReportHipError("hipMemcpy(DM basis1)", err)) goto cleanup_failed;
+    err = hipMemcpy(d_phase_index, phase_index, entry_int_bytes, hipMemcpyHostToDevice);
+    if (BandColReportHipError("hipMemcpy(DM phase_index)", err)) goto cleanup_failed;
+    err = hipMemcpy(d_phase_r, phase_r, pair_bytes, hipMemcpyHostToDevice);
+    if (BandColReportHipError("hipMemcpy(DM phase_r)", err)) goto cleanup_failed;
+    err = hipMemcpy(d_phase_i, phase_i, pair_bytes, hipMemcpyHostToDevice);
+    if (BandColReportHipError("hipMemcpy(DM phase_i)", err)) goto cleanup_failed;
+    err = hipMemcpy(d_eigen, eigen, state_bytes, hipMemcpyHostToDevice);
+    if (BandColReportHipError("hipMemcpy(DM eigen)", err)) goto cleanup_failed;
+    err = hipMemcpy(d_occ_weight, occ_weight, state_bytes, hipMemcpyHostToDevice);
+    if (BandColReportHipError("hipMemcpy(DM occ)", err)) goto cleanup_failed;
+    err = hipMemcpy(d_cdm, CDM1, dm_bytes, hipMemcpyHostToDevice);
+    if (BandColReportHipError("hipMemcpy(DM cdm)", err)) goto cleanup_failed;
+    err = hipMemcpy(d_edm, EDM1, dm_bytes, hipMemcpyHostToDevice);
+    if (BandColReportHipError("hipMemcpy(DM edm)", err)) goto cleanup_failed;
+
+    hipLaunchKernelGGL(BandColDMKernel, grid, block, 0, 0,
+                       entry_count, nk, evec_stride, d_basis0, d_basis1, d_phase_index,
+                       d_phase_r, d_phase_i, d_eigen, d_occ_weight, evec_device, d_cdm, d_edm);
+    err = hipGetLastError();
+    if (BandColReportHipError("BandColDMKernel launch", err)) goto cleanup_failed;
+    err = hipDeviceSynchronize();
+    if (BandColReportHipError("BandColDMKernel synchronize", err)) goto cleanup_failed;
+
+    err = hipMemcpy(CDM1, d_cdm, dm_bytes, hipMemcpyDeviceToHost);
+    if (BandColReportHipError("hipMemcpy(DM cdm back)", err)) goto cleanup_failed;
+    err = hipMemcpy(EDM1, d_edm, dm_bytes, hipMemcpyDeviceToHost);
+    if (BandColReportHipError("hipMemcpy(DM edm back)", err)) goto cleanup_failed;
+
+    goto cleanup;
+
+cleanup_failed:
+    failed = 1;
+
+cleanup:
+    if (d_edm != NULL) hipFree(d_edm);
+    if (d_cdm != NULL) hipFree(d_cdm);
+    if (d_occ_weight != NULL) hipFree(d_occ_weight);
+    if (d_eigen != NULL) hipFree(d_eigen);
+    if (d_phase_i != NULL) hipFree(d_phase_i);
+    if (d_phase_r != NULL) hipFree(d_phase_r);
+    if (d_phase_index != NULL) hipFree(d_phase_index);
+    if (d_basis1 != NULL) hipFree(d_basis1);
+    if (d_basis0 != NULL) hipFree(d_basis0);
+    return failed;
 }
 
 __global__ static void ClusterColDMKernel(int entry_count, int size_H1, int maxn, int nk_occ, int calc_pdm,
