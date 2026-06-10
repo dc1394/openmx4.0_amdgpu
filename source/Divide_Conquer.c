@@ -237,7 +237,11 @@ typedef struct {
 
 static DCCuSolverCtx DC_cusolver_ctx = {0};
 static int           DC_cusolver_gemm_disabled = 0;
+#ifdef __HIP_PLATFORM_AMD__
+static int           DC_cusolver_gemmul8_disabled = 1;
+#else
 static int           DC_cusolver_gemmul8_disabled = 0;
+#endif
 static int           DC_cusolver_eigen_disabled = 0;
 
 static unsigned DC_EnvU32(const char *name, unsigned fallback)
@@ -256,6 +260,63 @@ static unsigned DC_EnvU32(const char *name, unsigned fallback)
     }
 
     return (unsigned)parsed;
+}
+
+static int DC_EnvI32Any(const char *name1, const char *name2, const char *name3, int fallback)
+{
+    const char *value = NULL;
+    char       *end   = NULL;
+    long        parsed;
+
+    if (name1 != NULL)
+        value = getenv(name1);
+    if ((value == NULL || value[0] == '\0') && name2 != NULL)
+        value = getenv(name2);
+    if ((value == NULL || value[0] == '\0') && name3 != NULL)
+        value = getenv(name3);
+    if (value == NULL || value[0] == '\0') {
+        return fallback;
+    }
+
+    parsed = strtol(value, &end, 10);
+    if (end == value || *end != '\0') {
+        return fallback;
+    }
+
+    return (int)parsed;
+}
+
+static int DC_CuSolver_RankAllowed(void)
+{
+    static int initialized = 0;
+    static int allowed     = 1;
+
+    if (!initialized) {
+        int      local_rank;
+        int      device_count = 1;
+        unsigned max_ranks;
+
+#ifdef __HIP_PLATFORM_AMD__
+        max_ranks = DC_EnvU32("DC_GPU_MAX_RANKS_PER_DEVICE", 4u);
+#else
+        max_ranks = DC_EnvU32("DC_GPU_MAX_RANKS_PER_DEVICE", 1024u);
+#endif
+        max_ranks = DC_EnvU32("OPENMX_DC_GPU_MAX_RANKS_PER_DEVICE", max_ranks);
+
+        local_rank = DC_EnvI32Any("OMPI_COMM_WORLD_LOCAL_RANK", "MPI_LOCALRANKID", "SLURM_LOCALID", -1);
+        if (local_rank < 0) {
+            MPI_Comm_rank(mpi_comm_level1, &local_rank);
+        }
+
+        if (cudaGetDeviceCount(&device_count) != cudaSuccess || device_count <= 0) {
+            device_count = 1;
+        }
+
+        allowed = (0 < max_ranks && (unsigned)(local_rank / device_count) < max_ranks);
+        initialized = 1;
+    }
+
+    return allowed;
 }
 
 static const char *DC_CuSolver_CublasStatusName(cublasStatus_t status)
@@ -316,6 +377,15 @@ static const char *DC_CuSolver_StatusName(cusolverStatus_t status)
 
 static void DC_CuSolver_DisableGemmPathCuda(const char *where, cudaError_t status);
 
+static void DC_Eigen_lapack_cpu(double **a, double *ko, int n, int EVmax)
+{
+    int saved_scf_eigen_lib_flag = scf_eigen_lib_flag;
+
+    scf_eigen_lib_flag = ELPA2;
+    Eigen_lapack(a, ko, n, EVmax);
+    scf_eigen_lib_flag = saved_scf_eigen_lib_flag;
+}
+
 static int DC_CuSolver_GemmDisabled(void)
 {
     return DC_cusolver_gemm_disabled;
@@ -330,7 +400,11 @@ static size_t DC_CuSolver_Gemmul8ReserveBytes(void)
 {
     unsigned reserve_mib;
 
+#ifdef __HIP_PLATFORM_AMD__
+    reserve_mib = DC_EnvU32("GEMMUL8_MIN_FREE_AFTER_MB", 64u);
+#else
     reserve_mib = DC_EnvU32("GEMMUL8_MIN_FREE_AFTER_MB", 1536u);
+#endif
     reserve_mib = DC_EnvU32("OPENMX_GEMMUL8_MIN_FREE_AFTER_MB", reserve_mib);
 
     return (size_t)reserve_mib * (size_t)1024 * (size_t)1024;
@@ -340,7 +414,11 @@ static size_t DC_CuSolver_CublasReserveBytes(void)
 {
     unsigned reserve_mib;
 
+#ifdef __HIP_PLATFORM_AMD__
+    reserve_mib = DC_EnvU32("CUBLAS_MIN_FREE_AFTER_MB", 64u);
+#else
     reserve_mib = DC_EnvU32("CUBLAS_MIN_FREE_AFTER_MB", 3072u);
+#endif
     reserve_mib = DC_EnvU32("OPENMX_CUBLAS_MIN_FREE_AFTER_MB", reserve_mib);
 
     return (size_t)reserve_mib * (size_t)1024 * (size_t)1024;
@@ -350,10 +428,77 @@ static size_t DC_CuSolver_EigenReserveBytes(void)
 {
     unsigned reserve_mib;
 
+#ifdef __HIP_PLATFORM_AMD__
+    reserve_mib = DC_EnvU32("CUSOLVER_MIN_FREE_AFTER_MB", 16u);
+#else
     reserve_mib = DC_EnvU32("CUSOLVER_MIN_FREE_AFTER_MB", 1536u);
+#endif
     reserve_mib = DC_EnvU32("OPENMX_CUSOLVER_MIN_FREE_AFTER_MB", reserve_mib);
 
     return (size_t)reserve_mib * (size_t)1024 * (size_t)1024;
+}
+
+static void DC_CuSolver_ReleaseWorkspace(void)
+{
+    DCCuSolverCtx *ctx = &DC_cusolver_ctx;
+
+    if (ctx->d_work != NULL) {
+        wait_cudafunc(cudaFree(ctx->d_work));
+        ctx->d_work = NULL;
+        ctx->d_work_bytes = 0;
+    }
+    if (ctx->h_work != NULL) {
+        free(ctx->h_work);
+        ctx->h_work = NULL;
+        ctx->h_work_bytes = 0;
+    }
+}
+
+static void DC_CuSolver_ReleaseGemmScratch(void)
+{
+    DCCuSolverCtx *ctx = &DC_cusolver_ctx;
+
+    if (ctx->d_H != NULL) {
+        wait_cudafunc(cudaFree(ctx->d_H));
+        ctx->d_H = NULL;
+    }
+    if (ctx->d_tmp != NULL) {
+        wait_cudafunc(cudaFree(ctx->d_tmp));
+        ctx->d_tmp = NULL;
+    }
+    if (ctx->d_A != NULL) {
+        wait_cudafunc(cudaFree(ctx->d_A));
+        ctx->d_A = NULL;
+    }
+    if (ctx->d_C != NULL) {
+        wait_cudafunc(cudaFree(ctx->d_C));
+        ctx->d_C = NULL;
+    }
+}
+
+static void DC_CuSolver_ReleaseTransformScratch(void)
+{
+    DCCuSolverCtx *ctx = &DC_cusolver_ctx;
+
+    if (ctx->d_H != NULL) {
+        wait_cudafunc(cudaFree(ctx->d_H));
+        ctx->d_H = NULL;
+    }
+    if (ctx->d_tmp != NULL) {
+        wait_cudafunc(cudaFree(ctx->d_tmp));
+        ctx->d_tmp = NULL;
+    }
+}
+
+static void DC_CuSolver_ReleaseOverlapBuffer(void)
+{
+    DCCuSolverCtx *ctx = &DC_cusolver_ctx;
+
+    if (ctx->d_S != NULL) {
+        wait_cudafunc(cudaFree(ctx->d_S));
+        ctx->d_S = NULL;
+    }
+    ctx->loaded_s_dim = 0;
 }
 
 static void DC_CuSolver_DisableEigenPathMemory(const char *where, size_t need_bytes, size_t free_bytes,
@@ -502,6 +647,8 @@ static int DC_CuSolver_PrepareGemmBackendForSolve(int n, int num1)
     if (DC_CuSolver_GemmDisabled()) {
         return 0;
     }
+
+    DC_CuSolver_ReleaseWorkspace();
 
     if (DC_cusolver_gemmul8_disabled) {
         return DC_CuSolver_HasCublasMemoryForSolve("DC Hamiltonian GEMM");
@@ -687,7 +834,8 @@ static int DC_CuSolver_EnsureMatrixCapacity(int num)
 
     DC_CuSolver_Init();
 
-    if (num <= ctx->matrix_dim) {
+    if (num <= ctx->matrix_dim && ctx->d_S != NULL && ctx->d_W != NULL && ctx->d_info != NULL &&
+        ctx->h_matrix != NULL) {
         return 1;
     }
 
@@ -695,22 +843,7 @@ static int DC_CuSolver_EnsureMatrixCapacity(int num)
         wait_cudafunc(cudaFree(ctx->d_S));
         ctx->d_S = NULL;
     }
-    if (ctx->d_H != NULL) {
-        wait_cudafunc(cudaFree(ctx->d_H));
-        ctx->d_H = NULL;
-    }
-    if (ctx->d_tmp != NULL) {
-        wait_cudafunc(cudaFree(ctx->d_tmp));
-        ctx->d_tmp = NULL;
-    }
-    if (ctx->d_A != NULL) {
-        wait_cudafunc(cudaFree(ctx->d_A));
-        ctx->d_A = NULL;
-    }
-    if (ctx->d_C != NULL) {
-        wait_cudafunc(cudaFree(ctx->d_C));
-        ctx->d_C = NULL;
-    }
+    DC_CuSolver_ReleaseGemmScratch();
     if (ctx->d_W != NULL) {
         wait_cudafunc(cudaFree(ctx->d_W));
         ctx->d_W = NULL;
@@ -746,30 +879,6 @@ static int DC_CuSolver_EnsureMatrixCapacity(int num)
         DC_CuSolver_Destroy();
         return 0;
     }
-    cuda_status = cudaMalloc((void **)&ctx->d_H, matrix_bytes);
-    if (cuda_status != cudaSuccess) {
-        DC_CuSolver_DisableGemmPathCuda("cudaMalloc(d_H)", cuda_status);
-        DC_CuSolver_Destroy();
-        return 0;
-    }
-    cuda_status = cudaMalloc((void **)&ctx->d_tmp, matrix_bytes);
-    if (cuda_status != cudaSuccess) {
-        DC_CuSolver_DisableGemmPathCuda("cudaMalloc(d_tmp)", cuda_status);
-        DC_CuSolver_Destroy();
-        return 0;
-    }
-    cuda_status = cudaMalloc((void **)&ctx->d_A, matrix_bytes);
-    if (cuda_status != cudaSuccess) {
-        DC_CuSolver_DisableGemmPathCuda("cudaMalloc(d_A)", cuda_status);
-        DC_CuSolver_Destroy();
-        return 0;
-    }
-    cuda_status = cudaMalloc((void **)&ctx->d_C, matrix_bytes);
-    if (cuda_status != cudaSuccess) {
-        DC_CuSolver_DisableGemmPathCuda("cudaMalloc(d_C)", cuda_status);
-        DC_CuSolver_Destroy();
-        return 0;
-    }
     cuda_status = cudaMalloc((void **)&ctx->d_W,
                              DC_CheckedArrayBytes((size_t)num, sizeof(double), "CuSOLVER eigenvalue buffer"));
     if (cuda_status != cudaSuccess) {
@@ -792,6 +901,46 @@ static int DC_CuSolver_EnsureMatrixCapacity(int num)
 
     ctx->matrix_dim   = num;
     ctx->loaded_s_dim = 0;
+    return 1;
+}
+
+static int DC_CuSolver_EnsureGemmCapacity(int num)
+{
+    DCCuSolverCtx *ctx = &DC_cusolver_ctx;
+    size_t         matrix_bytes;
+    cudaError_t    cuda_status;
+
+    if (!DC_CuSolver_EnsureMatrixCapacity(num)) {
+        return 0;
+    }
+
+    matrix_bytes = DC_CheckedArrayBytes(DC_CheckedMulCount((size_t)num, (size_t)num, "CuSOLVER GEMM matrix"),
+                                        sizeof(double), "CuSOLVER GEMM matrix");
+
+    if (ctx->d_H == NULL) {
+        cuda_status = cudaMalloc((void **)&ctx->d_H, matrix_bytes);
+        if (cuda_status != cudaSuccess) {
+            DC_CuSolver_DisableGemmPathCuda("cudaMalloc(d_H)", cuda_status);
+            DC_CuSolver_Destroy();
+            return 0;
+        }
+    }
+    if (ctx->d_tmp == NULL) {
+        cuda_status = cudaMalloc((void **)&ctx->d_tmp, matrix_bytes);
+        if (cuda_status != cudaSuccess) {
+            DC_CuSolver_DisableGemmPathCuda("cudaMalloc(d_tmp)", cuda_status);
+            DC_CuSolver_Destroy();
+            return 0;
+        }
+    }
+    if (ctx->d_A == NULL) {
+        cuda_status = cudaMalloc((void **)&ctx->d_A, matrix_bytes);
+        if (cuda_status != cudaSuccess) {
+            DC_CuSolver_DisableGemmPathCuda("cudaMalloc(d_A)", cuda_status);
+            DC_CuSolver_Destroy();
+            return 0;
+        }
+    }
     return 1;
 }
 
@@ -818,7 +967,14 @@ static int DC_CuSolver_EnsureWorkspace(int m, int maxn, double *d_A, const char 
     if (DC_CuSolver_EigenDisabled()) {
         return 0;
     }
-    if (!DC_CuSolver_EnsureMatrixCapacity(m)) {
+
+    DC_CuSolver_Init();
+    if (m > ctx->matrix_dim || ctx->d_W == NULL || ctx->d_info == NULL) {
+        if (!DC_CuSolver_EnsureMatrixCapacity(m)) {
+            return 0;
+        }
+    }
+    if (ctx->d_W == NULL || ctx->d_info == NULL) {
         return 0;
     }
 
@@ -904,34 +1060,41 @@ static int DC_CuSolver_Eigen(double *d_A, int m, int maxn, double *W, const char
                                       ctx->d_work_bytes, ctx->h_work, ctx->h_work_bytes, ctx->d_info);
     if (solver_status != CUSOLVER_STATUS_SUCCESS) {
         DC_CuSolver_DisableEigenPathStatus(where, "cusolverDnXsyevdx", solver_status);
+        DC_CuSolver_ReleaseWorkspace();
         return 0;
     }
 
     cuda_status = cudaMemcpyAsync(W, ctx->d_W, sizeof(double) * (size_t)maxn, cudaMemcpyDeviceToHost, ctx->stream);
     if (cuda_status != cudaSuccess) {
         DC_CuSolver_DisableGemmPathCuda("cudaMemcpyAsync(cuSOLVER eigenvalues)", cuda_status);
+        DC_CuSolver_ReleaseWorkspace();
         return 0;
     }
     cuda_status = cudaMemcpyAsync(&info, ctx->d_info, sizeof(int32_t), cudaMemcpyDeviceToHost, ctx->stream);
     if (cuda_status != cudaSuccess) {
         DC_CuSolver_DisableGemmPathCuda("cudaMemcpyAsync(cuSOLVER info)", cuda_status);
+        DC_CuSolver_ReleaseWorkspace();
         return 0;
     }
     cuda_status = cudaStreamSynchronize(ctx->stream);
     if (cuda_status != cudaSuccess) {
         DC_CuSolver_DisableGemmPathCuda("cudaStreamSynchronize(cuSOLVER)", cuda_status);
+        DC_CuSolver_ReleaseWorkspace();
         return 0;
     }
 
     if (info != 0) {
         DC_CuSolver_DisableEigenPathInfo(where, info);
+        DC_CuSolver_ReleaseWorkspace();
         return 0;
     }
     if (h_meig != (int64_t)maxn) {
         DC_CuSolver_DisableEigenPathEigenpairs(where, h_meig, maxn);
+        DC_CuSolver_ReleaseWorkspace();
         return 0;
     }
 
+    DC_CuSolver_ReleaseWorkspace();
     return 1;
 }
 
@@ -1108,7 +1271,7 @@ static int DCCol_CPU_SolveHamiltonian(int n, int p_min, double **S_DC, double **
         }
     }
 
-    Eigen_lapack(C, ko, num1, num1);
+    DC_Eigen_lapack_cpu(C, ko, num1, num1);
 
     for (i1 = 1; i1 <= n; i1++) {
         for (j1 = 1; j1 <= num1; j1++) {
@@ -1164,7 +1327,8 @@ static int DCCol_CPU_SolveHamiltonian(int n, int p_min, double **S_DC, double **
     return num1;
 }
 
-static int DCCol_CuSolver_SolveHamiltonian(int n, int p_min, double **H_DC_spin, double *ko, double **C)
+static int DCCol_CuSolver_SolveHamiltonian(int n, int p_min, double **S_DC, double **H_DC_spin, double *ko,
+                                           double **C)
 {
     DCCuSolverCtx *ctx = &DC_cusolver_ctx;
     double         alpha = 1.0;
@@ -1184,19 +1348,26 @@ static int DCCol_CuSolver_SolveHamiltonian(int n, int p_min, double **H_DC_spin,
     matrix_bytes = DC_CheckedArrayBytes(DC_CheckedMulCount((size_t)n, (size_t)n, "DC Hamiltonian matrix"),
                                         sizeof(double), "DC Hamiltonian matrix");
 
+    if (!DC_CuSolver_EnsureGemmCapacity(n)) {
+        return 0;
+    }
+
     DCCol_CuSolver_PackMatrix(n, H_DC_spin, ctx->h_matrix);
     cuda_status = cudaMemcpyAsync(ctx->d_H, ctx->h_matrix, matrix_bytes, cudaMemcpyHostToDevice, ctx->stream);
     if (cuda_status != cudaSuccess) {
         DC_CuSolver_DisableGemmPathCuda("cudaMemcpyAsync(H)", cuda_status);
+        DC_CuSolver_ReleaseGemmScratch();
         return 0;
     }
 
     if (!DC_CuSolver_TryGpuDgemm(ctx->cublas, CUBLAS_OP_N, CUBLAS_OP_N, n, n, n, &alpha, ctx->d_H, n, ctx->d_S,
                                  n, &beta, ctx->d_tmp, n, "H*S")) {
+        DC_CuSolver_ReleaseGemmScratch();
         return 0;
     }
     if (!DC_CuSolver_TryGpuDgemm(ctx->cublas, CUBLAS_OP_T, CUBLAS_OP_N, n, n, n, &alpha, ctx->d_S, n,
                                  ctx->d_tmp, n, &beta, ctx->d_H, n, "S^T*H*S")) {
+        DC_CuSolver_ReleaseGemmScratch();
         return 0;
     }
 
@@ -1206,16 +1377,57 @@ static int DCCol_CuSolver_SolveHamiltonian(int n, int p_min, double **H_DC_spin,
                                     cudaMemcpyDeviceToDevice, ctx->stream);
     if (cuda_status != cudaSuccess) {
         DC_CuSolver_DisableGemmPathCuda("cudaMemcpy2DAsync(active Hamiltonian)", cuda_status);
+        DC_CuSolver_ReleaseGemmScratch();
+        return 0;
+    }
+    cuda_status = cudaStreamSynchronize(ctx->stream);
+    if (cuda_status != cudaSuccess) {
+        DC_CuSolver_DisableGemmPathCuda("cudaStreamSynchronize(active Hamiltonian)", cuda_status);
+        DC_CuSolver_ReleaseGemmScratch();
+        return 0;
+    }
+    DC_CuSolver_ReleaseTransformScratch();
+    DC_CuSolver_ReleaseOverlapBuffer();
+
+    if (!DC_CuSolver_Eigen(ctx->d_A, num1, num1, ko + 1, "Hamiltonian diagonalization")) {
+        DC_CuSolver_ReleaseGemmScratch();
         return 0;
     }
 
-    if (!DC_CuSolver_Eigen(ctx->d_A, num1, num1, ko + 1, "Hamiltonian diagonalization")) {
+    cuda_status = cudaMalloc((void **)&ctx->d_S, matrix_bytes);
+    if (cuda_status != cudaSuccess) {
+        DC_CuSolver_DisableGemmPathCuda("cudaMalloc(d_S reload)", cuda_status);
+        DC_CuSolver_ReleaseGemmScratch();
         return 0;
+    }
+    DCCol_CuSolver_PackMatrix(n, S_DC, ctx->h_matrix);
+    cuda_status = cudaMemcpyAsync(ctx->d_S, ctx->h_matrix, matrix_bytes, cudaMemcpyHostToDevice, ctx->stream);
+    if (cuda_status != cudaSuccess) {
+        DC_CuSolver_DisableGemmPathCuda("cudaMemcpyAsync(reloaded S)", cuda_status);
+        DC_CuSolver_ReleaseGemmScratch();
+        return 0;
+    }
+    cuda_status = cudaStreamSynchronize(ctx->stream);
+    if (cuda_status != cudaSuccess) {
+        DC_CuSolver_DisableGemmPathCuda("cudaStreamSynchronize(reloaded S)", cuda_status);
+        DC_CuSolver_ReleaseGemmScratch();
+        return 0;
+    }
+    ctx->loaded_s_dim = n;
+
+    if (ctx->d_C == NULL) {
+        cuda_status = cudaMalloc((void **)&ctx->d_C, matrix_bytes);
+        if (cuda_status != cudaSuccess) {
+            DC_CuSolver_DisableGemmPathCuda("cudaMalloc(d_C)", cuda_status);
+            DC_CuSolver_ReleaseGemmScratch();
+            return 0;
+        }
     }
 
     if (!DC_CuSolver_TryGpuDgemm(ctx->cublas, CUBLAS_OP_N, CUBLAS_OP_N, n, num1, num1, &alpha,
                                  ctx->d_S + (size_t)(p_min - 1) * (size_t)n, n, ctx->d_A, num1, &beta,
                                  ctx->d_C, n, "S*C")) {
+        DC_CuSolver_ReleaseGemmScratch();
         return 0;
     }
 
@@ -1223,12 +1435,14 @@ static int DCCol_CuSolver_SolveHamiltonian(int n, int p_min, double **H_DC_spin,
                                   cudaMemcpyDeviceToHost, ctx->stream);
     if (cuda_status != cudaSuccess) {
         DC_CuSolver_DisableGemmPathCuda("cudaMemcpyAsync(C)", cuda_status);
+        DC_CuSolver_ReleaseGemmScratch();
         return 0;
     }
 
     cuda_status = cudaStreamSynchronize(ctx->stream);
     if (cuda_status != cudaSuccess) {
         DC_CuSolver_DisableGemmPathCuda("cudaStreamSynchronize(C)", cuda_status);
+        DC_CuSolver_ReleaseGemmScratch();
         return 0;
     }
 
@@ -1238,6 +1452,7 @@ static int DCCol_CuSolver_SolveHamiltonian(int n, int p_min, double **H_DC_spin,
         }
     }
 
+    DC_CuSolver_ReleaseGemmScratch();
     return 1;
 }
 
@@ -1909,7 +2124,7 @@ static double DC_Col(char * mode, int SCF_iter, double ***** Hks, double **** OL
 
             int use_dc_gpu =
                 (scf_eigen_lib_flag == CuSOLVER && !DC_CuSolver_GemmDisabled() && !DC_CuSolver_EigenDisabled() &&
-                 DC_GPU_Threshold() <= NUM);
+                 DC_CuSolver_RankAllowed() && DC_GPU_Threshold() <= NUM);
             if (SCF_iter <= 2) {
                 memset(S_DC_store, 0, sizeof(double) * (size_t)n2 * (size_t)n2);
             }
@@ -1970,10 +2185,10 @@ static double DC_Col(char * mode, int SCF_iter, double ***** Hks, double **** OL
                 if (use_dc_gpu) {
                     if (!DCCol_CuSolver_DiagonalizeOverlap(NUM, S_DC, ko)) {
                         use_dc_gpu = 0;
-                        Eigen_lapack(S_DC, ko, NUM, NUM);
+                        DC_Eigen_lapack_cpu(S_DC, ko, NUM, NUM);
                     }
                 } else {
-                    Eigen_lapack(S_DC, ko, NUM, NUM);
+                    DC_Eigen_lapack_cpu(S_DC, ko, NUM, NUM);
                 }
 
                 /***********************************************
@@ -2080,7 +2295,7 @@ static double DC_Col(char * mode, int SCF_iter, double ***** Hks, double **** OL
                     if (!DC_CuSolver_PrepareGemmBackendForSolve(NUM, NUM1)) {
                         use_dc_gpu = 0;
                         NUM1       = DCCol_CPU_SolveHamiltonian(NUM, P_min, S_DC, H_DC[spin], ko, C);
-                    } else if (!DCCol_CuSolver_SolveHamiltonian(NUM, P_min, H_DC[spin], ko, C)) {
+                    } else if (!DCCol_CuSolver_SolveHamiltonian(NUM, P_min, S_DC, H_DC[spin], ko, C)) {
                         use_dc_gpu = 0;
                         NUM1       = DCCol_CPU_SolveHamiltonian(NUM, P_min, S_DC, H_DC[spin], ko, C);
                     }
@@ -3620,7 +3835,7 @@ static double DC_NonCol(char * mode, int SCF_iter, double ***** Hks, double ****
             if (SCF_iter <= 2) {
                 // dtime(&timeA);
 
-                Eigen_lapack(S_DC, ko, NUM, NUM);
+                DC_Eigen_lapack_cpu(S_DC, ko, NUM, NUM);
 
                 // dtime(&timeB);
                 // printf("timeA = %.3f\n", timeB - timeA);
