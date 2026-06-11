@@ -10,6 +10,11 @@
 
 #include "gemmul8.hpp"
 
+extern "C" int openmx_magma_zgemm(char transa, char transb, int m, int n, int k,
+                                  const void *alpha, const void *d_A, int lda,
+                                  const void *d_B, int ldb, const void *beta,
+                                  void *d_C, int ldc, void *stream, void *hipblas_handle);
+
 namespace {
 
 constexpr unsigned kDefaultNumModuli = 15u;
@@ -49,6 +54,7 @@ struct WorkspaceReport {
     size_t      total_bytes    = 0;
     size_t      reserve_bytes  = 0;
     unsigned    max_workspace_percent = 0;
+    unsigned    ranks_per_gpu  = 1;
     const char *reason = "allocation failure";
 };
 
@@ -122,6 +128,33 @@ unsigned gemmul8_num_moduli(const char *openmx_env, const char *gemmul8_env)
     return num_moduli;
 }
 
+/* Number of MPI ranks sharing this GPU. The workspace budget must be divided by
+   this: each rank checks free memory independently, so 32 ranks can each "see"
+   room for a 1-GiB workspace and collectively exhaust the device, after which
+   hipBLASLt's lazy initialization inside GEMMul8 dies with out-of-memory. */
+unsigned ranks_sharing_gpu()
+{
+    unsigned local_size = env_u32("OPENMX_GEMMUL8_LOCAL_RANKS", 0u);
+
+    if (local_size == 0u) {
+        local_size = env_u32("OMPI_COMM_WORLD_LOCAL_SIZE", 0u);
+    }
+    if (local_size == 0u) {
+        local_size = env_u32("SLURM_NTASKS_PER_NODE", 0u);
+    }
+    if (local_size == 0u) {
+        local_size = 1u;
+    }
+
+    int device_count = 0;
+    if (cudaGetDeviceCount(&device_count) != cudaSuccess || device_count < 1) {
+        device_count = 1;
+    }
+
+    unsigned ranks = local_size / static_cast<unsigned>(device_count);
+    return (ranks == 0u) ? 1u : ranks;
+}
+
 cudaError_t release_workspace(Workspace &workspace)
 {
     if (workspace.ptr == nullptr) {
@@ -138,9 +171,15 @@ cudaError_t release_workspace(Workspace &workspace)
     return status;
 }
 
-bool workspace_exceeds_fraction(size_t required, size_t total, unsigned max_percent)
+bool workspace_exceeds_fraction(size_t required, size_t total, unsigned max_percent, unsigned ranks_per_gpu)
 {
-    return total != 0 && max_percent != 0 && (total * static_cast<size_t>(max_percent)) / 100u < required;
+    if (total == 0 || max_percent == 0) {
+        return false;
+    }
+    if (ranks_per_gpu == 0u) {
+        ranks_per_gpu = 1u;
+    }
+    return (total * static_cast<size_t>(max_percent)) / 100u / ranks_per_gpu < required;
 }
 
 bool free_after_workspace_is_too_low(size_t free_bytes, size_t workspace_size, size_t required, size_t reserve)
@@ -173,6 +212,8 @@ cublasStatus_t ensure_workspace(cublasHandle_t handle, size_t m, size_t n, size_
     const size_t required = gemmul8::workSize<is_complex, gemmul8::Backend::INT8>(m, n, k, num_moduli);
     WorkspaceKey key      = {device, stream};
 
+    const unsigned ranks_per_gpu = ranks_sharing_gpu();
+
     if (report != nullptr) {
         report->required_bytes = required;
         report->reserve_bytes =
@@ -180,6 +221,7 @@ cublasStatus_t ensure_workspace(cublasHandle_t handle, size_t m, size_t n, size_
         report->max_workspace_percent = env_percent("OPENMX_GEMMUL8_MAX_WORKSPACE_PERCENT",
                                                      "GEMMUL8_MAX_WORKSPACE_PERCENT",
                                                      kDefaultMaxWorkspacePercent);
+        report->ranks_per_gpu = ranks_per_gpu;
     }
 
     std::lock_guard<std::mutex> lock(g_workspace_mutex);
@@ -194,7 +236,8 @@ cublasStatus_t ensure_workspace(cublasHandle_t handle, size_t m, size_t n, size_
     }
 
     if (cuda_status == cudaSuccess &&
-        workspace_exceeds_fraction(required, total_bytes, report != nullptr ? report->max_workspace_percent : 0u)) {
+        workspace_exceeds_fraction(required, total_bytes, report != nullptr ? report->max_workspace_percent : 0u,
+                                   ranks_per_gpu)) {
         if (report != nullptr) {
             report->reason = "workspace fraction policy";
         }
@@ -245,7 +288,7 @@ cublasStatus_t ensure_workspace(cublasHandle_t handle, size_t m, size_t n, size_
 }
 
 template <bool is_complex>
-void log_workspace_fallback_once(const WorkspaceReport &report)
+void log_workspace_fallback_once(const WorkspaceReport &report, const char *target)
 {
     static bool warned = false;
 
@@ -257,12 +300,38 @@ void log_workspace_fallback_once(const WorkspaceReport &report)
     fprintf(stderr,
             "openmx_gemmul8%sgemm: GEMMul8 workspace fallback by %s; "
             "need %.3f MiB, CUDA free %.3f MiB / total %.3f MiB, "
-            "reserve %.3f MiB, max-workspace %u%%. Falling back to native cuBLAS.\n",
+            "reserve %.3f MiB, max-workspace %u%% shared by %u rank(s). Falling back to %s.\n",
             is_complex ? "Z" : "D", report.reason, (double)report.required_bytes / (1024.0 * 1024.0),
             (double)report.free_bytes / (1024.0 * 1024.0), (double)report.total_bytes / (1024.0 * 1024.0),
-            (double)report.reserve_bytes / (1024.0 * 1024.0), report.max_workspace_percent);
+            (double)report.reserve_bytes / (1024.0 * 1024.0), report.max_workspace_percent, report.ranks_per_gpu,
+            target);
     fflush(stderr);
     warned = true;
+}
+
+void log_magma_zgemm_fallback_failed_once(int magma_status)
+{
+    static bool warned = false;
+
+    std::lock_guard<std::mutex> lock(g_workspace_mutex);
+    if (warned) {
+        return;
+    }
+
+    fprintf(stderr,
+            "openmx_gemmul8Zgemm: MAGMA magmablas_zgemm fallback failed (info=%d). "
+            "Returning CUBLAS_STATUS_ALLOC_FAILED so the caller can fall back to CPU BLAS.\n",
+            magma_status);
+    fflush(stderr);
+    warned = true;
+}
+
+char cublas_op_to_char(cublasOperation_t op)
+{
+    if (op == CUBLAS_OP_C) {
+        return 'C';
+    }
+    return (op == CUBLAS_OP_T) ? 'T' : 'N';
 }
 
 } // namespace
@@ -295,7 +364,7 @@ extern "C" cublasStatus_t openmx_gemmul8Dgemm(cublasHandle_t handle,
 
     if (gemmul8_disabled("OPENMX_GEMMUL8_DISABLE_D", "GEMMUL8_DISABLE_D")) {
         report.reason = "environment disable";
-        log_workspace_fallback_once<false>(report);
+        log_workspace_fallback_once<false>(report, "native cuBLAS");
         return cublasDgemm(handle, gemmul8_transa, gemmul8_transb, m, n, k, alpha, A, lda, B, ldb, beta, C, ldc);
     }
 
@@ -303,7 +372,7 @@ extern "C" cublasStatus_t openmx_gemmul8Dgemm(cublasHandle_t handle,
         ensure_workspace<false>(handle, static_cast<size_t>(m), static_cast<size_t>(n), static_cast<size_t>(k),
                                 num_moduli, &work, &report);
     if (status == CUBLAS_STATUS_ALLOC_FAILED) {
-        log_workspace_fallback_once<false>(report);
+        log_workspace_fallback_once<false>(report, "native cuBLAS");
         return cublasDgemm(handle, gemmul8_transa, gemmul8_transb, m, n, k, alpha, A, lda, B, ldb, beta, C, ldc);
     }
     if (status != CUBLAS_STATUS_SUCCESS) {
@@ -369,7 +438,7 @@ extern "C" cublasStatus_t openmx_gemmul8Zgemm(cublasHandle_t handle,
 
     if (gemmul8_disabled("OPENMX_GEMMUL8_DISABLE_Z", "GEMMUL8_DISABLE_Z")) {
         report.reason = "environment disable";
-        log_workspace_fallback_once<true>(report);
+        log_workspace_fallback_once<true>(report, "native cuBLAS");
         return cublasZgemm(handle, transa, transb, m, n, k, alpha, A, lda, B, ldb, beta, C, ldc);
     }
 
@@ -377,8 +446,23 @@ extern "C" cublasStatus_t openmx_gemmul8Zgemm(cublasHandle_t handle,
         ensure_workspace<true>(handle, static_cast<size_t>(m), static_cast<size_t>(n), static_cast<size_t>(k),
                                num_moduli, &work, &report);
     if (status == CUBLAS_STATUS_ALLOC_FAILED) {
-        log_workspace_fallback_once<true>(report);
-        return cublasZgemm(handle, transa, transb, m, n, k, alpha, A, lda, B, ldb, beta, C, ldc);
+        /* GPU memory is too tight for the GEMMul8 workspace: fall back to the native
+           MAGMA kernel (no extra workspace). If even that fails, report ALLOC_FAILED
+           so the caller can fall back to CPU BLAS. */
+        log_workspace_fallback_once<true>(report, "MAGMA magmablas_zgemm");
+
+        cudaStream_t stream = nullptr;
+        if (cublasGetStream(handle, &stream) != CUBLAS_STATUS_SUCCESS) {
+            return CUBLAS_STATUS_INTERNAL_ERROR;
+        }
+
+        int magma_status = openmx_magma_zgemm(cublas_op_to_char(transa), cublas_op_to_char(transb), m, n, k, alpha, A,
+                                              lda, B, ldb, beta, C, ldc, (void *)stream, (void *)handle);
+        if (magma_status != 0) {
+            log_magma_zgemm_fallback_failed_once(magma_status);
+            return CUBLAS_STATUS_ALLOC_FAILED;
+        }
+        return CUBLAS_STATUS_SUCCESS;
     }
     if (status != CUBLAS_STATUS_SUCCESS) {
         return status;

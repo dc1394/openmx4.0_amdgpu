@@ -1133,20 +1133,106 @@ static void BandCol_CuSolver_PrepareTransformedS(int build_from_overlap, int n, 
     ctx->transformed_s_dim   = n;
 }
 
+static void BandCol_ZgemmLogCpuFallbackOnce(cublasStatus_t status, int m, int n, int k)
+{
+    static int logged = 0;
+
+    if (logged) {
+        return;
+    }
+    fprintf(stderr,
+            "<Band_DFT_Col> GPU ZGEMM (GEMMul8/MAGMA) failed for m=%d,n=%d,k=%d: status=%d. "
+            "Falling back to CPU BLAS zgemm.\n",
+            m, n, k, (int)status);
+    fflush(stderr);
+    logged = 1;
+}
+
+static void BandCol_ZgemmCpu(cublasOperation_t transa, cublasOperation_t transb, int m, int n, int k,
+                             dcomplex const *A, dcomplex const *B, dcomplex *C)
+{
+    char transa_cpu = (transa == CUBLAS_OP_C) ? 'C' : ((transa == CUBLAS_OP_T) ? 'T' : 'N');
+    char transb_cpu = (transb == CUBLAS_OP_C) ? 'C' : ((transb == CUBLAS_OP_T) ? 'T' : 'N');
+    int mi = m;
+    int ni = n;
+    int ki = k;
+    int lda = m;
+    int ldb = k;
+    int ldc = m;
+    dcomplex alpha = {1.0, 0.0};
+    dcomplex beta = {0.0, 0.0};
+
+    zgemm_(&transa_cpu, &transb_cpu, &mi, &ni, &ki, &alpha, (dcomplex *)A, &lda, (dcomplex *)B, &ldb, &beta, C, &ldc);
+}
+
+/* ZGEMM on device pointers: GEMMul8 first (which itself falls back to MAGMA when the
+   GPU workspace cannot be allocated); if both fail, copy the operands to the host
+   and run CPU BLAS zgemm, then copy the result back to the device. */
+static void BandCol_CuSolver_ZgemmDevice(cublasOperation_t transa, cublasOperation_t transb, int m, int n, int k,
+                                         dcomplex const *d_A, dcomplex const *d_B, dcomplex *d_C)
+{
+    BandColCuSolverCtx *ctx = &BandCol_cusolver_ctx;
+    cuDoubleComplex     alpha = make_cuDoubleComplex(1.0, 0.0);
+    cuDoubleComplex     beta  = make_cuDoubleComplex(0.0, 0.0);
+    cublasStatus_t      status;
+    size_t              a_bytes, b_bytes, c_bytes;
+    dcomplex           *A, *B, *C;
+
+    status = openmx_gemmul8Zgemm(ctx->cublas, transa, transb, m, n, k, &alpha, (cuDoubleComplex const *)d_A, m,
+                                 (cuDoubleComplex const *)d_B, k, &beta, (cuDoubleComplex *)d_C, m);
+    if (status == CUBLAS_STATUS_SUCCESS) {
+        return;
+    }
+
+    BandCol_ZgemmLogCpuFallbackOnce(status, m, n, k);
+
+    a_bytes = sizeof(dcomplex) * (size_t)m * (size_t)k;
+    b_bytes = sizeof(dcomplex) * (size_t)k * (size_t)n;
+    c_bytes = sizeof(dcomplex) * (size_t)m * (size_t)n;
+
+    A = (dcomplex *)malloc(a_bytes);
+    B = (dcomplex *)malloc(b_bytes);
+    C = (dcomplex *)malloc(c_bytes);
+    if (A == NULL || B == NULL || C == NULL) {
+        BandCol_AbortWithMessage("Out of host memory in CPU ZGEMM fallback in Band_DFT_Col.c.");
+    }
+
+    wait_cudafunc(cudaMemcpy(A, d_A, a_bytes, cudaMemcpyDeviceToHost));
+    wait_cudafunc(cudaMemcpy(B, d_B, b_bytes, cudaMemcpyDeviceToHost));
+
+    BandCol_ZgemmCpu(transa, transb, m, n, k, A, B, C);
+
+    wait_cudafunc(cudaMemcpy(d_C, C, c_bytes, cudaMemcpyHostToDevice));
+
+    free(C);
+    free(B);
+    free(A);
+}
+
 static void BandCol_CuSolver_Zgemm_OpenACC(cublasOperation_t transa, cublasOperation_t transb, int m, int n, int k,
                                            dcomplex const * A, dcomplex const * B, dcomplex * C)
 {
     BandColCuSolverCtx *ctx = &BandCol_cusolver_ctx;
     cuDoubleComplex     alpha = make_cuDoubleComplex(1.0, 0.0);
     cuDoubleComplex     beta  = make_cuDoubleComplex(0.0, 0.0);
+    cublasStatus_t      status = CUBLAS_STATUS_SUCCESS;
 
     BandCol_CuSolver_Init();
 
 #pragma acc data present(A[0 : m * k], B[0 : k * n], C[0 : m * n])
-#pragma acc host_data use_device(A, B, C)
     {
-        wait_cudafunc(openmx_gemmul8Zgemm(ctx->cublas, transa, transb, m, n, k, &alpha, (cuDoubleComplex const *)A, m,
-                                             (cuDoubleComplex const *)B, k, &beta, (cuDoubleComplex *)C, m));
+#pragma acc host_data use_device(A, B, C)
+        {
+            status = openmx_gemmul8Zgemm(ctx->cublas, transa, transb, m, n, k, &alpha, (cuDoubleComplex const *)A, m,
+                                         (cuDoubleComplex const *)B, k, &beta, (cuDoubleComplex *)C, m);
+        }
+
+        if (status != CUBLAS_STATUS_SUCCESS) {
+            BandCol_ZgemmLogCpuFallbackOnce(status, m, n, k);
+#pragma acc update self(A[0 : m * k], B[0 : k * n])
+            BandCol_ZgemmCpu(transa, transb, m, n, k, A, B, C);
+#pragma acc update device(C[0 : m * n])
+        }
     }
 }
 
@@ -1191,8 +1277,6 @@ static dcomplex *BandCol_CuSolver_SolveHamiltonianImpl(int n, int maxn, const dc
 {
     BandColCuSolverCtx * ctx = &BandCol_cusolver_ctx;
     size_t               matrix_bytes;
-    cuDoubleComplex      alpha = make_cuDoubleComplex(1.0, 0.0);
-    cuDoubleComplex      beta  = make_cuDoubleComplex(0.0, 0.0);
 
     if (!(ctx->transformed_s_valid && ctx->transformed_s_dim == n)) {
         BandCol_AbortWithMessage("Transformed overlap is not ready in BandCol_CuSolver_SolveHamiltonian.");
@@ -1204,13 +1288,9 @@ static dcomplex *BandCol_CuSolver_SolveHamiltonianImpl(int n, int maxn, const dc
         wait_cudafunc(cudaMemcpy(ctx->d_H, H_in, matrix_bytes, cudaMemcpyHostToDevice));
     }
 
-    wait_cudafunc(openmx_gemmul8Zgemm(ctx->cublas, CUBLAS_OP_N, CUBLAS_OP_N, n, n, n, &alpha,
-                                         (cuDoubleComplex *)ctx->d_H, n, (cuDoubleComplex *)ctx->d_S, n, &beta,
-                                         (cuDoubleComplex *)ctx->d_tmp, n));
+    BandCol_CuSolver_ZgemmDevice(CUBLAS_OP_N, CUBLAS_OP_N, n, n, n, ctx->d_H, ctx->d_S, ctx->d_tmp);
 
-    wait_cudafunc(openmx_gemmul8Zgemm(ctx->cublas, CUBLAS_OP_C, CUBLAS_OP_N, n, n, n, &alpha,
-                                         (cuDoubleComplex *)ctx->d_S, n, (cuDoubleComplex *)ctx->d_tmp, n, &beta,
-                                         (cuDoubleComplex *)ctx->d_H, n));
+    BandCol_CuSolver_ZgemmDevice(CUBLAS_OP_C, CUBLAS_OP_N, n, n, n, ctx->d_S, ctx->d_tmp, ctx->d_H);
 
     BandCol_CuSolver_Eigen(ctx->d_H, n, maxn, ko + 1);
 
@@ -1218,9 +1298,7 @@ static dcomplex *BandCol_CuSolver_SolveHamiltonianImpl(int n, int maxn, const dc
         return NULL;
     }
 
-    wait_cudafunc(openmx_gemmul8Zgemm(ctx->cublas, CUBLAS_OP_T, CUBLAS_OP_T, n, n, n, &alpha,
-                                         (cuDoubleComplex *)ctx->d_H, n, (cuDoubleComplex *)ctx->d_S, n, &beta,
-                                         (cuDoubleComplex *)ctx->d_tmp, n));
+    BandCol_CuSolver_ZgemmDevice(CUBLAS_OP_T, CUBLAS_OP_T, n, n, n, ctx->d_H, ctx->d_S, ctx->d_tmp);
 
     if (C_out != NULL) {
         wait_cudafunc(cudaMemcpy(C_out, ctx->d_tmp, matrix_bytes, cudaMemcpyDeviceToHost));
@@ -1287,7 +1365,12 @@ static void BandCol_ConstructDenseCsHs_HIP(int need_s, int n, double k1, double 
 
     if (BandCol_BuildDenseCsHs_HIP(need_s, count, h_count, phase_count, n, entries, phase_r, phase_i,
                                    H1, S1, d_H, d_S) != 0) {
-        BandCol_AbortWithMessage("Band_DFT_Col HIP dense matrix generation failed.");
+        /* Likely out of GPU memory: drop this rank's cached GEMMul8 workspace and retry. */
+        openmx_gemmul8ReleaseWorkspaces();
+        if (BandCol_BuildDenseCsHs_HIP(need_s, count, h_count, phase_count, n, entries, phase_r, phase_i,
+                                       H1, S1, d_H, d_S) != 0) {
+            BandCol_AbortWithMessage("Band_DFT_Col HIP dense matrix generation failed.");
+        }
     }
 
     BandCol_last_construct_on_device = 1;
@@ -4251,6 +4334,10 @@ diagonalize1:
         MPI_Comm_free(&mpi_comm_rows);
         MPI_Comm_free(&mpi_comm_cols);
     }
+
+    /* Many ranks share one GPU; cached GEMMul8 workspaces (~1 GiB per rank) would
+       otherwise accumulate across SCF iterations and starve later allocations. */
+    openmx_gemmul8ReleaseWorkspaces();
 
     MPI_Barrier(mpi_comm_level1);
     dtime(&TEtime);
