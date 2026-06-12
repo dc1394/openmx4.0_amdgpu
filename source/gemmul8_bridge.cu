@@ -10,11 +10,6 @@
 
 #include "gemmul8.hpp"
 
-extern "C" int openmx_magma_zgemm(char transa, char transb, int m, int n, int k,
-                                  const void *alpha, const void *d_A, int lda,
-                                  const void *d_B, int ldb, const void *beta,
-                                  void *d_C, int ldc, void *stream, void *hipblas_handle);
-
 namespace {
 
 constexpr unsigned kDefaultNumModuli = 15u;
@@ -309,31 +304,6 @@ void log_workspace_fallback_once(const WorkspaceReport &report, const char *targ
     warned = true;
 }
 
-void log_magma_zgemm_fallback_failed_once(int magma_status)
-{
-    static bool warned = false;
-
-    std::lock_guard<std::mutex> lock(g_workspace_mutex);
-    if (warned) {
-        return;
-    }
-
-    fprintf(stderr,
-            "openmx_gemmul8Zgemm: MAGMA magmablas_zgemm fallback failed (info=%d). "
-            "Returning CUBLAS_STATUS_ALLOC_FAILED so the caller can fall back to CPU BLAS.\n",
-            magma_status);
-    fflush(stderr);
-    warned = true;
-}
-
-char cublas_op_to_char(cublasOperation_t op)
-{
-    if (op == CUBLAS_OP_C) {
-        return 'C';
-    }
-    return (op == CUBLAS_OP_T) ? 'T' : 'N';
-}
-
 } // namespace
 
 extern "C" cublasStatus_t openmx_gemmul8Dgemm(cublasHandle_t handle,
@@ -446,23 +416,11 @@ extern "C" cublasStatus_t openmx_gemmul8Zgemm(cublasHandle_t handle,
         ensure_workspace<true>(handle, static_cast<size_t>(m), static_cast<size_t>(n), static_cast<size_t>(k),
                                num_moduli, &work, &report);
     if (status == CUBLAS_STATUS_ALLOC_FAILED) {
-        /* GPU memory is too tight for the GEMMul8 workspace: fall back to the native
-           MAGMA kernel (no extra workspace). If even that fails, report ALLOC_FAILED
-           so the caller can fall back to CPU BLAS. */
-        log_workspace_fallback_once<true>(report, "MAGMA magmablas_zgemm");
-
-        cudaStream_t stream = nullptr;
-        if (cublasGetStream(handle, &stream) != CUBLAS_STATUS_SUCCESS) {
-            return CUBLAS_STATUS_INTERNAL_ERROR;
-        }
-
-        int magma_status = openmx_magma_zgemm(cublas_op_to_char(transa), cublas_op_to_char(transb), m, n, k, alpha, A,
-                                              lda, B, ldb, beta, C, ldc, (void *)stream, (void *)handle);
-        if (magma_status != 0) {
-            log_magma_zgemm_fallback_failed_once(magma_status);
-            return CUBLAS_STATUS_ALLOC_FAILED;
-        }
-        return CUBLAS_STATUS_SUCCESS;
+        /* GPU memory is too tight for the GEMMul8 workspace: fall back to native
+           hipBLAS (cublasZgemm), which needs no extra workspace. If even that fails,
+           its status propagates so the caller can fall back to CPU BLAS. */
+        log_workspace_fallback_once<true>(report, "native cuBLAS (hipBLAS)");
+        return cublasZgemm(handle, transa, transb, m, n, k, alpha, A, lda, B, ldb, beta, C, ldc);
     }
     if (status != CUBLAS_STATUS_SUCCESS) {
         return status;

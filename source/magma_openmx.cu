@@ -2,9 +2,7 @@
 #include <cuda_runtime.h>
 
 #include <cstdio>
-#include <cstdint>
 #include <mutex>
-#include <unordered_map>
 
 namespace {
 
@@ -151,143 +149,7 @@ int ensure_z_work(magma_int_t lwork, magma_int_t lrwork, magma_int_t liwork)
     return MAGMA_SUCCESS;
 }
 
-struct ZgemmQueueKey {
-    int          device;
-    cudaStream_t stream;
-
-    bool operator==(const ZgemmQueueKey &other) const
-    {
-        return device == other.device && stream == other.stream;
-    }
-};
-
-struct ZgemmQueueKeyHash {
-    std::size_t operator()(const ZgemmQueueKey &key) const
-    {
-        return (static_cast<std::size_t>(key.device) << 32) ^ (reinterpret_cast<std::uintptr_t>(key.stream) << 1);
-    }
-};
-
-std::mutex g_zgemm_queue_mutex;
-std::unordered_map<ZgemmQueueKey, magma_queue_t, ZgemmQueueKeyHash> g_zgemm_queues;
-
-magma_queue_t ensure_zgemm_queue(int device, cudaStream_t stream, hipblasHandle_t hipblas_handle)
-{
-    std::lock_guard<std::mutex> lock(g_zgemm_queue_mutex);
-    ZgemmQueueKey key = {device, stream};
-
-    auto it = g_zgemm_queues.find(key);
-    if (it != g_zgemm_queues.end()) {
-        return it->second;
-    }
-
-    magma_queue_t queue = nullptr;
-    magma_queue_create_from_hip(device, stream, hipblas_handle, nullptr, &queue);
-    if (queue != nullptr) {
-        g_zgemm_queues.emplace(key, queue);
-    }
-    return queue;
-}
-
-int magma_trans_from_char(char op, magma_trans_t *trans)
-{
-    switch (op) {
-    case 'N':
-    case 'n':
-        *trans = MagmaNoTrans;
-        return MAGMA_SUCCESS;
-    case 'T':
-    case 't':
-        *trans = MagmaTrans;
-        return MAGMA_SUCCESS;
-    case 'C':
-    case 'c':
-        *trans = MagmaConjTrans;
-        return MAGMA_SUCCESS;
-    default:
-        return MAGMA_ERR_ILLEGAL_VALUE;
-    }
-}
-
 } // namespace
-
-/* Native MAGMA ZGEMM (magmablas_zgemm) on device pointers; alpha/beta/dA/dB/dC use
-   the cuDoubleComplex layout. Returns MAGMA_SUCCESS (0) on success. Needs no GPU
-   workspace beyond the one-time queue, so it can run when GEMMul8 cannot.
-   hipblas_handle (optional, may be NULL) is reused for the MAGMA queue so no
-   extra hipBLAS handle has to be created on an already memory-starved GPU. */
-extern "C" int openmx_magma_zgemm(char transa, char transb, int m, int n, int k,
-                                  const void *alpha, const void *d_A, int lda,
-                                  const void *d_B, int ldb, const void *beta,
-                                  void *d_C, int ldc, void *stream, void *hipblas_handle)
-{
-    magma_trans_t magma_transa;
-    magma_trans_t magma_transb;
-    int           device = -1;
-
-    if (m <= 0 || n <= 0 || k <= 0) {
-        return MAGMA_SUCCESS;
-    }
-    if (alpha == nullptr || beta == nullptr || d_A == nullptr || d_B == nullptr || d_C == nullptr) {
-        return MAGMA_ERR_ILLEGAL_VALUE;
-    }
-    if (magma_trans_from_char(transa, &magma_transa) != MAGMA_SUCCESS ||
-        magma_trans_from_char(transb, &magma_transb) != MAGMA_SUCCESS) {
-        return MAGMA_ERR_ILLEGAL_VALUE;
-    }
-
-    int err = ensure_magma_initialized();
-    if (err != MAGMA_SUCCESS) {
-        return err;
-    }
-
-    if (cudaGetDevice(&device) != cudaSuccess) {
-        return MAGMA_ERR_UNKNOWN;
-    }
-
-    magma_queue_t queue =
-        ensure_zgemm_queue(device, static_cast<cudaStream_t>(stream), static_cast<hipblasHandle_t>(hipblas_handle));
-    if (queue == nullptr) {
-        return MAGMA_ERR_DEVICE_ALLOC;
-    }
-
-    (void)hipGetLastError();
-
-    /* MAGMA's gemm kernels compute C = alpha*A*B + beta*C reading C even when
-       beta == 0, so NaN bit patterns in an uninitialized C would propagate
-       (0 * NaN = NaN). Zero the m-by-n C block first to honor BLAS semantics. */
-    {
-        const magmaDoubleComplex *beta_z = static_cast<const magmaDoubleComplex *>(beta);
-        if (MAGMA_Z_REAL(*beta_z) == 0.0 && MAGMA_Z_IMAG(*beta_z) == 0.0) {
-            hipError_t memset_status =
-                hipMemset2DAsync(d_C, (size_t)ldc * sizeof(magmaDoubleComplex), 0,
-                                 (size_t)m * sizeof(magmaDoubleComplex), (size_t)n,
-                                 static_cast<cudaStream_t>(stream));
-            if (memset_status != hipSuccess) {
-                std::fprintf(stderr, "openmx_magma_zgemm: hipMemset2DAsync failed: %s\n",
-                             hipGetErrorString(memset_status));
-                std::fflush(stderr);
-                return MAGMA_ERR_UNKNOWN;
-            }
-        }
-    }
-    magmablas_zgemm(magma_transa, magma_transb, static_cast<magma_int_t>(m), static_cast<magma_int_t>(n),
-                    static_cast<magma_int_t>(k), *static_cast<const magmaDoubleComplex *>(alpha),
-                    static_cast<magmaDoubleComplex_const_ptr>(d_A), static_cast<magma_int_t>(lda),
-                    static_cast<magmaDoubleComplex_const_ptr>(d_B), static_cast<magma_int_t>(ldb),
-                    *static_cast<const magmaDoubleComplex *>(beta), static_cast<magmaDoubleComplex_ptr>(d_C),
-                    static_cast<magma_int_t>(ldc), queue);
-
-    cudaError_t launch_status = hipGetLastError();
-    if (launch_status != cudaSuccess) {
-        std::fprintf(stderr, "openmx_magma_zgemm: magmablas_zgemm launch failed: %s\n",
-                     cudaGetErrorString(launch_status));
-        std::fflush(stderr);
-        return MAGMA_ERR_UNKNOWN;
-    }
-
-    return MAGMA_SUCCESS;
-}
 
 extern "C" int openmx_magma_dsyevdx_gpu(int n, int maxn, double *d_A, double *w, int *mout_out)
 {
