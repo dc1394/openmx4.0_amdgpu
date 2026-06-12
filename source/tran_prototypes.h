@@ -42,7 +42,7 @@ typedef float Type_Orbs_Grid; /* type of Orbs_Grid */
     do {                                                                           \
         cudaError_t err_ = (err);                                                  \
         if (err_ != cudaSuccess) {                                                 \
-            fprintf(stderr, "CUDA error %d at %s:%d\n", err_, __FILE__, __LINE__); \
+            fprintf(stderr, "HIP error %d at %s:%d\n", err_, __FILE__, __LINE__); \
             exit(1);                                                               \
         }                                                                          \
     } while (0)

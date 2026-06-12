@@ -467,7 +467,7 @@ static void ClusterCol_CuSolver_EnsureMatrixCapacity(int n)
     size_t vector_bytes;
 
     if (n<=0){
-        ClusterCol_AbortWithMessage("Invalid matrix size in Cluster_DFT_Col.c CuSolver workspace.");
+        ClusterCol_AbortWithMessage("Invalid matrix size in Cluster_DFT_Col.c GPU solver workspace.");
     }
 
     ClusterCol_CuSolver_Init();
@@ -1107,12 +1107,12 @@ static void ClusterCol_CuSolverDensePath(
         set_openacc_nvidia_device_from_local_rank_noncollective();
     }
 
-    dense_count = ClusterCol_CheckedMulCount((size_t)n, (size_t)n, "CuSOLVER dense matrix");
-    S   = (double *)ClusterCol_MallocArray(dense_count, sizeof(double), "CuSOLVER overlap matrix");
-    H   = (double *)ClusterCol_MallocArray(dense_count, sizeof(double), "CuSOLVER Hamiltonian matrix");
-    tmp = (double *)ClusterCol_MallocArray(dense_count, sizeof(double), "CuSOLVER temporary matrix");
-    A   = (double *)ClusterCol_MallocArray(dense_count, sizeof(double), "CuSOLVER transformed Hamiltonian");
-    C   = (double *)ClusterCol_MallocArray(dense_count, sizeof(double), "CuSOLVER transformed eigenvectors");
+    dense_count = ClusterCol_CheckedMulCount((size_t)n, (size_t)n, "GPU solver dense matrix");
+    S   = (double *)ClusterCol_MallocArray(dense_count, sizeof(double), "GPU solver overlap matrix");
+    H   = (double *)ClusterCol_MallocArray(dense_count, sizeof(double), "GPU solver Hamiltonian matrix");
+    tmp = (double *)ClusterCol_MallocArray(dense_count, sizeof(double), "GPU solver temporary matrix");
+    A   = (double *)ClusterCol_MallocArray(dense_count, sizeof(double), "GPU solver transformed Hamiltonian");
+    C   = (double *)ClusterCol_MallocArray(dense_count, sizeof(double), "GPU solver transformed eigenvectors");
 
     Patch2Full_Cluster(CntOLP, S, MP);
     ClusterCol_CuSolver_CheckInfo("hipsolverDnDsyevdx(overlap)", cusolver_Syevdx(S, ko[0], n, n));
@@ -1442,8 +1442,8 @@ double Cluster_DFT_Col(
   }
   n2 = n + 2;
 
-  /* GPU dispatch (added by H.Kawai): assign CUDA/OpenACC device when CuSOLVER is requested */
-  if (scf_eigen_lib_flag == CuSOLVER && n >= GPU_CPU_SWITCH_NUM &&
+  /* GPU dispatch (added by H.Kawai): assign CUDA/OpenACC device when GPUSOLVER is requested */
+  if (scf_eigen_lib_flag == GPUSOLVER && n >= GPU_CPU_SWITCH_NUM &&
       Set_Hamiltonian_OpenACC_Rank_Is_Selected()) {
       set_cuda_default_device_from_local_rank_noncollective();
       set_openacc_nvidia_device_from_local_rank_noncollective();
@@ -1522,7 +1522,7 @@ double Cluster_DFT_Col(
     }
   }
 
-  if (scf_eigen_lib_flag==CuSOLVER && GPU_CPU_SWITCH_NUM<=n){
+  if (scf_eigen_lib_flag==GPUSOLVER && GPU_CPU_SWITCH_NUM<=n){
     ClusterCol_SetMaxNAndPartitions(SCF_iter,mode,TZ,n,numprocs1, &MaxN,is2,ie2);
     use_cusolver_direct_cluster_dm = 1;
     firsttime = 0;
@@ -1567,7 +1567,7 @@ double Cluster_DFT_Col(
       F77_NAME(solve_evp_real,SOLVE_EVP_REAL)(&n, &n, Cs, &na_rows, &ko[0][1], Ss, &na_rows, &nblk, &mpi_comm_rows_int, &mpi_comm_cols_int);
     }
 
-    else if (scf_eigen_lib_flag==2 || scf_eigen_lib_flag==CuSOLVER){
+    else if (scf_eigen_lib_flag==2 || scf_eigen_lib_flag==GPUSOLVER){
 
 #ifndef kcomp
 
@@ -1748,7 +1748,7 @@ double Cluster_DFT_Col(
   }
   firsttime=0;
 
-  if (scf_eigen_lib_flag==CuSOLVER && GPU_CPU_SWITCH_NUM<=n &&
+  if (scf_eigen_lib_flag==GPUSOLVER && GPU_CPU_SWITCH_NUM<=n &&
       !(SpinP_switch==1 && numprocs0!=1)){
     ClusterCol_CuSolverDensePath(SCF_iter,SpinP_switch,ko,nh,CntOLP,
                                  numprocs0,myworld1,myid1,MP,is2,ie2,
@@ -1806,7 +1806,7 @@ double Cluster_DFT_Col(
     F77_NAME(solve_evp_real,SOLVE_EVP_REAL)(&n, &MaxN, Hs, &na_rows, &ko[spin][1], Cs, 
                                             &na_rows, &nblk, &mpi_comm_rows_int, &mpi_comm_cols_int);
   }
-  else if (scf_eigen_lib_flag==2 || scf_eigen_lib_flag==CuSOLVER){
+  else if (scf_eigen_lib_flag==2 || scf_eigen_lib_flag==GPUSOLVER){
 
 #ifndef kcomp
     int mpiworld;

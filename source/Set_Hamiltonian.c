@@ -311,18 +311,18 @@ static int Set_Hamiltonian_CuSolver_LocalPackedSize(int myid)
             int tnoB = Spe_Total_CNO[wanB];
 
             neighbor_orbitals = Set_Hamiltonian_checked_add(neighbor_orbitals, (size_t)tnoB,
-                                                            "CuSolver packed neighbor orbitals", myid);
+                                                            "GPU solver packed neighbor orbitals", myid);
         }
 
         total = Set_Hamiltonian_checked_add(
             total,
             Set_Hamiltonian_checked_mul((size_t)tnoA, neighbor_orbitals,
-                                        "CuSolver packed local matrix segment", myid),
-            "CuSolver packed local matrix segment", myid);
+                                        "GPU solver packed local matrix segment", myid),
+            "GPU solver packed local matrix segment", myid);
     }
 
     if ((size_t)INT_MAX < total) {
-        Set_Hamiltonian_abort("CuSolver packed cache", "local packed matrix segment exceeds INT_MAX", myid);
+        Set_Hamiltonian_abort("GPU solver packed cache", "local packed matrix segment exceeds INT_MAX", myid);
     }
 
     return (int)total;
@@ -334,7 +334,7 @@ static void Set_Hamiltonian_CuSolver_PackLocalMatrix(double ****mat, double *loc
     int k = 0;
 
     if (mat == NULL) {
-        Set_Hamiltonian_abort("CuSolver packed cache", "NULL sparse matrix", myid);
+        Set_Hamiltonian_abort("GPU solver packed cache", "NULL sparse matrix", myid);
     }
 
     for (int MA_AN = 1; MA_AN <= Matomnum; MA_AN++) {
@@ -371,7 +371,7 @@ static void Set_Hamiltonian_CuSolver_PackLocalMatrix(double ****mat, double *loc
     }
 
     if (k != local_size) {
-        Set_Hamiltonian_abort("CuSolver packed cache", "packed local matrix size mismatch", myid);
+        Set_Hamiltonian_abort("GPU solver packed cache", "packed local matrix size mismatch", myid);
     }
 }
 
@@ -386,12 +386,12 @@ static void Set_Hamiltonian_CuSolver_GatherMatrixToSelected(double ****mat, doub
 
     *target = NULL;
     local = (double *)Set_Hamiltonian_malloc(sizeof(double) * (size_t)(0 < local_size ? local_size : 1),
-                                             "CuSolver packed local matrix", myid);
+                                             "GPU solver packed local matrix", myid);
     Set_Hamiltonian_CuSolver_PackLocalMatrix(mat, local, local_size, order_mode, myid);
 
     if (myid == first_selected_root) {
         recvbuf = (double *)Set_Hamiltonian_malloc(sizeof(double) * (size_t)(0 < total_size ? total_size : 1),
-                                                   "CuSolver packed matrix cache", myid);
+                                                   "GPU solver packed matrix cache", myid);
     }
 
     MPI_Gatherv(local, local_size, MPI_DOUBLE, recvbuf, (int *)counts, (int *)displs, MPI_DOUBLE, first_selected_root,
@@ -403,7 +403,7 @@ static void Set_Hamiltonian_CuSolver_GatherMatrixToSelected(double ****mat, doub
         }
         else {
             *target = (double *)Set_Hamiltonian_malloc(sizeof(double) * (size_t)(0 < total_size ? total_size : 1),
-                                                       "CuSolver packed matrix cache", myid);
+                                                       "GPU solver packed matrix cache", myid);
         }
         MPI_Bcast(*target, total_size, MPI_DOUBLE, 0, selected_comm);
     }
@@ -453,7 +453,7 @@ void Set_Hamiltonian_Build_CuSolver_HS_Cache(int use_contracted)
 
     Set_Hamiltonian_CuSolver_Free_Cache();
 
-    if (scf_eigen_lib_flag != CuSOLVER) {
+    if (scf_eigen_lib_flag != GPUSOLVER) {
         return;
     }
 
@@ -463,11 +463,11 @@ void Set_Hamiltonian_Build_CuSolver_HS_Cache(int use_contracted)
     local_size = Set_Hamiltonian_CuSolver_LocalPackedSize(myid);
     local_matomnum = Matomnum;
 
-    selected_roots = (int *)Set_Hamiltonian_malloc(sizeof(int) * (size_t)numprocs, "CuSolver selected roots", myid);
-    counts = (int *)Set_Hamiltonian_malloc(sizeof(int) * (size_t)numprocs, "CuSolver packed counts", myid);
-    displs = (int *)Set_Hamiltonian_malloc(sizeof(int) * (size_t)numprocs, "CuSolver packed displacements", myid);
-    atom_counts = (int *)Set_Hamiltonian_malloc(sizeof(int) * (size_t)numprocs, "CuSolver atom counts", myid);
-    atom_displs = (int *)Set_Hamiltonian_malloc(sizeof(int) * (size_t)numprocs, "CuSolver atom displacements", myid);
+    selected_roots = (int *)Set_Hamiltonian_malloc(sizeof(int) * (size_t)numprocs, "GPU solver selected roots", myid);
+    counts = (int *)Set_Hamiltonian_malloc(sizeof(int) * (size_t)numprocs, "GPU solver packed counts", myid);
+    displs = (int *)Set_Hamiltonian_malloc(sizeof(int) * (size_t)numprocs, "GPU solver packed displacements", myid);
+    atom_counts = (int *)Set_Hamiltonian_malloc(sizeof(int) * (size_t)numprocs, "GPU solver atom counts", myid);
+    atom_displs = (int *)Set_Hamiltonian_malloc(sizeof(int) * (size_t)numprocs, "GPU solver atom displacements", myid);
 
     MPI_Allgather(&local_selected, 1, MPI_INT, selected_roots, 1, MPI_INT, mpi_comm_level1);
     MPI_Allgather(&local_size, 1, MPI_INT, counts, 1, MPI_INT, mpi_comm_level1);
@@ -481,10 +481,10 @@ void Set_Hamiltonian_Build_CuSolver_HS_Cache(int use_contracted)
             selected_count++;
         }
         if (counts[ID] < 0 || atom_counts[ID] < 0) {
-            Set_Hamiltonian_abort("CuSolver packed cache", "negative gather count", myid);
+            Set_Hamiltonian_abort("GPU solver packed cache", "negative gather count", myid);
         }
         if ((size_t)INT_MAX < (size_t)total_size + (size_t)counts[ID]) {
-            Set_Hamiltonian_abort("CuSolver packed cache", "packed matrix size exceeds INT_MAX", myid);
+            Set_Hamiltonian_abort("GPU solver packed cache", "packed matrix size exceeds INT_MAX", myid);
         }
         displs[ID] = total_size;
         total_size += counts[ID];
@@ -494,13 +494,13 @@ void Set_Hamiltonian_Build_CuSolver_HS_Cache(int use_contracted)
         int atom_total = 0;
         for (int ID = 0; ID < numprocs; ID++) {
             if ((size_t)INT_MAX < (size_t)atom_total + (size_t)atom_counts[ID]) {
-                Set_Hamiltonian_abort("CuSolver packed cache", "atom-order size exceeds INT_MAX", myid);
+                Set_Hamiltonian_abort("GPU solver packed cache", "atom-order size exceeds INT_MAX", myid);
             }
             atom_displs[ID] = atom_total;
             atom_total += atom_counts[ID];
         }
         if (atom_total != atomnum) {
-            Set_Hamiltonian_abort("CuSolver packed cache", "atom-order length mismatch", myid);
+            Set_Hamiltonian_abort("GPU solver packed cache", "atom-order length mismatch", myid);
         }
     }
 
@@ -524,7 +524,7 @@ void Set_Hamiltonian_Build_CuSolver_HS_Cache(int use_contracted)
 
     if (myid == first_selected_root) {
         cache->order_GA = (int *)Set_Hamiltonian_malloc(sizeof(int) * (size_t)(atomnum + 2),
-                                                        "CuSolver atom order cache", myid);
+                                                        "GPU solver atom order cache", myid);
     }
 
     MPI_Gatherv((0 < Matomnum) ? &M2G[1] : &dummy_atom, Matomnum, MPI_INT,
@@ -534,7 +534,7 @@ void Set_Hamiltonian_Build_CuSolver_HS_Cache(int use_contracted)
     if (local_selected) {
         if (myid != first_selected_root) {
             cache->order_GA = (int *)Set_Hamiltonian_malloc(sizeof(int) * (size_t)(atomnum + 2),
-                                                            "CuSolver atom order cache", myid);
+                                                            "GPU solver atom order cache", myid);
         }
         cache->order_GA[0] = 0;
         cache->order_GA[atomnum + 1] = 0;

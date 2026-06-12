@@ -118,7 +118,7 @@ static int Krylov_GPU_Enabled(void)
     Keep Krylov's local dense GPU path behind one switch so it is easy to
     fall back to the CPU BLAS/LAPACK path when needed.
   */
-  return KRYLOV_ENABLE_GPU && scf_eigen_lib_flag == CuSOLVER;
+  return KRYLOV_ENABLE_GPU && scf_eigen_lib_flag == GPUSOLVER;
 }
 
 typedef struct {
@@ -245,7 +245,7 @@ static void Krylov_GPU_EnsureHostWork(Krylov_GPU_Workspace *ws, size_t bytes)
     if (ws->h_work != NULL) free(ws->h_work);
     ws->h_work = (bytes == 0) ? NULL : malloc(bytes);
     if (bytes != 0 && ws->h_work == NULL){
-      fprintf(stderr,"Krylov: could not allocate cuSOLVER host workspace.\n");
+      fprintf(stderr,"Krylov: could not allocate GPU solver host workspace.\n");
       MPI_Abort(MPI_COMM_WORLD,1);
     }
     ws->h_work_bytes = bytes;
@@ -434,10 +434,10 @@ static void Krylov_Eigen2(Krylov_GPU_Workspace *ws, double *a, int csize, double
   if (info != 0 || h_meig != (int64_t)EVmax){
     if (info != 0){
       fprintf(stderr,"Krylov: %s failed, info=%d; falling back to LAPACK.\n",
-              (n == EVmax) ? "cusolverDnXsyevd" : "cusolverDnXsyevdx",(int)info);
+              (n == EVmax) ? "hipsolverDnDsyevd" : "hipsolverDnDsyevdx",(int)info);
     }
     else{
-      fprintf(stderr,"Krylov: cusolverDnXsyevdx returned %lld eigenpairs, expected %d; falling back to LAPACK.\n",
+      fprintf(stderr,"Krylov: hipsolverDnDsyevdx returned %lld eigenpairs, expected %d; falling back to LAPACK.\n",
               (long long)h_meig,EVmax);
     }
     Eigen_lapack2(a,csize,ko,n,EVmax);

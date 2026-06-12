@@ -1588,7 +1588,7 @@ static void Eigen_cusolver_x(double ** a, double * ko, int n0, int EVmax)
     }
 
     if (info < 0) {
-        printf("cusolverDnXsyevdx: info=%d\n", info);
+        printf("hipsolverDnDsyevdx: info=%d\n", info);
         exit(10);
     }
 
@@ -1633,7 +1633,7 @@ void Eigen_cusolver_x_openacc(double ** a, double * ko, int n0, int EVmax)
     }
 
     if (info < 0) {
-        printf("cusolverDnXsyevdx: info=%d\n", info);
+        printf("hipsolverDnDsyevdx: info=%d\n", info);
         exit(10);
     }
 
@@ -1679,7 +1679,7 @@ void Eigen_cusolver_d(double ** a, double * ko, int n, int EVmax)
     }
 
     if (info < 0) {
-        printf("cusolverDnXsyevd: info=%d\n", info);
+        printf("hipsolverDnDsyevd: info=%d\n", info);
         exit(10);
     }
 

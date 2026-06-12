@@ -12,25 +12,25 @@ static const char *OpenMX_ZgemmCublasStatusName(cublasStatus_t status)
 {
     switch (status) {
     case CUBLAS_STATUS_SUCCESS:
-        return "CUBLAS_STATUS_SUCCESS";
+        return "HIPBLAS_STATUS_SUCCESS";
     case CUBLAS_STATUS_NOT_INITIALIZED:
-        return "CUBLAS_STATUS_NOT_INITIALIZED";
+        return "HIPBLAS_STATUS_NOT_INITIALIZED";
     case CUBLAS_STATUS_ALLOC_FAILED:
-        return "CUBLAS_STATUS_ALLOC_FAILED";
+        return "HIPBLAS_STATUS_ALLOC_FAILED";
     case CUBLAS_STATUS_INVALID_VALUE:
-        return "CUBLAS_STATUS_INVALID_VALUE";
+        return "HIPBLAS_STATUS_INVALID_VALUE";
     case CUBLAS_STATUS_ARCH_MISMATCH:
-        return "CUBLAS_STATUS_ARCH_MISMATCH";
+        return "HIPBLAS_STATUS_ARCH_MISMATCH";
     case CUBLAS_STATUS_MAPPING_ERROR:
-        return "CUBLAS_STATUS_MAPPING_ERROR";
+        return "HIPBLAS_STATUS_MAPPING_ERROR";
     case CUBLAS_STATUS_EXECUTION_FAILED:
-        return "CUBLAS_STATUS_EXECUTION_FAILED";
+        return "HIPBLAS_STATUS_EXECUTION_FAILED";
     case CUBLAS_STATUS_INTERNAL_ERROR:
-        return "CUBLAS_STATUS_INTERNAL_ERROR";
+        return "HIPBLAS_STATUS_INTERNAL_ERROR";
     case CUBLAS_STATUS_NOT_SUPPORTED:
-        return "CUBLAS_STATUS_NOT_SUPPORTED";
+        return "HIPBLAS_STATUS_NOT_SUPPORTED";
     default:
-        return "CUBLAS_STATUS_UNKNOWN";
+        return "HIPBLAS_STATUS_UNKNOWN";
     }
 }
 
@@ -77,7 +77,7 @@ static void OpenMX_ZgemmLogGemmul8Retry(const char *where, cublasStatus_t status
 {
     fprintf(stderr,
             "<GEMM> rank %d: GEMMul8 failed in %s for ZGEMM(m=%d,n=%d,k=%d): %s (%d). "
-            "Retrying with native cuBLAS/hipBLAS.\n",
+            "Retrying with native hipBLAS.\n",
             OpenMX_ZgemmRank(), where, m, n, k, OpenMX_ZgemmCublasStatusName(status), (int)status);
     fflush(stderr);
 }
@@ -112,7 +112,7 @@ static void OpenMX_ZgemmLogBackendOnce(const char *backend, int m, int n, int k)
 
     fprintf(stderr,
             "<GEMM> rank %d: using %s for ZGEMM(m=%d,n=%d,k=%d). "
-            "If it fails, OpenMX retries native cuBLAS/hipBLAS and then CPU BLAS.\n",
+            "If it fails, OpenMX retries native hipBLAS and then CPU BLAS.\n",
             rank, backend, m, n, k);
     fflush(stderr);
     *logged = 1;
@@ -137,7 +137,7 @@ static cublasStatus_t OpenMX_ZgemmTryGpu(cublasHandle_t handle, cublasOperation_
     status = cublasZgemm(handle, transa, transb, m, n, k, &alpha, (cuDoubleComplex const *)A, m,
                          (cuDoubleComplex const *)B, k, &beta, (cuDoubleComplex *)C, m);
     if (status == CUBLAS_STATUS_SUCCESS) {
-        OpenMX_ZgemmLogBackendOnce("native cuBLAS/hipBLAS", m, n, k);
+        OpenMX_ZgemmLogBackendOnce("native hipBLAS", m, n, k);
     }
     return status;
 }
@@ -154,48 +154,48 @@ void my_cublasZgemm(cublasOperation_t transa, cublasOperation_t transb, int m, i
 
     status = cublasCreate(&handle);
     if (status != CUBLAS_STATUS_SUCCESS) {
-        OpenMX_ZgemmLogCpuFallback("my_cublasZgemm:cublasCreate", "native cuBLAS/hipBLAS", status, m, n, k);
+        OpenMX_ZgemmLogCpuFallback("my_cublasZgemm:hipblasCreate", "native hipBLAS", status, m, n, k);
         OpenMX_ZgemmCpu(transa, transb, m, n, k, A, B, C);
         return;
     }
 
     cuda_status = cudaMalloc((void **)&d_A, m * k * sizeof(cuDoubleComplex));
     if (cuda_status != cudaSuccess) {
-        OpenMX_ZgemmLogCudaCpuFallback("my_cublasZgemm:cudaMalloc(A)", cuda_status, m, n, k);
+        OpenMX_ZgemmLogCudaCpuFallback("my_cublasZgemm:hipMalloc(A)", cuda_status, m, n, k);
         goto cpu_fallback;
     }
     cuda_status = cudaMalloc((void **)&d_B, n * k * sizeof(cuDoubleComplex));
     if (cuda_status != cudaSuccess) {
-        OpenMX_ZgemmLogCudaCpuFallback("my_cublasZgemm:cudaMalloc(B)", cuda_status, m, n, k);
+        OpenMX_ZgemmLogCudaCpuFallback("my_cublasZgemm:hipMalloc(B)", cuda_status, m, n, k);
         goto cpu_fallback;
     }
     cuda_status = cudaMalloc((void **)&d_C, m * n * sizeof(cuDoubleComplex));
     if (cuda_status != cudaSuccess) {
-        OpenMX_ZgemmLogCudaCpuFallback("my_cublasZgemm:cudaMalloc(C)", cuda_status, m, n, k);
+        OpenMX_ZgemmLogCudaCpuFallback("my_cublasZgemm:hipMalloc(C)", cuda_status, m, n, k);
         goto cpu_fallback;
     }
 
     cuda_status = cudaMemcpy(d_A, A, m * k * sizeof(cuDoubleComplex), cudaMemcpyHostToDevice);
     if (cuda_status != cudaSuccess) {
-        OpenMX_ZgemmLogCudaCpuFallback("my_cublasZgemm:cudaMemcpy(A)", cuda_status, m, n, k);
+        OpenMX_ZgemmLogCudaCpuFallback("my_cublasZgemm:hipMemcpy(A)", cuda_status, m, n, k);
         goto cpu_fallback;
     }
     cuda_status = cudaMemcpy(d_B, B, n * k * sizeof(cuDoubleComplex), cudaMemcpyHostToDevice);
     if (cuda_status != cudaSuccess) {
-        OpenMX_ZgemmLogCudaCpuFallback("my_cublasZgemm:cudaMemcpy(B)", cuda_status, m, n, k);
+        OpenMX_ZgemmLogCudaCpuFallback("my_cublasZgemm:hipMemcpy(B)", cuda_status, m, n, k);
         goto cpu_fallback;
     }
 
     status = OpenMX_ZgemmTryGpu(handle, transa, transb, m, n, k, (dcomplex const *)d_A, (dcomplex const *)d_B,
                                 (dcomplex *)d_C, "my_cublasZgemm");
     if (status != CUBLAS_STATUS_SUCCESS) {
-        OpenMX_ZgemmLogCpuFallback("my_cublasZgemm", "native cuBLAS/hipBLAS", status, m, n, k);
+        OpenMX_ZgemmLogCpuFallback("my_cublasZgemm", "native hipBLAS", status, m, n, k);
         goto cpu_fallback;
     }
 
     cuda_status = cudaMemcpy(C, d_C, m * n * sizeof(cuDoubleComplex), cudaMemcpyDeviceToHost);
     if (cuda_status != cudaSuccess) {
-        OpenMX_ZgemmLogCudaCpuFallback("my_cublasZgemm:cudaMemcpy(C)", cuda_status, m, n, k);
+        OpenMX_ZgemmLogCudaCpuFallback("my_cublasZgemm:hipMemcpy(C)", cuda_status, m, n, k);
         goto cpu_fallback;
     }
 
@@ -240,14 +240,14 @@ void my_cublasZgemm_openacc(cublasOperation_t transa, cublasOperation_t transb, 
     if (handle != NULL) {
         cublasStatus_t destroy_status = cublasDestroy(handle);
         if (destroy_status != CUBLAS_STATUS_SUCCESS) {
-            fprintf(stderr, "<GEMM> rank %d: cublasDestroy failed after ZGEMM: %s (%d).\n", OpenMX_ZgemmRank(),
+            fprintf(stderr, "<GEMM> rank %d: hipblasDestroy failed after ZGEMM: %s (%d).\n", OpenMX_ZgemmRank(),
                     OpenMX_ZgemmCublasStatusName(destroy_status), (int)destroy_status);
             fflush(stderr);
         }
     }
 
     if (status != CUBLAS_STATUS_SUCCESS) {
-        OpenMX_ZgemmLogCpuFallback("my_cublasZgemm_openacc", "native cuBLAS/hipBLAS", status, m, n, k);
+        OpenMX_ZgemmLogCpuFallback("my_cublasZgemm_openacc", "native hipBLAS", status, m, n, k);
 #pragma acc update self(A[0 : m * k], B[0 : k * n])
         OpenMX_ZgemmCpu(transa, transb, m, n, k, A, B, C);
 #pragma acc update device(C[0 : m * n])

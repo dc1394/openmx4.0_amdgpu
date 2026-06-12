@@ -2809,7 +2809,7 @@ typedef enum
 {
     ELPA1    = 1,
     ELPA2    = 2,
-    CuSOLVER = 3
+    GPUSOLVER = 3
 } SCF_Eigen_Lib;
 int KrylovH_order,KrylovS_order,recalc_EM,EKC_invS_flag;
 int EC_Sub_Dim,Energy_Decomposition_flag;

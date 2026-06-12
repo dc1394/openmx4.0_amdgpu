@@ -78,25 +78,25 @@ static const char *ClusterNonCol_CublasStatusName(cublasStatus_t status)
 {
     switch (status) {
     case CUBLAS_STATUS_SUCCESS:
-        return "CUBLAS_STATUS_SUCCESS";
+        return "HIPBLAS_STATUS_SUCCESS";
     case CUBLAS_STATUS_NOT_INITIALIZED:
-        return "CUBLAS_STATUS_NOT_INITIALIZED";
+        return "HIPBLAS_STATUS_NOT_INITIALIZED";
     case CUBLAS_STATUS_ALLOC_FAILED:
-        return "CUBLAS_STATUS_ALLOC_FAILED";
+        return "HIPBLAS_STATUS_ALLOC_FAILED";
     case CUBLAS_STATUS_INVALID_VALUE:
-        return "CUBLAS_STATUS_INVALID_VALUE";
+        return "HIPBLAS_STATUS_INVALID_VALUE";
     case CUBLAS_STATUS_ARCH_MISMATCH:
-        return "CUBLAS_STATUS_ARCH_MISMATCH";
+        return "HIPBLAS_STATUS_ARCH_MISMATCH";
     case CUBLAS_STATUS_MAPPING_ERROR:
-        return "CUBLAS_STATUS_MAPPING_ERROR";
+        return "HIPBLAS_STATUS_MAPPING_ERROR";
     case CUBLAS_STATUS_EXECUTION_FAILED:
-        return "CUBLAS_STATUS_EXECUTION_FAILED";
+        return "HIPBLAS_STATUS_EXECUTION_FAILED";
     case CUBLAS_STATUS_INTERNAL_ERROR:
-        return "CUBLAS_STATUS_INTERNAL_ERROR";
+        return "HIPBLAS_STATUS_INTERNAL_ERROR";
     case CUBLAS_STATUS_NOT_SUPPORTED:
-        return "CUBLAS_STATUS_NOT_SUPPORTED";
+        return "HIPBLAS_STATUS_NOT_SUPPORTED";
     default:
-        return "CUBLAS_STATUS_UNKNOWN";
+        return "HIPBLAS_STATUS_UNKNOWN";
     }
 }
 
@@ -166,7 +166,7 @@ static void ClusterNonCol_LogGemmul8Retry(const char *where, const char *kind, c
 {
     fprintf(stderr,
             "<GEMM> rank %d: GEMMul8 failed in %s for %sGEMM(m=%d,n=%d,k=%d): %s (%d). "
-            "Retrying with native cuBLAS/hipBLAS.\n",
+            "Retrying with native hipBLAS.\n",
             ClusterNonCol_MpiRankForLog(), where, kind, m, n, k, ClusterNonCol_CublasStatusName(status),
             (int)status);
     fflush(stderr);
@@ -215,7 +215,7 @@ static void ClusterNonCol_LogGemmBackendOnce(const char *kind, const char *backe
 
     fprintf(stderr,
             "<GEMM> rank %d: using %s for %sGEMM(m=%d,n=%d,k=%d). "
-            "If it fails, OpenMX retries native cuBLAS/hipBLAS and then CPU BLAS.\n",
+            "If it fails, OpenMX retries native hipBLAS and then CPU BLAS.\n",
             rank, backend, kind, m, n, k);
     fflush(stderr);
     *logged = 1;
@@ -238,7 +238,7 @@ static cublasStatus_t ClusterNonCol_TryDeviceDgemm(cublasHandle_t handle, cublas
     ClusterNonCol_LogGemmul8Retry(where, "D", status, m, n, k);
     status = cublasDgemm(handle, transa, transb, m, n, k, &alpha, A, m, B, k, &beta, C, m);
     if (status == CUBLAS_STATUS_SUCCESS) {
-        ClusterNonCol_LogGemmBackendOnce("D", "native cuBLAS/hipBLAS", m, n, k);
+        ClusterNonCol_LogGemmBackendOnce("D", "native hipBLAS", m, n, k);
     }
     return status;
 }
@@ -263,7 +263,7 @@ static cublasStatus_t ClusterNonCol_TryDeviceZgemm(cublasHandle_t handle, cublas
     status = cublasZgemm(handle, transa, transb, m, n, k, &alpha, (const cuDoubleComplex *)A, m,
                          (const cuDoubleComplex *)B, k, &beta, (cuDoubleComplex *)C, m);
     if (status == CUBLAS_STATUS_SUCCESS) {
-        ClusterNonCol_LogGemmBackendOnce("Z", "native cuBLAS/hipBLAS", m, n, k);
+        ClusterNonCol_LogGemmBackendOnce("Z", "native hipBLAS", m, n, k);
     }
     return status;
 }
@@ -283,7 +283,7 @@ static void ClusterNonCol_TransformRealDenseMatricesGPU(int n, const double *S, 
     if (blas_status != CUBLAS_STATUS_SUCCESS) {
         for (int i = 0; i < matrix_count; i++) {
             ClusterNonCol_LogGemmCpuFallback("ClusterNonCol_TransformRealDenseMatricesGPU:create", "D",
-                                             "native cuBLAS/hipBLAS", blas_status, n, n, n);
+                                             "native hipBLAS", blas_status, n, n, n);
             ClusterNonCol_DgemmCPU(CUBLAS_OP_N, CUBLAS_OP_N, n, n, n, matrices[i], S, work);
             ClusterNonCol_DgemmCPU(CUBLAS_OP_T, CUBLAS_OP_N, n, n, n, S, work, matrices[i]);
         }
@@ -315,7 +315,7 @@ static void ClusterNonCol_TransformRealDenseMatricesGPU(int n, const double *S, 
                                                        "ClusterNonCol_TransformRealDenseMatricesGPU:H*S");
             if (blas_status != CUBLAS_STATUS_SUCCESS) {
                 ClusterNonCol_LogGemmCpuFallback("ClusterNonCol_TransformRealDenseMatricesGPU:H*S", "D",
-                                                 "native cuBLAS/hipBLAS", blas_status, n, n, n);
+                                                 "native hipBLAS", blas_status, n, n, n);
                 use_cpu = 1;
             }
         }
@@ -326,7 +326,7 @@ static void ClusterNonCol_TransformRealDenseMatricesGPU(int n, const double *S, 
                                                        "ClusterNonCol_TransformRealDenseMatricesGPU:S^T*(H*S)");
             if (blas_status != CUBLAS_STATUS_SUCCESS) {
                 ClusterNonCol_LogGemmCpuFallback("ClusterNonCol_TransformRealDenseMatricesGPU:S^T*(H*S)", "D",
-                                                 "native cuBLAS/hipBLAS", blas_status, n, n, n);
+                                                 "native hipBLAS", blas_status, n, n, n);
                 use_cpu = 1;
             }
         }
@@ -378,7 +378,7 @@ static void ClusterNonCol_BackTransformDenseEVecGPU(int n2, const dcomplex *evec
     blas_status = cublasCreate(&handle);
     if (blas_status != CUBLAS_STATUS_SUCCESS) {
         ClusterNonCol_LogGemmCpuFallback("ClusterNonCol_BackTransformDenseEVecGPU:create", "Z",
-                                         "native cuBLAS/hipBLAS", blas_status, n2, n2, n2);
+                                         "native hipBLAS", blas_status, n2, n2, n2);
         ClusterNonCol_ZgemmCPU(CUBLAS_OP_T, CUBLAS_OP_T, n2, n2, n2, evec_transformed, ss2, dense_evec);
         return;
     }
@@ -399,7 +399,7 @@ static void ClusterNonCol_BackTransformDenseEVecGPU(int n2, const dcomplex *evec
                                                "ClusterNonCol_BackTransformDenseEVecGPU");
     if (blas_status != CUBLAS_STATUS_SUCCESS) {
         ClusterNonCol_LogGemmCpuFallback("ClusterNonCol_BackTransformDenseEVecGPU", "Z",
-                                         "native cuBLAS/hipBLAS", blas_status, n2, n2, n2);
+                                         "native hipBLAS", blas_status, n2, n2, n2);
         goto cpu_fallback;
     }
 
@@ -779,10 +779,10 @@ static double ClusterNonCol_ScatterDenseEVecToLocal(int myid, int numprocs, int 
 
         if (0 < max_send_count) {
             if (max_send_count > (size_t)INT_MAX / 2u) {
-                ClusterNonCol_AbortWithMessage("CuSOLVER dense eigenvector send buffer exceeds MPI count limit.");
+                ClusterNonCol_AbortWithMessage("GPU solver dense eigenvector send buffer exceeds MPI count limit.");
             }
             sendbuf = (dcomplex *)ClusterNonCol_MallocArray(max_send_count, sizeof(dcomplex),
-                                                            "CuSOLVER dense eigenvector send buffer");
+                                                            "GPU solver dense eigenvector send buffer");
         }
 
         for (int ID = 0; ID < numprocs; ID++) {
@@ -816,7 +816,7 @@ static double ClusterNonCol_ScatterDenseEVecToLocal(int myid, int numprocs, int 
             MPI_Status stat;
 
             if (recv_count > (size_t)INT_MAX / 2u) {
-                ClusterNonCol_AbortWithMessage("CuSOLVER dense eigenvector receive buffer exceeds MPI count limit.");
+                ClusterNonCol_AbortWithMessage("GPU solver dense eigenvector receive buffer exceeds MPI count limit.");
             }
             MPI_Recv(EVec1, (int)(recv_count * 2u), MPI_DOUBLE, Host_ID, tag, mpi_comm_level1, &stat);
         }
@@ -1820,15 +1820,15 @@ double Cluster_DFT_NonCol(
   }
   n2 = 2*n;
 
-  /* GPU dispatch (added by H.Kawai): assign CUDA/OpenACC device when CuSOLVER is requested */
-    if (scf_eigen_lib_flag == CuSOLVER && n2 >= GPU_CPU_SWITCH_NUM &&
+  /* GPU dispatch (added by H.Kawai): assign CUDA/OpenACC device when GPUSOLVER is requested */
+    if (scf_eigen_lib_flag == GPUSOLVER && n2 >= GPU_CPU_SWITCH_NUM &&
         Set_Hamiltonian_OpenACC_Rank_Is_Selected()) {
       set_cuda_default_device_from_local_rank_noncollective();
       set_openacc_nvidia_device_from_local_rank_noncollective();
     }
 
   use_cusolver_direct_cluster_dm =
-    (scf_eigen_lib_flag == CuSOLVER && GPU_CPU_SWITCH_NUM <= n2 &&
+    (scf_eigen_lib_flag == GPUSOLVER && GPU_CPU_SWITCH_NUM <= n2 &&
      strcasecmp(mode,"scf") == 0 &&
      MO_fileout != 1 && xanes_calc != 1 && xanes_gs_fileout != 1 &&
      !cal_partial_charge && !Dos_fileout && !DosGauss_fileout);
@@ -2020,10 +2020,10 @@ double Cluster_DFT_NonCol(
       F77_NAME(solve_evp_real,SOLVE_EVP_REAL)( &n, &n, Cs, &na_rows, &ko[1], Ss, &na_rows, &nblk,
                                                &mpi_comm_rows_int, &mpi_comm_cols_int );
     }
-    else if (scf_eigen_lib_flag==CuSOLVER && GPU_CPU_SWITCH_NUM<=n2 && na_rows==n && na_cols==n){
+    else if (scf_eigen_lib_flag==GPUSOLVER && GPU_CPU_SWITCH_NUM<=n2 && na_rows==n && na_cols==n){
       ClusterNonCol_CuSolver_DenseDsyevx(Cs,Ss,ko,n,n,"Cluster_DFT_NonCol overlap");
     }
-    else if (scf_eigen_lib_flag==2 || scf_eigen_lib_flag==CuSOLVER){
+    else if (scf_eigen_lib_flag==2 || scf_eigen_lib_flag==GPUSOLVER){
 
 #ifndef kcomp
 
@@ -2210,10 +2210,10 @@ double Cluster_DFT_NonCol(
     F77_NAME(solve_evp_complex,SOLVE_EVP_COMPLEX)( &n2, &MaxN, Hs2, &na_rows2, &ko[1], Cs2, &na_rows2,
                                                    &nblk2, &mpi_comm_rows_int, &mpi_comm_cols_int );
   }
-  else if (scf_eigen_lib_flag==CuSOLVER && GPU_CPU_SWITCH_NUM<=n2 && na_rows2==n2 && na_cols2==n2){
+  else if (scf_eigen_lib_flag==GPUSOLVER && GPU_CPU_SWITCH_NUM<=n2 && na_rows2==n2 && na_cols2==n2){
     ClusterNonCol_CuSolver_DenseZheevx(Hs2,Cs2,ko,n2,MaxN,"Cluster_DFT_NonCol Hamiltonian");
   }
-  else if (scf_eigen_lib_flag==2 || scf_eigen_lib_flag==CuSOLVER){
+  else if (scf_eigen_lib_flag==2 || scf_eigen_lib_flag==GPUSOLVER){
 
 #ifndef kcomp
 
@@ -2623,7 +2623,7 @@ double Cluster_DFT_NonCol(
     if (use_cusolver_direct_cluster_dm){
 
       if (myid==Host_ID && !cusolver_direct_evec_on_device){
-        ClusterNonCol_AbortWithMessage("CuSOLVER device eigenvectors are not available in Cluster_DFT_NonCol.c.");
+        ClusterNonCol_AbortWithMessage("GPU solver device eigenvectors are not available in Cluster_DFT_NonCol.c.");
       }
 
       time6 += ClusterNonCol_CalcDMRootDense_OpenACC(myid,size_H1,MP,n,n2,MaxN,CDM,iDM[0],EDM,ko,

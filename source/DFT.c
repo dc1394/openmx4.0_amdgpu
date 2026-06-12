@@ -37,7 +37,7 @@ double Cluster_DFT_NonCol_ScatterCuSolverCachedEVec(int n2, int *is2, int *ie2, 
 
 static int DFT_SetOLPKinUseGPU(void)
 {
-    return (scf_eigen_lib_flag == CuSOLVER && omp_get_max_threads() == 1);
+    return (scf_eigen_lib_flag == GPUSOLVER && omp_get_max_threads() == 1);
 }
 
 static int DFT_SetProExpnVNAUseGPU(void)
@@ -53,13 +53,13 @@ static void DFT_GPU_DeviceInit(int basis_count)
 {
     int myid0;
 
-    if (!(scf_eigen_lib_flag_input == CuSOLVER)) return;
+    if (!(scf_eigen_lib_flag_input == GPUSOLVER)) return;
 
     MPI_Comm_rank(mpi_comm_level1,&myid0);
-    scf_eigen_lib_flag = CuSOLVER;
+    scf_eigen_lib_flag = GPUSOLVER;
 
     if (Solver!=5 && Solver!=11 && basis_count < GPU_CPU_SWITCH_NUM && myid0==Host_ID && 0<level_stdout) {
-        printf("<DFT> CuSOLVER requested; global matrix dimension %d is below %d, so global dense eigensolver paths use a CPU fallback while GPU kernels remain enabled.\n",
+        printf("<DFT> gpusolver requested; global matrix dimension %d is below %d, so global dense eigensolver paths use a CPU fallback while GPU kernels remain enabled.\n",
                basis_count,GPU_CPU_SWITCH_NUM);
         fflush(stdout);
     }
@@ -88,7 +88,7 @@ static void DFT_GPU_DeviceInit(int basis_count)
     if (!cuda_ok) {
         scf_eigen_lib_flag = ELPA2;
         if (myid0==Host_ID && 0<level_stdout) {
-            printf("<DFT> CuSOLVER requested, but no HIP device is available; using ELPA2.\n");
+            printf("<DFT> gpusolver requested, but no HIP device is available; using ELPA2.\n");
             fflush(stdout);
         }
     }
@@ -96,7 +96,7 @@ static void DFT_GPU_DeviceInit(int basis_count)
 
 static int DFT_GPU_EigensolverActive(void)
 {
-    if (scf_eigen_lib_flag!=CuSOLVER) return 0;
+    if (scf_eigen_lib_flag!=GPUSOLVER) return 0;
     if (Solver==5 || Solver==11) return 1;
     return (GPU_CPU_SWITCH_NUM<=DFT_GPU_BasisCount());
 }
@@ -154,7 +154,7 @@ double **OrbOpt_Hessian,*His_OrbOpt_Etot;
 
 static int DFT_SetHamiltonianOpenACCSelectedRank(int myid0)
 {
-    if (scf_eigen_lib_flag != CuSOLVER) {
+    if (scf_eigen_lib_flag != GPUSOLVER) {
         return 1;
     }
 
@@ -202,7 +202,7 @@ static void DFT_ConfigureSetHamiltonianOpenACC(int myid0)
 
 static void DFT_PrepareCuSolverHSPackedCache(void)
 {
-    if (scf_eigen_lib_flag == CuSOLVER && (Solver == 2 || Solver == 3)) {
+    if (scf_eigen_lib_flag == GPUSOLVER && (Solver == 2 || Solver == 3)) {
         Set_Hamiltonian_Build_CuSolver_HS_Cache(Cnt_switch == 1);
     }
     else {
@@ -388,7 +388,7 @@ double DFT(int MD_iter, int Cnt_Now)
 
   if (MYID_MPI_COMM_WORLD==Host_ID && 0<level_stdout){
     printf("<MD=%2d>  Calculation of the nonlocal matrix%s\n",MD_iter,
-           (scf_eigen_lib_flag==CuSOLVER) ? " (GPU-accelerated)" : "");
+           (scf_eigen_lib_flag==GPUSOLVER) ? " (GPU-accelerated)" : "");
     fflush(stdout);
   }
 

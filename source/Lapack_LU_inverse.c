@@ -18,7 +18,7 @@
     do {                                                                                                                      \
         cudaError_t err = (call);                                                                                             \
         if (cudaSuccess != err) {                                                                                             \
-            fprintf(stderr, "CUDA Error:\nFile = %s\nLine = %d\nReason = %s\n", __FILE__, __LINE__, cudaGetErrorString(err)); \
+            fprintf(stderr, "HIP Error:\nFile = %s\nLine = %d\nReason = %s\n", __FILE__, __LINE__, cudaGetErrorString(err)); \
             cudaDeviceReset();                                                                                                \
             exit(EXIT_FAILURE);                                                                                               \
         }                                                                                                                     \
@@ -29,7 +29,7 @@
     do {                                                                                                     \
         cublasStatus_t status = (call);                                                                      \
         if (CUBLAS_STATUS_SUCCESS != status) {                                                               \
-            fprintf(stderr, "CUBLAS Error:\nFile = %s\nLine = %d\nCode = %d\n", __FILE__, __LINE__, status); \
+            fprintf(stderr, "hipBLAS Error:\nFile = %s\nLine = %d\nCode = %d\n", __FILE__, __LINE__, status); \
             cudaDeviceReset();                                                                               \
             exit(EXIT_FAILURE);                                                                              \
         }                                                                                                    \

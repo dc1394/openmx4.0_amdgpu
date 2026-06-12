@@ -1546,7 +1546,7 @@ double Band_DFT_Col(int SCF_iter, int knum_i, int knum_j, int knum_k, int SpinP_
         if (max_tno < tnoA)
             max_tno = tnoA;
     }
-    use_cusolver_dense = (scf_eigen_lib_flag == CuSOLVER && GPU_CPU_SWITCH_NUM <= n);
+    use_cusolver_dense = (scf_eigen_lib_flag == GPUSOLVER && GPU_CPU_SWITCH_NUM <= n);
 
     /****************************************************
      find TZ
@@ -2490,7 +2490,7 @@ diagonalize1:
                     if (scf_eigen_lib_flag == 1) {
                         F77_NAME(solve_evp_complex, SOLVE_EVP_COMPLEX)
                         (&n, &n, Cs, &na_rows, &ko[1], Ss, &na_rows, &nblk, &mpi_comm_rows_int, &mpi_comm_cols_int);
-                    } else if (scf_eigen_lib_flag == 2 || scf_eigen_lib_flag == CuSOLVER) {
+                    } else if (scf_eigen_lib_flag == 2 || scf_eigen_lib_flag == GPUSOLVER) {
 
 #ifndef kcomp
                         int mpiworld;
@@ -2622,7 +2622,7 @@ diagonalize1:
                 if (scf_eigen_lib_flag == 1) {
                     F77_NAME(solve_evp_complex, SOLVE_EVP_COMPLEX)
                     (&n, &MaxN, Hs, &na_rows, &ko[1], Cs, &na_rows, &nblk, &mpi_comm_rows_int, &mpi_comm_cols_int);
-                } else if (scf_eigen_lib_flag == 2 || scf_eigen_lib_flag == CuSOLVER) {
+                } else if (scf_eigen_lib_flag == 2 || scf_eigen_lib_flag == GPUSOLVER) {
 
 #ifndef kcomp
                     int mpiworld;
@@ -3719,7 +3719,7 @@ diagonalize1:
                 if (scf_eigen_lib_flag == 1) {
                     F77_NAME(solve_evp_complex, SOLVE_EVP_COMPLEX)
                     (&n, &n, Cs, &na_rows, &ko[1], Ss, &na_rows, &nblk, &mpi_comm_rows_int, &mpi_comm_cols_int);
-                } else if (scf_eigen_lib_flag == 2 || scf_eigen_lib_flag == CuSOLVER) {
+                } else if (scf_eigen_lib_flag == 2 || scf_eigen_lib_flag == GPUSOLVER) {
 
 #ifndef kcomp
                     int mpiworld;
@@ -3812,7 +3812,7 @@ diagonalize1:
                 if (scf_eigen_lib_flag == 1) {
                     F77_NAME(solve_evp_complex, SOLVE_EVP_COMPLEX)
                     (&n, &MaxN, Hs, &na_rows, &ko[1], Cs, &na_rows, &nblk, &mpi_comm_rows_int, &mpi_comm_cols_int);
-                } else if (scf_eigen_lib_flag == 2 || scf_eigen_lib_flag == CuSOLVER) {
+                } else if (scf_eigen_lib_flag == 2 || scf_eigen_lib_flag == GPUSOLVER) {
 
 #ifndef kcomp
                     int mpiworld;
@@ -4349,7 +4349,7 @@ void Construct_Band_CsHs(int SCF_iter, int all_knum, int * order_GA, int * MP, d
                          double k2, double k3, dcomplex * Cs, dcomplex * Hs, int n, int owns_global_dense_rank)
 {
     const int need_s = (SCF_iter == 1 || all_knum != 1);
-    const int use_cusolver_dense = (scf_eigen_lib_flag == CuSOLVER && GPU_CPU_SWITCH_NUM <= n);
+    const int use_cusolver_dense = (scf_eigen_lib_flag == GPUSOLVER && GPU_CPU_SWITCH_NUM <= n);
     const int dense_cusolver_owner =
         (use_cusolver_dense &&
          ((all_knum == 1 && owns_global_dense_rank) ||

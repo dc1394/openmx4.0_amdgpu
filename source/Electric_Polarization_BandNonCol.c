@@ -561,17 +561,17 @@ double Electric_Polarization_BandNonCol(
   mpi_comm_rows_int = MPI_Comm_c2f(mpi_comm_rows);
   mpi_comm_cols_int = MPI_Comm_c2f(mpi_comm_cols);
 
-  if (scf_eigen_lib_flag==1 || (numprocs2<5 && scf_eigen_lib_flag!=CuSOLVER)){
+  if (scf_eigen_lib_flag==1 || (numprocs2<5 && scf_eigen_lib_flag!=GPUSOLVER)){
     F77_NAME(solve_evp_complex,SOLVE_EVP_COMPLEX)
       ( &n2, &MaxN, Hs2, &na_rows2, &ko[1], VDMs_ABC, &na_rows2, &nblk2, &mpi_comm_rows_int, &mpi_comm_cols_int );
   }
 
-  else if (scf_eigen_lib_flag==CuSOLVER && GPU_CPU_SWITCH_NUM<=n2 && na_rows2==n2 && na_cols2==n2){
+  else if (scf_eigen_lib_flag==GPUSOLVER && GPU_CPU_SWITCH_NUM<=n2 && na_rows2==n2 && na_cols2==n2){
     OpenMX_CuSolver_DenseZheevx_1based(Hs2,VDMs_ABC,ko,n2,MaxN,
-                                       "Electric_Polarization_BandNonCol DM Hamiltonian CuSOLVER");
+                                       "Electric_Polarization_BandNonCol DM Hamiltonian GPU solver");
   }
 
-  else if (scf_eigen_lib_flag==2 || scf_eigen_lib_flag==CuSOLVER){
+  else if (scf_eigen_lib_flag==2 || scf_eigen_lib_flag==GPUSOLVER){
 
 #ifndef kcomp
     int mpiworld;
@@ -654,17 +654,17 @@ double Electric_Polarization_BandNonCol(
 	  mpi_comm_rows_int = MPI_Comm_c2f(mpi_comm_rows);
 	  mpi_comm_cols_int = MPI_Comm_c2f(mpi_comm_cols);
 
-	  if (scf_eigen_lib_flag==1 || (numprocs2<5 && scf_eigen_lib_flag!=CuSOLVER)){
+	  if (scf_eigen_lib_flag==1 || (numprocs2<5 && scf_eigen_lib_flag!=GPUSOLVER)){
 	    F77_NAME(solve_evp_complex,SOLVE_EVP_COMPLEX)
 	      ( &n, &n, Cs, &na_rows, &ko[1], Ss, &na_rows, &nblk, &mpi_comm_rows_int, &mpi_comm_cols_int );
 	  }
 
-	  else if (scf_eigen_lib_flag==CuSOLVER && GPU_CPU_SWITCH_NUM<=n2 && na_rows==n && na_cols==n){
+	  else if (scf_eigen_lib_flag==GPUSOLVER && GPU_CPU_SWITCH_NUM<=n2 && na_rows==n && na_cols==n){
 	    OpenMX_CuSolver_DenseZheevx_1based(Cs,Ss,ko,n,n,
-					       "Electric_Polarization_BandNonCol overlap CuSOLVER");
+					       "Electric_Polarization_BandNonCol overlap GPU solver");
 	  }
 
-	  else if (scf_eigen_lib_flag==2 || scf_eigen_lib_flag==CuSOLVER){
+	  else if (scf_eigen_lib_flag==2 || scf_eigen_lib_flag==GPUSOLVER){
 
 #ifndef kcomp
 	    int mpiworld;
@@ -836,17 +836,17 @@ double Electric_Polarization_BandNonCol(
 	mpi_comm_rows_int = MPI_Comm_c2f(mpi_comm_rows);
 	mpi_comm_cols_int = MPI_Comm_c2f(mpi_comm_cols);
 
-	if (scf_eigen_lib_flag==1 || (numprocs2<5 && scf_eigen_lib_flag!=CuSOLVER)){
+	if (scf_eigen_lib_flag==1 || (numprocs2<5 && scf_eigen_lib_flag!=GPUSOLVER)){
 	  F77_NAME(solve_evp_complex,SOLVE_EVP_COMPLEX)
 	    ( &n2, &MaxN, Hs2, &na_rows2, &ko[1], Cs2, &na_rows2, &nblk2, &mpi_comm_rows_int, &mpi_comm_cols_int );
 	}
 
-	else if (scf_eigen_lib_flag==CuSOLVER && GPU_CPU_SWITCH_NUM<=n2 && na_rows2==n2 && na_cols2==n2){
+	else if (scf_eigen_lib_flag==GPUSOLVER && GPU_CPU_SWITCH_NUM<=n2 && na_rows2==n2 && na_cols2==n2){
 	  OpenMX_CuSolver_DenseZheevx_1based(Hs2,Cs2,ko,n2,MaxN,
-					     "Electric_Polarization_BandNonCol Hamiltonian CuSOLVER");
+					     "Electric_Polarization_BandNonCol Hamiltonian GPU solver");
 	}
 
-	else if (scf_eigen_lib_flag==2 || scf_eigen_lib_flag==CuSOLVER){
+	else if (scf_eigen_lib_flag==2 || scf_eigen_lib_flag==GPUSOLVER){
 
 #ifndef kcomp
 	  int mpiworld;
@@ -997,17 +997,17 @@ double Electric_Polarization_BandNonCol(
 	mpi_comm_rows_int = MPI_Comm_c2f(mpi_comm_rows);
 	mpi_comm_cols_int = MPI_Comm_c2f(mpi_comm_cols);
 
-        if (scf_eigen_lib_flag==1 || (numprocs2<5 && scf_eigen_lib_flag!=CuSOLVER)){
+        if (scf_eigen_lib_flag==1 || (numprocs2<5 && scf_eigen_lib_flag!=GPUSOLVER)){
   	  F77_NAME(solve_evp_complex,SOLVE_EVP_COMPLEX)
           ( &n, &n, Cs, &na_rows, &ko[1], Ss, &na_rows, &nblk, &mpi_comm_rows_int, &mpi_comm_cols_int );
 	}
 
-        else if (scf_eigen_lib_flag==CuSOLVER && GPU_CPU_SWITCH_NUM<=n2 && na_rows==n && na_cols==n){
+        else if (scf_eigen_lib_flag==GPUSOLVER && GPU_CPU_SWITCH_NUM<=n2 && na_rows==n && na_cols==n){
           OpenMX_CuSolver_DenseZheevx_1based(Cs,Ss,ko,n,n,
-                                             "Electric_Polarization_BandNonCol ABC overlap CuSOLVER");
+                                             "Electric_Polarization_BandNonCol ABC overlap GPU solver");
         }
 
-        else if (scf_eigen_lib_flag==2 || scf_eigen_lib_flag==CuSOLVER){
+        else if (scf_eigen_lib_flag==2 || scf_eigen_lib_flag==GPUSOLVER){
 
 #ifndef kcomp
           int mpiworld;
@@ -1166,17 +1166,17 @@ double Electric_Polarization_BandNonCol(
 	mpi_comm_rows_int = MPI_Comm_c2f(mpi_comm_rows);
 	mpi_comm_cols_int = MPI_Comm_c2f(mpi_comm_cols);
   
-        if (scf_eigen_lib_flag==1 || (numprocs2<5 && scf_eigen_lib_flag!=CuSOLVER)){
+        if (scf_eigen_lib_flag==1 || (numprocs2<5 && scf_eigen_lib_flag!=GPUSOLVER)){
   	  F77_NAME(solve_evp_complex,SOLVE_EVP_COMPLEX)
           ( &n2, &MaxN, Hs2, &na_rows2, &ko[1], Cs2, &na_rows2, &nblk2, &mpi_comm_rows_int, &mpi_comm_cols_int );
 	}
 
-        else if (scf_eigen_lib_flag==CuSOLVER && GPU_CPU_SWITCH_NUM<=n2 && na_rows2==n2 && na_cols2==n2){
+        else if (scf_eigen_lib_flag==GPUSOLVER && GPU_CPU_SWITCH_NUM<=n2 && na_rows2==n2 && na_cols2==n2){
           OpenMX_CuSolver_DenseZheevx_1based(Hs2,Cs2,ko,n2,MaxN,
-                                             "Electric_Polarization_BandNonCol ABC Hamiltonian CuSOLVER");
+                                             "Electric_Polarization_BandNonCol ABC Hamiltonian GPU solver");
         }
 
-        else if (scf_eigen_lib_flag==2 || scf_eigen_lib_flag==CuSOLVER){
+        else if (scf_eigen_lib_flag==2 || scf_eigen_lib_flag==GPUSOLVER){
 
 #ifndef kcomp
           int mpiworld;

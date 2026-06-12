@@ -168,7 +168,7 @@ static void DCLNO_GPUProxy_Init(void)
 
     cuda_err = cudaGetDeviceCount(&DCLNO_ngpu);
     if (cuda_err != cudaSuccess || DCLNO_ngpu <= 0) {
-        fprintf(stderr, "DC-LNO GPU proxy: failed to detect CUDA devices (err=%d, count=%d).\n",
+        fprintf(stderr, "DC-LNO GPU proxy: failed to detect HIP devices (err=%d, count=%d).\n",
                 (int)cuda_err, DCLNO_ngpu);
         fflush(stderr);
         MPI_Abort(base_comm, 1);
@@ -392,15 +392,15 @@ static void DCLNO_CuSolver_EnsureMatrixCapacity(int num)
     if (ctx->d_info != NULL) wait_cudafunc(cudaFree(ctx->d_info));
 
     matrix_bytes = DCLNO_CheckedArrayBytes(DCLNO_CheckedMulCount((size_t)num, (size_t)num,
-                                                                 "CuSOLVER dense matrix dimensions"),
+                                                                 "GPU solver dense matrix dimensions"),
                                            sizeof(double),
-                                           "CuSOLVER dense matrix buffer");
+                                           "GPU solver dense matrix buffer");
 
     wait_cudafunc(cudaMalloc((void**)&ctx->d_S, matrix_bytes));
     wait_cudafunc(cudaMalloc((void**)&ctx->d_H, matrix_bytes));
     wait_cudafunc(cudaMalloc((void**)&ctx->d_tmp, matrix_bytes));
     wait_cudafunc(cudaMalloc((void**)&ctx->d_W,
-                             DCLNO_CheckedArrayBytes((size_t)num, sizeof(double), "CuSOLVER eigenvalue buffer")));
+                             DCLNO_CheckedArrayBytes((size_t)num, sizeof(double), "GPU solver eigenvalue buffer")));
     wait_cudafunc(cudaMalloc((void**)&ctx->d_info, sizeof(int32_t)));
 
     ctx->max_num = num;
@@ -447,7 +447,7 @@ static void DCLNO_CuSolver_EnsureWorkspace(int m, int maxn)
     }
     else if (h_bytes > ctx->h_work_bytes) {
         if (ctx->h_work != NULL) free(ctx->h_work);
-        ctx->h_work = DCLNO_MallocArray(h_bytes, 1, "CuSOLVER host workspace");
+        ctx->h_work = DCLNO_MallocArray(h_bytes, 1, "GPU solver host workspace");
         ctx->h_work_bytes = h_bytes;
     }
 }
@@ -479,7 +479,7 @@ static void DCLNO_CuSolver_Eigen(double *d_A, int m, int maxn, double *W)
     wait_cudafunc(cudaStreamSynchronize(ctx->stream));
 
     if (info != 0) {
-        fprintf(stderr, "cusolverDnXsyevdx failed in DC-LNO: info=%d\n", (int)info);
+        fprintf(stderr, "hipsolverDnDsyevdx failed in DC-LNO: info=%d\n", (int)info);
         exit(10);
     }
 }
@@ -498,13 +498,13 @@ static void DCLNO_Solve_Col_CuSolver(int NUM, int NUM2, double *Smat, double *Hm
     }
 
     full_bytes = DCLNO_CheckedArrayBytes(DCLNO_CheckedMulCount((size_t)NUM, (size_t)NUM,
-                                                               "CuSOLVER full matrix dimensions"),
+                                                               "GPU solver full matrix dimensions"),
                                          sizeof(double),
-                                         "CuSOLVER full matrix copy");
+                                         "GPU solver full matrix copy");
     partial_bytes = DCLNO_CheckedArrayBytes(DCLNO_CheckedMulCount((size_t)NUM, (size_t)NUM2,
-                                                                  "CuSOLVER eigenvector dimensions"),
+                                                                  "GPU solver eigenvector dimensions"),
                                             sizeof(double),
-                                            "CuSOLVER partial eigenvector copy");
+                                            "GPU solver partial eigenvector copy");
 
     DCLNO_CuSolver_EnsureMatrixCapacity(NUM);
 
@@ -519,7 +519,7 @@ static void DCLNO_Solve_Col_CuSolver(int NUM, int NUM2, double *Smat, double *Hm
 
     wait_cudafunc(cudaMemcpyAsync(ctx->d_W, ko + 1,
                                   DCLNO_CheckedArrayBytes((size_t)NUM, sizeof(double),
-                                                          "CuSOLVER host-to-device eigenvalue scale"),
+                                                          "GPU solver host-to-device eigenvalue scale"),
                                   cudaMemcpyHostToDevice, ctx->stream));
 
     wait_cudafunc(cublasDdgmm(ctx->cublas, CUBLAS_SIDE_RIGHT, NUM, NUM,
@@ -905,7 +905,7 @@ static double DC_Col(char * mode, int MD_iter, int SCF_iter, int SucceedReadingD
     time8 = 0.0;
     time9 = 0.0;
 
-    use_gpu_accel = (scf_eigen_lib_flag == CuSOLVER);
+    use_gpu_accel = (scf_eigen_lib_flag == GPUSOLVER);
     if (use_gpu_accel) {
         DCLNO_GPUProxy_Init();
     }

@@ -12,25 +12,25 @@ static const char *OpenMX_DgemmCublasStatusName(cublasStatus_t status)
 {
     switch (status) {
     case CUBLAS_STATUS_SUCCESS:
-        return "CUBLAS_STATUS_SUCCESS";
+        return "HIPBLAS_STATUS_SUCCESS";
     case CUBLAS_STATUS_NOT_INITIALIZED:
-        return "CUBLAS_STATUS_NOT_INITIALIZED";
+        return "HIPBLAS_STATUS_NOT_INITIALIZED";
     case CUBLAS_STATUS_ALLOC_FAILED:
-        return "CUBLAS_STATUS_ALLOC_FAILED";
+        return "HIPBLAS_STATUS_ALLOC_FAILED";
     case CUBLAS_STATUS_INVALID_VALUE:
-        return "CUBLAS_STATUS_INVALID_VALUE";
+        return "HIPBLAS_STATUS_INVALID_VALUE";
     case CUBLAS_STATUS_ARCH_MISMATCH:
-        return "CUBLAS_STATUS_ARCH_MISMATCH";
+        return "HIPBLAS_STATUS_ARCH_MISMATCH";
     case CUBLAS_STATUS_MAPPING_ERROR:
-        return "CUBLAS_STATUS_MAPPING_ERROR";
+        return "HIPBLAS_STATUS_MAPPING_ERROR";
     case CUBLAS_STATUS_EXECUTION_FAILED:
-        return "CUBLAS_STATUS_EXECUTION_FAILED";
+        return "HIPBLAS_STATUS_EXECUTION_FAILED";
     case CUBLAS_STATUS_INTERNAL_ERROR:
-        return "CUBLAS_STATUS_INTERNAL_ERROR";
+        return "HIPBLAS_STATUS_INTERNAL_ERROR";
     case CUBLAS_STATUS_NOT_SUPPORTED:
-        return "CUBLAS_STATUS_NOT_SUPPORTED";
+        return "HIPBLAS_STATUS_NOT_SUPPORTED";
     default:
-        return "CUBLAS_STATUS_UNKNOWN";
+        return "HIPBLAS_STATUS_UNKNOWN";
     }
 }
 
@@ -74,7 +74,7 @@ static void OpenMX_DgemmLogGemmul8Retry(const char *where, cublasStatus_t status
 {
     fprintf(stderr,
             "<GEMM> rank %d: GEMMul8 failed in %s for DGEMM(m=%d,n=%d,k=%d): %s (%d). "
-            "Retrying with native cuBLAS/hipBLAS.\n",
+            "Retrying with native hipBLAS.\n",
             OpenMX_DgemmRank(), where, m, n, k, OpenMX_DgemmCublasStatusName(status), (int)status);
     fflush(stderr);
 }
@@ -109,7 +109,7 @@ static void OpenMX_DgemmLogBackendOnce(const char *backend, int m, int n, int k)
 
     fprintf(stderr,
             "<GEMM> rank %d: using %s for DGEMM(m=%d,n=%d,k=%d). "
-            "If it fails, OpenMX retries native cuBLAS/hipBLAS and then CPU BLAS.\n",
+            "If it fails, OpenMX retries native hipBLAS and then CPU BLAS.\n",
             rank, backend, m, n, k);
     fflush(stderr);
     *logged = 1;
@@ -132,7 +132,7 @@ static cublasStatus_t OpenMX_DgemmTryGpu(cublasHandle_t handle, cublasOperation_
     OpenMX_DgemmLogGemmul8Retry(where, status, m, n, k);
     status = cublasDgemm(handle, transa, transb, m, n, k, &alpha, A, m, B, k, &beta, C, m);
     if (status == CUBLAS_STATUS_SUCCESS) {
-        OpenMX_DgemmLogBackendOnce("native cuBLAS/hipBLAS", m, n, k);
+        OpenMX_DgemmLogBackendOnce("native hipBLAS", m, n, k);
     }
     return status;
 }
@@ -149,47 +149,47 @@ void my_cublasDgemm(cublasOperation_t transa, cublasOperation_t transb, int m, i
 
     status = cublasCreate(&handle);
     if (status != CUBLAS_STATUS_SUCCESS) {
-        OpenMX_DgemmLogCpuFallback("my_cublasDgemm:cublasCreate", "native cuBLAS/hipBLAS", status, m, n, k);
+        OpenMX_DgemmLogCpuFallback("my_cublasDgemm:hipblasCreate", "native hipBLAS", status, m, n, k);
         OpenMX_DgemmCpu(transa, transb, m, n, k, A, B, C);
         return;
     }
 
     cuda_status = cudaMalloc((void **)&d_A, m * k * sizeof(double));
     if (cuda_status != cudaSuccess) {
-        OpenMX_DgemmLogCudaCpuFallback("my_cublasDgemm:cudaMalloc(A)", cuda_status, m, n, k);
+        OpenMX_DgemmLogCudaCpuFallback("my_cublasDgemm:hipMalloc(A)", cuda_status, m, n, k);
         goto cpu_fallback;
     }
     cuda_status = cudaMalloc((void **)&d_B, n * k * sizeof(double));
     if (cuda_status != cudaSuccess) {
-        OpenMX_DgemmLogCudaCpuFallback("my_cublasDgemm:cudaMalloc(B)", cuda_status, m, n, k);
+        OpenMX_DgemmLogCudaCpuFallback("my_cublasDgemm:hipMalloc(B)", cuda_status, m, n, k);
         goto cpu_fallback;
     }
     cuda_status = cudaMalloc((void **)&d_C, m * n * sizeof(double));
     if (cuda_status != cudaSuccess) {
-        OpenMX_DgemmLogCudaCpuFallback("my_cublasDgemm:cudaMalloc(C)", cuda_status, m, n, k);
+        OpenMX_DgemmLogCudaCpuFallback("my_cublasDgemm:hipMalloc(C)", cuda_status, m, n, k);
         goto cpu_fallback;
     }
 
     cuda_status = cudaMemcpy(d_A, A, m * k * sizeof(double), cudaMemcpyHostToDevice);
     if (cuda_status != cudaSuccess) {
-        OpenMX_DgemmLogCudaCpuFallback("my_cublasDgemm:cudaMemcpy(A)", cuda_status, m, n, k);
+        OpenMX_DgemmLogCudaCpuFallback("my_cublasDgemm:hipMemcpy(A)", cuda_status, m, n, k);
         goto cpu_fallback;
     }
     cuda_status = cudaMemcpy(d_B, B, n * k * sizeof(double), cudaMemcpyHostToDevice);
     if (cuda_status != cudaSuccess) {
-        OpenMX_DgemmLogCudaCpuFallback("my_cublasDgemm:cudaMemcpy(B)", cuda_status, m, n, k);
+        OpenMX_DgemmLogCudaCpuFallback("my_cublasDgemm:hipMemcpy(B)", cuda_status, m, n, k);
         goto cpu_fallback;
     }
 
     status = OpenMX_DgemmTryGpu(handle, transa, transb, m, n, k, d_A, d_B, d_C, "my_cublasDgemm");
     if (status != CUBLAS_STATUS_SUCCESS) {
-        OpenMX_DgemmLogCpuFallback("my_cublasDgemm", "native cuBLAS/hipBLAS", status, m, n, k);
+        OpenMX_DgemmLogCpuFallback("my_cublasDgemm", "native hipBLAS", status, m, n, k);
         goto cpu_fallback;
     }
 
     cuda_status = cudaMemcpy(C, d_C, m * n * sizeof(double), cudaMemcpyDeviceToHost);
     if (cuda_status != cudaSuccess) {
-        OpenMX_DgemmLogCudaCpuFallback("my_cublasDgemm:cudaMemcpy(C)", cuda_status, m, n, k);
+        OpenMX_DgemmLogCudaCpuFallback("my_cublasDgemm:hipMemcpy(C)", cuda_status, m, n, k);
         goto cpu_fallback;
     }
 
@@ -234,14 +234,14 @@ void my_cublasDgemm_openacc(cublasOperation_t transa, cublasOperation_t transb, 
     if (handle != NULL) {
         cublasStatus_t destroy_status = cublasDestroy(handle);
         if (destroy_status != CUBLAS_STATUS_SUCCESS) {
-            fprintf(stderr, "<GEMM> rank %d: cublasDestroy failed after DGEMM: %s (%d).\n", OpenMX_DgemmRank(),
+            fprintf(stderr, "<GEMM> rank %d: hipblasDestroy failed after DGEMM: %s (%d).\n", OpenMX_DgemmRank(),
                     OpenMX_DgemmCublasStatusName(destroy_status), (int)destroy_status);
             fflush(stderr);
         }
     }
 
     if (status != CUBLAS_STATUS_SUCCESS) {
-        OpenMX_DgemmLogCpuFallback("my_cublasDgemm_openacc", "native cuBLAS/hipBLAS", status, m, n, k);
+        OpenMX_DgemmLogCpuFallback("my_cublasDgemm_openacc", "native hipBLAS", status, m, n, k);
 #pragma acc update self(A[0 : m * k], B[0 : k * n])
         OpenMX_DgemmCpu(transa, transb, m, n, k, A, B, C);
 #pragma acc update device(C[0 : m * n])
