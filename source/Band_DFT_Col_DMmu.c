@@ -17,7 +17,7 @@
 #include <math.h>
 #include <time.h>
 #include "openmx_common.h"
-#include "openmx_cusolver_dense_utils.h"
+#include "openmx_gpusolver_dense_utils.h"
 #include "lapack_prototypes.h"
 #include "tran_variables.h"
 #include "mpi.h"
@@ -824,7 +824,7 @@ diagonalize1:
         ( &n, &n, Cs, &na_rows, &ko[1], Ss, &na_rows, &nblk, &mpi_comm_rows_int, &mpi_comm_cols_int );
       }
       else if (scf_eigen_lib_flag==GPUSOLVER && GPU_CPU_SWITCH_NUM<=n && na_rows==n && na_cols==n){
-        OpenMX_CuSolver_DenseZheevx_1based(Cs,Ss,ko,n,n,"Band_DFT_Col_DMmu overlap GPU solver");
+        OpenMX_GpuSolver_DenseZheevx_1based(Cs,Ss,ko,n,n,"Band_DFT_Col_DMmu overlap GPU solver");
       }
 
       else if (scf_eigen_lib_flag==2 || scf_eigen_lib_flag==GPUSOLVER){
@@ -928,7 +928,7 @@ diagonalize1:
       ( &n, &MaxN, Hs, &na_rows, &ko[1], Cs, &na_rows, &nblk, &mpi_comm_rows_int, &mpi_comm_cols_int );
     }
     else if (scf_eigen_lib_flag==GPUSOLVER && GPU_CPU_SWITCH_NUM<=n && na_rows==n && na_cols==n){
-      OpenMX_CuSolver_DenseZheevx_1based(Hs,Cs,ko,n,MaxN,"Band_DFT_Col_DMmu Hamiltonian GPU solver");
+      OpenMX_GpuSolver_DenseZheevx_1based(Hs,Cs,ko,n,MaxN,"Band_DFT_Col_DMmu Hamiltonian GPU solver");
     }
 
     else if (scf_eigen_lib_flag==2 || scf_eigen_lib_flag==GPUSOLVER){
@@ -1778,7 +1778,7 @@ diagonalize1:
         ( &n, &n, Cs, &na_rows, &ko[1], Ss, &na_rows, &nblk, &mpi_comm_rows_int, &mpi_comm_cols_int);
       }
       else if (scf_eigen_lib_flag==GPUSOLVER && GPU_CPU_SWITCH_NUM<=n && na_rows==n && na_cols==n){
-        OpenMX_CuSolver_DenseZheevx_1based(Cs,Ss,ko,n,n,"Band_DFT_Col_DMmu DM overlap GPU solver");
+        OpenMX_GpuSolver_DenseZheevx_1based(Cs,Ss,ko,n,n,"Band_DFT_Col_DMmu DM overlap GPU solver");
       }
 
       else if (scf_eigen_lib_flag==2 || scf_eigen_lib_flag==GPUSOLVER){
@@ -1872,7 +1872,7 @@ diagonalize1:
         ( &n, &MaxN, Hs, &na_rows, &ko[1], Cs, &na_rows, &nblk, &mpi_comm_rows_int, &mpi_comm_cols_int );
       }
       else if (scf_eigen_lib_flag==GPUSOLVER && GPU_CPU_SWITCH_NUM<=n && na_rows==n && na_cols==n){
-        OpenMX_CuSolver_DenseZheevx_1based(Hs,Cs,ko,n,MaxN,"Band_DFT_Col_DMmu DM Hamiltonian GPU solver");
+        OpenMX_GpuSolver_DenseZheevx_1based(Hs,Cs,ko,n,MaxN,"Band_DFT_Col_DMmu DM Hamiltonian GPU solver");
       }
 
       else if (scf_eigen_lib_flag==2 || scf_eigen_lib_flag==GPUSOLVER){

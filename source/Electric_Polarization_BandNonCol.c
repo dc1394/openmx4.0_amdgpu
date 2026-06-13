@@ -19,7 +19,7 @@
 #include <complex.h>
 #include "mpi.h"
 #include "openmx_common.h"
-#include "openmx_cusolver_dense_utils.h"
+#include "openmx_gpusolver_dense_utils.h"
 #include "lapack_prototypes.h"
 #include "tran_variables.h"
 #include <omp.h>
@@ -567,7 +567,7 @@ double Electric_Polarization_BandNonCol(
   }
 
   else if (scf_eigen_lib_flag==GPUSOLVER && GPU_CPU_SWITCH_NUM<=n2 && na_rows2==n2 && na_cols2==n2){
-    OpenMX_CuSolver_DenseZheevx_1based(Hs2,VDMs_ABC,ko,n2,MaxN,
+    OpenMX_GpuSolver_DenseZheevx_1based(Hs2,VDMs_ABC,ko,n2,MaxN,
                                        "Electric_Polarization_BandNonCol DM Hamiltonian GPU solver");
   }
 
@@ -660,7 +660,7 @@ double Electric_Polarization_BandNonCol(
 	  }
 
 	  else if (scf_eigen_lib_flag==GPUSOLVER && GPU_CPU_SWITCH_NUM<=n2 && na_rows==n && na_cols==n){
-	    OpenMX_CuSolver_DenseZheevx_1based(Cs,Ss,ko,n,n,
+	    OpenMX_GpuSolver_DenseZheevx_1based(Cs,Ss,ko,n,n,
 					       "Electric_Polarization_BandNonCol overlap GPU solver");
 	  }
 
@@ -842,7 +842,7 @@ double Electric_Polarization_BandNonCol(
 	}
 
 	else if (scf_eigen_lib_flag==GPUSOLVER && GPU_CPU_SWITCH_NUM<=n2 && na_rows2==n2 && na_cols2==n2){
-	  OpenMX_CuSolver_DenseZheevx_1based(Hs2,Cs2,ko,n2,MaxN,
+	  OpenMX_GpuSolver_DenseZheevx_1based(Hs2,Cs2,ko,n2,MaxN,
 					     "Electric_Polarization_BandNonCol Hamiltonian GPU solver");
 	}
 
@@ -1003,7 +1003,7 @@ double Electric_Polarization_BandNonCol(
 	}
 
         else if (scf_eigen_lib_flag==GPUSOLVER && GPU_CPU_SWITCH_NUM<=n2 && na_rows==n && na_cols==n){
-          OpenMX_CuSolver_DenseZheevx_1based(Cs,Ss,ko,n,n,
+          OpenMX_GpuSolver_DenseZheevx_1based(Cs,Ss,ko,n,n,
                                              "Electric_Polarization_BandNonCol ABC overlap GPU solver");
         }
 
@@ -1172,7 +1172,7 @@ double Electric_Polarization_BandNonCol(
 	}
 
         else if (scf_eigen_lib_flag==GPUSOLVER && GPU_CPU_SWITCH_NUM<=n2 && na_rows2==n2 && na_cols2==n2){
-          OpenMX_CuSolver_DenseZheevx_1based(Hs2,Cs2,ko,n2,MaxN,
+          OpenMX_GpuSolver_DenseZheevx_1based(Hs2,Cs2,ko,n2,MaxN,
                                              "Electric_Polarization_BandNonCol ABC Hamiltonian GPU solver");
         }
 

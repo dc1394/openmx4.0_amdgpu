@@ -33,7 +33,7 @@ int TRAN_SCF_Iter_Band;
 static int DFT_GPU_BasisCount(void);
 static int DFT_SetOLPKinUseGPU(void);
 static int DFT_SetProExpnVNAUseGPU(void);
-double Cluster_DFT_NonCol_ScatterCuSolverCachedEVec(int n2, int *is2, int *ie2, dcomplex *EVec1);
+double Cluster_DFT_NonCol_ScatterGpuSolverCachedEVec(int n2, int *is2, int *ie2, dcomplex *EVec1);
 
 static int DFT_SetOLPKinUseGPU(void)
 {
@@ -203,10 +203,10 @@ static void DFT_ConfigureSetHamiltonianOpenACC(int myid0)
 static void DFT_PrepareCuSolverHSPackedCache(void)
 {
     if (scf_eigen_lib_flag == GPUSOLVER && (Solver == 2 || Solver == 3)) {
-        Set_Hamiltonian_Build_CuSolver_HS_Cache(Cnt_switch == 1);
+        Set_Hamiltonian_Build_GpuSolver_HS_Cache(Cnt_switch == 1);
     }
     else {
-        Set_Hamiltonian_Invalidate_CuSolver_HS_Cache();
+        Set_Hamiltonian_Invalidate_GpuSolver_HS_Cache();
     }
 }
 
@@ -1545,7 +1545,7 @@ double DFT(int MD_iter, int Cnt_Now)
 
   if (Solver==2 && SpinP_switch==3){
 
-    time5 += Cluster_DFT_NonCol_ScatterCuSolverCachedEVec(n*2,is2,ie2,EVec1_NonCol);
+    time5 += Cluster_DFT_NonCol_ScatterGpuSolverCachedEVec(n*2,is2,ie2,EVec1_NonCol);
 
     /* EDM */
 

@@ -4073,7 +4073,7 @@ static double DC_NonCol(char * mode, int SCF_iter, double ***** Hks, double ****
 
                     NUM1 = 2 * NUM - (P_min - 1);
 
-                    Eigen_cusolver_x_complex_openacc(C, ko, NUM1, NUM1);
+                    Eigen_gpusolver_x_complex_openacc(C, ko, NUM1, NUM1);
 
                     // dtime(&timeE);
                     // printf("timeD = %.3f\n", timeE - timeD);

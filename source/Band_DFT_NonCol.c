@@ -3343,8 +3343,8 @@ double Band_DFT_NonCol(
     int root_dense_owner;
     int owns_root_dense;
     int use_setham_packed_cache =
-      (Set_Hamiltonian_CuSolver_Packed_CacheReady() &&
-       Set_Hamiltonian_CuSolver_Packed_OrderMode()==1);
+      (Set_Hamiltonian_GpuSolver_Packed_CacheReady() &&
+       Set_Hamiltonian_GpuSolver_Packed_OrderMode()==1);
     int root_s_valid = 0;
     int rebuild_overlap;
     int root_rank;
@@ -3365,20 +3365,20 @@ double Band_DFT_NonCol(
     owns_root_dense = (myid0==root_dense_owner);
 
     if (use_setham_packed_cache){
-      Set_Hamiltonian_CuSolver_SetMP(MP);
+      Set_Hamiltonian_GpuSolver_SetMP(MP);
       if (owns_root_dense){
-        if (!Set_Hamiltonian_CuSolver_Packed_OwnsCache()){
+        if (!Set_Hamiltonian_GpuSolver_Packed_OwnsCache()){
           BandNonCol_AbortWithMessage("Set_Hamiltonian packed cache is not owned by this rank in Band_DFT_NonCol.c.");
         }
-        packed_order_GA = Set_Hamiltonian_CuSolver_Packed_OrderGA();
-        m_olp = Set_Hamiltonian_CuSolver_Packed_Overlap();
-        m_h11 = Set_Hamiltonian_CuSolver_Packed_H(0);
-        m_h22 = Set_Hamiltonian_CuSolver_Packed_H(1);
-        m_h12 = Set_Hamiltonian_CuSolver_Packed_H(2);
-        m_h12i = Set_Hamiltonian_CuSolver_Packed_H(3);
-        m_i11 = Set_Hamiltonian_CuSolver_Packed_ImNL(0);
-        m_i22 = Set_Hamiltonian_CuSolver_Packed_ImNL(1);
-        m_i12 = Set_Hamiltonian_CuSolver_Packed_ImNL(2);
+        packed_order_GA = Set_Hamiltonian_GpuSolver_Packed_OrderGA();
+        m_olp = Set_Hamiltonian_GpuSolver_Packed_Overlap();
+        m_h11 = Set_Hamiltonian_GpuSolver_Packed_H(0);
+        m_h22 = Set_Hamiltonian_GpuSolver_Packed_H(1);
+        m_h12 = Set_Hamiltonian_GpuSolver_Packed_H(2);
+        m_h12i = Set_Hamiltonian_GpuSolver_Packed_H(3);
+        m_i11 = Set_Hamiltonian_GpuSolver_Packed_ImNL(0);
+        m_i22 = Set_Hamiltonian_GpuSolver_Packed_ImNL(1);
+        m_i12 = Set_Hamiltonian_GpuSolver_Packed_ImNL(2);
 
         if (packed_order_GA==NULL || m_olp==NULL || m_h11==NULL || m_h22==NULL ||
             m_h12==NULL || m_h12i==NULL || m_i11==NULL || m_i22==NULL || m_i12==NULL){

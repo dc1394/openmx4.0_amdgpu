@@ -1946,14 +1946,14 @@ double Band_DFT_Col(int SCF_iter, int knum_i, int knum_j, int knum_k, int SpinP_
     owns_dense_k_rank = (use_cusolver_dense && Set_Hamiltonian_OpenACC_Rank_Is_Selected());
     owns_global_dense_rank = (all_knum == 1 && owns_dense_k_rank);
     use_setham_packed_cache =
-        (use_cusolver_dense && all_knum == 1 && Set_Hamiltonian_CuSolver_Packed_CacheReady() &&
-         Set_Hamiltonian_CuSolver_Packed_OrderMode() == 0);
+        (use_cusolver_dense && all_knum == 1 && Set_Hamiltonian_GpuSolver_Packed_CacheReady() &&
+         Set_Hamiltonian_GpuSolver_Packed_OrderMode() == 0);
     if (use_setham_packed_cache) {
-        size_H1 = Set_Hamiltonian_CuSolver_Packed_Size();
-        Set_Hamiltonian_CuSolver_SetMP(MP);
-        if (Set_Hamiltonian_CuSolver_Packed_OwnsCache()) {
-            setham_order_GA = Set_Hamiltonian_CuSolver_Packed_OrderGA();
-            setham_S1 = Set_Hamiltonian_CuSolver_Packed_Overlap();
+        size_H1 = Set_Hamiltonian_GpuSolver_Packed_Size();
+        Set_Hamiltonian_GpuSolver_SetMP(MP);
+        if (Set_Hamiltonian_GpuSolver_Packed_OwnsCache()) {
+            setham_order_GA = Set_Hamiltonian_GpuSolver_Packed_OrderGA();
+            setham_S1 = Set_Hamiltonian_GpuSolver_Packed_Overlap();
         }
     }
 
@@ -2206,7 +2206,7 @@ double Band_DFT_Col(int SCF_iter, int knum_i, int knum_j, int knum_k, int SpinP_
     /* set S1 */
 
     if (use_setham_packed_cache) {
-        if (Set_Hamiltonian_CuSolver_Packed_OwnsCache()) {
+        if (Set_Hamiltonian_GpuSolver_Packed_OwnsCache()) {
             if (setham_order_GA == NULL || setham_S1 == NULL) {
                 BandCol_AbortWithMessage("Set_Hamiltonian packed overlap cache is missing in Band_DFT_Col.c.");
             }
@@ -2225,8 +2225,8 @@ diagonalize1:
     if (use_setham_packed_cache) {
         int cache_spin = (SpinP_switch == 0) ? 0 : spin;
 
-        if (Set_Hamiltonian_CuSolver_Packed_OwnsCache()) {
-            setham_H1 = Set_Hamiltonian_CuSolver_Packed_H(cache_spin);
+        if (Set_Hamiltonian_GpuSolver_Packed_OwnsCache()) {
+            setham_H1 = Set_Hamiltonian_GpuSolver_Packed_H(cache_spin);
             if (setham_H1 == NULL) {
                 BandCol_AbortWithMessage("Set_Hamiltonian packed Hamiltonian cache is missing in Band_DFT_Col.c.");
             }

@@ -968,8 +968,8 @@ static void ClusterCol_CuSolverRootDensePath(int SCF_iter, int SpinP_switch, dou
     int spin_end = SpinP_switch;
     int rebuild_s = (SCF_iter==1);
     int use_setham_packed_cache =
-        (Set_Hamiltonian_CuSolver_Packed_CacheReady() &&
-         Set_Hamiltonian_CuSolver_Packed_OrderMode() == 0);
+        (Set_Hamiltonian_GpuSolver_Packed_CacheReady() &&
+         Set_Hamiltonian_GpuSolver_Packed_OrderMode() == 0);
 
     if (SpinP_switch==1 && numprocs0!=1){
         spin_start = myworld1;
@@ -981,14 +981,14 @@ static void ClusterCol_CuSolverRootDensePath(int SCF_iter, int SpinP_switch, dou
             fprintf(stderr,
                     "<Cluster> rank %d: hipSOLVER collinear dense GPU path requires the Set_Hamiltonian packed cache "
                     "(cache_ready=%d, order_mode=%d). Refusing the old dense fallback.\n",
-                    myid0, Set_Hamiltonian_CuSolver_Packed_CacheReady(),
-                    Set_Hamiltonian_CuSolver_Packed_OrderMode());
+                    myid0, Set_Hamiltonian_GpuSolver_Packed_CacheReady(),
+                    Set_Hamiltonian_GpuSolver_Packed_OrderMode());
             fflush(stderr);
         }
         ClusterCol_AbortWithMessage("Cluster_DFT_Col hipSOLVER dense GPU path is missing its packed cache.");
     }
 
-    Set_Hamiltonian_CuSolver_SetMP(MP);
+    Set_Hamiltonian_GpuSolver_SetMP(MP);
     ClusterCol_ReleaseCuSolverCachedEVec(myid1);
     ClusterCol_DetailTimer_Begin(myid1, SCF_iter, n, MaxN);
 
@@ -1018,12 +1018,12 @@ static void ClusterCol_CuSolverRootDensePath(int SCF_iter, int SpinP_switch, dou
 
     if (rebuild_s){
         if (owns_dense) {
-            int tnum = Set_Hamiltonian_CuSolver_Packed_Size();
-            int *cache_order_GA = Set_Hamiltonian_CuSolver_Packed_OrderGA();
-            double *cache_S = Set_Hamiltonian_CuSolver_Packed_Overlap();
+            int tnum = Set_Hamiltonian_GpuSolver_Packed_Size();
+            int *cache_order_GA = Set_Hamiltonian_GpuSolver_Packed_OrderGA();
+            double *cache_S = Set_Hamiltonian_GpuSolver_Packed_Overlap();
             int *dense_index = NULL;
 
-            if (!Set_Hamiltonian_CuSolver_Packed_OwnsCache() || cache_order_GA == NULL || cache_S == NULL) {
+            if (!Set_Hamiltonian_GpuSolver_Packed_OwnsCache() || cache_order_GA == NULL || cache_S == NULL) {
                 ClusterCol_AbortWithMessage("Set_Hamiltonian packed overlap cache is missing in Cluster_DFT_Col.c.");
             }
             dense_index = (int*)ClusterCol_MallocArray((size_t)tnum,sizeof(int),"packed overlap dense_index");
@@ -1038,14 +1038,14 @@ static void ClusterCol_CuSolverRootDensePath(int SCF_iter, int SpinP_switch, dou
 
     for (int spin=spin_start; spin<=spin_end; spin++){
         if (owns_dense){
-            int tnum = Set_Hamiltonian_CuSolver_Packed_Size();
-            int *cache_order_GA = Set_Hamiltonian_CuSolver_Packed_OrderGA();
-            double *cache_H = Set_Hamiltonian_CuSolver_Packed_H(spin);
+            int tnum = Set_Hamiltonian_GpuSolver_Packed_Size();
+            int *cache_order_GA = Set_Hamiltonian_GpuSolver_Packed_OrderGA();
+            double *cache_H = Set_Hamiltonian_GpuSolver_Packed_H(spin);
             int *dense_index = NULL;
             size_t nmax = ClusterCol_CheckedMulCount((size_t)n,(size_t)MaxN,"root dense eigenvectors");
             double *C = NULL;
 
-            if (!Set_Hamiltonian_CuSolver_Packed_OwnsCache() || cache_order_GA == NULL || cache_H == NULL) {
+            if (!Set_Hamiltonian_GpuSolver_Packed_OwnsCache() || cache_order_GA == NULL || cache_H == NULL) {
                 ClusterCol_AbortWithMessage("Set_Hamiltonian packed Hamiltonian cache is missing in Cluster_DFT_Col.c.");
             }
             dense_index = (int*)ClusterCol_MallocArray((size_t)tnum,sizeof(int),"packed Hamiltonian dense_index");
@@ -1115,7 +1115,7 @@ static void ClusterCol_CuSolverDensePath(
     C   = (double *)ClusterCol_MallocArray(dense_count, sizeof(double), "GPU solver transformed eigenvectors");
 
     Patch2Full_Cluster(CntOLP, S, MP);
-    ClusterCol_CuSolver_CheckInfo("hipsolverDnDsyevdx(overlap)", cusolver_Syevdx(S, ko[0], n, n));
+    ClusterCol_CuSolver_CheckInfo("hipsolverDnDsyevdx(overlap)", gpusolver_Syevdx(S, ko[0], n, n));
 
     for (l = n; 1 <= l; l--) {
         ko[0][l] = ko[0][l - 1];
@@ -1157,7 +1157,7 @@ static void ClusterCol_CuSolverDensePath(
         F77_NAME(dgemm, DGEMM)("N", "N", &n, &n, &n, &alpha, H, &n, S, &n, &beta, tmp, &n);
         F77_NAME(dgemm, DGEMM)("T", "N", &n, &n, &n, &alpha, S, &n, tmp, &n, &beta, A, &n);
 
-        ClusterCol_CuSolver_CheckInfo("hipsolverDnDsyevdx(Hamiltonian)", cusolver_Syevdx(A, ko[spin], n, MaxN));
+        ClusterCol_CuSolver_CheckInfo("hipsolverDnDsyevdx(Hamiltonian)", gpusolver_Syevdx(A, ko[spin], n, MaxN));
 
         for (l = MaxN; 1 <= l; l--) {
             ko[spin][l] = ko[spin][l - 1];

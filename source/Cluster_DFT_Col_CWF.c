@@ -19,7 +19,7 @@
 #include <sys/stat.h>
 #include "mpi.h"
 #include "openmx_common.h"
-#include "openmx_cusolver_dense_utils.h"
+#include "openmx_gpusolver_dense_utils.h"
 #include "lapack_prototypes.h"
 #include "set_cuda_default_device_from_local_rank.h"
 #include "set_openacc_device_from_local_rank.h"
@@ -386,7 +386,7 @@ double Cluster_DFT_Col_CWF(
     }
 
     else if (scf_eigen_lib_flag==GPUSOLVER && GPU_CPU_SWITCH_NUM<=n && na_rows==n && na_cols==n){
-      OpenMX_CuSolver_DenseDsyevx_1based(Cs,Ss,ko[0],n,n,"Cluster_DFT_Col_CWF overlap GPU solver");
+      OpenMX_GpuSolver_DenseDsyevx_1based(Cs,Ss,ko[0],n,n,"Cluster_DFT_Col_CWF overlap GPU solver");
     }
 
     else if (scf_eigen_lib_flag==2 || scf_eigen_lib_flag==GPUSOLVER){
@@ -676,7 +676,7 @@ double Cluster_DFT_Col_CWF(
                                             &na_rows, &nblk, &mpi_comm_rows_int, &mpi_comm_cols_int);
   }
   else if (scf_eigen_lib_flag==GPUSOLVER && GPU_CPU_SWITCH_NUM<=n && na_rows==n && na_cols==n){
-    OpenMX_CuSolver_DenseDsyevx_1based(Hs,Cs,ko[spin],n,MaxN,"Cluster_DFT_Col_CWF Hamiltonian GPU solver");
+    OpenMX_GpuSolver_DenseDsyevx_1based(Hs,Cs,ko[spin],n,MaxN,"Cluster_DFT_Col_CWF Hamiltonian GPU solver");
   }
 
   else if (scf_eigen_lib_flag==2 || scf_eigen_lib_flag==GPUSOLVER){
