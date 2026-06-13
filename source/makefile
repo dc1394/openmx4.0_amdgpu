@@ -111,13 +111,12 @@ LIB= $(RPATHS) $(FFTW_LIBS) $(MATH_GROUP) $(MPI_FORTRAN_LIBS) $(ROCM_GPU_LIBS) $
 
 GEMMUL8_REPO_URL ?= https://github.com/RIKEN-RCCS/GEMMul8.git
 GEMMUL8_REPO_DIR ?= third_party/GEMMul8
-# gemmul8_openmx.cu depends on the old nested-repo layout; newer upstream
-# commits restructured the repository, so the checkout must stay pinned.
-GEMMUL8_COMMIT ?= 3115e709de0786e4cd8206753c44d71d309a6da3
-GEMMUL8_DIR ?= $(GEMMUL8_REPO_DIR)/GEMMul8
+# gemmul8_openmx.cu instantiates GEMMul8 internals directly, so the
+# checkout must stay pinned to a commit whose internal layout it matches.
+GEMMUL8_COMMIT ?= 884a28750f28ae39a20475db8c2ebe4130b4d4ef
+GEMMUL8_DIR ?= $(GEMMUL8_REPO_DIR)
 GEMMUL8_LIB ?= $(GEMMUL8_DIR)/lib/libgemmul8.a
-GEMMUL8_OPENMX_OBJ ?= gemmul8_openmx.o
-GEMMUL8_HIP_PATH ?= $(ROCM)
+GEMMUL8_OPENMX_OBJ ?= $(GEMMUL8_DIR)/src/gemmul8_openmx.o
 GEMMUL8_GPU_ARCH ?= $(ARCH)
 HIPCC_GEMMUL8_FLAGS = -std=c++20 -O3 --offload-arch=$(GEMMUL8_GPU_ARCH) -I. -I$(GEMMUL8_DIR)/include -I$(GEMMUL8_DIR)/src -I$(ROCM)/include -D__HIP_PLATFORM_AMD__ -ffp-contract=off -Wno-unused-result -Wno-unused-command-line-argument -Wno-unused-value -DOCML_BASIC_ROUNDED_OPERATIONS -DGPU_ARCH=$(GEMMUL8_GPU_ARCH)
 MAGMA_VERSION ?= 2.9.0
@@ -694,7 +693,7 @@ $(GEMMUL8_DIR)/Makefile:
 $(GEMMUL8_OPENMX_OBJ): gemmul8_openmx.cu $(GEMMUL8_DIR)/Makefile
 	$(HIPCC) $(HIPCC_GEMMUL8_FLAGS) -c gemmul8_openmx.cu -o $(GEMMUL8_OPENMX_OBJ)
 $(GEMMUL8_LIB): $(GEMMUL8_OPENMX_OBJ)
-	$(MAKE) -C $(GEMMUL8_DIR) BACKEND=hip HIP_PATH=$(GEMMUL8_HIP_PATH) GPU_ARCH=$(GEMMUL8_GPU_ARCH) lib/libgemmul8.a
+	mkdir -p $(GEMMUL8_DIR)/lib
 	ar rcs $(GEMMUL8_LIB) $(GEMMUL8_OPENMX_OBJ)
 $(MAGMA_DIR)/Makefile:
 	mkdir -p "$(MAGMA_DIR)"
