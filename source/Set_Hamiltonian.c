@@ -60,9 +60,9 @@ typedef struct {
     double *overlap;
     double *h[4];
     double *imnl[3];
-} SetHamiltonianCuSolverPackedCache;
+} SetHamiltonianGpuSolverPackedCache;
 
-static SetHamiltonianCuSolverPackedCache Set_Hamiltonian_CuSolver_Cache = {0};
+static SetHamiltonianGpuSolverPackedCache Set_Hamiltonian_GpuSolver_Cache = {0};
 
 static void Set_Hamiltonian_abort(const char *where, const char *message, int myid)
 {
@@ -273,9 +273,9 @@ static void *Set_Hamiltonian_malloc(size_t bytes, const char *name, int myid)
     return p;
 }
 
-static void Set_Hamiltonian_CuSolver_Free_Cache(void)
+static void Set_Hamiltonian_GpuSolver_Free_Cache(void)
 {
-    SetHamiltonianCuSolverPackedCache *cache = &Set_Hamiltonian_CuSolver_Cache;
+    SetHamiltonianGpuSolverPackedCache *cache = &Set_Hamiltonian_GpuSolver_Cache;
     int i;
 
     free(cache->order_GA);
@@ -292,10 +292,10 @@ static void Set_Hamiltonian_CuSolver_Free_Cache(void)
 
 void Set_Hamiltonian_Invalidate_GpuSolver_HS_Cache(void)
 {
-    Set_Hamiltonian_CuSolver_Free_Cache();
+    Set_Hamiltonian_GpuSolver_Free_Cache();
 }
 
-static int Set_Hamiltonian_CuSolver_LocalPackedSize(int myid)
+static int Set_Hamiltonian_GpuSolver_LocalPackedSize(int myid)
 {
     size_t total = 0;
 
@@ -328,7 +328,7 @@ static int Set_Hamiltonian_CuSolver_LocalPackedSize(int myid)
     return (int)total;
 }
 
-static void Set_Hamiltonian_CuSolver_PackLocalMatrix(double ****mat, double *local, int local_size, int order_mode,
+static void Set_Hamiltonian_GpuSolver_PackLocalMatrix(double ****mat, double *local, int local_size, int order_mode,
                                                      int myid)
 {
     int k = 0;
@@ -375,7 +375,7 @@ static void Set_Hamiltonian_CuSolver_PackLocalMatrix(double ****mat, double *loc
     }
 }
 
-static void Set_Hamiltonian_CuSolver_GatherMatrixToSelected(double ****mat, double **target, int order_mode,
+static void Set_Hamiltonian_GpuSolver_GatherMatrixToSelected(double ****mat, double **target, int order_mode,
                                                              int local_size, int total_size, const int *counts,
                                                             const int *displs, const int *selected_roots,
                                                             MPI_Comm selected_comm, int first_selected_root,
@@ -387,7 +387,7 @@ static void Set_Hamiltonian_CuSolver_GatherMatrixToSelected(double ****mat, doub
     *target = NULL;
     local = (double *)Set_Hamiltonian_malloc(sizeof(double) * (size_t)(0 < local_size ? local_size : 1),
                                              "GPU solver packed local matrix", myid);
-    Set_Hamiltonian_CuSolver_PackLocalMatrix(mat, local, local_size, order_mode, myid);
+    Set_Hamiltonian_GpuSolver_PackLocalMatrix(mat, local, local_size, order_mode, myid);
 
     if (myid == first_selected_root) {
         recvbuf = (double *)Set_Hamiltonian_malloc(sizeof(double) * (size_t)(0 < total_size ? total_size : 1),
@@ -428,7 +428,7 @@ void Set_Hamiltonian_GpuSolver_SetMP(int *MP)
 
 void Set_Hamiltonian_Build_GpuSolver_HS_Cache(int use_contracted)
 {
-    SetHamiltonianCuSolverPackedCache *cache = &Set_Hamiltonian_CuSolver_Cache;
+    SetHamiltonianGpuSolverPackedCache *cache = &Set_Hamiltonian_GpuSolver_Cache;
     int myid, numprocs;
     int local_selected;
     int selected_count = 0;
@@ -451,7 +451,7 @@ void Set_Hamiltonian_Build_GpuSolver_HS_Cache(int use_contracted)
     MPI_Comm_size(mpi_comm_level1, &numprocs);
     MPI_Comm_rank(mpi_comm_level1, &myid);
 
-    Set_Hamiltonian_CuSolver_Free_Cache();
+    Set_Hamiltonian_GpuSolver_Free_Cache();
 
     if (scf_eigen_lib_flag != GPUSOLVER) {
         return;
@@ -460,7 +460,7 @@ void Set_Hamiltonian_Build_GpuSolver_HS_Cache(int use_contracted)
     order_mode = (SpinP_switch == 3) ? SET_HAMILTONIAN_PACK_ORDER_NONCOL : SET_HAMILTONIAN_PACK_ORDER_COL;
     spin_count = (SpinP_switch == 3) ? 4 : (SpinP_switch + 1);
     local_selected = Set_Hamiltonian_OpenACC_Rank_Selected ? 1 : 0;
-    local_size = Set_Hamiltonian_CuSolver_LocalPackedSize(myid);
+    local_size = Set_Hamiltonian_GpuSolver_LocalPackedSize(myid);
     local_matomnum = Matomnum;
 
     selected_roots = (int *)Set_Hamiltonian_malloc(sizeof(int) * (size_t)numprocs, "GPU solver selected roots", myid);
@@ -545,19 +545,19 @@ void Set_Hamiltonian_Build_GpuSolver_HS_Cache(int use_contracted)
     h_src = use_contracted ? CntH : H;
     imnl_src = use_contracted ? iCntHNL : iHNL;
 
-    Set_Hamiltonian_CuSolver_GatherMatrixToSelected(overlap_src, &cache->overlap, order_mode, local_size, total_size,
+    Set_Hamiltonian_GpuSolver_GatherMatrixToSelected(overlap_src, &cache->overlap, order_mode, local_size, total_size,
                                                     counts, displs, selected_roots, selected_comm,
                                                     first_selected_root, myid);
 
     for (int spin = 0; spin < spin_count; spin++) {
-        Set_Hamiltonian_CuSolver_GatherMatrixToSelected(h_src[spin], &cache->h[spin], order_mode, local_size,
+        Set_Hamiltonian_GpuSolver_GatherMatrixToSelected(h_src[spin], &cache->h[spin], order_mode, local_size,
                                                         total_size, counts, displs, selected_roots, selected_comm,
                                                         first_selected_root, myid);
     }
 
     if (SpinP_switch == 3 && imnl_src != NULL) {
         for (int comp = 0; comp < 3; comp++) {
-            Set_Hamiltonian_CuSolver_GatherMatrixToSelected(imnl_src[comp], &cache->imnl[comp], order_mode,
+            Set_Hamiltonian_GpuSolver_GatherMatrixToSelected(imnl_src[comp], &cache->imnl[comp], order_mode,
                                                             local_size, total_size, counts, displs, selected_roots,
                                                             selected_comm, first_selected_root, myid);
         }
@@ -576,33 +576,33 @@ void Set_Hamiltonian_Build_GpuSolver_HS_Cache(int use_contracted)
 
 int Set_Hamiltonian_GpuSolver_Packed_CacheReady(void)
 {
-    return Set_Hamiltonian_CuSolver_Cache.ready;
+    return Set_Hamiltonian_GpuSolver_Cache.ready;
 }
 
 int Set_Hamiltonian_GpuSolver_Packed_OwnsCache(void)
 {
-    SetHamiltonianCuSolverPackedCache *cache = &Set_Hamiltonian_CuSolver_Cache;
+    SetHamiltonianGpuSolverPackedCache *cache = &Set_Hamiltonian_GpuSolver_Cache;
     return (cache->ready && cache->owns);
 }
 
 int Set_Hamiltonian_GpuSolver_Packed_OrderMode(void)
 {
-    return Set_Hamiltonian_CuSolver_Cache.order_mode;
+    return Set_Hamiltonian_GpuSolver_Cache.order_mode;
 }
 
 int Set_Hamiltonian_GpuSolver_Packed_Size(void)
 {
-    return Set_Hamiltonian_CuSolver_Cache.size;
+    return Set_Hamiltonian_GpuSolver_Cache.size;
 }
 
 int *Set_Hamiltonian_GpuSolver_Packed_OrderGA(void)
 {
-    return Set_Hamiltonian_CuSolver_Cache.order_GA;
+    return Set_Hamiltonian_GpuSolver_Cache.order_GA;
 }
 
 double *Set_Hamiltonian_GpuSolver_Packed_Overlap(void)
 {
-    return Set_Hamiltonian_CuSolver_Cache.overlap;
+    return Set_Hamiltonian_GpuSolver_Cache.overlap;
 }
 
 double *Set_Hamiltonian_GpuSolver_Packed_H(int spin)
@@ -610,7 +610,7 @@ double *Set_Hamiltonian_GpuSolver_Packed_H(int spin)
     if (spin < 0 || 4 <= spin) {
         return NULL;
     }
-    return Set_Hamiltonian_CuSolver_Cache.h[spin];
+    return Set_Hamiltonian_GpuSolver_Cache.h[spin];
 }
 
 double *Set_Hamiltonian_GpuSolver_Packed_ImNL(int comp)
@@ -618,7 +618,7 @@ double *Set_Hamiltonian_GpuSolver_Packed_ImNL(int comp)
     if (comp < 0 || 3 <= comp) {
         return NULL;
     }
-    return Set_Hamiltonian_CuSolver_Cache.imnl[comp];
+    return Set_Hamiltonian_GpuSolver_Cache.imnl[comp];
 }
 
 double Set_Hamiltonian(char * mode, int MD_iter, int SCF_iter, int SCF_iter0, int TRAN_Poisson_flag2,

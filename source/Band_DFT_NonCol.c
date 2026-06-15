@@ -108,15 +108,15 @@ typedef struct
     size_t             d_work_bytes;
     size_t             h_work_bytes;
     cudaStream_t       stream;
-    cusolverDnHandle_t cusolver;
+    cusolverDnHandle_t gpusolver;
     dcomplex *         d_A;
     double *           d_W;
     int32_t *          d_info;
     void *             d_work;
     void *             h_work;
-} BandNonColCuSolverWorkspace;
+} BandNonColGpuSolverWorkspace;
 
-static BandNonColCuSolverWorkspace BandNonCol_cusolver_workspace = {0};
+static BandNonColGpuSolverWorkspace BandNonCol_gpusolver_workspace = {0};
 
 typedef struct
 {
@@ -356,16 +356,16 @@ static void BandNonCol_DMGpu_Destroy(void)
     w->device_id = -1;
 }
 
-static void BandNonCol_CuSolver_Destroy(void)
+static void BandNonCol_GpuSolver_Destroy(void)
 {
-    BandNonColCuSolverWorkspace * w = &BandNonCol_cusolver_workspace;
+    BandNonColGpuSolverWorkspace * w = &BandNonCol_gpusolver_workspace;
 
     if (w->d_A      != NULL) wait_cudafunc(cudaFree(w->d_A));
     if (w->d_W      != NULL) wait_cudafunc(cudaFree(w->d_W));
     if (w->d_info   != NULL) wait_cudafunc(cudaFree(w->d_info));
     if (w->d_work   != NULL) wait_cudafunc(cudaFree(w->d_work));
     if (w->h_work   != NULL) free(w->h_work);
-    if (w->cusolver != NULL) wait_cudafunc(cusolverDnDestroy(w->cusolver));
+    if (w->gpusolver != NULL) wait_cudafunc(cusolverDnDestroy(w->gpusolver));
     if (w->stream   != NULL) wait_cudafunc(cudaStreamDestroy(w->stream));
 
     memset(w, 0, sizeof(*w));
@@ -386,34 +386,34 @@ static void BandNonCol_DMGpu_Init(void)
     w->device_id   = current_device;
 }
 
-static void BandNonCol_CuSolver_Init(void)
+static void BandNonCol_GpuSolver_Init(void)
 {
-    BandNonColCuSolverWorkspace * w = &BandNonCol_cusolver_workspace;
+    BandNonColGpuSolverWorkspace * w = &BandNonCol_gpusolver_workspace;
     int current_device;
 
     wait_cudafunc(cudaGetDevice(&current_device));
     if (w->initialized && w->device_id == current_device) return;
-    if (w->initialized) BandNonCol_CuSolver_Destroy();
+    if (w->initialized) BandNonCol_GpuSolver_Destroy();
 
     wait_cudafunc(cudaStreamCreateWithFlags(&w->stream, cudaStreamNonBlocking));
-    wait_cudafunc(cusolverDnCreate(&w->cusolver));
-    wait_cudafunc(cusolverDnSetStream(w->cusolver, w->stream));
+    wait_cudafunc(cusolverDnCreate(&w->gpusolver));
+    wait_cudafunc(cusolverDnSetStream(w->gpusolver, w->stream));
 
     w->initialized = 1;
     w->device_id   = current_device;
 }
 
-static void BandNonCol_CuSolver_EnsureInfo(void)
+static void BandNonCol_GpuSolver_EnsureInfo(void)
 {
-    BandNonColCuSolverWorkspace * w = &BandNonCol_cusolver_workspace;
+    BandNonColGpuSolverWorkspace * w = &BandNonCol_gpusolver_workspace;
 
-    BandNonCol_CuSolver_Init();
+    BandNonCol_GpuSolver_Init();
     if (w->d_info==NULL) wait_cudafunc(cudaMalloc((void**)&w->d_info,sizeof(int32_t)));
 }
 
-static void BandNonCol_CuSolver_ReleaseDeviceWorkspace(void)
+static void BandNonCol_GpuSolver_ReleaseDeviceWorkspace(void)
 {
-    BandNonColCuSolverWorkspace * w = &BandNonCol_cusolver_workspace;
+    BandNonColGpuSolverWorkspace * w = &BandNonCol_gpusolver_workspace;
 
     if (w->d_work!=NULL) wait_cudafunc(cudaFree(w->d_work));
     w->d_work = NULL;
@@ -448,14 +448,14 @@ static int BandNonCol_MaxConcurrentKGpuTurns(void)
     return 4;
 }
 
-static void BandNonCol_CuSolver_EnsureMatrixCapacity(int n)
+static void BandNonCol_GpuSolver_EnsureMatrixCapacity(int n)
 {
-    BandNonColCuSolverWorkspace * w = &BandNonCol_cusolver_workspace;
+    BandNonColGpuSolverWorkspace * w = &BandNonCol_gpusolver_workspace;
     size_t nn;
 
     if (n<=0) BandNonCol_AbortWithMessage("Invalid GPU solver matrix size in Band_DFT_NonCol.c.");
 
-    BandNonCol_CuSolver_Init();
+    BandNonCol_GpuSolver_Init();
     if (n<=w->matrix_dim) return;
 
     if (w->d_A    != NULL) wait_cudafunc(cudaFree(w->d_A));
@@ -470,9 +470,9 @@ static void BandNonCol_CuSolver_EnsureMatrixCapacity(int n)
     w->matrix_dim = n;
 }
 
-static void BandNonCol_CuSolver_EnsureWorkspace(int n, int maxn)
+static void BandNonCol_GpuSolver_EnsureWorkspace(int n, int maxn)
 {
-    BandNonColCuSolverWorkspace * w = &BandNonCol_cusolver_workspace;
+    BandNonColGpuSolverWorkspace * w = &BandNonCol_gpusolver_workspace;
     cusolverEigMode_t  jobz = CUSOLVER_EIG_MODE_VECTOR;
     cublasFillMode_t   uplo = CUBLAS_FILL_MODE_LOWER;
     cusolverEigRange_t range;
@@ -486,10 +486,10 @@ static void BandNonCol_CuSolver_EnsureWorkspace(int n, int maxn)
         BandNonCol_AbortWithMessage("Invalid GPU solver eigensolver dimensions in Band_DFT_NonCol.c.");
     }
 
-    BandNonCol_CuSolver_EnsureMatrixCapacity(n);
+    BandNonCol_GpuSolver_EnsureMatrixCapacity(n);
     range = (n==maxn) ? CUSOLVER_EIG_RANGE_ALL : CUSOLVER_EIG_RANGE_I;
 
-    wait_cudafunc(cusolverDnXsyevdx_bufferSize(w->cusolver,NULL,jobz,range,uplo,n,
+    wait_cudafunc(cusolverDnXsyevdx_bufferSize(w->gpusolver,NULL,jobz,range,uplo,n,
                                                CUDA_C_64F,(cuDoubleComplex*)w->d_A,n,&vl,&vu,1L,maxn,&h_meig,
                                                CUDA_R_64F,w->d_W,CUDA_C_64F,&d_bytes,&h_bytes));
 
@@ -513,7 +513,7 @@ static void BandNonCol_CuSolver_EnsureWorkspace(int n, int maxn)
     }
 }
 
-static void BandNonCol_CuSolver_DenseZheevx_Device(dcomplex *A, double *ko, int n, int maxn,
+static void BandNonCol_GpuSolver_DenseZheevx_Device(dcomplex *A, double *ko, int n, int maxn,
                                                    const char *where)
 {
     dcomplex *d_A = NULL;
@@ -739,7 +739,7 @@ static void BandNonCol_AddDense_OpenACC(int n, dcomplex *dst, const dcomplex *sr
     }
 }
 
-static void BandNonCol_CuSolver_DenseZheevx(dcomplex *A, dcomplex *Z, double *ko, int n, int maxn,
+static void BandNonCol_GpuSolver_DenseZheevx(dcomplex *A, dcomplex *Z, double *ko, int n, int maxn,
                                             const char *where)
 {
     dcomplex *d_A = NULL;
@@ -855,7 +855,7 @@ static size_t BandNonCol_MaxBytes(size_t a, size_t b)
     return (a<b) ? b : a;
 }
 
-static size_t BandNonCol_CuSolverWorkFallbackBytes(int n)
+static size_t BandNonCol_GpuSolverWorkFallbackBytes(int n)
 {
     size_t nn = BandNonCol_CheckedMul((size_t)n,(size_t)n,"GPU solver fallback workspace matrix count");
     size_t matrix_bytes = BandNonCol_ArrayBytes(nn,sizeof(dcomplex),"GPU solver fallback workspace matrix");
@@ -863,7 +863,7 @@ static size_t BandNonCol_CuSolverWorkFallbackBytes(int n)
     return BandNonCol_CheckedMul(matrix_bytes,4U,"GPU solver fallback workspace");
 }
 
-static size_t BandNonCol_QueryCuSolverWorkBytes(int n, int maxn)
+static size_t BandNonCol_QueryGpuSolverWorkBytes(int n, int maxn)
 {
     cusolverDnHandle_t handle = NULL;
     cudaStream_t stream = NULL;
@@ -877,7 +877,7 @@ static size_t BandNonCol_QueryCuSolverWorkBytes(int n, int maxn)
     int64_t h_meig = 0;
     size_t d_bytes = 0;
     size_t h_bytes = 0;
-    size_t fallback = BandNonCol_CuSolverWorkFallbackBytes(n);
+    size_t fallback = BandNonCol_GpuSolverWorkFallbackBytes(n);
 
     cuda_status = cudaStreamCreateWithFlags(&stream,cudaStreamNonBlocking);
     if (cuda_status!=cudaSuccess) return fallback;
@@ -912,8 +912,8 @@ static size_t BandNonCol_RootDenseDeviceBytes(int n, int n2, int MaxN, int size_
     size_t overlap_peak = 0;
     size_t hamiltonian_peak = 0;
     size_t wavefunction_peak = 0;
-    size_t work_n = BandNonCol_QueryCuSolverWorkBytes(n,n);
-    size_t work_n2 = BandNonCol_QueryCuSolverWorkBytes(n2,MaxN);
+    size_t work_n = BandNonCol_QueryGpuSolverWorkBytes(n,n);
+    size_t work_n2 = BandNonCol_QueryGpuSolverWorkBytes(n2,MaxN);
     size_t ko_bytes = BandNonCol_ArrayBytes((size_t)n2+1U,sizeof(double),"root dense eigenvalue vector");
 
     BandNonCol_AddBytes(&construct_bytes,
@@ -2624,9 +2624,9 @@ double Band_DFT_NonCol(
 
   int AN,Rn,size_H1;
   int parallel_mode;
-  int use_root_dense_cusolver;
-  int use_k_dense_cusolver;
-  int root_dense_serial_cusolver_worlds = 0;
+  int use_root_dense_gpusolver;
+  int use_k_dense_gpusolver;
+  int root_dense_serial_gpusolver_worlds = 0;
   int owns_dense_k_rank;
   int numprocs0,myid0;
   int ID,ID0,ID1;
@@ -3077,11 +3077,11 @@ double Band_DFT_NonCol(
 	  MPI_Allreduce(&num_kloop0, &all_knum, 1, MPI_INT, MPI_PROD, mpi_comm_level1);
 	  MPI_Allreduce(&num_kloop0, &max_num_kloop0, 1, MPI_INT, MPI_MAX, mpi_comm_level1);
 
-		  use_root_dense_cusolver = (scf_eigen_lib_flag==GPUSOLVER && all_knum==1 && GPU_CPU_SWITCH_NUM<=n2);
-		  use_k_dense_cusolver = (scf_eigen_lib_flag==GPUSOLVER && all_knum!=1 &&
+		  use_root_dense_gpusolver = (scf_eigen_lib_flag==GPUSOLVER && all_knum==1 && GPU_CPU_SWITCH_NUM<=n2);
+		  use_k_dense_gpusolver = (scf_eigen_lib_flag==GPUSOLVER && all_knum!=1 &&
 		                          GPU_CPU_SWITCH_NUM<=n2 && strcasecmp(mode,"scf")==0);
-		  owns_dense_k_rank = (use_k_dense_cusolver && Set_Hamiltonian_OpenACC_Rank_Is_Selected());
-		  if (use_root_dense_cusolver || use_k_dense_cusolver){
+		  owns_dense_k_rank = (use_k_dense_gpusolver && Set_Hamiltonian_OpenACC_Rank_Is_Selected());
+		  if (use_root_dense_gpusolver || use_k_dense_gpusolver){
 		    BandNonCol_SetDenseGemmul8Defaults();
 		    MPI_Barrier(mpi_comm_level1);
 		  }
@@ -3246,7 +3246,7 @@ double Band_DFT_NonCol(
 
   dtime(&SiloopTime);
 
-  if (use_k_dense_cusolver){
+  if (use_k_dense_gpusolver){
 
     int max_concurrent_gpu_turns = BandNonCol_MaxConcurrentKGpuTurns();
     BandNonColRootDenseWorkspace *rdw;
@@ -3337,7 +3337,7 @@ double Band_DFT_NonCol(
     free(m_i22);
     free(m_i12);
   }
-  else if (use_root_dense_cusolver){
+  else if (use_root_dense_gpusolver){
 
     int max_concurrent_gpu_turns = BandNonCol_MaxConcurrentKGpuTurns();
     int root_dense_owner;
@@ -3360,7 +3360,7 @@ double Band_DFT_NonCol(
     double *m_i12 = NULL;
     int *packed_order_GA = order_GA;
 
-    root_dense_serial_cusolver_worlds = 0;
+    root_dense_serial_gpusolver_worlds = 0;
     root_dense_owner = Comm_World_StartID2[myworld2];
     owns_root_dense = (myid0==root_dense_owner);
 
@@ -3518,7 +3518,7 @@ double Band_DFT_NonCol(
 	mpi_comm_cols_int = MPI_Comm_c2f(mpi_comm_cols);
 
 	if (scf_eigen_lib_flag==GPUSOLVER && GPU_CPU_SWITCH_NUM<=n2 && na_rows==n && na_cols==n){
-	  BandNonCol_CuSolver_DenseZheevx(Cs,Ss,ko,n,n,"Band_DFT_NonCol overlap");
+	  BandNonCol_GpuSolver_DenseZheevx(Cs,Ss,ko,n,n,"Band_DFT_NonCol overlap");
 	}
 	else if (scf_eigen_lib_flag==1 || (numprocs2<5 && scf_eigen_lib_flag!=GPUSOLVER)){
 	  F77_NAME(solve_evp_complex,SOLVE_EVP_COMPLEX)
@@ -3711,7 +3711,7 @@ double Band_DFT_NonCol(
       mpi_comm_cols_int = MPI_Comm_c2f(mpi_comm_cols);
 
         if (scf_eigen_lib_flag==GPUSOLVER && GPU_CPU_SWITCH_NUM<=n2 && na_rows2==n2 && na_cols2==n2){
-          BandNonCol_CuSolver_DenseZheevx(Hs2,Cs2,ko,n2,MaxN,"Band_DFT_NonCol Hamiltonian");
+          BandNonCol_GpuSolver_DenseZheevx(Hs2,Cs2,ko,n2,MaxN,"Band_DFT_NonCol Hamiltonian");
         }
         else if (scf_eigen_lib_flag==1 || (numprocs2<5 && scf_eigen_lib_flag!=GPUSOLVER)){
 	  F77_NAME(solve_evp_complex,SOLVE_EVP_COMPLEX)
@@ -3891,8 +3891,8 @@ double Band_DFT_NonCol(
 
   for (kloop=0; kloop<T_knum; kloop++){
     /* get ID in the zeroth world */
-    if (use_root_dense_cusolver){
-      ID = root_dense_serial_cusolver_worlds ? Host_ID : Comm_World_StartID2[kloop];
+    if (use_root_dense_gpusolver){
+      ID = root_dense_serial_gpusolver_worlds ? Host_ID : Comm_World_StartID2[kloop];
     }
     else {
       ID = Comm_World_StartID1[0] + T_k_ID[myworld1][kloop];
@@ -4119,7 +4119,7 @@ double Band_DFT_NonCol(
 
     if ( strcasecmp(mode,"scf")==0 ){
 
-      if (use_root_dense_cusolver){
+      if (use_root_dense_gpusolver){
         int root_dense_owner = Comm_World_StartID2[kloop];
         int owns_root_dense = (myid0==root_dense_owner);
         BandNonColRootDenseWorkspace *rdw = &BandNonCol_root_dense_workspace;
@@ -4218,7 +4218,7 @@ double Band_DFT_NonCol(
 
 	    /* for kloop */
 
-	    if (use_k_dense_cusolver){
+	    if (use_k_dense_gpusolver){
 	      int max_concurrent_gpu_turns = BandNonCol_MaxConcurrentKGpuTurns();
 	      BandNonColRootDenseWorkspace *rdw;
 	      double *pack_buffer = NULL;
@@ -4365,7 +4365,7 @@ double Band_DFT_NonCol(
 	mpi_comm_cols_int = MPI_Comm_c2f(mpi_comm_cols);
 
         if (scf_eigen_lib_flag==GPUSOLVER && GPU_CPU_SWITCH_NUM<=n2 && na_rows==n && na_cols==n){
-          BandNonCol_CuSolver_DenseZheevx(Cs,Ss,ko,n,n,"Band_DFT_NonCol overlap");
+          BandNonCol_GpuSolver_DenseZheevx(Cs,Ss,ko,n,n,"Band_DFT_NonCol overlap");
         }
         else if (scf_eigen_lib_flag==1 || (numprocs2<5 && scf_eigen_lib_flag!=GPUSOLVER)){
   	  F77_NAME(solve_evp_complex,SOLVE_EVP_COMPLEX)
@@ -4543,7 +4543,7 @@ double Band_DFT_NonCol(
 	mpi_comm_cols_int = MPI_Comm_c2f(mpi_comm_cols);
   
         if (scf_eigen_lib_flag==GPUSOLVER && GPU_CPU_SWITCH_NUM<=n2 && na_rows2==n2 && na_cols2==n2){
-          BandNonCol_CuSolver_DenseZheevx(Hs2,Cs2,ko,n2,MaxN,"Band_DFT_NonCol Hamiltonian");
+          BandNonCol_GpuSolver_DenseZheevx(Hs2,Cs2,ko,n2,MaxN,"Band_DFT_NonCol Hamiltonian");
         }
         else if (scf_eigen_lib_flag==1 || (numprocs2<5 && scf_eigen_lib_flag!=GPUSOLVER)){
 	  F77_NAME(solve_evp_complex,SOLVE_EVP_COMPLEX)
