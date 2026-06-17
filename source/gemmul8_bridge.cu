@@ -81,6 +81,17 @@ bool env_bool(const char *name, bool fallback)
     return value[0] == '1';
 }
 
+bool verbose_logging_enabled()
+{
+    bool verbose = env_bool("OPENMX_GPU_VERBOSE", false);
+
+    verbose = env_bool("OPENMX_GEMM_VERBOSE", verbose);
+    verbose = env_bool("OPENMX_GEMMUL8_VERBOSE", verbose);
+    verbose = env_bool("GEMMUL8_VERBOSE", verbose);
+
+    return verbose;
+}
+
 unsigned env_percent(const char *openmx_env, const char *gemmul8_env, unsigned fallback)
 {
     unsigned percent = env_u32(gemmul8_env, fallback);
@@ -286,6 +297,10 @@ template <bool is_complex>
 void log_workspace_fallback_once(const WorkspaceReport &report, const char *target)
 {
     static bool warned = false;
+
+    if (!verbose_logging_enabled()) {
+        return;
+    }
 
     std::lock_guard<std::mutex> lock(g_workspace_mutex);
     if (warned) {

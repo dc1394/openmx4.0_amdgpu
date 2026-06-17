@@ -47,6 +47,17 @@ static int OpenMX_ZgemmRank(void)
     return rank;
 }
 
+static int OpenMX_ZgemmVerbose(void)
+{
+    const char *value = getenv("OPENMX_GPU_VERBOSE");
+
+    if (value == NULL || value[0] == '\0') {
+        value = getenv("OPENMX_GEMM_VERBOSE");
+    }
+
+    return (value != NULL && value[0] == '1');
+}
+
 static char OpenMX_ZgemmOpChar(cublasOperation_t op)
 {
     if (op == CUBLAS_OP_C) {
@@ -107,6 +118,8 @@ static void OpenMX_ZgemmLogBackendOnce(const char *backend, int m, int n, int k)
     static int logged_native = 0;
     int rank = OpenMX_ZgemmRank();
     int *logged = (backend[0] == 'G') ? &logged_gemmul8 : &logged_native;
+
+    if (!OpenMX_ZgemmVerbose()) return;
 
     if (rank != 0 || *logged) return;
 

@@ -818,6 +818,13 @@ static void BandNonCol_AbortWithMessage(const char *msg)
     MPI_Abort(mpi_comm_level1,1);
 }
 
+static int BandNonCol_GpuVerbose(void)
+{
+    const char *value = getenv("OPENMX_GPU_VERBOSE");
+
+    return (value != NULL && value[0] == '1');
+}
+
 static size_t BandNonCol_CheckedAdd(size_t a, size_t b, const char *label)
 {
     if (b>((size_t)-1)-a){
@@ -991,11 +998,13 @@ static int BandNonCol_RootDenseParallelKWorldsFit(int n, int n2, int MaxN, int s
 
     if (potential_owner && !selected_owner){
         if (myid0==Comm_World_StartID2[myworld2]){
-            fprintf(stderr,
-                    "<Band>  Rank %d is a non-collinear dense GPU solver k-world owner, "
-                    "but it is not selected for HIP/OpenACC; using serialized k-worlds.\n",
-                    myid0);
-            fflush(stderr);
+            if (BandNonCol_GpuVerbose()) {
+                fprintf(stderr,
+                        "<Band>  Rank %d is a non-collinear dense GPU solver k-world owner, "
+                        "but it is not selected for HIP/OpenACC; using serialized k-worlds.\n",
+                        myid0);
+                fflush(stderr);
+            }
         }
         local_fit = 0;
     }
@@ -1045,7 +1054,7 @@ static int BandNonCol_RootDenseParallelKWorldsFit(int n, int n2, int MaxN, int s
 
         if (group_free<group_required || group_free-group_required<group_reserve){
             local_fit = 0;
-            if (device_rank==0){
+            if (BandNonCol_GpuVerbose() && device_rank==0){
                 printf("<Band>  Serializing non-collinear dense GPU solver k-worlds: GPU device %d is shared by %d owner rank(s), "
                        "free %.3f MiB, need %.3f MiB plus %.3f MiB reserve.\n",
                        cuda_device,device_ranks,

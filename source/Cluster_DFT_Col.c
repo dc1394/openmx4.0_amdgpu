@@ -114,6 +114,13 @@ static void ClusterCol_AbortWithMessage(const char *message)
     MPI_Abort(mpi_comm_level1, 1);
 }
 
+static int ClusterCol_GpuVerbose(void)
+{
+    const char *value = getenv("OPENMX_GPU_VERBOSE");
+
+    return (value != NULL && value[0] == '1');
+}
+
 static size_t ClusterCol_CheckedMulCount(size_t a, size_t b, const char *label)
 {
     if (a != 0 && b > ((size_t)-1) / a) {
@@ -851,7 +858,7 @@ static void ClusterCol_CalcOneSpinDMRootDense(int myid0, int myid1, int spin, in
         if (0 < nk_occ) {
             static int logged_dm_gpu = 0;
 
-            if (!logged_dm_gpu) {
+            if (ClusterCol_GpuVerbose() && !logged_dm_gpu) {
                 fprintf(stderr,
                         "<Cluster> rank %d: collinear density matrix generation uses a HIP GPU kernel on the selected rank only "
                         "(entries=%d, occupied states=%d%s).\n",
@@ -992,7 +999,7 @@ static void ClusterCol_GpuSolverRootDensePath(int SCF_iter, int SpinP_switch, do
     ClusterCol_ReleaseGpuSolverCachedEVec(myid1);
     ClusterCol_DetailTimer_Begin(myid1, SCF_iter, n, MaxN);
 
-    if (myid1 == 0) {
+    if (ClusterCol_GpuVerbose() && myid1 == 0) {
         static int logged_root_dense = 0;
 
         if (!logged_root_dense) {

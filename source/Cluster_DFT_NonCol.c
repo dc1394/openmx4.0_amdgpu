@@ -41,6 +41,13 @@ static void ClusterNonCol_AbortWithMessage(const char *message)
     MPI_Abort(mpi_comm_level1, 1);
 }
 
+static int ClusterNonCol_GpuVerbose(void)
+{
+    const char *value = getenv("OPENMX_GPU_VERBOSE");
+
+    return (value != NULL && value[0] == '1');
+}
+
 static size_t ClusterNonCol_CheckedMulCount(size_t a, size_t b, const char *label)
 {
     if (a != 0 && b > SIZE_MAX / a) {
@@ -201,6 +208,8 @@ static void ClusterNonCol_LogGemmBackendOnce(const char *kind, const char *backe
     static int logged_z_native = 0;
     int rank = ClusterNonCol_MpiRankForLog();
     int *logged;
+
+    if (!ClusterNonCol_GpuVerbose()) return;
 
     if (rank != 0) return;
 
@@ -729,7 +738,7 @@ static double ClusterNonCol_CalcDMRootDense_OpenACC(int myid, int size_H1, int *
         if (0 < nk_occ) {
             static int logged_dm_gpu = 0;
 
-            if (!logged_dm_gpu) {
+            if (ClusterNonCol_GpuVerbose() && !logged_dm_gpu) {
                 fprintf(stderr,
                         "<Cluster> rank %d: density matrix generation uses a HIP GPU kernel on the selected rank only "
                         "(entries=%d, occupied states=%d%s).\n",
@@ -1301,7 +1310,8 @@ static void ClusterNonCol_BuildDeviceDenseFromGathered(const double *H1, const i
     nn_ll = (long long)nn;
 
     ClusterNonCol_RequireOpenMPTargetDevice("dense matrix generation");
-    if (!logged_dense_build && ClusterNonCol_MpiRankForLog() == Host_ID) {
+    if (ClusterNonCol_GpuVerbose() &&
+        !logged_dense_build && ClusterNonCol_MpiRankForLog() == Host_ID) {
         fprintf(stderr,
                 "<Cluster> rank %d: dense matrix generation uses OpenMP target GPU on the selected rank only "
                 "(n=%d, packed entries=%d).\n",
@@ -1506,7 +1516,7 @@ static void ClusterNonCol_GpuSolverRootDensePath(int SCF_iter, double *ko, doubl
 
     Set_Hamiltonian_GpuSolver_SetMP(MP);
 
-    if (myid == Host_ID) {
+    if (ClusterNonCol_GpuVerbose() && myid == Host_ID) {
         static int logged_root_dense = 0;
 
         if (!logged_root_dense) {
