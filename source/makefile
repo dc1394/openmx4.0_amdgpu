@@ -119,12 +119,15 @@ GEMMUL8_LIB ?= $(GEMMUL8_DIR)/lib/libgemmul8.a
 GEMMUL8_OPENMX_OBJ ?= $(GEMMUL8_DIR)/src/gemmul8_openmx.o
 GEMMUL8_GPU_ARCH ?= $(ARCH)
 HIPCC_GEMMUL8_FLAGS = -std=c++20 -O3 --offload-arch=$(GEMMUL8_GPU_ARCH) -I. -I$(GEMMUL8_DIR)/include -I$(GEMMUL8_DIR)/src -I$(ROCM)/include -D__HIP_PLATFORM_AMD__ -ffp-contract=off -Wno-unused-result -Wno-unused-command-line-argument -Wno-unused-value -DOCML_BASIC_ROUNDED_OPERATIONS -DGPU_ARCH=$(GEMMUL8_GPU_ARCH)
-MAGMA_VERSION ?= 2.9.0
-MAGMA_URL ?= https://icl.utk.edu/projectsfiles/magma/downloads/magma-$(MAGMA_VERSION).tar.gz
-MAGMA_ARCHIVE ?= /tmp/magma-$(MAGMA_VERSION).tar.gz
+MAGMA_VERSION ?= 2.10.0
 MAGMA_DIR ?= third_party/magma
+MAGMA_ARCHIVE_BASENAME ?= magma-$(MAGMA_VERSION).tar.gz
+MAGMA_ARCHIVE ?= $(MAGMA_DIR)/$(MAGMA_ARCHIVE_BASENAME)
 MAGMA_LIB ?= $(MAGMA_DIR)/lib/libmagma.a
 MAGMA_GPU_TARGET ?= $(ARCH)
+MAGMA_MAKE_INC ?= third_party/magma.openmx.make.inc
+MAGMA_STAMP ?= $(MAGMA_DIR)/.openmx-magma-$(MAGMA_VERSION).stamp
+MAGMA_EXTRA_GFXS ?= 1200
 HIPCC_MAGMA_FLAGS = $(HIPCC_GEMMUL8_FLAGS) -I$(MAGMA_DIR)/include -I$(MAGMA_DIR)/control
 
 CFLAGS  = -g 
@@ -282,7 +285,8 @@ gemmul8-clean:
 	rm -f "$(GEMMUL8_OPENMX_OBJ)" "$(GEMMUL8_LIB)"
 
 magma-clean:
-	$(MAKE) -C "$(MAGMA_DIR)" clean || true
+	if [ -f "$(MAGMA_DIR)/Makefile" ]; then $(MAKE) -C "$(MAGMA_DIR)" clean; fi
+	find "$(MAGMA_DIR)" -mindepth 1 -maxdepth 1 ! -name "$(MAGMA_ARCHIVE_BASENAME)" -exec rm -rf {} +
 	rm -f magma_openmx.o
 
 FFTW3_USERS = Poisson.o Stress.o Poisson_ESM.o TRAN_Poisson.o TRAN_CDen_Main.o TRAN_Set_Electrode_Grid.o
@@ -695,19 +699,28 @@ $(GEMMUL8_OPENMX_OBJ): gemmul8_openmx.cu $(GEMMUL8_DIR)/Makefile
 $(GEMMUL8_LIB): $(GEMMUL8_OPENMX_OBJ)
 	mkdir -p $(GEMMUL8_DIR)/lib
 	ar rcs $(GEMMUL8_LIB) $(GEMMUL8_OPENMX_OBJ)
-$(MAGMA_DIR)/Makefile:
-	mkdir -p "$(MAGMA_DIR)"
-	if [ -f "$(MAGMA_ARCHIVE)" ]; then \
-	  tar -xzf "$(MAGMA_ARCHIVE)" -C "$(MAGMA_DIR)" --strip-components=1; \
-	else \
-	  curl -L --fail "$(MAGMA_URL)" -o "$(MAGMA_ARCHIVE)"; \
-	  tar -xzf "$(MAGMA_ARCHIVE)" -C "$(MAGMA_DIR)" --strip-components=1; \
-	fi
-$(MAGMA_DIR)/make.inc:
-	@echo "MAGMA make.inc was not found in $(MAGMA_DIR)."
-	@echo "Restore third_party/magma/make.inc or override MAGMA_DIR with a configured MAGMA source tree."
+$(MAGMA_ARCHIVE):
+	@echo "Bundled MAGMA archive was not found: $(MAGMA_ARCHIVE)"
+	@echo "Place magma-$(MAGMA_VERSION).tar.gz from https://icl.utk.edu/magma/ under $(MAGMA_DIR)/, or override MAGMA_ARCHIVE."
 	@false
-$(MAGMA_LIB): $(MAGMA_DIR)/Makefile $(MAGMA_DIR)/make.inc
+
+$(MAGMA_MAKE_INC):
+	@echo "OpenMX MAGMA make.inc template was not found: $(MAGMA_MAKE_INC)"
+	@false
+
+$(MAGMA_STAMP): $(MAGMA_ARCHIVE) $(MAGMA_MAKE_INC)
+	mkdir -p "$(MAGMA_DIR)"
+	find "$(MAGMA_DIR)" -mindepth 1 -maxdepth 1 ! -name "$(MAGMA_ARCHIVE_BASENAME)" -exec rm -rf {} +
+	tar -xzf "$(MAGMA_ARCHIVE)" -C "$(MAGMA_DIR)" --strip-components=1
+	ln -sf Makefile.gen.hip "$(MAGMA_DIR)/make.gen.hipMAGMA"
+	sed -i 's/^\([[:space:]]*VALID_GFXS =.*\)/\1 $(MAGMA_EXTRA_GFXS)/' "$(MAGMA_DIR)/Makefile"
+	install -m 0644 "$(MAGMA_MAKE_INC)" "$(MAGMA_DIR)/make.inc"
+	rm -f magma_openmx.o
+	touch "$@"
+
+$(MAGMA_DIR)/Makefile $(MAGMA_DIR)/make.inc: $(MAGMA_STAMP)
+
+$(MAGMA_LIB): $(MAGMA_STAMP)
 	$(MAKE) -C "$(MAGMA_DIR)" BACKEND=hip ROCM_PATH="$(ROCM)" GPU_TARGET="$(MAGMA_GPU_TARGET)" lib/libmagma.a
 Divide_Conquer_Dosout.o: Divide_Conquer_Dosout.c openmx_common.h
 	$(CC) -c Divide_Conquer_Dosout.c
