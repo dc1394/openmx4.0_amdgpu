@@ -1503,18 +1503,9 @@ static void ClusterNonCol_GpuSolverRootDensePath(int SCF_iter, double *ko, doubl
     *dense_evec_out = NULL;
     *dense_evec_on_device_out = 0;
 
-    if (!use_setham_packed_cache) {
-        if (myid == Host_ID) {
-            fprintf(stderr,
-                    "<Cluster> rank %d: MAGMA dense GPU path requires the Set_Hamiltonian packed cache "
-                    "(cache_ready=%d, order_mode=%d). Refusing the old 32-rank dense fallback.\n",
-                    Host_ID, cache_ready, cache_order);
-            fflush(stderr);
-        }
-        ClusterNonCol_AbortWithMessage("Cluster_DFT_NonCol MAGMA dense GPU path is missing its packed cache.");
+    if (use_setham_packed_cache) {
+        Set_Hamiltonian_GpuSolver_SetMP(MP);
     }
-
-    Set_Hamiltonian_GpuSolver_SetMP(MP);
 
     if (ClusterNonCol_GpuVerbose() && myid == Host_ID) {
         static int logged_root_dense = 0;
@@ -1573,11 +1564,16 @@ static void ClusterNonCol_GpuSolverRootDensePath(int SCF_iter, double *ko, doubl
     MPI_Bcast(&rebuild_s, 1, MPI_INT, Host_ID, mpi_comm_level1);
 
     if (rebuild_s) {
-        if (owns_dense) {
-            if (!Set_Hamiltonian_GpuSolver_Packed_OwnsCache()) {
-                ClusterNonCol_AbortWithMessage("Set_Hamiltonian packed overlap cache is not owned by this rank.");
+        if (use_setham_packed_cache) {
+            if (owns_dense) {
+                if (!Set_Hamiltonian_GpuSolver_Packed_OwnsCache()) {
+                    ClusterNonCol_AbortWithMessage("Set_Hamiltonian packed overlap cache is not owned by this rank.");
+                }
+                ClusterNonCol_LoadDeviceDenseFromSetHamCache(Set_Hamiltonian_GpuSolver_Packed_Overlap(), MP, n, S);
             }
-            ClusterNonCol_LoadDeviceDenseFromSetHamCache(Set_Hamiltonian_GpuSolver_Packed_Overlap(), MP, n, S);
+        }
+        else {
+            Patch2Device_Cluster_NonCol_Owner(CntOLP, S, MP, owns_dense, n);
         }
 
         if (owns_dense) {
@@ -1600,17 +1596,28 @@ static void ClusterNonCol_GpuSolverRootDensePath(int SCF_iter, double *ko, doubl
         }
     }
 
-    if (owns_dense) {
-        if (!Set_Hamiltonian_GpuSolver_Packed_OwnsCache()) {
-            ClusterNonCol_AbortWithMessage("Set_Hamiltonian packed Hamiltonian cache is not owned by this rank.");
+    if (use_setham_packed_cache) {
+        if (owns_dense) {
+            if (!Set_Hamiltonian_GpuSolver_Packed_OwnsCache()) {
+                ClusterNonCol_AbortWithMessage("Set_Hamiltonian packed Hamiltonian cache is not owned by this rank.");
+            }
+            ClusterNonCol_LoadDeviceDenseFromSetHamCache(Set_Hamiltonian_GpuSolver_Packed_H(0), MP, n, rHs11);
+            ClusterNonCol_LoadDeviceDenseFromSetHamCache(Set_Hamiltonian_GpuSolver_Packed_H(1), MP, n, rHs22);
+            ClusterNonCol_LoadDeviceDenseFromSetHamCache(Set_Hamiltonian_GpuSolver_Packed_H(2), MP, n, rHs12);
+            ClusterNonCol_LoadDeviceDenseFromSetHamCache(Set_Hamiltonian_GpuSolver_Packed_H(3), MP, n, iHs12);
+            ClusterNonCol_LoadDeviceDenseFromSetHamCache(Set_Hamiltonian_GpuSolver_Packed_ImNL(0), MP, n, iHs11);
+            ClusterNonCol_LoadDeviceDenseFromSetHamCache(Set_Hamiltonian_GpuSolver_Packed_ImNL(1), MP, n, iHs22);
+            ClusterNonCol_LoadDeviceDenseFromSetHamCache(Set_Hamiltonian_GpuSolver_Packed_ImNL(2), MP, n, Cs);
         }
-        ClusterNonCol_LoadDeviceDenseFromSetHamCache(Set_Hamiltonian_GpuSolver_Packed_H(0), MP, n, rHs11);
-        ClusterNonCol_LoadDeviceDenseFromSetHamCache(Set_Hamiltonian_GpuSolver_Packed_H(1), MP, n, rHs22);
-        ClusterNonCol_LoadDeviceDenseFromSetHamCache(Set_Hamiltonian_GpuSolver_Packed_H(2), MP, n, rHs12);
-        ClusterNonCol_LoadDeviceDenseFromSetHamCache(Set_Hamiltonian_GpuSolver_Packed_H(3), MP, n, iHs12);
-        ClusterNonCol_LoadDeviceDenseFromSetHamCache(Set_Hamiltonian_GpuSolver_Packed_ImNL(0), MP, n, iHs11);
-        ClusterNonCol_LoadDeviceDenseFromSetHamCache(Set_Hamiltonian_GpuSolver_Packed_ImNL(1), MP, n, iHs22);
-        ClusterNonCol_LoadDeviceDenseFromSetHamCache(Set_Hamiltonian_GpuSolver_Packed_ImNL(2), MP, n, Cs);
+    }
+    else {
+        Patch2Device_Cluster_NonCol_Owner(nh[0],   rHs11, MP, owns_dense, n);
+        Patch2Device_Cluster_NonCol_Owner(nh[1],   rHs22, MP, owns_dense, n);
+        Patch2Device_Cluster_NonCol_Owner(nh[2],   rHs12, MP, owns_dense, n);
+        Patch2Device_Cluster_NonCol_Owner(nh[3],   iHs12, MP, owns_dense, n);
+        Patch2Device_Cluster_NonCol_Owner(ImNL[0], iHs11, MP, owns_dense, n);
+        Patch2Device_Cluster_NonCol_Owner(ImNL[1], iHs22, MP, owns_dense, n);
+        Patch2Device_Cluster_NonCol_Owner(ImNL[2], Cs,    MP, owns_dense, n);
     }
 
     if (owns_dense) {

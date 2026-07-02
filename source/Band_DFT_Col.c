@@ -172,6 +172,88 @@ static void BandCol_AbortWithMessage(const char * msg)
     exit(1);
 }
 
+static int BandCol_SerializeGpuSolverGpuTurns(void)
+{
+    const char *value = getenv("OPENMX_GPUSOLVER_SERIAL_GPU_TURNS");
+
+    if (value == NULL) {
+        return 1;
+    }
+    return (atoi(value) != 0);
+}
+
+static int BandCol_GpuPersistentEnabled(void)
+{
+    const char *value = getenv("OPENMX_BAND_GPU_PERSISTENT");
+
+    if (value == NULL) {
+        return 0;
+    }
+    return (atoi(value) != 0);
+}
+
+static int BandCol_GpuPersistentDecide(void)
+{
+    static int decided = -1;
+
+    if (decided < 0) {
+        if (!BandCol_GpuPersistentEnabled()) {
+            decided = 0;
+        } else {
+            size_t      free_bytes = 0, total_bytes = 0;
+            size_t      min_free = 2048ULL * 1024ULL * 1024ULL;
+            const char *value = getenv("OPENMX_BAND_GPU_PERSISTENT_MIN_FREE_MB");
+
+            if (value != NULL) {
+                long mb = atol(value);
+                if (0 <= mb) {
+                    min_free = (size_t)mb * 1024ULL * 1024ULL;
+                }
+            }
+
+            if (cudaMemGetInfo(&free_bytes, &total_bytes) != cudaSuccess) {
+                decided = 0;
+            } else if (free_bytes < min_free) {
+                fprintf(stderr,
+                        "Band_DFT_Col: persistent GPU buffers disabled (%.0f MiB free < %.0f MiB threshold).\n",
+                        (double)free_bytes / (1024.0 * 1024.0), (double)min_free / (1024.0 * 1024.0));
+                decided = 0;
+            } else {
+                decided = 1;
+            }
+        }
+    }
+    return decided;
+}
+
+static int BandCol_GemmWorkspaceTurnRelease(void)
+{
+    const char *value = getenv("OPENMX_BAND_GEMMUL8_TURN_RELEASE");
+
+    if (value == NULL) {
+        return 1;
+    }
+    return (atoi(value) != 0);
+}
+
+static int BandCol_GpuTurnGroup(void)
+{
+    const char *value = getenv("OPENMX_BAND_GPU_TURN_GROUP");
+    long        group;
+
+    if (value == NULL) {
+        return 2;
+    }
+    group = strtol(value, NULL, 10);
+    if (group < 1L) {
+        return 1;
+    }
+    if (1024L < group) {
+        return 1024;
+    }
+    return (int)group;
+}
+
 static int BandCol_MaxConcurrentKGpuTurns(void)
 {
     const char *value = getenv("OPENMX_BAND_GPU_MAX_CONCURRENT_K");
@@ -934,6 +1016,13 @@ static int BandCol_GpuSolver_HasHostTransformedS(int n)
     BandColGpuSolverCtx *ctx = &BandCol_gpusolver_ctx;
 
     return (ctx->h_transformed_s != NULL && ctx->h_transformed_s_dim == n);
+}
+
+static int BandCol_GpuSolver_HasDeviceTransformedS(int n)
+{
+    BandColGpuSolverCtx *ctx = &BandCol_gpusolver_ctx;
+
+    return (ctx->initialized && ctx->transformed_s_valid && ctx->transformed_s_dim == n);
 }
 
 static void BandCol_GpuSolver_SaveTransformedS(int n)
@@ -2009,7 +2098,11 @@ double Band_DFT_Col(int SCF_iter, int knum_i, int knum_j, int knum_k, int SpinP_
     //     init_gpusolvermp(myworld2, MPI_CommWD2, &opts2, &opts3, &opts4);
     // }
 
-    if (!use_gpusolver_dense) {
+    if (all_knum != 1 && use_gpusolver_dense) {
+        if (n != na_cols || n != na_rows) {
+            BandCol_AbortWithMessage("GPUSOLVER band path requires full dense matrices in Band_DFT_Col.c.");
+        }
+    } else if (!use_gpusolver_dense) {
         MPI_Comm_split(MPI_CommWD2[myworld2], my_pcol, my_prow, &mpi_comm_rows);
         MPI_Comm_split(MPI_CommWD2[myworld2], my_prow, my_pcol, &mpi_comm_cols);
 
@@ -2360,6 +2453,7 @@ diagonalize1:
     } else {
         for (kloop0 = 0; kloop0 < num_kloop0; kloop0++) {
             if (use_gpusolver_dense) {
+                int my_gpu_turn;
                 kloop = S_knum + kloop0;
 
                 k1 = T_KGrids1[kloop];
@@ -2372,9 +2466,19 @@ diagonalize1:
                     dtime(&starttimesh);
                 }
 
-                if (owns_global_dense_rank) {
-                    dcomplex *evec_device;
-                    const int build_s = !BandCol_GpuSolver_HasHostTransformedS(n);
+                my_gpu_turn = spin * T_knum + kloop;
+                const int serialize_gpu_turns = BandCol_SerializeGpuSolverGpuTurns();
+                const int gpu_turn_group = serialize_gpu_turns ? BandCol_GpuTurnGroup() : 1;
+                const int first_gpu_turn = serialize_gpu_turns ? 0 : my_gpu_turn;
+                const int last_gpu_turn = serialize_gpu_turns ? Num_Comm_World1 * T_knum : (my_gpu_turn + 1);
+                for (int gpu_turn = first_gpu_turn; gpu_turn < last_gpu_turn; gpu_turn++) {
+                    if (serialize_gpu_turns && gpu_turn % gpu_turn_group == 0) {
+                        MPI_Barrier(mpi_comm_level1);
+                    }
+
+                    if (owns_global_dense_rank && my_gpu_turn == gpu_turn) {
+                        dcomplex *evec_device;
+                        const int build_s = (SCF_iter == 1) || !BandCol_GpuSolver_HasHostTransformedS(n);
                         const int construct_scf_iter = build_s ? 1 : SCF_iter;
 
                         Construct_Band_CsHs(construct_scf_iter, all_knum, use_setham_packed_cache ? setham_order_GA : order_GA, MP,
@@ -2405,7 +2509,7 @@ diagonalize1:
                         if (build_s) {
                             BandCol_GpuSolver_PrepareTransformedS(1, n, construct_on_device ? NULL : Ss, ko, koS);
                             BandCol_GpuSolver_SaveTransformedS(n);
-                        } else {
+                        } else if (!(BandCol_GpuPersistentDecide() && BandCol_GpuSolver_HasDeviceTransformedS(n))) {
                             BandCol_GpuSolver_LoadTransformedS(n);
                         }
                         transformed_s_ready = 1;
@@ -2426,9 +2530,17 @@ diagonalize1:
                             evec_device = BandCol_GpuSolver_SolveHamiltonianDeviceOnly(n, MaxN, Hs, ko);
                         }
 
-                        BandCol_GpuSolver_SaveDeviceEigenvectors(evec_device, n);
-                        BandCol_ConstructCache_Reset();
-                        BandCol_GpuSolver_ReleaseDeviceMemory();
+                        if (BandCol_GemmWorkspaceTurnRelease()) {
+                            openmx_gemmul8ReleaseWorkspaces();
+                        }
+
+                        if (BandCol_GpuPersistentDecide()) {
+                            (void)evec_device;
+                        } else {
+                            BandCol_GpuSolver_SaveDeviceEigenvectors(evec_device, n);
+                            BandCol_ConstructCache_Reset();
+                            BandCol_GpuSolver_ReleaseDeviceMemory();
+                        }
 
                         if (measure_time) {
                             dtime(&Etime);
@@ -2454,10 +2566,13 @@ diagonalize1:
                             dtime(&endtime);
                             partmul = endtime - starttime;
                         }
+                    }
                 }
-                MPI_Barrier(mpi_comm_level1);
+                if (!serialize_gpu_turns) {
+                    MPI_Barrier(mpi_comm_level1);
+                }
 
-	            } else {
+		            } else {
                 kloop = S_knum + kloop0;
 
                 k1 = T_KGrids1[kloop];
@@ -3125,17 +3240,41 @@ diagonalize1:
                 dtime(&Stime0);
             }
 
-            if (owns_global_dense_rank) {
-                dcomplex *evec_device = BandCol_GpuSolver_UploadHostEigenvectors(n);
+            {
+                int my_gpu_turn = spin * T_knum + kloop;
+                const int serialize_gpu_turns = BandCol_SerializeGpuSolverGpuTurns();
+                const int gpu_turn_group = serialize_gpu_turns ? BandCol_GpuTurnGroup() : 1;
+                const int first_gpu_turn = serialize_gpu_turns ? 0 : my_gpu_turn;
+                const int last_gpu_turn = serialize_gpu_turns ? Num_Comm_World1 * T_knum : (my_gpu_turn + 1);
 
-                BandCol_AccumulateDenseTransposedDM_Device(n, MaxN, spin, kloop, k1, k2, k3, evec_device, n,
-                                                           MP, use_setham_packed_cache ? setham_order_GA : order_GA, EIGEN,
-                                                           BandCol_dm_workspace.OccWeight, CDM1, EDM1,
-                                                           size_H1);
-                BandCol_GpuSolver_ClearHostEigenvectors();
-                BandCol_GpuSolver_ReleaseDeviceMemory();
+                for (int gpu_turn = first_gpu_turn; gpu_turn < last_gpu_turn; gpu_turn++) {
+                    if (serialize_gpu_turns && gpu_turn % gpu_turn_group == 0) {
+                        MPI_Barrier(mpi_comm_level1);
+                    }
+
+                    if (owns_global_dense_rank && my_gpu_turn == gpu_turn) {
+                        dcomplex *evec_device;
+
+                        if (BandCol_GpuPersistentDecide()) {
+                            evec_device = BandCol_GpuSolver_DeviceEigenvectors();
+                        } else {
+                            evec_device = BandCol_GpuSolver_UploadHostEigenvectors(n);
+                        }
+
+                        BandCol_AccumulateDenseTransposedDM_Device(n, MaxN, spin, kloop, k1, k2, k3, evec_device, n,
+                                                                   MP, use_setham_packed_cache ? setham_order_GA : order_GA, EIGEN,
+                                                                   BandCol_dm_workspace.OccWeight, CDM1, EDM1,
+                                                                   size_H1);
+                        if (!BandCol_GpuPersistentDecide()) {
+                            BandCol_GpuSolver_ClearHostEigenvectors();
+                            BandCol_GpuSolver_ReleaseDeviceMemory();
+                        }
+                    }
+                }
+                if (!serialize_gpu_turns) {
+                    MPI_Barrier(mpi_comm_level1);
+                }
             }
-            MPI_Barrier(mpi_comm_level1);
 
             if (measure_time) {
                 dtime(&Etime0);
@@ -3602,6 +3741,10 @@ diagonalize1:
                     /****************************************************
                           1/sqrt(ko) * U^t * H * U * 1/sqrt(ko)
                     ****************************************************/
+
+                    if (n != na_rows_max || n != na_cols_max) {
+                        BandCol_AbortWithMessage("GPUSOLVER DM path requires full dense matrices in Band_DFT_Col.c.");
+                    }
 
                     if (measure_time)
                         dtime(&Stime);
