@@ -983,19 +983,10 @@ static void ClusterCol_GpuSolverRootDensePath(int SCF_iter, int SpinP_switch, do
         spin_end = myworld1;
     }
 
-    if (!use_setham_packed_cache) {
-        if (myid1 == 0) {
-            fprintf(stderr,
-                    "<Cluster> rank %d: hipSOLVER collinear dense GPU path requires the Set_Hamiltonian packed cache "
-                    "(cache_ready=%d, order_mode=%d). Refusing the old dense fallback.\n",
-                    myid0, Set_Hamiltonian_GpuSolver_Packed_CacheReady(),
-                    Set_Hamiltonian_GpuSolver_Packed_OrderMode());
-            fflush(stderr);
-        }
-        ClusterCol_AbortWithMessage("Cluster_DFT_Col hipSOLVER dense GPU path is missing its packed cache.");
+    if (use_setham_packed_cache) {
+        Set_Hamiltonian_GpuSolver_SetMP(MP);
     }
 
-    Set_Hamiltonian_GpuSolver_SetMP(MP);
     ClusterCol_ReleaseGpuSolverCachedEVec(myid1);
     ClusterCol_DetailTimer_Begin(myid1, SCF_iter, n, MaxN);
 
@@ -1024,19 +1015,25 @@ static void ClusterCol_GpuSolverRootDensePath(int SCF_iter, int SpinP_switch, do
     MPI_Bcast(&rebuild_s,1,MPI_INT,0,MPI_CommWD1[myworld1]);
 
     if (rebuild_s){
-        if (owns_dense) {
-            int tnum = Set_Hamiltonian_GpuSolver_Packed_Size();
-            int *cache_order_GA = Set_Hamiltonian_GpuSolver_Packed_OrderGA();
-            double *cache_S = Set_Hamiltonian_GpuSolver_Packed_Overlap();
-            int *dense_index = NULL;
+        if (use_setham_packed_cache) {
+            if (owns_dense) {
+                int tnum = Set_Hamiltonian_GpuSolver_Packed_Size();
+                int *cache_order_GA = Set_Hamiltonian_GpuSolver_Packed_OrderGA();
+                double *cache_S = Set_Hamiltonian_GpuSolver_Packed_Overlap();
+                int *dense_index = NULL;
 
-            if (!Set_Hamiltonian_GpuSolver_Packed_OwnsCache() || cache_order_GA == NULL || cache_S == NULL) {
-                ClusterCol_AbortWithMessage("Set_Hamiltonian packed overlap cache is missing in Cluster_DFT_Col.c.");
+                if (!Set_Hamiltonian_GpuSolver_Packed_OwnsCache() || cache_order_GA == NULL || cache_S == NULL) {
+                    ClusterCol_AbortWithMessage("Set_Hamiltonian packed overlap cache is missing in Cluster_DFT_Col.c.");
+                }
+                dense_index = (int*)ClusterCol_MallocArray((size_t)tnum,sizeof(int),"packed overlap dense_index");
+                ClusterCol_BuildDenseIndex(cache_order_GA,MP,n,tnum,dense_index);
+                ClusterCol_BuildDeviceDenseFromPacked(cache_S,dense_index,tnum,n,ClusterCol_gpusolver_ctx.d_S);
+                free(dense_index);
             }
-            dense_index = (int*)ClusterCol_MallocArray((size_t)tnum,sizeof(int),"packed overlap dense_index");
-            ClusterCol_BuildDenseIndex(cache_order_GA,MP,n,tnum,dense_index);
-            ClusterCol_BuildDeviceDenseFromPacked(cache_S,dense_index,tnum,n,ClusterCol_gpusolver_ctx.d_S);
-            free(dense_index);
+        }
+        else {
+            Patch2Device_Cluster_Owner(CntOLP,MP,owns_dense,n,
+                                       owns_dense ? ClusterCol_gpusolver_ctx.d_S : NULL);
         }
         if (owns_dense){
             ClusterCol_GpuSolver_PrepareTransformedSDevice(1,n,ko[0]);
@@ -1044,31 +1041,44 @@ static void ClusterCol_GpuSolverRootDensePath(int SCF_iter, int SpinP_switch, do
     }
 
     for (int spin=spin_start; spin<=spin_end; spin++){
-        if (owns_dense){
-            int tnum = Set_Hamiltonian_GpuSolver_Packed_Size();
-            int *cache_order_GA = Set_Hamiltonian_GpuSolver_Packed_OrderGA();
-            double *cache_H = Set_Hamiltonian_GpuSolver_Packed_H(spin);
-            int *dense_index = NULL;
-            size_t nmax = ClusterCol_CheckedMulCount((size_t)n,(size_t)MaxN,"root dense eigenvectors");
-            double *C = NULL;
+        if (use_setham_packed_cache) {
+            if (owns_dense){
+                int tnum = Set_Hamiltonian_GpuSolver_Packed_Size();
+                int *cache_order_GA = Set_Hamiltonian_GpuSolver_Packed_OrderGA();
+                double *cache_H = Set_Hamiltonian_GpuSolver_Packed_H(spin);
+                int *dense_index = NULL;
+                size_t nmax = ClusterCol_CheckedMulCount((size_t)n,(size_t)MaxN,"root dense eigenvectors");
+                double *C = NULL;
 
-            if (!Set_Hamiltonian_GpuSolver_Packed_OwnsCache() || cache_order_GA == NULL || cache_H == NULL) {
-                ClusterCol_AbortWithMessage("Set_Hamiltonian packed Hamiltonian cache is missing in Cluster_DFT_Col.c.");
+                if (!Set_Hamiltonian_GpuSolver_Packed_OwnsCache() || cache_order_GA == NULL || cache_H == NULL) {
+                    ClusterCol_AbortWithMessage("Set_Hamiltonian packed Hamiltonian cache is missing in Cluster_DFT_Col.c.");
+                }
+                dense_index = (int*)ClusterCol_MallocArray((size_t)tnum,sizeof(int),"packed Hamiltonian dense_index");
+                ClusterCol_BuildDenseIndex(cache_order_GA,MP,n,tnum,dense_index);
+                ClusterCol_BuildDeviceDenseFromPacked(cache_H,dense_index,tnum,n,ClusterCol_gpusolver_ctx.d_H);
+                free(dense_index);
+
+                C = (double*)ClusterCol_MallocArray(nmax,sizeof(double),"root dense eigenvectors");
+                ClusterCol_GpuSolver_SolveHamiltonianDevice(n,MaxN,ko[spin],C);
+                ClusterCol_StashGpuSolverDenseEVec(myid1, spin, n, MaxN, &C);
+                free(C);
             }
-            dense_index = (int*)ClusterCol_MallocArray((size_t)tnum,sizeof(int),"packed Hamiltonian dense_index");
-            ClusterCol_BuildDenseIndex(cache_order_GA,MP,n,tnum,dense_index);
-            ClusterCol_BuildDeviceDenseFromPacked(cache_H,dense_index,tnum,n,ClusterCol_gpusolver_ctx.d_H);
-            free(dense_index);
+        }
+        else {
+            Patch2Device_Cluster_Owner(nh[spin],MP,owns_dense,n,
+                                       owns_dense ? ClusterCol_gpusolver_ctx.d_H : NULL);
+            if (owns_dense){
+                size_t nmax = ClusterCol_CheckedMulCount((size_t)n,(size_t)MaxN,"root dense eigenvectors");
+                double *C = NULL;
 
-            C = (double*)ClusterCol_MallocArray(nmax,sizeof(double),"root dense eigenvectors");
-            ClusterCol_GpuSolver_SolveHamiltonianDevice(n,MaxN,ko[spin],C);
-            ClusterCol_StashGpuSolverDenseEVec(myid1, spin, n, MaxN, &C);
-            free(C);
+                C = (double*)ClusterCol_MallocArray(nmax,sizeof(double),"root dense eigenvectors");
+                ClusterCol_GpuSolver_SolveHamiltonianDevice(n,MaxN,ko[spin],C);
+                ClusterCol_StashGpuSolverDenseEVec(myid1, spin, n, MaxN, &C);
+                free(C);
+            }
         }
     }
 
-    (void)CntOLP;
-    (void)nh;
     (void)numprocs1;
     (void)is2;
     (void)ie2;
