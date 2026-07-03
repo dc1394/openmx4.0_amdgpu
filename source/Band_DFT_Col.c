@@ -242,9 +242,16 @@ static int BandCol_GpuTurnGroup(void)
     long        group;
 
     if (value == NULL) {
-        return 2;
+        value = getenv("OPENMX_BAND_GPU_MAX_RANKS_PER_DEVICE");
+        if (value == NULL) {
+            group = 4;
+        } else {
+            group = strtol(value, NULL, 10);
+        }
+    } else {
+        group = strtol(value, NULL, 10);
     }
-    group = strtol(value, NULL, 10);
+
     if (group < 1L) {
         return 1;
     }
@@ -263,6 +270,18 @@ static int BandCol_MaxConcurrentKGpuTurns(void)
         char *endp = NULL;
         limit = strtol(value, &endp, 10);
         if (endp == value || limit < 1L) {
+            return 1;
+        }
+        if ((long)INT_MAX < limit) {
+            return INT_MAX;
+        }
+        return (int)limit;
+    }
+
+    value = getenv("OPENMX_BAND_GPU_MAX_RANKS_PER_DEVICE");
+    if (value != NULL) {
+        limit = strtol(value, NULL, 10);
+        if (limit < 1L) {
             return 1;
         }
         if ((long)INT_MAX < limit) {
@@ -2030,6 +2049,13 @@ double Band_DFT_Col(int SCF_iter, int knum_i, int knum_j, int knum_k, int SpinP_
 
     if (SpinP_switch == 1 && numprocs0 == 1 && all_knum == 1) {
         all_knum = 0;
+    }
+
+    if (use_gpusolver_dense && myid0 == Host_ID && SCF_iter == 1 && 0 < level_stdout) {
+        int gpu_turn_limit = (all_knum == 1) ? BandCol_GpuTurnGroup() : BandCol_MaxConcurrentKGpuTurns();
+        printf("<Band_DFT_Col>  GPUSOLVER GPU-turn concurrency is limited to %d MPI rank(s); other ranks wait.\n",
+               gpu_turn_limit);
+        fflush(stdout);
     }
 
     owns_dense_k_rank = (use_gpusolver_dense && Set_Hamiltonian_OpenACC_Rank_Is_Selected());
