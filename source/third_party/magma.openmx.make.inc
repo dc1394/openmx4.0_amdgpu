@@ -35,3 +35,9 @@ LIBDIR      += -L$(AOCL_LIB)
 LIBDIR      += -L$(ROCM_PATH)/lib
 
 INC         += -I$(ROCM_PATH)/include
+
+# GEMMul8 (Ozaki Scheme II) integration — libmagma.a references gemmul8::
+# symbols from interface_hip/ozaki2.o; testers need the archive + hipblaslt.
+LIBDIR      += -L../GEMMul8/lib
+LIB         += -lgemmul8 -lhipblaslt
+INC         += -I../GEMMul8/include

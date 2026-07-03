@@ -118,7 +118,7 @@ GEMMUL8_DIR ?= $(GEMMUL8_REPO_DIR)
 GEMMUL8_LIB ?= $(GEMMUL8_DIR)/lib/libgemmul8.a
 GEMMUL8_OPENMX_OBJ ?= $(GEMMUL8_DIR)/src/gemmul8_openmx.o
 GEMMUL8_GPU_ARCH ?= $(ARCH)
-HIPCC_GEMMUL8_FLAGS = -std=c++20 -O3 --offload-arch=$(GEMMUL8_GPU_ARCH) -I. -I$(GEMMUL8_DIR)/include -I$(GEMMUL8_DIR)/src -I$(ROCM)/include -D__HIP_PLATFORM_AMD__ -ffp-contract=off -Wno-unused-result -Wno-unused-command-line-argument -Wno-unused-value -DOCML_BASIC_ROUNDED_OPERATIONS -DGPU_ARCH=$(GEMMUL8_GPU_ARCH)
+HIPCC_GEMMUL8_FLAGS = -std=c++20 -O3 -fPIC --offload-arch=$(GEMMUL8_GPU_ARCH) -I. -I$(GEMMUL8_DIR)/include -I$(GEMMUL8_DIR)/src -I$(ROCM)/include -D__HIP_PLATFORM_AMD__ -ffp-contract=off -Wno-unused-result -Wno-unused-command-line-argument -Wno-unused-value -DOCML_BASIC_ROUNDED_OPERATIONS -DGPU_ARCH=$(GEMMUL8_GPU_ARCH)
 MAGMA_VERSION ?= 2.10.0
 MAGMA_DIR ?= third_party/magma
 MAGMA_ARCHIVE_BASENAME ?= magma-$(MAGMA_VERSION).tar.gz
@@ -126,6 +126,7 @@ MAGMA_ARCHIVE ?= $(MAGMA_DIR)/$(MAGMA_ARCHIVE_BASENAME)
 MAGMA_LIB ?= $(MAGMA_DIR)/lib/libmagma.a
 MAGMA_GPU_TARGET ?= $(ARCH)
 MAGMA_MAKE_INC ?= third_party/magma.openmx.make.inc
+MAGMA_PATCH ?= third_party/magma-ozaki2.patch
 MAGMA_STAMP ?= $(MAGMA_DIR)/.openmx-magma-$(MAGMA_VERSION).stamp
 MAGMA_EXTRA_GFXS ?= 1200
 HIPCC_MAGMA_FLAGS = $(HIPCC_GEMMUL8_FLAGS) -I$(MAGMA_DIR)/include -I$(MAGMA_DIR)/control
@@ -299,7 +300,7 @@ $(FFTW3_USERS): | $(FFTW3_LIB)
 .DEFAULT_GOAL := openmx
 
 openmx:	$(FFTW3_LIB) $(GEMMUL8_LIB) $(MAGMA_LIB) $(OBJS)
-	$(CC) $(OBJS) $(STACK) $(GEMMUL8_LIB) $(MAGMA_LIB) $(LIB) -lm -o openmx
+	$(CC) $(OBJS) $(STACK) $(MAGMA_LIB) $(GEMMUL8_LIB) $(LIB) -lm -o openmx
 	
 #
 #
@@ -708,13 +709,35 @@ $(MAGMA_MAKE_INC):
 	@echo "OpenMX MAGMA make.inc template was not found: $(MAGMA_MAKE_INC)"
 	@false
 
-$(MAGMA_STAMP): $(MAGMA_ARCHIVE) $(MAGMA_MAKE_INC)
+$(MAGMA_STAMP): $(MAGMA_ARCHIVE) $(MAGMA_MAKE_INC) $(MAGMA_PATCH)
 	mkdir -p "$(MAGMA_DIR)"
 	find "$(MAGMA_DIR)" -mindepth 1 -maxdepth 1 ! -name "$(MAGMA_ARCHIVE_BASENAME)" -exec rm -rf {} +
 	tar -xzf "$(MAGMA_ARCHIVE)" -C "$(MAGMA_DIR)" --strip-components=1
 	ln -sf Makefile.gen.hip "$(MAGMA_DIR)/make.gen.hipMAGMA"
 	sed -i 's/^\([[:space:]]*VALID_GFXS =.*\)/\1 $(MAGMA_EXTRA_GFXS)/' "$(MAGMA_DIR)/Makefile"
 	install -m 0644 "$(MAGMA_MAKE_INC)" "$(MAGMA_DIR)/make.inc"
+	# Apply the Ozaki Scheme II (GEMMul8) integration on top of pristine MAGMA.
+	# The rule runs from source/, so the shell opens the patch relative to
+	# source/ while patch -d chdirs into the MAGMA tree and strips -p1.
+	patch -d "$(MAGMA_DIR)" -p1 < "$(MAGMA_PATCH)"
+	# tools/codegen.py is NOT shipped; the patch bumps the mtimes of the
+	# precision templates it edits, so touch every file MAGMA would otherwise
+	# try to regenerate from them (blas_{s,c,d}_v2 from blas_z_v2, slaex3 from
+	# dlaex3, and the s/d/c _ozaki2 driver + tester siblings) so no codegen
+	# rule ever fires.
+	touch "$(MAGMA_DIR)/interface_hip/blas_s_v2.cpp" \
+	      "$(MAGMA_DIR)/interface_hip/blas_c_v2.cpp" \
+	      "$(MAGMA_DIR)/interface_hip/blas_d_v2.cpp" \
+	      "$(MAGMA_DIR)/src/slaex3.cpp"
+	touch "$(MAGMA_DIR)/src/ssyevdx_ozaki2.cpp" \
+	      "$(MAGMA_DIR)/src/dsyevdx_ozaki2.cpp" \
+	      "$(MAGMA_DIR)/src/cheevdx_ozaki2.cpp" \
+	      "$(MAGMA_DIR)/src/ssyevdx_ozaki2_gpu.cpp" \
+	      "$(MAGMA_DIR)/src/dsyevdx_ozaki2_gpu.cpp" \
+	      "$(MAGMA_DIR)/src/cheevdx_ozaki2_gpu.cpp"
+	touch "$(MAGMA_DIR)/testing/testing_ssyevdx_ozaki2.cpp" \
+	      "$(MAGMA_DIR)/testing/testing_dsyevdx_ozaki2.cpp" \
+	      "$(MAGMA_DIR)/testing/testing_cheevdx_ozaki2.cpp"
 	rm -f magma_openmx.o
 	touch "$@"
 

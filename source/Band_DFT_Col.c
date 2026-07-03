@@ -1454,8 +1454,10 @@ static void BandCol_ConstructDenseCsHs_HIP(int need_s, int n, double k1, double 
 
     if (BandCol_BuildDenseCsHs_HIP(need_s, count, h_count, phase_count, n, entries, phase_r, phase_i,
                                    H1, S1, d_H, d_S) != 0) {
-        /* Likely out of GPU memory: drop this rank's cached GEMMul8 workspace and retry. */
+        /* Likely out of GPU memory: drop this rank's cached GEMMul8 and MAGMA
+           Ozaki-II workspaces and retry. */
         openmx_gemmul8ReleaseWorkspaces();
+        openmx_magma_ozaki2_release();
         if (BandCol_BuildDenseCsHs_HIP(need_s, count, h_count, phase_count, n, entries, phase_r, phase_i,
                                        H1, S1, d_H, d_S) != 0) {
             BandCol_AbortWithMessage("Band_DFT_Col HIP dense matrix generation failed.");
@@ -2531,6 +2533,9 @@ diagonalize1:
                         }
 
                         if (BandCol_GemmWorkspaceTurnRelease()) {
+                            /* Note: the MAGMA Ozaki-II workspace is NOT dropped here —
+                               its rank-divided cap plus free-VRAM guard keep it bounded,
+                               and re-growing it every GPU turn costs ~50-100 ms each. */
                             openmx_gemmul8ReleaseWorkspaces();
                         }
 
@@ -4481,6 +4486,7 @@ diagonalize1:
     /* Many ranks share one GPU; cached GEMMul8 workspaces (~1 GiB per rank) would
        otherwise accumulate across SCF iterations and starve later allocations. */
     openmx_gemmul8ReleaseWorkspaces();
+    openmx_magma_ozaki2_release();
 
     MPI_Barrier(mpi_comm_level1);
     dtime(&TEtime);
