@@ -40,6 +40,8 @@
 #define DCLNO_PROXY_TAG_COL_EVAL   41003
 #define DCLNO_PROXY_TAG_COL_CVEC   41004
 
+extern int openmx_magma_dsyevdx_gpu(int n, int maxn, double *d_A, double *w, int *mout);
+
 /* ------------------------------------------------------------------ */
 /* forward declarations                                               */
 /* ------------------------------------------------------------------ */
@@ -297,18 +299,12 @@ static void DCLNO_Eigen_lapack_d_reuse(double **a,
 typedef struct {
     int                initialized;
     int                max_num;
-    size_t             d_work_bytes;
-    size_t             h_work_bytes;
     cudaStream_t       stream;
     cublasHandle_t     cublas;
-    cusolverDnHandle_t gpusolver;
     double *           d_S;
     double *           d_H;
     double *           d_tmp;
     double *           d_W;
-    int32_t *          d_info;
-    void *             d_work;
-    void *             h_work;
 } DCLNO_GpuSolverCtx;
 
 static DCLNO_GpuSolverCtx DCLNO_gpusolver_ctx = {0};
@@ -322,10 +318,6 @@ static void DCLNO_GpuSolver_Destroy(void)
     if (ctx->d_H    != NULL) wait_cudafunc(cudaFree(ctx->d_H));
     if (ctx->d_tmp  != NULL) wait_cudafunc(cudaFree(ctx->d_tmp));
     if (ctx->d_W    != NULL) wait_cudafunc(cudaFree(ctx->d_W));
-    if (ctx->d_info != NULL) wait_cudafunc(cudaFree(ctx->d_info));
-    if (ctx->d_work != NULL) wait_cudafunc(cudaFree(ctx->d_work));
-    if (ctx->h_work != NULL) free(ctx->h_work);
-    if (ctx->gpusolver != NULL) wait_cudafunc(cusolverDnDestroy(ctx->gpusolver));
     if (ctx->cublas   != NULL) wait_cudafunc(cublasDestroy(ctx->cublas));
     if (ctx->stream   != NULL) wait_cudafunc(cudaStreamDestroy(ctx->stream));
 
@@ -365,9 +357,7 @@ static void DCLNO_GpuSolver_Init(void)
 
     wait_cudafunc(cudaStreamCreateWithFlags(&ctx->stream, cudaStreamNonBlocking));
     wait_cudafunc(cublasCreate(&ctx->cublas));
-    wait_cudafunc(cusolverDnCreate(&ctx->gpusolver));
     wait_cudafunc(cublasSetStream(ctx->cublas, ctx->stream));
-    wait_cudafunc(cusolverDnSetStream(ctx->gpusolver, ctx->stream));
 
     ctx->initialized = 1;
 }
@@ -389,7 +379,6 @@ static void DCLNO_GpuSolver_EnsureMatrixCapacity(int num)
     if (ctx->d_H    != NULL) wait_cudafunc(cudaFree(ctx->d_H));
     if (ctx->d_tmp  != NULL) wait_cudafunc(cudaFree(ctx->d_tmp));
     if (ctx->d_W    != NULL) wait_cudafunc(cudaFree(ctx->d_W));
-    if (ctx->d_info != NULL) wait_cudafunc(cudaFree(ctx->d_info));
 
     matrix_bytes = DCLNO_CheckedArrayBytes(DCLNO_CheckedMulCount((size_t)num, (size_t)num,
                                                                  "GPU solver dense matrix dimensions"),
@@ -401,86 +390,32 @@ static void DCLNO_GpuSolver_EnsureMatrixCapacity(int num)
     wait_cudafunc(cudaMalloc((void**)&ctx->d_tmp, matrix_bytes));
     wait_cudafunc(cudaMalloc((void**)&ctx->d_W,
                              DCLNO_CheckedArrayBytes((size_t)num, sizeof(double), "GPU solver eigenvalue buffer")));
-    wait_cudafunc(cudaMalloc((void**)&ctx->d_info, sizeof(int32_t)));
 
     ctx->max_num = num;
-}
-
-static void DCLNO_GpuSolver_EnsureWorkspace(int m, int maxn)
-{
-    DCLNO_GpuSolverCtx *ctx = &DCLNO_gpusolver_ctx;
-    cusolverEigMode_t  jobz = CUSOLVER_EIG_MODE_VECTOR;
-    cublasFillMode_t   uplo = CUBLAS_FILL_MODE_LOWER;
-    cusolverEigRange_t range;
-    double             vl = 0.0;
-    double             vu = 0.0;
-    int64_t            h_meig = 0;
-    size_t             d_bytes = 0;
-    size_t             h_bytes = 0;
-
-    if (m <= 0 || maxn <= 0 || maxn > m) {
-        DCLNO_AbortWithMessage("Invalid eigensolver dimensions in DCLNO_GpuSolver_EnsureWorkspace.");
-    }
-
-    DCLNO_GpuSolver_EnsureMatrixCapacity(m);
-
-    range = (m == maxn) ? CUSOLVER_EIG_RANGE_ALL : CUSOLVER_EIG_RANGE_I;
-
-    wait_cudafunc(cusolverDnXsyevdx_bufferSize(ctx->gpusolver, NULL, jobz, range, uplo, m,
-                                               CUDA_R_64F, ctx->d_S, m, &vl, &vu, 1L, maxn,
-                                               &h_meig, CUDA_R_64F, ctx->d_W, CUDA_R_64F,
-                                               &d_bytes, &h_bytes));
-
-    if (d_bytes > ctx->d_work_bytes) {
-        if (ctx->d_work != NULL) wait_cudafunc(cudaFree(ctx->d_work));
-        ctx->d_work = NULL;
-        if (d_bytes > 0) {
-            wait_cudafunc(cudaMalloc((void**)&ctx->d_work, d_bytes));
-        }
-        ctx->d_work_bytes = d_bytes;
-    }
-
-    if (h_bytes == 0) {
-        if (ctx->h_work != NULL) free(ctx->h_work);
-        ctx->h_work = NULL;
-        ctx->h_work_bytes = 0;
-    }
-    else if (h_bytes > ctx->h_work_bytes) {
-        if (ctx->h_work != NULL) free(ctx->h_work);
-        ctx->h_work = DCLNO_MallocArray(h_bytes, 1, "GPU solver host workspace");
-        ctx->h_work_bytes = h_bytes;
-    }
 }
 
 static void DCLNO_GpuSolver_Eigen(double *d_A, int m, int maxn, double *W)
 {
     DCLNO_GpuSolverCtx *ctx = &DCLNO_gpusolver_ctx;
-    cusolverEigMode_t  jobz = CUSOLVER_EIG_MODE_VECTOR;
-    cublasFillMode_t   uplo = CUBLAS_FILL_MODE_LOWER;
-    cusolverEigRange_t range;
-    double             vl = 0.0;
-    double             vu = 0.0;
-    int64_t            h_meig = 0;
-    int32_t            info = 0;
+    int                info = 0;
+    int                mout = 0;
+    char               msg[256];
 
-    DCLNO_GpuSolver_EnsureWorkspace(m, maxn);
+    if (m <= 0 || maxn <= 0 || maxn > m || d_A == NULL || W == NULL) {
+        DCLNO_AbortWithMessage("Invalid eigensolver arguments in DCLNO_GpuSolver_Eigen.");
+    }
 
-    range = (m == maxn) ? CUSOLVER_EIG_RANGE_ALL : CUSOLVER_EIG_RANGE_I;
-
-    wait_cudafunc(cusolverDnXsyevdx(ctx->gpusolver, NULL, jobz, range, uplo, m, CUDA_R_64F,
-                                    d_A, m, &vl, &vu, 1L, maxn, &h_meig, CUDA_R_64F,
-                                    ctx->d_W, CUDA_R_64F, ctx->d_work, ctx->d_work_bytes,
-                                    ctx->h_work, ctx->h_work_bytes, ctx->d_info));
-
-    wait_cudafunc(cudaMemcpyAsync(W, ctx->d_W, sizeof(double) * (size_t)maxn,
-                                  cudaMemcpyDeviceToHost, ctx->stream));
-    wait_cudafunc(cudaMemcpyAsync(&info, ctx->d_info, sizeof(int32_t),
-                                  cudaMemcpyDeviceToHost, ctx->stream));
+    DCLNO_GpuSolver_EnsureMatrixCapacity(m);
     wait_cudafunc(cudaStreamSynchronize(ctx->stream));
 
+    info = openmx_magma_dsyevdx_gpu(m, maxn, d_A, W, &mout);
     if (info != 0) {
-        fprintf(stderr, "hipsolverDnDsyevdx failed in DC-LNO: info=%d\n", (int)info);
-        exit(10);
+        snprintf(msg, sizeof(msg), "magma_dsyevdx_gpu failed in DC-LNO: info=%d", info);
+        DCLNO_AbortWithMessage(msg);
+    }
+    if (mout != maxn) {
+        snprintf(msg, sizeof(msg), "magma_dsyevdx_gpu returned %d eigenpairs in DC-LNO, expected %d.", mout, maxn);
+        DCLNO_AbortWithMessage(msg);
     }
 }
 
@@ -1079,7 +1014,6 @@ static double DC_Col(char * mode, int MD_iter, int SCF_iter, int SucceedReadingD
         MPI_Allreduce(MPI_IN_PLACE, &gpu_group_max_msize, 1, MPI_INT, MPI_MAX, DCLNO_gpu_group_comm);
         if (DCLNO_is_gpu_owner && gpu_group_max_msize >= DCLNO_GPU_PROXY_EIGEN_THRESHOLD_COL) {
             DCLNO_GpuSolver_EnsureMatrixCapacity(gpu_group_max_msize);
-            DCLNO_GpuSolver_EnsureWorkspace(gpu_group_max_msize, gpu_group_max_msize);
         }
     }
 

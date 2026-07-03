@@ -28,6 +28,8 @@
 #define measure_time 0
 // #define _BENCHMARK   1
 
+extern int openmx_magma_dsyevdx_gpu(int n, int maxn, double *d_A, double *w, int *mout);
+
 static double DC_Col(char * mode, int SCF_iter, double ***** Hks, double **** OLP0, double ***** CDM, double ***** EDM,
                      double Eele0[2], double Eele1[2]);
 
@@ -218,20 +220,13 @@ typedef struct {
     int                device_id;
     int                matrix_dim;
     int                loaded_s_dim;
-    size_t             d_work_bytes;
-    size_t             h_work_bytes;
     cudaStream_t       stream;
     cublasHandle_t     cublas;
-    cusolverDnHandle_t gpusolver;
     double *           d_S;
     double *           d_H;
     double *           d_tmp;
     double *           d_A;
     double *           d_C;
-    double *           d_W;
-    int32_t *          d_info;
-    void *             d_work;
-    void *             h_work;
     double *           h_matrix;
 } DCGpuSolverCtx;
 
@@ -344,37 +339,6 @@ static const char *DC_GpuSolver_CublasStatusName(cublasStatus_t status)
     return "HIPBLAS_STATUS_ERROR";
 }
 
-static const char *DC_GpuSolver_StatusName(cusolverStatus_t status)
-{
-    if (status == CUSOLVER_STATUS_SUCCESS)
-        return "CUSOLVER_STATUS_SUCCESS";
-    if (status == CUSOLVER_STATUS_NOT_INITIALIZED)
-        return "CUSOLVER_STATUS_NOT_INITIALIZED";
-    if (status == CUSOLVER_STATUS_ALLOC_FAILED)
-        return "CUSOLVER_STATUS_ALLOC_FAILED";
-    if (status == CUSOLVER_STATUS_INVALID_VALUE)
-        return "CUSOLVER_STATUS_INVALID_VALUE";
-    if (status == CUSOLVER_STATUS_ARCH_MISMATCH)
-        return "CUSOLVER_STATUS_ARCH_MISMATCH";
-    if (status == CUSOLVER_STATUS_MAPPING_ERROR)
-        return "CUSOLVER_STATUS_MAPPING_ERROR";
-    if (status == CUSOLVER_STATUS_EXECUTION_FAILED)
-        return "CUSOLVER_STATUS_EXECUTION_FAILED";
-    if (status == CUSOLVER_STATUS_INTERNAL_ERROR)
-        return "CUSOLVER_STATUS_INTERNAL_ERROR";
-    if (status == CUSOLVER_STATUS_MATRIX_TYPE_NOT_SUPPORTED)
-        return "CUSOLVER_STATUS_MATRIX_TYPE_NOT_SUPPORTED";
-    if (status == CUSOLVER_STATUS_NOT_SUPPORTED)
-        return "CUSOLVER_STATUS_NOT_SUPPORTED";
-    if (status == CUSOLVER_STATUS_ZERO_PIVOT)
-        return "CUSOLVER_STATUS_ZERO_PIVOT";
-    if (status == CUSOLVER_STATUS_INVALID_LICENSE)
-        return "CUSOLVER_STATUS_INVALID_LICENSE";
-    if (status == CUSOLVER_STATUS_INVALID_WORKSPACE)
-        return "CUSOLVER_STATUS_INVALID_WORKSPACE";
-    return "CUSOLVER_STATUS_ERROR";
-}
-
 static void DC_GpuSolver_DisableGemmPathCuda(const char *where, cudaError_t status);
 
 static void DC_Eigen_lapack_cpu(double **a, double *ko, int n, int EVmax)
@@ -424,36 +388,6 @@ static size_t DC_GpuSolver_CublasReserveBytes(void)
     return (size_t)reserve_mib * (size_t)1024 * (size_t)1024;
 }
 
-static size_t DC_GpuSolver_EigenReserveBytes(void)
-{
-    unsigned reserve_mib;
-
-#ifdef __HIP_PLATFORM_AMD__
-    reserve_mib = DC_EnvU32("GPUSOLVER_MIN_FREE_AFTER_MB", 16u);
-#else
-    reserve_mib = DC_EnvU32("GPUSOLVER_MIN_FREE_AFTER_MB", 1536u);
-#endif
-    reserve_mib = DC_EnvU32("OPENMX_GPUSOLVER_MIN_FREE_AFTER_MB", reserve_mib);
-
-    return (size_t)reserve_mib * (size_t)1024 * (size_t)1024;
-}
-
-static void DC_GpuSolver_ReleaseWorkspace(void)
-{
-    DCGpuSolverCtx *ctx = &DC_gpusolver_ctx;
-
-    if (ctx->d_work != NULL) {
-        wait_cudafunc(cudaFree(ctx->d_work));
-        ctx->d_work = NULL;
-        ctx->d_work_bytes = 0;
-    }
-    if (ctx->h_work != NULL) {
-        free(ctx->h_work);
-        ctx->h_work = NULL;
-        ctx->h_work_bytes = 0;
-    }
-}
-
 static void DC_GpuSolver_ReleaseGemmScratch(void)
 {
     DCGpuSolverCtx *ctx = &DC_gpusolver_ctx;
@@ -501,57 +435,6 @@ static void DC_GpuSolver_ReleaseOverlapBuffer(void)
     ctx->loaded_s_dim = 0;
 }
 
-static void DC_GpuSolver_DisableEigenPathMemory(const char *where, size_t need_bytes, size_t free_bytes,
-                                               size_t total_bytes, size_t reserve_bytes)
-{
-    int rank = -1;
-
-    DC_gpusolver_eigen_disabled = 1;
-    DC_gpusolver_gemm_disabled  = 1;
-    openmx_gemmul8ReleaseWorkspaces();
-
-    MPI_Comm_rank(mpi_comm_level1, &rank);
-    fprintf(stderr,
-            "<DC> rank %d: GPU solver is unsafe before %s; "
-            "needed device workspace %.3f MiB, GPU free %.3f MiB / total %.3f MiB, reserve %.3f MiB. "
-            "Falling back to the CPU divide-conquer solve.\n",
-            rank, where, (double)need_bytes / (1024.0 * 1024.0), (double)free_bytes / (1024.0 * 1024.0),
-            (double)total_bytes / (1024.0 * 1024.0), (double)reserve_bytes / (1024.0 * 1024.0));
-    fflush(stderr);
-}
-
-static void DC_GpuSolver_DisableEigenPathStatus(const char *where, const char *api, cusolverStatus_t status)
-{
-    int rank = -1;
-
-    DC_gpusolver_eigen_disabled = 1;
-    DC_gpusolver_gemm_disabled  = 1;
-    openmx_gemmul8ReleaseWorkspaces();
-
-    MPI_Comm_rank(mpi_comm_level1, &rank);
-    fprintf(stderr,
-            "<DC> rank %d: GPU solver failed in %s at %s: %s (%d). "
-            "Falling back to the CPU divide-conquer solve.\n",
-            rank, where, api, DC_GpuSolver_StatusName(status), (int)status);
-    fflush(stderr);
-}
-
-static void DC_GpuSolver_DisableEigenPathHost(const char *where, size_t need_bytes)
-{
-    int rank = -1;
-
-    DC_gpusolver_eigen_disabled = 1;
-    DC_gpusolver_gemm_disabled  = 1;
-    openmx_gemmul8ReleaseWorkspaces();
-
-    MPI_Comm_rank(mpi_comm_level1, &rank);
-    fprintf(stderr,
-            "<DC> rank %d: GPU solver host workspace allocation is unsafe before %s; "
-            "needed %.3f MiB. Falling back to the CPU divide-conquer solve.\n",
-            rank, where, (double)need_bytes / (1024.0 * 1024.0));
-    fflush(stderr);
-}
-
 static void DC_GpuSolver_DisableEigenPathInfo(const char *where, int32_t info)
 {
     int rank = -1;
@@ -562,7 +445,7 @@ static void DC_GpuSolver_DisableEigenPathInfo(const char *where, int32_t info)
 
     MPI_Comm_rank(mpi_comm_level1, &rank);
     fprintf(stderr,
-            "<DC> rank %d: GPU solver failed in %s: hipsolverDnDsyevdx info=%d. "
+            "<DC> rank %d: MAGMA eigensolver failed in %s: magma_dsyevdx_gpu info=%d. "
             "Falling back to the CPU divide-conquer solve.\n",
             rank, where, (int)info);
     fflush(stderr);
@@ -647,8 +530,6 @@ static int DC_GpuSolver_PrepareGemmBackendForSolve(int n, int num1)
     if (DC_GpuSolver_GemmDisabled()) {
         return 0;
     }
-
-    DC_GpuSolver_ReleaseWorkspace();
 
     if (DC_gpusolver_gemmul8_disabled) {
         return DC_GpuSolver_HasCublasMemoryForSolve("DC Hamiltonian GEMM");
@@ -774,18 +655,8 @@ static void DC_GpuSolver_Destroy(void)
         wait_cudafunc(cudaFree(ctx->d_A));
     if (ctx->d_C != NULL)
         wait_cudafunc(cudaFree(ctx->d_C));
-    if (ctx->d_W != NULL)
-        wait_cudafunc(cudaFree(ctx->d_W));
-    if (ctx->d_info != NULL)
-        wait_cudafunc(cudaFree(ctx->d_info));
-    if (ctx->d_work != NULL)
-        wait_cudafunc(cudaFree(ctx->d_work));
-    if (ctx->h_work != NULL)
-        free(ctx->h_work);
     if (ctx->h_matrix != NULL)
         wait_cudafunc(cudaFreeHost(ctx->h_matrix));
-    if (ctx->gpusolver != NULL)
-        wait_cudafunc(cusolverDnDestroy(ctx->gpusolver));
     if (ctx->cublas != NULL)
         wait_cudafunc(cublasDestroy(ctx->cublas));
     if (ctx->stream != NULL)
@@ -813,9 +684,7 @@ static void DC_GpuSolver_Init(void)
 
     wait_cudafunc(cudaStreamCreateWithFlags(&ctx->stream, cudaStreamNonBlocking));
     wait_cudafunc(cublasCreate(&ctx->cublas));
-    wait_cudafunc(cusolverDnCreate(&ctx->gpusolver));
     wait_cudafunc(cublasSetStream(ctx->cublas, ctx->stream));
-    wait_cudafunc(cusolverDnSetStream(ctx->gpusolver, ctx->stream));
 
     ctx->initialized  = 1;
     ctx->device_id    = current_device;
@@ -834,8 +703,7 @@ static int DC_GpuSolver_EnsureMatrixCapacity(int num)
 
     DC_GpuSolver_Init();
 
-    if (num <= ctx->matrix_dim && ctx->d_S != NULL && ctx->d_W != NULL && ctx->d_info != NULL &&
-        ctx->h_matrix != NULL) {
+    if (num <= ctx->matrix_dim && ctx->d_S != NULL && ctx->h_matrix != NULL) {
         return 1;
     }
 
@@ -844,24 +712,6 @@ static int DC_GpuSolver_EnsureMatrixCapacity(int num)
         ctx->d_S = NULL;
     }
     DC_GpuSolver_ReleaseGemmScratch();
-    if (ctx->d_W != NULL) {
-        wait_cudafunc(cudaFree(ctx->d_W));
-        ctx->d_W = NULL;
-    }
-    if (ctx->d_info != NULL) {
-        wait_cudafunc(cudaFree(ctx->d_info));
-        ctx->d_info = NULL;
-    }
-    if (ctx->d_work != NULL) {
-        wait_cudafunc(cudaFree(ctx->d_work));
-        ctx->d_work       = NULL;
-        ctx->d_work_bytes = 0;
-    }
-    if (ctx->h_work != NULL) {
-        free(ctx->h_work);
-        ctx->h_work       = NULL;
-        ctx->h_work_bytes = 0;
-    }
     if (ctx->h_matrix != NULL) {
         wait_cudafunc(cudaFreeHost(ctx->h_matrix));
         ctx->h_matrix = NULL;
@@ -876,19 +726,6 @@ static int DC_GpuSolver_EnsureMatrixCapacity(int num)
     cuda_status = cudaMalloc((void **)&ctx->d_S, matrix_bytes);
     if (cuda_status != cudaSuccess) {
         DC_GpuSolver_DisableGemmPathCuda("hipMalloc(d_S)", cuda_status);
-        DC_GpuSolver_Destroy();
-        return 0;
-    }
-    cuda_status = cudaMalloc((void **)&ctx->d_W,
-                             DC_CheckedArrayBytes((size_t)num, sizeof(double), "GPU solver eigenvalue buffer"));
-    if (cuda_status != cudaSuccess) {
-        DC_GpuSolver_DisableGemmPathCuda("hipMalloc(d_W)", cuda_status);
-        DC_GpuSolver_Destroy();
-        return 0;
-    }
-    cuda_status = cudaMalloc((void **)&ctx->d_info, sizeof(int32_t));
-    if (cuda_status != cudaSuccess) {
-        DC_GpuSolver_DisableGemmPathCuda("hipMalloc(d_info)", cuda_status);
         DC_GpuSolver_Destroy();
         return 0;
     }
@@ -944,24 +781,15 @@ static int DC_GpuSolver_EnsureGemmCapacity(int num)
     return 1;
 }
 
-static int DC_GpuSolver_EnsureWorkspace(int m, int maxn, double *d_A, const char *where)
+static int DC_GpuSolver_Eigen(double *d_A, int m, int maxn, double *W, const char *where)
 {
-    DCGpuSolverCtx *    ctx   = &DC_gpusolver_ctx;
-    cusolverEigMode_t  jobz  = CUSOLVER_EIG_MODE_VECTOR;
-    cublasFillMode_t   uplo  = CUBLAS_FILL_MODE_LOWER;
-    cusolverEigRange_t range = (m == maxn) ? CUSOLVER_EIG_RANGE_ALL : CUSOLVER_EIG_RANGE_I;
-    double             vl    = 0.0;
-    double             vu    = 0.0;
-    int64_t            h_meig;
-    size_t             d_bytes = 0;
-    size_t             h_bytes = 0;
-    size_t             free_bytes = 0, total_bytes = 0, reserve_bytes, releasable_bytes, available_bytes;
-    cusolverStatus_t   solver_status;
-    cudaError_t        cuda_status;
-    void *             new_h_work;
+    DCGpuSolverCtx *ctx = &DC_gpusolver_ctx;
+    int             info;
+    int             mout = 0;
+    cudaError_t     cuda_status;
 
-    if (m <= 0 || maxn <= 0 || maxn > m) {
-        DC_AbortWithMessage("Invalid eigensolver dimensions in DC_GpuSolver_EnsureWorkspace.");
+    if (m <= 0 || maxn <= 0 || maxn > m || d_A == NULL || W == NULL) {
+        DC_AbortWithMessage("Invalid eigensolver arguments in DC_GpuSolver_Eigen.");
     }
 
     if (DC_GpuSolver_EigenDisabled()) {
@@ -969,132 +797,23 @@ static int DC_GpuSolver_EnsureWorkspace(int m, int maxn, double *d_A, const char
     }
 
     DC_GpuSolver_Init();
-    if (m > ctx->matrix_dim || ctx->d_W == NULL || ctx->d_info == NULL) {
-        if (!DC_GpuSolver_EnsureMatrixCapacity(m)) {
-            return 0;
-        }
-    }
-    if (ctx->d_W == NULL || ctx->d_info == NULL) {
-        return 0;
-    }
 
-    solver_status = cusolverDnXsyevdx_bufferSize(ctx->gpusolver, NULL, jobz, range, uplo, m, CUDA_R_64F, d_A, m, &vl,
-                                                 &vu, 1L, maxn, &h_meig, CUDA_R_64F, ctx->d_W, CUDA_R_64F, &d_bytes,
-                                                 &h_bytes);
-    if (solver_status != CUSOLVER_STATUS_SUCCESS) {
-        DC_GpuSolver_DisableEigenPathStatus(where, "hipsolverDnDsyevdx_bufferSize", solver_status);
-        return 0;
-    }
-
-    if (d_bytes > ctx->d_work_bytes) {
-        reserve_bytes    = DC_GpuSolver_EigenReserveBytes();
-        cuda_status      = cudaMemGetInfo(&free_bytes, &total_bytes);
-        releasable_bytes = (ctx->d_work != NULL) ? ctx->d_work_bytes : 0;
-        available_bytes  = (SIZE_MAX - free_bytes < releasable_bytes) ? SIZE_MAX : free_bytes + releasable_bytes;
-
-        if (cuda_status != cudaSuccess) {
-            DC_GpuSolver_DisableGemmPathCuda("hipMemGetInfo(GPU solver preflight)", cuda_status);
-            return 0;
-        }
-        if (available_bytes < d_bytes || available_bytes - d_bytes < reserve_bytes) {
-            DC_GpuSolver_DisableEigenPathMemory(where, d_bytes, free_bytes, total_bytes, reserve_bytes);
-            return 0;
-        }
-
-        if (ctx->d_work != NULL) {
-            wait_cudafunc(cudaFree(ctx->d_work));
-        }
-        ctx->d_work = NULL;
-        if (0 < d_bytes) {
-            cuda_status = cudaMalloc((void **)&ctx->d_work, d_bytes);
-            if (cuda_status != cudaSuccess) {
-                ctx->d_work_bytes = 0;
-                DC_GpuSolver_DisableGemmPathCuda("hipMalloc(GPU solver device workspace)", cuda_status);
-                return 0;
-            }
-        }
-        ctx->d_work_bytes = d_bytes;
-    }
-
-    if (h_bytes == 0) {
-        if (ctx->h_work != NULL)
-            free(ctx->h_work);
-        ctx->h_work       = NULL;
-        ctx->h_work_bytes = 0;
-    } else if (h_bytes > ctx->h_work_bytes) {
-        if (ctx->h_work != NULL)
-            free(ctx->h_work);
-        ctx->h_work       = NULL;
-        new_h_work        = malloc(h_bytes);
-        if (new_h_work == NULL) {
-            ctx->h_work_bytes = 0;
-            DC_GpuSolver_DisableEigenPathHost(where, h_bytes);
-            return 0;
-        }
-        ctx->h_work       = new_h_work;
-        ctx->h_work_bytes = h_bytes;
-    }
-
-    return 1;
-}
-
-static int DC_GpuSolver_Eigen(double *d_A, int m, int maxn, double *W, const char *where)
-{
-    DCGpuSolverCtx *    ctx   = &DC_gpusolver_ctx;
-    cusolverEigMode_t  jobz  = CUSOLVER_EIG_MODE_VECTOR;
-    cublasFillMode_t   uplo  = CUBLAS_FILL_MODE_LOWER;
-    cusolverEigRange_t range = (m == maxn) ? CUSOLVER_EIG_RANGE_ALL : CUSOLVER_EIG_RANGE_I;
-    double             vl    = 0.0;
-    double             vu    = 0.0;
-    int64_t            h_meig = 0;
-    int32_t            info   = 0;
-    cusolverStatus_t   solver_status;
-    cudaError_t        cuda_status;
-
-    if (!DC_GpuSolver_EnsureWorkspace(m, maxn, d_A, where)) {
-        return 0;
-    }
-
-    solver_status = cusolverDnXsyevdx(ctx->gpusolver, NULL, jobz, range, uplo, m, CUDA_R_64F, d_A, m, &vl, &vu, 1L,
-                                      maxn, &h_meig, CUDA_R_64F, ctx->d_W, CUDA_R_64F, ctx->d_work,
-                                      ctx->d_work_bytes, ctx->h_work, ctx->h_work_bytes, ctx->d_info);
-    if (solver_status != CUSOLVER_STATUS_SUCCESS) {
-        DC_GpuSolver_DisableEigenPathStatus(where, "hipsolverDnDsyevdx", solver_status);
-        DC_GpuSolver_ReleaseWorkspace();
-        return 0;
-    }
-
-    cuda_status = cudaMemcpyAsync(W, ctx->d_W, sizeof(double) * (size_t)maxn, cudaMemcpyDeviceToHost, ctx->stream);
-    if (cuda_status != cudaSuccess) {
-        DC_GpuSolver_DisableGemmPathCuda("hipMemcpyAsync(GPU solver eigenvalues)", cuda_status);
-        DC_GpuSolver_ReleaseWorkspace();
-        return 0;
-    }
-    cuda_status = cudaMemcpyAsync(&info, ctx->d_info, sizeof(int32_t), cudaMemcpyDeviceToHost, ctx->stream);
-    if (cuda_status != cudaSuccess) {
-        DC_GpuSolver_DisableGemmPathCuda("hipMemcpyAsync(GPU solver info)", cuda_status);
-        DC_GpuSolver_ReleaseWorkspace();
-        return 0;
-    }
     cuda_status = cudaStreamSynchronize(ctx->stream);
     if (cuda_status != cudaSuccess) {
-        DC_GpuSolver_DisableGemmPathCuda("hipStreamSynchronize(GPU solver)", cuda_status);
-        DC_GpuSolver_ReleaseWorkspace();
+        DC_GpuSolver_DisableGemmPathCuda("hipStreamSynchronize(MAGMA eigensolver input)", cuda_status);
         return 0;
     }
 
+    info = openmx_magma_dsyevdx_gpu(m, maxn, d_A, W, &mout);
     if (info != 0) {
         DC_GpuSolver_DisableEigenPathInfo(where, info);
-        DC_GpuSolver_ReleaseWorkspace();
         return 0;
     }
-    if (h_meig != (int64_t)maxn) {
-        DC_GpuSolver_DisableEigenPathEigenpairs(where, h_meig, maxn);
-        DC_GpuSolver_ReleaseWorkspace();
+    if (mout != maxn) {
+        DC_GpuSolver_DisableEigenPathEigenpairs(where, (int64_t)mout, maxn);
         return 0;
     }
 
-    DC_GpuSolver_ReleaseWorkspace();
     return 1;
 }
 

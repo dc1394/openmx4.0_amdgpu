@@ -111,6 +111,7 @@ static void Embedding_Matrix_trd(int spin, int Mc_AN, double *****Hks,
 static int Eigen_lapack_x(double **a, double *ko, int n, int EVmax);
 static int Eigen_lapack_d(double **a, double *ko, int n, int EVmax);
 static int Eigen_lapack_r(double **a, double *ko, int n, int EVmax);
+extern int openmx_magma_dsyevdx_gpu(int n, int maxn, double *d_A, double *w, int *mout);
 
 static int Krylov_GPU_Enabled(void)
 {
@@ -124,22 +125,14 @@ static int Krylov_GPU_Enabled(void)
 typedef struct {
   int active;
   cublasHandle_t cublas;
-  cusolverDnHandle_t gpusolver;
   cudaStream_t stream;
   double *d_A;
   double *d_B;
   double *d_C;
-  double *d_W;
-  int32_t *d_info;
-  void *d_work;
-  void *h_work;
   double *h_A;
   size_t d_A_count;
   size_t d_B_count;
   size_t d_C_count;
-  size_t d_W_count;
-  size_t d_work_bytes;
-  size_t h_work_bytes;
   size_t h_A_count;
 } Krylov_GPU_Workspace;
 
@@ -147,7 +140,6 @@ static void Krylov_GPU_InitOnce(void);
 static void Krylov_GPU_Workspace_Init(Krylov_GPU_Workspace *ws);
 static void Krylov_GPU_Workspace_Free(Krylov_GPU_Workspace *ws);
 static void Krylov_GPU_EnsureCublas(Krylov_GPU_Workspace *ws);
-static void Krylov_GPU_EnsureGpusolver(Krylov_GPU_Workspace *ws);
 static void Krylov_GPU_PreparePool(int nthrds);
 static Krylov_GPU_Workspace *Krylov_GPU_GetWorkspace(int thread_id);
 static void Krylov_Dgemm(Krylov_GPU_Workspace *ws,
@@ -218,40 +210,6 @@ static void Krylov_GPU_EnsureDouble(double **ptr, size_t *capacity, size_t count
   }
 }
 
-static void Krylov_GPU_EnsureInfo(int32_t **ptr)
-{
-  if (*ptr == NULL){
-    wait_cudafunc(cudaMalloc((void**)ptr, sizeof(int32_t)));
-  }
-}
-
-static void Krylov_GPU_EnsureDeviceWork(Krylov_GPU_Workspace *ws, size_t bytes)
-{
-  if (ws->d_work_bytes < bytes){
-    if (ws->d_work != NULL) wait_cudafunc(cudaFree(ws->d_work));
-    if (bytes != 0){
-      wait_cudafunc(cudaMalloc((void**)&ws->d_work, bytes));
-    }
-    else{
-      ws->d_work = NULL;
-    }
-    ws->d_work_bytes = bytes;
-  }
-}
-
-static void Krylov_GPU_EnsureHostWork(Krylov_GPU_Workspace *ws, size_t bytes)
-{
-  if (ws->h_work_bytes < bytes){
-    if (ws->h_work != NULL) free(ws->h_work);
-    ws->h_work = (bytes == 0) ? NULL : malloc(bytes);
-    if (bytes != 0 && ws->h_work == NULL){
-      fprintf(stderr,"Krylov: could not allocate GPU solver host workspace.\n");
-      MPI_Abort(MPI_COMM_WORLD,1);
-    }
-    ws->h_work_bytes = bytes;
-  }
-}
-
 static void Krylov_GPU_EnsureHostMatrix(Krylov_GPU_Workspace *ws, size_t count)
 {
   if (ws->h_A_count < count){
@@ -281,12 +239,7 @@ static void Krylov_GPU_Workspace_Free(Krylov_GPU_Workspace *ws)
   if (ws->d_A    != NULL) wait_cudafunc(cudaFree(ws->d_A));
   if (ws->d_B    != NULL) wait_cudafunc(cudaFree(ws->d_B));
   if (ws->d_C    != NULL) wait_cudafunc(cudaFree(ws->d_C));
-  if (ws->d_W    != NULL) wait_cudafunc(cudaFree(ws->d_W));
-  if (ws->d_info != NULL) wait_cudafunc(cudaFree(ws->d_info));
-  if (ws->d_work != NULL) wait_cudafunc(cudaFree(ws->d_work));
-  if (ws->h_work != NULL) free(ws->h_work);
   if (ws->h_A    != NULL) free(ws->h_A);
-  if (ws->gpusolver != NULL) wait_cudafunc(cusolverDnDestroy(ws->gpusolver));
   if (ws->cublas   != NULL) wait_cudafunc(cublasDestroy(ws->cublas));
   if (ws->stream   != NULL) wait_cudafunc(cudaStreamDestroy(ws->stream));
   memset(ws,0,sizeof(Krylov_GPU_Workspace));
@@ -297,14 +250,6 @@ static void Krylov_GPU_EnsureCublas(Krylov_GPU_Workspace *ws)
   if (ws->cublas == NULL){
     wait_cudafunc(cublasCreate(&ws->cublas));
     wait_cudafunc(cublasSetStream(ws->cublas, ws->stream));
-  }
-}
-
-static void Krylov_GPU_EnsureGpusolver(Krylov_GPU_Workspace *ws)
-{
-  if (ws->gpusolver == NULL){
-    wait_cudafunc(cusolverDnCreate(&ws->gpusolver));
-    wait_cudafunc(cusolverDnSetStream(ws->gpusolver, ws->stream));
   }
 }
 
@@ -354,18 +299,15 @@ static void Krylov_Dgemm(Krylov_GPU_Workspace *ws,
 static void Krylov_Eigen2(Krylov_GPU_Workspace *ws, double *a, int csize, double *ko, int n, int EVmax)
 {
   int i,j;
+  int info, mout;
 
   if (ws == NULL || !ws->active || n < KRYLOV_GPU_EIGEN_MIN){
     Eigen_lapack2(a,csize,ko,n,EVmax);
     return;
   }
 
-  Krylov_GPU_EnsureGpusolver(ws);
-
   Krylov_GPU_EnsureHostMatrix(ws,(size_t)n*(size_t)n);
   Krylov_GPU_EnsureDouble(&ws->d_A, &ws->d_A_count, (size_t)n*(size_t)n);
-  Krylov_GPU_EnsureDouble(&ws->d_W, &ws->d_W_count, (size_t)n);
-  Krylov_GPU_EnsureInfo(&ws->d_info);
 
   for (i=0; i<n; i++){
     for (j=0; j<n; j++){
@@ -375,74 +317,25 @@ static void Krylov_Eigen2(Krylov_GPU_Workspace *ws, double *a, int csize, double
 
   wait_cudafunc(cudaMemcpyAsync(ws->d_A, ws->h_A, sizeof(double)*(size_t)n*(size_t)n,
                                 cudaMemcpyHostToDevice, ws->stream));
-
-  cusolverEigMode_t jobz = CUSOLVER_EIG_MODE_VECTOR;
-  cublasFillMode_t uplo = CUBLAS_FILL_MODE_LOWER;
-  double vl = 0.0;
-  double vu = 0.0;
-  int64_t h_meig = 0;
-  size_t d_work_bytes = 0;
-  size_t h_work_bytes = 0;
-
-  if (n == EVmax){
-    wait_cudafunc(cusolverDnXsyevd_bufferSize(ws->gpusolver, NULL, jobz, uplo,
-                                              n, CUDA_R_64F, ws->d_A, n,
-                                              CUDA_R_64F, ws->d_W, CUDA_R_64F,
-                                              &d_work_bytes, &h_work_bytes));
-    h_meig = EVmax;
-  }
-  else{
-    cusolverEigRange_t range = CUSOLVER_EIG_RANGE_I;
-
-    wait_cudafunc(cusolverDnXsyevdx_bufferSize(ws->gpusolver, NULL, jobz, range, uplo,
-                                               n, CUDA_R_64F, ws->d_A, n,
-                                               &vl, &vu, 1L, EVmax, &h_meig,
-                                               CUDA_R_64F, ws->d_W, CUDA_R_64F,
-                                               &d_work_bytes, &h_work_bytes));
-  }
-
-  Krylov_GPU_EnsureDeviceWork(ws,d_work_bytes);
-  Krylov_GPU_EnsureHostWork(ws,h_work_bytes);
-
-  if (n == EVmax){
-    wait_cudafunc(cusolverDnXsyevd(ws->gpusolver, NULL, jobz, uplo,
-                                   n, CUDA_R_64F, ws->d_A, n,
-                                   CUDA_R_64F, ws->d_W, CUDA_R_64F,
-                                   ws->d_work, d_work_bytes,
-                                   ws->h_work, h_work_bytes, ws->d_info));
-  }
-  else{
-    cusolverEigRange_t range = CUSOLVER_EIG_RANGE_I;
-
-    wait_cudafunc(cusolverDnXsyevdx(ws->gpusolver, NULL, jobz, range, uplo,
-                                    n, CUDA_R_64F, ws->d_A, n,
-                                    &vl, &vu, 1L, EVmax, &h_meig,
-                                    CUDA_R_64F, ws->d_W, CUDA_R_64F,
-                                    ws->d_work, d_work_bytes,
-                                    ws->h_work, h_work_bytes, ws->d_info));
-  }
-
-  int32_t info = 0;
-  wait_cudafunc(cudaMemcpyAsync(ws->h_A, ws->d_A, sizeof(double)*(size_t)n*(size_t)n,
-                                cudaMemcpyDeviceToHost, ws->stream));
-  wait_cudafunc(cudaMemcpyAsync(ko+1, ws->d_W, sizeof(double)*(size_t)EVmax,
-                                cudaMemcpyDeviceToHost, ws->stream));
-  wait_cudafunc(cudaMemcpyAsync(&info, ws->d_info, sizeof(int32_t),
-                                cudaMemcpyDeviceToHost, ws->stream));
   wait_cudafunc(cudaStreamSynchronize(ws->stream));
 
-  if (info != 0 || h_meig != (int64_t)EVmax){
+  mout = 0;
+  info = openmx_magma_dsyevdx_gpu(n, EVmax, ws->d_A, ko+1, &mout);
+  if (info != 0 || mout != EVmax){
     if (info != 0){
-      fprintf(stderr,"Krylov: %s failed, info=%d; falling back to LAPACK.\n",
-              (n == EVmax) ? "hipsolverDnDsyevd" : "hipsolverDnDsyevdx",(int)info);
+      fprintf(stderr,"Krylov: magma_dsyevdx_gpu failed, info=%d; falling back to LAPACK.\n",info);
     }
     else{
-      fprintf(stderr,"Krylov: hipsolverDnDsyevdx returned %lld eigenpairs, expected %d; falling back to LAPACK.\n",
-              (long long)h_meig,EVmax);
+      fprintf(stderr,"Krylov: magma_dsyevdx_gpu returned %d eigenpairs, expected %d; falling back to LAPACK.\n",
+              mout,EVmax);
     }
     Eigen_lapack2(a,csize,ko,n,EVmax);
     return;
   }
+
+  wait_cudafunc(cudaMemcpyAsync(ws->h_A, ws->d_A, sizeof(double)*(size_t)n*(size_t)n,
+                                cudaMemcpyDeviceToHost, ws->stream));
+  wait_cudafunc(cudaStreamSynchronize(ws->stream));
 
   for (i=0; i<EVmax; i++){
     for (j=0; j<n; j++){
