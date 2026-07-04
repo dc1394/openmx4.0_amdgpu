@@ -2051,13 +2051,6 @@ double Band_DFT_Col(int SCF_iter, int knum_i, int knum_j, int knum_k, int SpinP_
         all_knum = 0;
     }
 
-    if (use_gpusolver_dense && myid0 == Host_ID && SCF_iter == 1 && 0 < level_stdout) {
-        int gpu_turn_limit = (all_knum == 1) ? BandCol_GpuTurnGroup() : BandCol_MaxConcurrentKGpuTurns();
-        printf("<Band_DFT_Col>  GPUSOLVER GPU-turn concurrency is limited to %d MPI rank(s); other ranks wait.\n",
-               gpu_turn_limit);
-        fflush(stdout);
-    }
-
     owns_dense_k_rank = (use_gpusolver_dense && Set_Hamiltonian_OpenACC_Rank_Is_Selected());
     owns_global_dense_rank = (all_knum == 1 && owns_dense_k_rank);
     use_setham_packed_cache =
