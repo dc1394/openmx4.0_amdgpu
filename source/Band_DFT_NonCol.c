@@ -428,6 +428,16 @@ static void BandNonCol_SetDenseGemmul8Defaults(void)
     }
 }
 
+static int BandNonCol_DefaultGpuTurnGroup(void)
+{
+    int device_count = 0;
+
+    if (cudaGetDeviceCount(&device_count) == cudaSuccess && 0 < device_count) {
+        return device_count;
+    }
+    return 1;
+}
+
 static int BandNonCol_SerializeGpuSolverGpuTurns(void)
 {
     const char *value = getenv("OPENMX_GPUSOLVER_SERIAL_GPU_TURNS");
@@ -446,7 +456,7 @@ static int BandNonCol_GpuTurnGroup(void)
     if (value==NULL){
         value = getenv("OPENMX_BAND_GPU_MAX_RANKS_PER_DEVICE");
         if (value==NULL){
-            group = 4;
+            group = BandNonCol_DefaultGpuTurnGroup();
         }
         else {
             group = strtol(value,NULL,10);
@@ -494,7 +504,7 @@ static int BandNonCol_MaxConcurrentKGpuTurns(void)
         return (int)limit;
     }
 
-    return 4;
+    return BandNonCol_DefaultGpuTurnGroup();
 }
 
 static void BandNonCol_GpuSolver_EnsureMatrixCapacity(int n)

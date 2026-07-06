@@ -72,7 +72,11 @@ typedef struct
     dcomplex *         h_scale;
     dcomplex *         h_evec;
     int                h_evec_dim;
+    int                h_evec_stride;
+    size_t             h_evec_count;
     int                d_evec_dim;
+    int                d_evec_stride;
+    size_t             d_evec_count;
     dcomplex *         h_transformed_s;
     int                h_transformed_s_dim;
 } BandColGpuSolverCtx;
@@ -172,6 +176,16 @@ static void BandCol_AbortWithMessage(const char * msg)
     exit(1);
 }
 
+static int BandCol_DefaultGpuTurnGroup(void)
+{
+    int device_count = 0;
+
+    if (cudaGetDeviceCount(&device_count) == cudaSuccess && 0 < device_count) {
+        return device_count;
+    }
+    return 1;
+}
+
 static int BandCol_SerializeGpuSolverGpuTurns(void)
 {
     const char *value = getenv("OPENMX_GPUSOLVER_SERIAL_GPU_TURNS");
@@ -244,7 +258,7 @@ static int BandCol_GpuTurnGroup(void)
     if (value == NULL) {
         value = getenv("OPENMX_BAND_GPU_MAX_RANKS_PER_DEVICE");
         if (value == NULL) {
-            group = 4;
+            group = BandCol_DefaultGpuTurnGroup();
         } else {
             group = strtol(value, NULL, 10);
         }
@@ -290,7 +304,7 @@ static int BandCol_MaxConcurrentKGpuTurns(void)
         return (int)limit;
     }
 
-    return 4;
+    return BandCol_DefaultGpuTurnGroup();
 }
 
 static void BandCol_ConstructCache_Reset(void)
@@ -944,6 +958,8 @@ static void BandCol_GpuSolver_ReleaseDeviceMemory(void)
     ctx->matrix_dim          = 0;
     ctx->scale_dim           = 0;
     ctx->d_evec_dim          = 0;
+    ctx->d_evec_stride       = 0;
+    ctx->d_evec_count        = 0;
     ctx->transformed_s_valid = 0;
     ctx->transformed_s_dim   = 0;
     ctx->d_work_bytes        = 0;
@@ -971,31 +987,35 @@ static void BandCol_GpuSolver_Destroy(void)
     free(ctx->h_transformed_s);
     ctx->h_evec     = NULL;
     ctx->h_evec_dim = 0;
+    ctx->h_evec_stride = 0;
+    ctx->h_evec_count = 0;
     ctx->h_transformed_s     = NULL;
     ctx->h_transformed_s_dim = 0;
 }
 
-static dcomplex *BandCol_GpuSolver_SaveDeviceEigenvectors(dcomplex *evec_device, int n)
+static dcomplex *BandCol_GpuSolver_SaveDeviceEigenvectors(dcomplex *evec_device, int n, int stride)
 {
     BandColGpuSolverCtx *ctx = &BandCol_gpusolver_ctx;
-    size_t              matrix_count;
+    size_t              evec_count;
 
-    if (evec_device == NULL) {
+    if (evec_device == NULL || n <= 0 || stride <= 0) {
         BandCol_AbortWithMessage("MAGMA dense device eigenvectors are not available in Band_DFT_Col.c.");
     }
 
-    matrix_count = (size_t)n * (size_t)n;
+    evec_count = (size_t)n * (size_t)stride;
 
-    if (ctx->h_evec_dim < n) {
-        dcomplex *new_evec = (dcomplex *)realloc(ctx->h_evec, sizeof(dcomplex) * matrix_count);
+    if (ctx->h_evec_count < evec_count) {
+        dcomplex *new_evec = (dcomplex *)realloc(ctx->h_evec, sizeof(dcomplex) * evec_count);
         if (new_evec == NULL) {
             BandCol_AbortWithMessage("Failed to allocate host eigenvector buffer in Band_DFT_Col.c.");
         }
         ctx->h_evec     = new_evec;
-        ctx->h_evec_dim = n;
+        ctx->h_evec_count = evec_count;
     }
+    ctx->h_evec_dim = n;
+    ctx->h_evec_stride = stride;
 
-    wait_cudafunc(cudaMemcpy(ctx->h_evec, evec_device, sizeof(dcomplex) * matrix_count, cudaMemcpyDeviceToHost));
+    wait_cudafunc(cudaMemcpy(ctx->h_evec, evec_device, sizeof(dcomplex) * evec_count, cudaMemcpyDeviceToHost));
     return ctx->h_evec;
 }
 
@@ -1007,27 +1027,44 @@ static dcomplex *BandCol_GpuSolver_HostEigenvectors(void)
 static dcomplex *BandCol_GpuSolver_UploadHostEigenvectors(int n)
 {
     BandColGpuSolverCtx *ctx = &BandCol_gpusolver_ctx;
-    size_t              matrix_count;
+    size_t              evec_count;
+    int                 stride;
 
     if (n <= 0) {
         BandCol_AbortWithMessage("Invalid eigenvector dimension in Band_DFT_Col.c.");
     }
-    if (ctx->h_evec == NULL || ctx->h_evec_dim < n) {
+    if (ctx->h_evec == NULL || ctx->h_evec_dim != n || ctx->h_evec_stride <= 0) {
         BandCol_AbortWithMessage("MAGMA dense host eigenvectors are not available in Band_DFT_Col.c.");
     }
 
-    matrix_count = (size_t)n * (size_t)n;
+    stride = ctx->h_evec_stride;
+    evec_count = (size_t)n * (size_t)stride;
 
-    if (ctx->d_evec_dim < n) {
+    if (ctx->d_evec_count < evec_count) {
         if (ctx->d_evec != NULL) {
             wait_cudafunc(cudaFree(ctx->d_evec));
         }
-        wait_cudafunc(cudaMalloc((void **)&ctx->d_evec, sizeof(dcomplex) * matrix_count));
-        ctx->d_evec_dim = n;
+        wait_cudafunc(cudaMalloc((void **)&ctx->d_evec, sizeof(dcomplex) * evec_count));
+        ctx->d_evec_count = evec_count;
     }
+    ctx->d_evec_dim = n;
+    ctx->d_evec_stride = stride;
 
-    wait_cudafunc(cudaMemcpy(ctx->d_evec, ctx->h_evec, sizeof(dcomplex) * matrix_count, cudaMemcpyHostToDevice));
+    wait_cudafunc(cudaMemcpy(ctx->d_evec, ctx->h_evec, sizeof(dcomplex) * evec_count, cudaMemcpyHostToDevice));
     return ctx->d_evec;
+}
+
+static int BandCol_GpuSolver_EigenvectorStride(void)
+{
+    BandColGpuSolverCtx *ctx = &BandCol_gpusolver_ctx;
+
+    if (ctx->d_evec != NULL && 0 < ctx->d_evec_stride) {
+        return ctx->d_evec_stride;
+    }
+    if (ctx->h_evec != NULL && 0 < ctx->h_evec_stride) {
+        return ctx->h_evec_stride;
+    }
+    return ctx->matrix_dim;
 }
 
 static int BandCol_GpuSolver_HasHostTransformedS(int n)
@@ -1086,6 +1123,8 @@ static void BandCol_GpuSolver_ClearHostEigenvectors(void)
     free(ctx->h_evec);
     ctx->h_evec     = NULL;
     ctx->h_evec_dim = 0;
+    ctx->h_evec_stride = 0;
+    ctx->h_evec_count = 0;
 }
 
 static void BandCol_GpuSolver_Init(void)
@@ -1380,11 +1419,37 @@ static void BandCol_GpuSolver_EigenHost(dcomplex *A, double *ko, int n, int maxn
     }
 }
 
+static dcomplex *BandCol_GpuSolver_EnsureEigenvectorCapacity(int n, int stride)
+{
+    BandColGpuSolverCtx *ctx = &BandCol_gpusolver_ctx;
+    size_t              evec_count;
+
+    if (n <= 0 || stride <= 0) {
+        BandCol_AbortWithMessage("Invalid eigenvector buffer dimensions in Band_DFT_Col.c.");
+    }
+
+    evec_count = (size_t)n * (size_t)stride;
+    if (ctx->d_evec_count < evec_count) {
+        if (ctx->d_evec != NULL) {
+            wait_cudafunc(cudaFree(ctx->d_evec));
+        }
+        wait_cudafunc(cudaMalloc((void **)&ctx->d_evec, sizeof(dcomplex) * evec_count));
+        ctx->d_evec_count = evec_count;
+    }
+
+    ctx->d_evec_dim = n;
+    ctx->d_evec_stride = stride;
+    return ctx->d_evec;
+}
+
 static dcomplex *BandCol_GpuSolver_SolveHamiltonianImpl(int n, int maxn, const dcomplex *H_in, double *ko, dcomplex *C_out,
                                                        int build_eigenvectors)
 {
     BandColGpuSolverCtx * ctx = &BandCol_gpusolver_ctx;
     size_t               matrix_bytes;
+    dcomplex            *evec_t;
+    cuDoubleComplex      alpha = make_cuDoubleComplex(1.0, 0.0);
+    cuDoubleComplex      beta = make_cuDoubleComplex(0.0, 0.0);
 
     if (!(ctx->transformed_s_valid && ctx->transformed_s_dim == n)) {
         BandCol_AbortWithMessage("Transformed overlap is not ready in BandCol_GpuSolver_SolveHamiltonian.");
@@ -1406,13 +1471,18 @@ static dcomplex *BandCol_GpuSolver_SolveHamiltonianImpl(int n, int maxn, const d
         return NULL;
     }
 
-    BandCol_GpuSolver_ZgemmDevice(CUBLAS_OP_T, CUBLAS_OP_T, n, n, n, ctx->d_H, ctx->d_S, ctx->d_tmp);
+    evec_t = BandCol_GpuSolver_EnsureEigenvectorCapacity(n, maxn);
+    wait_cudafunc(cublasZgemm(ctx->cublas, CUBLAS_OP_T, CUBLAS_OP_T, maxn, n, n,
+                              &alpha, (cuDoubleComplex *)ctx->d_H, n,
+                              (cuDoubleComplex *)ctx->d_S, n, &beta,
+                              (cuDoubleComplex *)evec_t, maxn));
 
     if (C_out != NULL) {
-        wait_cudafunc(cudaMemcpy(C_out, ctx->d_tmp, matrix_bytes, cudaMemcpyDeviceToHost));
+        wait_cudafunc(cudaMemcpy(C_out, evec_t, sizeof(dcomplex) * (size_t)n * (size_t)maxn,
+                                 cudaMemcpyDeviceToHost));
     }
 
-    return ctx->d_tmp;
+    return evec_t;
 }
 
 static void BandCol_GpuSolver_SolveHamiltonian(int n, int maxn, const dcomplex *H_in, double *ko, dcomplex *C_out)
@@ -1432,7 +1502,7 @@ static dcomplex *BandCol_GpuSolver_SolveHamiltonianDeviceInput(int n, int maxn, 
 
 static dcomplex *BandCol_GpuSolver_DeviceEigenvectors(void)
 {
-    return BandCol_gpusolver_ctx.d_tmp;
+    return BandCol_gpusolver_ctx.d_evec;
 }
 
 static int BandCol_LastConstructOnDevice(void)
@@ -2556,7 +2626,8 @@ diagonalize1:
                         if (BandCol_GpuPersistentDecide()) {
                             (void)evec_device;
                         } else {
-                            BandCol_GpuSolver_SaveDeviceEigenvectors(evec_device, n);
+                            BandCol_GpuSolver_SaveDeviceEigenvectors(evec_device, n,
+                                                                     BandCol_GpuSolver_EigenvectorStride());
                             BandCol_ConstructCache_Reset();
                             BandCol_GpuSolver_ReleaseDeviceMemory();
                         }
@@ -3280,7 +3351,8 @@ diagonalize1:
                             evec_device = BandCol_GpuSolver_UploadHostEigenvectors(n);
                         }
 
-                        BandCol_AccumulateDenseTransposedDM_Device(n, MaxN, spin, kloop, k1, k2, k3, evec_device, n,
+                        BandCol_AccumulateDenseTransposedDM_Device(n, MaxN, spin, kloop, k1, k2, k3, evec_device,
+                                                                   BandCol_GpuSolver_EigenvectorStride(),
                                                                    MP, use_setham_packed_cache ? setham_order_GA : order_GA, EIGEN,
                                                                    BandCol_dm_workspace.OccWeight, CDM1, EDM1,
                                                                    size_H1);
@@ -3839,7 +3911,8 @@ diagonalize1:
                         dtime(&Stime1);
                     }
 
-                    BandCol_AccumulateDenseTransposedDM_Device(n, MaxN, spin, kloop, k1, k2, k3, evec_device, n,
+                    BandCol_AccumulateDenseTransposedDM_Device(n, MaxN, spin, kloop, k1, k2, k3, evec_device,
+                                                               BandCol_GpuSolver_EigenvectorStride(),
                                                                MP, use_setham_packed_cache ? setham_order_GA : order_GA,
                                                                EIGEN, occ_weight, CDM1, EDM1, size_H1);
                     BandCol_GpuSolver_ReleaseDeviceMemory();
