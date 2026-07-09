@@ -177,12 +177,12 @@ static void BandCol_AbortWithMessage(const char * msg)
 
 static int BandCol_DefaultGpuTurnGroup(void)
 {
-    int device_count = 0;
-
-    if (hipGetDeviceCount(&device_count) == hipSuccess && 0 < device_count) {
-        return device_count;
-    }
-    return 1;
+    /* Upper bound on how many MPI ranks (k-point turns) use the GPU at the same
+       time.  With a single GPU this lets at most 2 k-points be diagonalized on
+       the GPU concurrently; the remaining ranks wait their turn.  Override with
+       OPENMX_BAND_GPU_MAX_CONCURRENT_K, OPENMX_BAND_GPU_MAX_RANKS_PER_DEVICE, or
+       OPENMX_BAND_GPU_TURN_GROUP. */
+    return 2;
 }
 
 static int BandCol_SerializeGpuSolverGpuTurns(void)
