@@ -124,8 +124,8 @@ static int Krylov_GPU_Enabled(void)
 
 typedef struct {
   int active;
-  cublasHandle_t cublas;
-  cudaStream_t stream;
+  hipblasHandle_t hipblas;
+  hipStream_t stream;
   double *d_A;
   double *d_B;
   double *d_C;
@@ -139,11 +139,11 @@ typedef struct {
 static void Krylov_GPU_InitOnce(void);
 static void Krylov_GPU_Workspace_Init(Krylov_GPU_Workspace *ws);
 static void Krylov_GPU_Workspace_Free(Krylov_GPU_Workspace *ws);
-static void Krylov_GPU_EnsureCublas(Krylov_GPU_Workspace *ws);
+static void Krylov_GPU_EnsureHipblas(Krylov_GPU_Workspace *ws);
 static void Krylov_GPU_PreparePool(int nthrds);
 static Krylov_GPU_Workspace *Krylov_GPU_GetWorkspace(int thread_id);
 static void Krylov_Dgemm(Krylov_GPU_Workspace *ws,
-                         cublasOperation_t transa, cublasOperation_t transb,
+                         hipblasOperation_t transa, hipblasOperation_t transb,
                          int m, int n, int k,
                          const double *A, int lda,
                          const double *B, int ldb,
@@ -159,7 +159,7 @@ static void Krylov_GPU_InitOnce(void)
   initialized = 1;
 
   if (Krylov_GPU_Enabled()){
-    wait_cudafunc(cudaFree(0));
+    wait_hipfunc(hipFree(0));
   }
 }
 
@@ -204,8 +204,8 @@ static Krylov_GPU_Workspace *Krylov_GPU_GetWorkspace(int thread_id)
 static void Krylov_GPU_EnsureDouble(double **ptr, size_t *capacity, size_t count)
 {
   if (*capacity < count){
-    if (*ptr != NULL) wait_cudafunc(cudaFree(*ptr));
-    wait_cudafunc(cudaMalloc((void**)ptr, sizeof(double)*count));
+    if (*ptr != NULL) wait_hipfunc(hipFree(*ptr));
+    wait_hipfunc(hipMalloc((void**)ptr, sizeof(double)*count));
     *capacity = count;
   }
 }
@@ -230,31 +230,31 @@ static void Krylov_GPU_Workspace_Init(Krylov_GPU_Workspace *ws)
   if (!Krylov_GPU_Enabled()) return;
 
   ws->active = 1;
-  wait_cudafunc(cudaStreamCreateWithFlags(&ws->stream, cudaStreamNonBlocking));
+  wait_hipfunc(hipStreamCreateWithFlags(&ws->stream, hipStreamNonBlocking));
 }
 
 static void Krylov_GPU_Workspace_Free(Krylov_GPU_Workspace *ws)
 {
-  if (ws->stream != NULL) wait_cudafunc(cudaStreamSynchronize(ws->stream));
-  if (ws->d_A    != NULL) wait_cudafunc(cudaFree(ws->d_A));
-  if (ws->d_B    != NULL) wait_cudafunc(cudaFree(ws->d_B));
-  if (ws->d_C    != NULL) wait_cudafunc(cudaFree(ws->d_C));
+  if (ws->stream != NULL) wait_hipfunc(hipStreamSynchronize(ws->stream));
+  if (ws->d_A    != NULL) wait_hipfunc(hipFree(ws->d_A));
+  if (ws->d_B    != NULL) wait_hipfunc(hipFree(ws->d_B));
+  if (ws->d_C    != NULL) wait_hipfunc(hipFree(ws->d_C));
   if (ws->h_A    != NULL) free(ws->h_A);
-  if (ws->cublas   != NULL) wait_cudafunc(cublasDestroy(ws->cublas));
-  if (ws->stream   != NULL) wait_cudafunc(cudaStreamDestroy(ws->stream));
+  if (ws->hipblas   != NULL) wait_hipfunc(hipblasDestroy(ws->hipblas));
+  if (ws->stream   != NULL) wait_hipfunc(hipStreamDestroy(ws->stream));
   memset(ws,0,sizeof(Krylov_GPU_Workspace));
 }
 
-static void Krylov_GPU_EnsureCublas(Krylov_GPU_Workspace *ws)
+static void Krylov_GPU_EnsureHipblas(Krylov_GPU_Workspace *ws)
 {
-  if (ws->cublas == NULL){
-    wait_cudafunc(cublasCreate(&ws->cublas));
-    wait_cudafunc(cublasSetStream(ws->cublas, ws->stream));
+  if (ws->hipblas == NULL){
+    wait_hipfunc(hipblasCreate(&ws->hipblas));
+    wait_hipfunc(hipblasSetStream(ws->hipblas, ws->stream));
   }
 }
 
 static void Krylov_Dgemm(Krylov_GPU_Workspace *ws,
-                         cublasOperation_t transa, cublasOperation_t transb,
+                         hipblasOperation_t transa, hipblasOperation_t transb,
                          int m, int n, int k,
                          const double *A, int lda,
                          const double *B, int ldb,
@@ -264,17 +264,17 @@ static void Krylov_Dgemm(Krylov_GPU_Workspace *ws,
   const double beta  = 0.0;
 
   if (ws == NULL || !ws->active || ((double)m*(double)n*(double)k < KRYLOV_GPU_DGEMM_MIN_FLOPS)){
-    char ta = (transa == CUBLAS_OP_N) ? 'N' : 'T';
-    char tb = (transb == CUBLAS_OP_N) ? 'N' : 'T';
+    char ta = (transa == HIPBLAS_OP_N) ? 'N' : 'T';
+    char tb = (transb == HIPBLAS_OP_N) ? 'N' : 'T';
     F77_NAME(dgemm,DGEMM)(&ta, &tb, &m, &n, &k, (double*)&alpha,
                           (double*)A, &lda, (double*)B, &ldb, (double*)&beta, C, &ldc);
     return;
   }
 
-  Krylov_GPU_EnsureCublas(ws);
+  Krylov_GPU_EnsureHipblas(ws);
 
-  size_t cols_A = (transa == CUBLAS_OP_N) ? (size_t)k : (size_t)m;
-  size_t cols_B = (transb == CUBLAS_OP_N) ? (size_t)n : (size_t)k;
+  size_t cols_A = (transa == HIPBLAS_OP_N) ? (size_t)k : (size_t)m;
+  size_t cols_B = (transb == HIPBLAS_OP_N) ? (size_t)n : (size_t)k;
   size_t count_A = (size_t)lda*cols_A;
   size_t count_B = (size_t)ldb*cols_B;
   size_t count_C = (size_t)ldc*(size_t)n;
@@ -283,17 +283,17 @@ static void Krylov_Dgemm(Krylov_GPU_Workspace *ws,
   Krylov_GPU_EnsureDouble(&ws->d_B, &ws->d_B_count, count_B);
   Krylov_GPU_EnsureDouble(&ws->d_C, &ws->d_C_count, count_C);
 
-  wait_cudafunc(cudaMemcpyAsync(ws->d_A, A, sizeof(double)*count_A,
-                                cudaMemcpyHostToDevice, ws->stream));
-  wait_cudafunc(cudaMemcpyAsync(ws->d_B, B, sizeof(double)*count_B,
-                                cudaMemcpyHostToDevice, ws->stream));
+  wait_hipfunc(hipMemcpyAsync(ws->d_A, A, sizeof(double)*count_A,
+                                hipMemcpyHostToDevice, ws->stream));
+  wait_hipfunc(hipMemcpyAsync(ws->d_B, B, sizeof(double)*count_B,
+                                hipMemcpyHostToDevice, ws->stream));
 
-  wait_cudafunc(cublasDgemm(ws->cublas, transa, transb, m, n, k,
+  wait_hipfunc(hipblasDgemm(ws->hipblas, transa, transb, m, n, k,
                             &alpha, ws->d_A, lda, ws->d_B, ldb, &beta, ws->d_C, ldc));
 
-  wait_cudafunc(cudaMemcpyAsync(C, ws->d_C, sizeof(double)*count_C,
-                                cudaMemcpyDeviceToHost, ws->stream));
-  wait_cudafunc(cudaStreamSynchronize(ws->stream));
+  wait_hipfunc(hipMemcpyAsync(C, ws->d_C, sizeof(double)*count_C,
+                                hipMemcpyDeviceToHost, ws->stream));
+  wait_hipfunc(hipStreamSynchronize(ws->stream));
 }
 
 static void Krylov_Eigen2(Krylov_GPU_Workspace *ws, double *a, int csize, double *ko, int n, int EVmax)
@@ -315,9 +315,9 @@ static void Krylov_Eigen2(Krylov_GPU_Workspace *ws, double *a, int csize, double
     }
   }
 
-  wait_cudafunc(cudaMemcpyAsync(ws->d_A, ws->h_A, sizeof(double)*(size_t)n*(size_t)n,
-                                cudaMemcpyHostToDevice, ws->stream));
-  wait_cudafunc(cudaStreamSynchronize(ws->stream));
+  wait_hipfunc(hipMemcpyAsync(ws->d_A, ws->h_A, sizeof(double)*(size_t)n*(size_t)n,
+                                hipMemcpyHostToDevice, ws->stream));
+  wait_hipfunc(hipStreamSynchronize(ws->stream));
 
   mout = 0;
   info = openmx_magma_dsyevdx_gpu(n, EVmax, ws->d_A, ko+1, &mout);
@@ -333,9 +333,9 @@ static void Krylov_Eigen2(Krylov_GPU_Workspace *ws, double *a, int csize, double
     return;
   }
 
-  wait_cudafunc(cudaMemcpyAsync(ws->h_A, ws->d_A, sizeof(double)*(size_t)n*(size_t)n,
-                                cudaMemcpyDeviceToHost, ws->stream));
-  wait_cudafunc(cudaStreamSynchronize(ws->stream));
+  wait_hipfunc(hipMemcpyAsync(ws->h_A, ws->d_A, sizeof(double)*(size_t)n*(size_t)n,
+                                hipMemcpyDeviceToHost, ws->stream));
+  wait_hipfunc(hipStreamSynchronize(ws->stream));
 
   for (i=0; i<EVmax; i++){
     for (j=0; j<n; j++){
@@ -1269,7 +1269,7 @@ static double Krylov_Col(char *mode,
 	M = Msize[Mc_AN]; N = Msize3[Mc_AN]; K = Msize[Mc_AN];
 	lda = M; ldb = K; ldc = Msize[Mc_AN]; 
 	
-	Krylov_Dgemm(gpu_ws, CUBLAS_OP_N, CUBLAS_OP_N, M, N, K,
+	Krylov_Dgemm(gpu_ws, HIPBLAS_OP_N, HIPBLAS_OP_N, M, N, K,
                      H_DC, lda, KU, ldb, C, ldc);
 
 	if (measure_time==1 && OMPID==0){ 
@@ -1308,7 +1308,7 @@ static double Krylov_Col(char *mode,
 	M = Msize3[Mc_AN]; N = Msize3[Mc_AN]; K = Msize[Mc_AN];
 	lda = K; ldb = K; ldc = Msize3[Mc_AN]; 
 
-	Krylov_Dgemm(gpu_ws, CUBLAS_OP_T, CUBLAS_OP_N, M, N, K,
+	Krylov_Dgemm(gpu_ws, HIPBLAS_OP_T, HIPBLAS_OP_N, M, N, K,
                      KU, lda, C, ldb, H_DC, ldc);
 
 	if (measure_time==1 && OMPID==0){ 
@@ -1384,7 +1384,7 @@ static double Krylov_Col(char *mode,
         M = Msize3[Mc_AN]; N = Msize[Mc_AN]; K = Msize3[Mc_AN];
         lda = K; ldb = N; ldc = Msize3[Mc_AN]; 
 
-	Krylov_Dgemm(gpu_ws, CUBLAS_OP_T, CUBLAS_OP_T, M, N, K,
+	Krylov_Dgemm(gpu_ws, HIPBLAS_OP_T, HIPBLAS_OP_T, M, N, K,
                      H_DC, lda, KU, ldb, C, ldc);
 
 	if (measure_time==1 && OMPID==0){ 
@@ -6469,7 +6469,7 @@ static double Krylov_Col_trd(char *mode,
 	M = Msize[Mc_AN]; N = Msize3[Mc_AN]; K = Msize[Mc_AN];
 	lda = M; ldb = K; ldc = Msize[Mc_AN]; 
 	
-	Krylov_Dgemm(gpu_ws, CUBLAS_OP_N, CUBLAS_OP_N, M, N, K,
+	Krylov_Dgemm(gpu_ws, HIPBLAS_OP_N, HIPBLAS_OP_N, M, N, K,
                      H_DC, lda, KU, ldb, C, ldc);
 
 	if (measure_time==1){ 
@@ -6508,7 +6508,7 @@ static double Krylov_Col_trd(char *mode,
 	M = Msize3[Mc_AN]; N = Msize3[Mc_AN]; K = Msize[Mc_AN];
 	lda = K; ldb = K; ldc = Msize3[Mc_AN]; 
 
-	Krylov_Dgemm(gpu_ws, CUBLAS_OP_T, CUBLAS_OP_N, M, N, K,
+	Krylov_Dgemm(gpu_ws, HIPBLAS_OP_T, HIPBLAS_OP_N, M, N, K,
                      KU, lda, C, ldb, H_DC, ldc);
 
 	if (measure_time==1){ 
@@ -6584,7 +6584,7 @@ static double Krylov_Col_trd(char *mode,
         M = Msize3[Mc_AN]; N = Msize[Mc_AN]; K = Msize3[Mc_AN];
         lda = K; ldb = N; ldc = Msize3[Mc_AN]; 
 
-	Krylov_Dgemm(gpu_ws, CUBLAS_OP_T, CUBLAS_OP_T, M, N, K,
+	Krylov_Dgemm(gpu_ws, HIPBLAS_OP_T, HIPBLAS_OP_T, M, N, K,
                      H_DC, lda, KU, ldb, C, ldc);
 
 	if (measure_time==1){ 

@@ -12,12 +12,10 @@
 #include "mpi.h"
 #include "openmx_common.h"
 #include "lapack_prototypes.h"
-#include "set_cuda_default_device_from_local_rank.h"
-#include "set_openacc_device_from_local_rank.h"
+#include "set_hip_default_device_from_local_rank.h"
 #include <fftw3.h>
 #include <math.h>
 #include <omp.h>
-#include <openacc.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <limits.h>
@@ -90,8 +88,8 @@ typedef struct {
     int                matrix_dim;
     int                transformed_s_valid;
     int                transformed_s_dim;
-    cudaStream_t       stream;
-    cublasHandle_t     cublas;
+    hipStream_t       stream;
+    hipblasHandle_t     hipblas;
     double *           d_S;
     double *           d_H;
     double *           d_tmp;
@@ -437,12 +435,12 @@ static void ClusterCol_GpuSolver_Destroy(void)
 {
     ClusterColGpuSolverCtx *ctx = &ClusterCol_gpusolver_ctx;
 
-    if (ctx->d_S != NULL)        wait_cudafunc(cudaFree(ctx->d_S));
-    if (ctx->d_H != NULL)        wait_cudafunc(cudaFree(ctx->d_H));
-    if (ctx->d_tmp != NULL)      wait_cudafunc(cudaFree(ctx->d_tmp));
-    if (ctx->d_W != NULL)        wait_cudafunc(cudaFree(ctx->d_W));
-    if (ctx->cublas != NULL)     wait_cudafunc(cublasDestroy(ctx->cublas));
-    if (ctx->stream != NULL)     wait_cudafunc(cudaStreamDestroy(ctx->stream));
+    if (ctx->d_S != NULL)        wait_hipfunc(hipFree(ctx->d_S));
+    if (ctx->d_H != NULL)        wait_hipfunc(hipFree(ctx->d_H));
+    if (ctx->d_tmp != NULL)      wait_hipfunc(hipFree(ctx->d_tmp));
+    if (ctx->d_W != NULL)        wait_hipfunc(hipFree(ctx->d_W));
+    if (ctx->hipblas != NULL)     wait_hipfunc(hipblasDestroy(ctx->hipblas));
+    if (ctx->stream != NULL)     wait_hipfunc(hipStreamDestroy(ctx->stream));
 
     memset(ctx, 0, sizeof(*ctx));
     ctx->device_id = -1;
@@ -453,14 +451,14 @@ static void ClusterCol_GpuSolver_Init(void)
     ClusterColGpuSolverCtx *ctx = &ClusterCol_gpusolver_ctx;
     int                    current_device;
 
-    wait_cudafunc(cudaGetDevice(&current_device));
+    wait_hipfunc(hipGetDevice(&current_device));
 
     if (ctx->initialized && ctx->device_id == current_device) return;
     if (ctx->initialized) ClusterCol_GpuSolver_Destroy();
 
-    wait_cudafunc(cudaStreamCreateWithFlags(&ctx->stream, cudaStreamNonBlocking));
-    wait_cudafunc(cublasCreate(&ctx->cublas));
-    wait_cudafunc(cublasSetStream(ctx->cublas, ctx->stream));
+    wait_hipfunc(hipStreamCreateWithFlags(&ctx->stream, hipStreamNonBlocking));
+    wait_hipfunc(hipblasCreate(&ctx->hipblas));
+    wait_hipfunc(hipblasSetStream(ctx->hipblas, ctx->stream));
 
     ctx->initialized = 1;
     ctx->device_id   = current_device;
@@ -481,19 +479,19 @@ static void ClusterCol_GpuSolver_EnsureMatrixCapacity(int n)
 
     if (n<=ctx->matrix_dim) return;
 
-    if (ctx->d_S != NULL)    wait_cudafunc(cudaFree(ctx->d_S));
-    if (ctx->d_H != NULL)    wait_cudafunc(cudaFree(ctx->d_H));
-    if (ctx->d_tmp != NULL)  wait_cudafunc(cudaFree(ctx->d_tmp));
-    if (ctx->d_W != NULL)    wait_cudafunc(cudaFree(ctx->d_W));
+    if (ctx->d_S != NULL)    wait_hipfunc(hipFree(ctx->d_S));
+    if (ctx->d_H != NULL)    wait_hipfunc(hipFree(ctx->d_H));
+    if (ctx->d_tmp != NULL)  wait_hipfunc(hipFree(ctx->d_tmp));
+    if (ctx->d_W != NULL)    wait_hipfunc(hipFree(ctx->d_W));
 
     dense_count = ClusterCol_CheckedMulCount((size_t)n,(size_t)n,"dense GPU matrix");
     matrix_bytes = ClusterCol_CheckedMulCount(dense_count,sizeof(double),"dense GPU matrix bytes");
     vector_bytes = ClusterCol_CheckedMulCount((size_t)n,sizeof(double),"dense GPU eigenvalue bytes");
 
-    wait_cudafunc(cudaMalloc((void**)&ctx->d_S,matrix_bytes));
-    wait_cudafunc(cudaMalloc((void**)&ctx->d_H,matrix_bytes));
-    wait_cudafunc(cudaMalloc((void**)&ctx->d_tmp,matrix_bytes));
-    wait_cudafunc(cudaMalloc((void**)&ctx->d_W,vector_bytes));
+    wait_hipfunc(hipMalloc((void**)&ctx->d_S,matrix_bytes));
+    wait_hipfunc(hipMalloc((void**)&ctx->d_H,matrix_bytes));
+    wait_hipfunc(hipMalloc((void**)&ctx->d_tmp,matrix_bytes));
+    wait_hipfunc(hipMalloc((void**)&ctx->d_W,vector_bytes));
 
     ctx->matrix_dim = n;
     ctx->transformed_s_valid = 0;
@@ -517,7 +515,7 @@ static void ClusterCol_GpuSolver_EigenDevice(double *d_A, int n, int maxn, doubl
         dtime(&stime);
     }
 
-    wait_cudafunc(cudaStreamSynchronize(ClusterCol_gpusolver_ctx.stream));
+    wait_hipfunc(hipStreamSynchronize(ClusterCol_gpusolver_ctx.stream));
     info = openmx_magma_dsyevdx_gpu(n,maxn,d_A,ko,&mout);
 
     if (detail_slot != NULL && ClusterCol_detail_timers.active) {
@@ -556,18 +554,18 @@ static void ClusterCol_GpuSolver_PrepareTransformedSDevice(int rebuild, int n, d
             dtime(&stime);
         }
 
-        wait_cudafunc(cudaMemcpyAsync(ctx->d_W,ko0+1,sizeof(double)*(size_t)n,cudaMemcpyHostToDevice,ctx->stream));
+        wait_hipfunc(hipMemcpyAsync(ctx->d_W,ko0+1,sizeof(double)*(size_t)n,hipMemcpyHostToDevice,ctx->stream));
 
         old_s = ctx->d_S;
         new_s = ctx->d_tmp;
-        wait_cudafunc(cublasDdgmm(ctx->cublas,CUBLAS_SIDE_RIGHT,n,n,
+        wait_hipfunc(hipblasDdgmm(ctx->hipblas,HIPBLAS_SIDE_RIGHT,n,n,
                                   old_s,n,ctx->d_W,1,new_s,n));
 
         ctx->d_S = new_s;
         ctx->d_tmp = old_s;
         ctx->transformed_s_valid = 1;
         ctx->transformed_s_dim = n;
-        wait_cudafunc(cudaStreamSynchronize(ctx->stream));
+        wait_hipfunc(hipStreamSynchronize(ctx->stream));
 
         if (ClusterCol_detail_timers.active) {
             ClusterCol_DetailTimer_Add(&ClusterCol_detail_timers.overlap_scale, stime);
@@ -583,7 +581,7 @@ static void ClusterCol_GpuSolver_PrepareTransformedS(int rebuild, int n, double 
 
     ClusterCol_GpuSolver_EnsureMatrixCapacity(n);
     if (rebuild || !(ctx->transformed_s_valid && ctx->transformed_s_dim==n)){
-        wait_cudafunc(cudaMemcpyAsync(ctx->d_S,S,matrix_bytes,cudaMemcpyHostToDevice,ctx->stream));
+        wait_hipfunc(hipMemcpyAsync(ctx->d_S,S,matrix_bytes,hipMemcpyHostToDevice,ctx->stream));
     }
     ClusterCol_GpuSolver_PrepareTransformedSDevice(rebuild,n,ko0);
 }
@@ -605,17 +603,17 @@ static void ClusterCol_GpuSolver_SolveHamiltonianDevice(int n, int maxn, double 
         double stime;
 
         dtime(&stime);
-        wait_cudafunc(cublasDsymm(ctx->cublas,CUBLAS_SIDE_LEFT,CUBLAS_FILL_MODE_LOWER,n,n,
+        wait_hipfunc(hipblasDsymm(ctx->hipblas,HIPBLAS_SIDE_LEFT,HIPBLAS_FILL_MODE_LOWER,n,n,
                                   &alpha,ctx->d_H,n,ctx->d_S,n,&beta,ctx->d_tmp,n));
-        wait_cudafunc(cublasDgemm(ctx->cublas,CUBLAS_OP_T,CUBLAS_OP_N,n,n,n,
+        wait_hipfunc(hipblasDgemm(ctx->hipblas,HIPBLAS_OP_T,HIPBLAS_OP_N,n,n,n,
                                   &alpha,ctx->d_S,n,ctx->d_tmp,n,&beta,ctx->d_H,n));
-        wait_cudafunc(cudaStreamSynchronize(ctx->stream));
+        wait_hipfunc(hipStreamSynchronize(ctx->stream));
         ClusterCol_DetailTimer_Add(&ClusterCol_detail_timers.h_transform_gemm, stime);
     }
     else {
-        wait_cudafunc(cublasDsymm(ctx->cublas,CUBLAS_SIDE_LEFT,CUBLAS_FILL_MODE_LOWER,n,n,
+        wait_hipfunc(hipblasDsymm(ctx->hipblas,HIPBLAS_SIDE_LEFT,HIPBLAS_FILL_MODE_LOWER,n,n,
                               &alpha,ctx->d_H,n,ctx->d_S,n,&beta,ctx->d_tmp,n));
-        wait_cudafunc(cublasDgemm(ctx->cublas,CUBLAS_OP_T,CUBLAS_OP_N,n,n,n,
+        wait_hipfunc(hipblasDgemm(ctx->hipblas,HIPBLAS_OP_T,HIPBLAS_OP_N,n,n,n,
                               &alpha,ctx->d_S,n,ctx->d_tmp,n,&beta,ctx->d_H,n));
     }
 
@@ -625,21 +623,21 @@ static void ClusterCol_GpuSolver_SolveHamiltonianDevice(int n, int maxn, double 
         double stime;
 
         dtime(&stime);
-        wait_cudafunc(cublasDgemm(ctx->cublas,CUBLAS_OP_T,CUBLAS_OP_T,maxn,n,n,
+        wait_hipfunc(hipblasDgemm(ctx->hipblas,HIPBLAS_OP_T,HIPBLAS_OP_T,maxn,n,n,
                                   &alpha,ctx->d_H,n,ctx->d_S,n,&beta,ctx->d_tmp,maxn));
-        wait_cudafunc(cudaStreamSynchronize(ctx->stream));
+        wait_hipfunc(hipStreamSynchronize(ctx->stream));
         ClusterCol_DetailTimer_Add(&ClusterCol_detail_timers.backtransform, stime);
 
         dtime(&stime);
-        wait_cudafunc(cudaMemcpyAsync(C,ctx->d_tmp,evec_bytes,cudaMemcpyDeviceToHost,ctx->stream));
-        wait_cudafunc(cudaStreamSynchronize(ctx->stream));
+        wait_hipfunc(hipMemcpyAsync(C,ctx->d_tmp,evec_bytes,hipMemcpyDeviceToHost,ctx->stream));
+        wait_hipfunc(hipStreamSynchronize(ctx->stream));
         ClusterCol_DetailTimer_Add(&ClusterCol_detail_timers.evec_copyout, stime);
     }
     else {
-        wait_cudafunc(cublasDgemm(ctx->cublas,CUBLAS_OP_T,CUBLAS_OP_T,maxn,n,n,
+        wait_hipfunc(hipblasDgemm(ctx->hipblas,HIPBLAS_OP_T,HIPBLAS_OP_T,maxn,n,n,
                                   &alpha,ctx->d_H,n,ctx->d_S,n,&beta,ctx->d_tmp,maxn));
-        wait_cudafunc(cudaMemcpyAsync(C,ctx->d_tmp,evec_bytes,cudaMemcpyDeviceToHost,ctx->stream));
-        wait_cudafunc(cudaStreamSynchronize(ctx->stream));
+        wait_hipfunc(hipMemcpyAsync(C,ctx->d_tmp,evec_bytes,hipMemcpyDeviceToHost,ctx->stream));
+        wait_hipfunc(hipStreamSynchronize(ctx->stream));
     }
 }
 
@@ -650,20 +648,20 @@ static void ClusterCol_GpuSolver_SolveHamiltonian(int n, int maxn, const double 
     size_t matrix_bytes = ClusterCol_CheckedMulCount(dense_count,sizeof(double),"Hamiltonian bytes");
 
     ClusterCol_GpuSolver_EnsureMatrixCapacity(n);
-    wait_cudafunc(cudaMemcpyAsync(ctx->d_H,H,matrix_bytes,cudaMemcpyHostToDevice,ctx->stream));
+    wait_hipfunc(hipMemcpyAsync(ctx->d_H,H,matrix_bytes,hipMemcpyHostToDevice,ctx->stream));
     ClusterCol_GpuSolver_SolveHamiltonianDevice(n,maxn,ko_spin,C);
 }
 
-static void ClusterCol_GEMMul8Dgemm_OpenACC(cublasOperation_t transa, cublasOperation_t transb, int m, int n, int k,
+static void ClusterCol_GEMMul8Dgemm_OpenMP(hipblasOperation_t transa, hipblasOperation_t transb, int m, int n, int k,
                                             double const * A, double const * B, double * C)
 {
     ClusterCol_GpuSolver_Init();
-#pragma acc data      present(A[0 : m * k], B[0 : k * n], C[0 : m * n])
-#pragma acc host_data use_device(A, B, C)
+#pragma omp target data map(present, alloc: A[0 : m * k], B[0 : k * n], C[0 : m * n])
+#pragma omp target data use_device_ptr(A, B, C)
     {
         double const alpha = 1.0;
         double const beta  = 0.0;
-        wait_cudafunc(openmx_gemmul8Dgemm(ClusterCol_gpusolver_ctx.cublas, transa, transb, m, n, k, &alpha, A, m, B, k, &beta, C, m));
+        wait_hipfunc(openmx_gemmul8Dgemm(ClusterCol_gpusolver_ctx.hipblas, transa, transb, m, n, k, &alpha, A, m, B, k, &beta, C, m));
     }
 }
 
@@ -1119,9 +1117,8 @@ static void ClusterCol_GpuSolverDensePath(
         ClusterCol_AbortWithMessage("Invalid hipSOLVER dense dimensions in Cluster_DFT_Col.c.");
     }
 
-    if (Set_Hamiltonian_OpenACC_Rank_Is_Selected()) {
-        set_cuda_default_device_from_local_rank_noncollective();
-        set_openacc_nvidia_device_from_local_rank_noncollective();
+    if (Set_Hamiltonian_OpenMP_Rank_Is_Selected()) {
+        set_hip_default_device_from_local_rank_noncollective();
     }
 
     dense_count = ClusterCol_CheckedMulCount((size_t)n, (size_t)n, "GPU solver dense matrix");
@@ -1459,11 +1456,10 @@ double Cluster_DFT_Col(
   }
   n2 = n + 2;
 
-  /* GPU dispatch (added by H.Kawai): assign CUDA/OpenACC device when GPUSOLVER is requested */
+  /* GPU dispatch (added by H.Kawai): assign HIP/OpenMP target device when GPUSOLVER is requested */
   if (scf_eigen_lib_flag == GPUSOLVER && n >= GPU_CPU_SWITCH_NUM &&
-      Set_Hamiltonian_OpenACC_Rank_Is_Selected()) {
-      set_cuda_default_device_from_local_rank_noncollective();
-      set_openacc_nvidia_device_from_local_rank_noncollective();
+      Set_Hamiltonian_OpenMP_Rank_Is_Selected()) {
+      set_hip_default_device_from_local_rank_noncollective();
   }
 
   /*

@@ -1,6 +1,6 @@
-#include <cublas_v2.h>
-#include <cuda_runtime.h>
-#include <cuComplex.h>
+#include "hipblas_compat.h"
+#include "hip_runtime_compat.h"
+#include "hip_complex_compat.h"
 
 #include <cstdlib>
 #include <cstdint>
@@ -20,7 +20,7 @@ constexpr size_t   kMiB = 1024u * 1024u;
 
 struct WorkspaceKey {
     int          device;
-    cudaStream_t stream;
+    hipStream_t stream;
 
     bool operator==(const WorkspaceKey &other) const
     {
@@ -153,7 +153,7 @@ unsigned ranks_sharing_gpu()
     }
 
     int device_count = 0;
-    if (cudaGetDeviceCount(&device_count) != cudaSuccess || device_count < 1) {
+    if (hipGetDeviceCount(&device_count) != hipSuccess || device_count < 1) {
         device_count = 1;
     }
 
@@ -161,15 +161,15 @@ unsigned ranks_sharing_gpu()
     return (ranks == 0u) ? 1u : ranks;
 }
 
-cudaError_t release_workspace(Workspace &workspace)
+hipError_t release_workspace(Workspace &workspace)
 {
     if (workspace.ptr == nullptr) {
         workspace.size = 0;
-        return cudaSuccess;
+        return hipSuccess;
     }
 
-    cudaError_t status = cudaFree(workspace.ptr);
-    if (status == cudaSuccess) {
+    hipError_t status = hipFree(workspace.ptr);
+    if (status == hipSuccess) {
         workspace.ptr  = nullptr;
         workspace.size = 0;
     }
@@ -199,20 +199,20 @@ bool free_after_workspace_is_too_low(size_t free_bytes, size_t workspace_size, s
 }
 
 template <bool is_complex>
-cublasStatus_t ensure_workspace(cublasHandle_t handle, size_t m, size_t n, size_t k, unsigned num_moduli, void **work,
+hipblasStatus_t ensure_workspace(hipblasHandle_t handle, size_t m, size_t n, size_t k, unsigned num_moduli, void **work,
                                 WorkspaceReport *report)
 {
-    cudaStream_t stream = nullptr;
+    hipStream_t stream = nullptr;
     int          device = -1;
 
-    cublasStatus_t cublas_status = cublasGetStream(handle, &stream);
-    if (cublas_status != CUBLAS_STATUS_SUCCESS) {
-        return cublas_status;
+    hipblasStatus_t hipblas_status = hipblasGetStream(handle, &stream);
+    if (hipblas_status != HIPBLAS_STATUS_SUCCESS) {
+        return hipblas_status;
     }
 
-    cudaError_t cuda_status = cudaGetDevice(&device);
-    if (cuda_status != cudaSuccess) {
-        return CUBLAS_STATUS_INTERNAL_ERROR;
+    hipError_t hip_status = hipGetDevice(&device);
+    if (hip_status != hipSuccess) {
+        return HIPBLAS_STATUS_INTERNAL_ERROR;
     }
 
     const size_t required = gemmul8::workSize<is_complex, gemmul8::Backend::INT8>(m, n, k, num_moduli);
@@ -235,62 +235,62 @@ cublasStatus_t ensure_workspace(cublasHandle_t handle, size_t m, size_t n, size_
 
     size_t free_bytes  = 0;
     size_t total_bytes = 0;
-    cuda_status        = cudaMemGetInfo(&free_bytes, &total_bytes);
-    if (cuda_status == cudaSuccess && report != nullptr) {
+    hip_status        = hipMemGetInfo(&free_bytes, &total_bytes);
+    if (hip_status == hipSuccess && report != nullptr) {
         report->free_bytes  = free_bytes;
         report->total_bytes = total_bytes;
     }
 
-    if (cuda_status == cudaSuccess &&
+    if (hip_status == hipSuccess &&
         workspace_exceeds_fraction(required, total_bytes, report != nullptr ? report->max_workspace_percent : 0u,
                                    ranks_per_gpu)) {
         if (report != nullptr) {
             report->reason = "workspace fraction policy";
         }
-        if (release_workspace(workspace) != cudaSuccess) {
-            return CUBLAS_STATUS_INTERNAL_ERROR;
+        if (release_workspace(workspace) != hipSuccess) {
+            return HIPBLAS_STATUS_INTERNAL_ERROR;
         }
-        return CUBLAS_STATUS_ALLOC_FAILED;
+        return HIPBLAS_STATUS_ALLOC_FAILED;
     }
 
     if (workspace.size < required) {
-        cuda_status = release_workspace(workspace);
-        if (cuda_status != cudaSuccess) {
-            return CUBLAS_STATUS_INTERNAL_ERROR;
+        hip_status = release_workspace(workspace);
+        if (hip_status != hipSuccess) {
+            return HIPBLAS_STATUS_INTERNAL_ERROR;
         }
 
-        cuda_status = cudaMemGetInfo(&free_bytes, &total_bytes);
-        if (cuda_status == cudaSuccess && report != nullptr) {
+        hip_status = hipMemGetInfo(&free_bytes, &total_bytes);
+        if (hip_status == hipSuccess && report != nullptr) {
             report->free_bytes  = free_bytes;
             report->total_bytes = total_bytes;
         }
     }
 
-    if (cuda_status == cudaSuccess &&
+    if (hip_status == hipSuccess &&
         free_after_workspace_is_too_low(free_bytes, workspace.size, required,
                                         report != nullptr ? report->reserve_bytes : 0u)) {
         if (report != nullptr) {
             report->reason = "free memory reserve policy";
         }
-        if (release_workspace(workspace) != cudaSuccess) {
-            return CUBLAS_STATUS_INTERNAL_ERROR;
+        if (release_workspace(workspace) != hipSuccess) {
+            return HIPBLAS_STATUS_INTERNAL_ERROR;
         }
-        return CUBLAS_STATUS_ALLOC_FAILED;
+        return HIPBLAS_STATUS_ALLOC_FAILED;
     }
 
     if (workspace.size < required) {
-        cuda_status = cudaMalloc(&workspace.ptr, required);
-        if (cuda_status != cudaSuccess) {
+        hip_status = hipMalloc(&workspace.ptr, required);
+        if (hip_status != hipSuccess) {
             if (report != nullptr) {
-                report->reason = "cudaMalloc failure";
+                report->reason = "hipMalloc failure";
             }
-            return CUBLAS_STATUS_ALLOC_FAILED;
+            return HIPBLAS_STATUS_ALLOC_FAILED;
         }
         workspace.size = required;
     }
 
     *work = workspace.ptr;
-    return CUBLAS_STATUS_SUCCESS;
+    return HIPBLAS_STATUS_SUCCESS;
 }
 
 template <bool is_complex>
@@ -321,9 +321,9 @@ void log_workspace_fallback_once(const WorkspaceReport &report, const char *targ
 
 } // namespace
 
-extern "C" cublasStatus_t openmx_gemmul8Dgemm(cublasHandle_t handle,
-                                               cublasOperation_t transa,
-                                               cublasOperation_t transb,
+extern "C" hipblasStatus_t openmx_gemmul8Dgemm(hipblasHandle_t handle,
+                                               hipblasOperation_t transa,
+                                               hipblasOperation_t transb,
                                                int m,
                                                int n,
                                                int k,
@@ -337,30 +337,30 @@ extern "C" cublasStatus_t openmx_gemmul8Dgemm(cublasHandle_t handle,
                                                int ldc)
 {
     if (m <= 0 || n <= 0 || k <= 0) {
-        return CUBLAS_STATUS_SUCCESS;
+        return HIPBLAS_STATUS_SUCCESS;
     }
 
     const unsigned num_moduli = gemmul8_num_moduli("OPENMX_GEMMUL8_NUM_MOD_D", "GEMMUL8_NUM_MOD_D");
     const bool     fastmode   = env_bool("OPENMX_GEMMUL8_FASTMODE_D", env_bool("GEMMUL8_FASTMODE_D", false));
-    const cublasOperation_t gemmul8_transa = (transa == CUBLAS_OP_C) ? CUBLAS_OP_T : transa;
-    const cublasOperation_t gemmul8_transb = (transb == CUBLAS_OP_C) ? CUBLAS_OP_T : transb;
+    const hipblasOperation_t gemmul8_transa = (transa == HIPBLAS_OP_C) ? HIPBLAS_OP_T : transa;
+    const hipblasOperation_t gemmul8_transb = (transb == HIPBLAS_OP_C) ? HIPBLAS_OP_T : transb;
     void          *work = nullptr;
     WorkspaceReport report;
 
     if (gemmul8_disabled("OPENMX_GEMMUL8_DISABLE_D", "GEMMUL8_DISABLE_D")) {
         report.reason = "environment disable";
         log_workspace_fallback_once<false>(report, "native cuBLAS");
-        return cublasDgemm(handle, gemmul8_transa, gemmul8_transb, m, n, k, alpha, A, lda, B, ldb, beta, C, ldc);
+        return hipblasDgemm(handle, gemmul8_transa, gemmul8_transb, m, n, k, alpha, A, lda, B, ldb, beta, C, ldc);
     }
 
-    cublasStatus_t status =
+    hipblasStatus_t status =
         ensure_workspace<false>(handle, static_cast<size_t>(m), static_cast<size_t>(n), static_cast<size_t>(k),
                                 num_moduli, &work, &report);
-    if (status == CUBLAS_STATUS_ALLOC_FAILED) {
+    if (status == HIPBLAS_STATUS_ALLOC_FAILED) {
         log_workspace_fallback_once<false>(report, "native cuBLAS");
-        return cublasDgemm(handle, gemmul8_transa, gemmul8_transb, m, n, k, alpha, A, lda, B, ldb, beta, C, ldc);
+        return hipblasDgemm(handle, gemmul8_transa, gemmul8_transb, m, n, k, alpha, A, lda, B, ldb, beta, C, ldc);
     }
-    if (status != CUBLAS_STATUS_SUCCESS) {
+    if (status != HIPBLAS_STATUS_SUCCESS) {
         return status;
     }
 
@@ -369,51 +369,51 @@ extern "C" cublasStatus_t openmx_gemmul8Dgemm(cublasHandle_t handle,
                                                         static_cast<size_t>(lda), B, static_cast<size_t>(ldb), beta, C,
                                                         static_cast<size_t>(ldc), num_moduli, fastmode, work);
 
-    return CUBLAS_STATUS_SUCCESS;
+    return HIPBLAS_STATUS_SUCCESS;
 }
 
 extern "C" void openmx_gemmul8ReleaseWorkspaces(void)
 {
     std::lock_guard<std::mutex> lock(g_workspace_mutex);
-    cudaError_t                 first_error = cudaSuccess;
+    hipError_t                 first_error = hipSuccess;
 
     for (auto it = g_workspaces.begin(); it != g_workspaces.end();) {
-        cudaError_t status = release_workspace(it->second);
-        if (status == cudaSuccess) {
+        hipError_t status = release_workspace(it->second);
+        if (status == hipSuccess) {
             it = g_workspaces.erase(it);
         } else {
-            if (first_error == cudaSuccess) {
+            if (first_error == hipSuccess) {
                 first_error = status;
             }
             ++it;
         }
     }
 
-    if (first_error != cudaSuccess) {
+    if (first_error != hipSuccess) {
         std::fprintf(stderr,
-                     "openmx_gemmul8ReleaseWorkspaces: cudaFree failed: %s\n",
-                     cudaGetErrorString(first_error));
+                     "openmx_gemmul8ReleaseWorkspaces: hipFree failed: %s\n",
+                     hipGetErrorString(first_error));
         std::fflush(stderr);
     }
 }
 
-extern "C" cublasStatus_t openmx_gemmul8Zgemm(cublasHandle_t handle,
-                                               cublasOperation_t transa,
-                                               cublasOperation_t transb,
+extern "C" hipblasStatus_t openmx_gemmul8Zgemm(hipblasHandle_t handle,
+                                               hipblasOperation_t transa,
+                                               hipblasOperation_t transb,
                                                int m,
                                                int n,
                                                int k,
-                                               const cuDoubleComplex *alpha,
-                                               const cuDoubleComplex *A,
+                                               const hipDoubleComplex *alpha,
+                                               const hipDoubleComplex *A,
                                                int lda,
-                                               const cuDoubleComplex *B,
+                                               const hipDoubleComplex *B,
                                                int ldb,
-                                               const cuDoubleComplex *beta,
-                                               cuDoubleComplex *C,
+                                               const hipDoubleComplex *beta,
+                                               hipDoubleComplex *C,
                                                int ldc)
 {
     if (m <= 0 || n <= 0 || k <= 0) {
-        return CUBLAS_STATUS_SUCCESS;
+        return HIPBLAS_STATUS_SUCCESS;
     }
 
     const unsigned num_moduli = gemmul8_num_moduli("OPENMX_GEMMUL8_NUM_MOD_Z", "GEMMUL8_NUM_MOD_Z");
@@ -424,27 +424,27 @@ extern "C" cublasStatus_t openmx_gemmul8Zgemm(cublasHandle_t handle,
     if (gemmul8_disabled("OPENMX_GEMMUL8_DISABLE_Z", "GEMMUL8_DISABLE_Z")) {
         report.reason = "environment disable";
         log_workspace_fallback_once<true>(report, "native cuBLAS");
-        return cublasZgemm(handle, transa, transb, m, n, k, alpha, A, lda, B, ldb, beta, C, ldc);
+        return hipblasZgemm(handle, transa, transb, m, n, k, alpha, A, lda, B, ldb, beta, C, ldc);
     }
 
-    cublasStatus_t status =
+    hipblasStatus_t status =
         ensure_workspace<true>(handle, static_cast<size_t>(m), static_cast<size_t>(n), static_cast<size_t>(k),
                                num_moduli, &work, &report);
-    if (status == CUBLAS_STATUS_ALLOC_FAILED) {
+    if (status == HIPBLAS_STATUS_ALLOC_FAILED) {
         /* GPU memory is too tight for the GEMMul8 workspace: fall back to native
-           hipBLAS (cublasZgemm), which needs no extra workspace. If even that fails,
+           hipBLAS (hipblasZgemm), which needs no extra workspace. If even that fails,
            its status propagates so the caller can fall back to CPU BLAS. */
         log_workspace_fallback_once<true>(report, "native cuBLAS (hipBLAS)");
-        return cublasZgemm(handle, transa, transb, m, n, k, alpha, A, lda, B, ldb, beta, C, ldc);
+        return hipblasZgemm(handle, transa, transb, m, n, k, alpha, A, lda, B, ldb, beta, C, ldc);
     }
-    if (status != CUBLAS_STATUS_SUCCESS) {
+    if (status != HIPBLAS_STATUS_SUCCESS) {
         return status;
     }
 
-    (void)gemmul8::gemm<cuDoubleComplex, gemmul8::Backend::INT8>(
+    (void)gemmul8::gemm<hipDoubleComplex, gemmul8::Backend::INT8>(
         handle, transa, transb, static_cast<size_t>(m), static_cast<size_t>(n), static_cast<size_t>(k), alpha, A,
         static_cast<size_t>(lda), B, static_cast<size_t>(ldb), beta, C, static_cast<size_t>(ldc), num_moduli, fastmode,
         work);
 
-    return CUBLAS_STATUS_SUCCESS;
+    return HIPBLAS_STATUS_SUCCESS;
 }

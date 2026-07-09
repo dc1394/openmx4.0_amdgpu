@@ -19,10 +19,10 @@
 #include "openmx_gpusolver_dense_utils.h"
 #include "lapack_prototypes.h"
 #include "mpi.h"
-#include "set_cuda_default_device_from_local_rank.h"
-#include "set_openacc_device_from_local_rank.h"
+#include "set_hip_default_device_from_local_rank.h"
+#include "set_openmp_device_from_local_rank.h"
 #include <omp.h>
-#include <openacc.h>
+#include <omp.h>
 #include "flpq_dm.h"
 #include "f77func.h"
 
@@ -31,8 +31,8 @@
 /* GPU GpuSolver context for Cluster_DFT_Col_DMmu (added by H.Kawai, Phase D) */
 typedef struct {
     int                device_id;
-    cublasHandle_t     cublas;
-    cusolverDnHandle_t gpusolver;
+    hipblasHandle_t     hipblas;
+    hipsolverDnHandle_t gpusolver;
 } ClusterColDMmuGpuSolverCtx;
 
 static ClusterColDMmuGpuSolverCtx ClusterColDMmu_gpusolver_ctx = {0};
@@ -40,8 +40,8 @@ static ClusterColDMmuGpuSolverCtx ClusterColDMmu_gpusolver_ctx = {0};
 static void ClusterColDMmu_GpuSolver_Destroy(void)
 {
     ClusterColDMmuGpuSolverCtx *ctx = &ClusterColDMmu_gpusolver_ctx;
-    if (ctx->gpusolver != NULL) wait_cudafunc(cusolverDnDestroy(ctx->gpusolver));
-    if (ctx->cublas != NULL)   wait_cudafunc(cublasDestroy(ctx->cublas));
+    if (ctx->gpusolver != NULL) wait_hipfunc(hipsolverDnDestroy(ctx->gpusolver));
+    if (ctx->hipblas != NULL)   wait_hipfunc(hipblasDestroy(ctx->hipblas));
     memset(ctx, 0, sizeof(*ctx));
     ctx->device_id = -1;
 }
@@ -50,24 +50,22 @@ static void ClusterColDMmu_GpuSolver_Init(void)
 {
     ClusterColDMmuGpuSolverCtx *ctx = &ClusterColDMmu_gpusolver_ctx;
     int current_device;
-    wait_cudafunc(cudaGetDevice(&current_device));
-    if (ctx->device_id == current_device && ctx->cublas != NULL) return;
-    if (ctx->cublas != NULL) ClusterColDMmu_GpuSolver_Destroy();
+    wait_hipfunc(hipGetDevice(&current_device));
+    if (ctx->device_id == current_device && ctx->hipblas != NULL) return;
+    if (ctx->hipblas != NULL) ClusterColDMmu_GpuSolver_Destroy();
     ctx->device_id = current_device;
-    wait_cudafunc(cublasCreate(&ctx->cublas));
-    wait_cudafunc(cusolverDnCreate(&ctx->gpusolver));
+    wait_hipfunc(hipblasCreate(&ctx->hipblas));
+    wait_hipfunc(hipsolverDnCreate(&ctx->gpusolver));
 }
 
-static void ClusterColDMmu_GEMMul8Dgemm_OpenACC(cublasOperation_t transa, cublasOperation_t transb, int m, int n, int k,
+static void ClusterColDMmu_GEMMul8Dgemm_OpenMP(hipblasOperation_t transa, hipblasOperation_t transb, int m, int n, int k,
                                                 double const * A, double const * B, double * C)
 {
     ClusterColDMmu_GpuSolver_Init();
-#pragma acc data      present(A[0 : m * k], B[0 : k * n], C[0 : m * n])
-#pragma acc host_data use_device(A, B, C)
     {
         double const alpha = 1.0;
         double const beta  = 0.0;
-        wait_cudafunc(openmx_gemmul8Dgemm(ClusterColDMmu_gpusolver_ctx.cublas, transa, transb, m, n, k, &alpha, A, m, B, k, &beta, C, m));
+        wait_hipfunc(openmx_gemmul8Dgemm(ClusterColDMmu_gpusolver_ctx.hipblas, transa, transb, m, n, k, &alpha, A, m, B, k, &beta, C, m));
     }
 }
 
@@ -200,10 +198,10 @@ double Cluster_DFT_Col_DMmu(
   }
   n2 = n + 2;
 
-  /* GPU dispatch (added by H.Kawai): assign CUDA/OpenACC device when GPUSOLVER is requested */
+  /* GPU dispatch (added by H.Kawai): assign CUDA/OpenMP device when GPUSOLVER is requested */
   if (scf_eigen_lib_flag == GPUSOLVER && n >= GPU_CPU_SWITCH_NUM) {
-      set_cuda_default_device_from_local_rank();
-      set_openacc_nvidia_device_from_local_rank();
+      set_hip_default_device_from_local_rank();
+      set_openmp_nvidia_device_from_local_rank();
   }
 
   /****************************************************

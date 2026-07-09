@@ -21,7 +21,7 @@
 #include <omp.h>
 
 
-static int SetOLPKinUseOpenACC(void);
+static int SetOLPKinUseOpenMP(void);
 
 #ifdef kcomp
 dcomplex****** Allocate6D_dcomplex(int size_1, int size_2, int size_3,
@@ -42,14 +42,14 @@ void Free2D_dcomplex(dcomplex** buffer);
 #endif
 
 
-static int SetOLPKinUseOpenACC(void)
+static int SetOLPKinUseOpenMP(void)
 {
   return (scf_eigen_lib_flag == GPUSOLVER);
 }
 
 static int SetOLPKinRadialGpuEnabled(void)
 {
-  /* The per-pair OpenACC offload of the radial integration is dominated by
+  /* The per-pair OpenMP offload of the radial integration is dominated by
      data-region setup and transfers (~1.2 s vs ~0.3 s on the CPU for the
      sidia333 benchmark), so it is opt-in via OPENMX_OLPKIN_RADIAL_GPU=1. */
   const char *value = getenv("OPENMX_OLPKIN_RADIAL_GPU");
@@ -236,7 +236,7 @@ double Set_OLP_Kin(double *****OLP, double *****H0)
 	    int i,j,k,l,m,p;
 	    int num0,num1;
 	    int grid_dim,max_Lmax_Four_Int;
-	    int use_openacc_radial;
+	    int use_openmp_radial;
 	    int use_bessel_cache;
 	    int cached_Cwan,cached_Hwan;
 	    int combo_cached_Cwan,combo_cached_Hwan;
@@ -356,7 +356,7 @@ double Set_OLP_Kin(double *****OLP, double *****H0)
 	    OMPID = omp_get_thread_num();
 	    Nthrds = omp_get_num_threads();
 	    Nprocs = omp_get_num_procs();
-	    use_openacc_radial = (SetOLPKinRadialGpuEnabled() && SetOLPKinUseOpenACC() && Nthrds==1);
+	    use_openmp_radial = (SetOLPKinRadialGpuEnabled() && SetOLPKinUseOpenMP() && Nthrds==1);
 	    use_bessel_cache = (Nthrds==1);
 	    if (use_bessel_cache) {
 	      if (OLPKin_bessel_lmax < 0) {
@@ -572,20 +572,14 @@ double Set_OLP_Kin(double *****OLP, double *****H0)
 		combo_cached_Hwan = Hwan;
 	      }
 
-	      if (use_openacc_radial && 0<combo_count){
+	      if (use_openmp_radial && 0<combo_count){
 	        size_t sph_valid_elems,sum_valid_elems;
 
 	        sph_valid_elems = (size_t)(Lmax_Four_Int+1)*(size_t)grid_dim;
 	        sum_valid_elems = (size_t)(Lmax_Four_Int+1)*(size_t)combo_count;
 
-#pragma acc data copyin(Normk_grid[0:grid_dim], RF_BesselCache0[0:rf_cache_elems], \
-                        RF_BesselCache1[0:rf_cache_elems], SphB_flat[0:sph_valid_elems], \
-                        SphBp_flat[0:sph_valid_elems], combo_rf0_offset[0:combo_count], \
-                        combo_rf1_offset[0:combo_count]) \
-                 copyout(sumS0_flat[0:sum_valid_elems], sumK0_flat[0:sum_valid_elems], \
-                         sumSr0_flat[0:sum_valid_elems], sumKr0_flat[0:sum_valid_elems])
 	        {
-#pragma acc parallel loop collapse(2)
+#pragma omp parallel for collapse(2)
 	          for (l=0; l<=Lmax_Four_Int; l++){
 	            for (combo=0; combo<combo_count; combo++){
 	              int rf0_offset,rf1_offset;
@@ -598,7 +592,6 @@ double Set_OLP_Kin(double *****OLP, double *****H0)
 	              local_sumSr0 = 0.0;
 	              local_sumKr0 = 0.0;
 
-#pragma acc loop vector reduction(+:local_sumS0,local_sumK0,local_sumSr0,local_sumKr0)
 	              for (i=0; i<grid_dim; i++){
 	                double acc_coe0,acc_Normk,acc_Normk2;
 	                double acc_sj,acc_sjp,acc_tmp0,acc_tmp1,acc_tmp2,acc_tmp3,acc_tmp4;

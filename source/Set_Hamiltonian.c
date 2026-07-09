@@ -17,7 +17,7 @@
 #include <limits.h>
 #include <math.h>
 #include <omp.h>
-#include <openacc.h>
+#include <omp.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -27,21 +27,21 @@
 
 void Calc_MatrixElements_dVH_Vxc_VNA(int Cnt_kind);
 static void Calc_MatrixElements_dVH_Vxc_VNA_CPU(int Cnt_kind);
-static void Calc_MatrixElements_dVH_Vxc_VNA_OpenACC(int Cnt_kind);
-static void Set_Hamiltonian_Base_OpenACC(int SCF_iter, double *****H0, double *****HNL, double *****H);
-static size_t Set_Hamiltonian_Base_OpenACC_DeviceBytes(int SCF_iter, int myid);
-static size_t Set_Hamiltonian_MatrixElements_OpenACC_DeviceBytes(int Cnt_kind, int myid);
+static void Calc_MatrixElements_dVH_Vxc_VNA_OpenMP(int Cnt_kind);
+static void Set_Hamiltonian_Base_OpenMP(int SCF_iter, double *****H0, double *****HNL, double *****H);
+static size_t Set_Hamiltonian_Base_OpenMP_DeviceBytes(int SCF_iter, int myid);
+static size_t Set_Hamiltonian_MatrixElements_OpenMP_DeviceBytes(int Cnt_kind, int myid);
 
-static int Set_Hamiltonian_OpenACC_Rank_Selected = 1;
+static int Set_Hamiltonian_OpenMP_Rank_Selected = 1;
 
-void Set_Hamiltonian_Set_OpenACC_Rank_Selected(int selected)
+void Set_Hamiltonian_Set_OpenMP_Rank_Selected(int selected)
 {
-    Set_Hamiltonian_OpenACC_Rank_Selected = selected ? 1 : 0;
+    Set_Hamiltonian_OpenMP_Rank_Selected = selected ? 1 : 0;
 }
 
-int Set_Hamiltonian_OpenACC_Rank_Is_Selected(void)
+int Set_Hamiltonian_OpenMP_Rank_Is_Selected(void)
 {
-    return Set_Hamiltonian_OpenACC_Rank_Selected;
+    return Set_Hamiltonian_OpenMP_Rank_Selected;
 }
 
 enum {
@@ -79,7 +79,7 @@ static size_t Set_Hamiltonian_checked_add(size_t a, size_t b, const char *label,
     if (b > ((size_t)-1) - a) {
         char message[256];
         snprintf(message, sizeof(message), "size overflow while estimating %s", label);
-        Set_Hamiltonian_abort("OpenACC memory check", message, myid);
+        Set_Hamiltonian_abort("OpenMP memory check", message, myid);
     }
 
     return a + b;
@@ -90,7 +90,7 @@ static size_t Set_Hamiltonian_checked_mul(size_t a, size_t b, const char *label,
     if (a != 0 && b > ((size_t)-1) / a) {
         char message[256];
         snprintf(message, sizeof(message), "size overflow while estimating %s", label);
-        Set_Hamiltonian_abort("OpenACC memory check", message, myid);
+        Set_Hamiltonian_abort("OpenMP memory check", message, myid);
     }
 
     return a * b;
@@ -107,20 +107,20 @@ static void Set_Hamiltonian_add_array_bytes(size_t *total, size_t count, size_t 
     *total = Set_Hamiltonian_checked_add(*total, bytes, label, myid);
 }
 
-static int Set_Hamiltonian_OpenACC_Enabled(void)
+static int Set_Hamiltonian_OpenMP_Enabled(void)
 {
     /*
-     * ROCm clang does not execute OpenACC pragmas.  Keep the explicit
+     * ROCm clang does not execute OpenMP pragmas.  Keep the explicit
      * HIP/hipSOLVER/GEMMul8 paths enabled elsewhere, but do not route the
-     * Hamiltonian assembly through the NVIDIA OpenACC-only kernels.
+     * Hamiltonian assembly through the NVIDIA OpenMP-only kernels.
      */
     return 0;
 }
 
-static int Set_Hamiltonian_MatrixElements_OpenACC_Enabled(void)
+static int Set_Hamiltonian_MatrixElements_OpenMP_Enabled(void)
 {
     /*
-     * The matrix-elements OpenACC path spends too much time in packing and
+     * The matrix-elements OpenMP path spends too much time in packing and
      * host-device copies for the current cluster workloads.  Keep the kernel
      * available for future tuning, but use the CPU path for this phase.
      */
@@ -130,70 +130,70 @@ static int Set_Hamiltonian_MatrixElements_OpenACC_Enabled(void)
 static int Set_Hamiltonian_DeviceMemoryOK(size_t required_bytes, const char *where, int myid, int use_device)
 {
     MPI_Comm node_comm, device_comm;
-    int local_rank, cuda_device_count, device_rank, device_ranks;
-    int cuda_device;
+    int local_rank, hip_device_count, device_rank, device_ranks;
+    int hip_device;
     size_t free_bytes, total_bytes;
-    cudaError_t cuda_err;
+    hipError_t hip_err;
     unsigned long long local_required, group_required, local_free, group_free;
-    int cuda_ok;
+    int hip_ok;
 
     MPI_Comm_split_type(mpi_comm_level1, MPI_COMM_TYPE_SHARED, 0, MPI_INFO_NULL, &node_comm);
     MPI_Comm_rank(node_comm, &local_rank);
 
-    cuda_device = -1;
+    hip_device = -1;
     free_bytes = 0;
     total_bytes = 0;
-    cuda_ok = 0;
+    hip_ok = 0;
 
     if (use_device) {
-        cuda_err = cudaGetDeviceCount(&cuda_device_count);
-        if (cuda_err != cudaSuccess || cuda_device_count <= 0) {
-            if (myid == Host_ID || cuda_err != cudaSuccess) {
+        hip_err = hipGetDeviceCount(&hip_device_count);
+        if (hip_err != hipSuccess || hip_device_count <= 0) {
+            if (myid == Host_ID || hip_err != hipSuccess) {
                 fprintf(stderr,
                         "Set_Hamiltonian: rank %d %s: failed to get HIP device count (%s); switching to CPU path.\n",
-                        myid, where, cuda_err == cudaSuccess ? "no HIP device" : cudaGetErrorString(cuda_err));
+                        myid, where, hip_err == hipSuccess ? "no HIP device" : hipGetErrorString(hip_err));
                 fflush(stderr);
             }
         }
         else {
-            cuda_device = local_rank % cuda_device_count;
+            hip_device = local_rank % hip_device_count;
 
-            cuda_err = cudaSetDevice(cuda_device);
-            if (cuda_err != cudaSuccess) {
+            hip_err = hipSetDevice(hip_device);
+            if (hip_err != hipSuccess) {
                 fprintf(stderr,
                         "Set_Hamiltonian: rank %d %s: failed to set HIP device %d (%s); switching to CPU path.\n",
-                        myid, where, cuda_device, cudaGetErrorString(cuda_err));
+                        myid, where, hip_device, hipGetErrorString(hip_err));
                 fflush(stderr);
             }
             else {
-                cuda_err = cudaMemGetInfo(&free_bytes, &total_bytes);
-                if (cuda_err != cudaSuccess) {
+                hip_err = hipMemGetInfo(&free_bytes, &total_bytes);
+                if (hip_err != hipSuccess) {
                     fprintf(stderr,
                             "Set_Hamiltonian: rank %d %s: failed to query HIP memory on device %d (%s); "
                             "switching to CPU path.\n",
-                            myid, where, cuda_device, cudaGetErrorString(cuda_err));
+                            myid, where, hip_device, hipGetErrorString(hip_err));
                     fflush(stderr);
                 }
                 else {
-                    cuda_ok = 1;
+                    hip_ok = 1;
                 }
             }
         }
     }
 
-    MPI_Comm_split(node_comm, cuda_ok ? cuda_device : MPI_UNDEFINED, 0, &device_comm);
+    MPI_Comm_split(node_comm, hip_ok ? hip_device : MPI_UNDEFINED, 0, &device_comm);
     MPI_Comm_free(&node_comm);
 
     if (!use_device) {
         return 1;
     }
 
-    if (!cuda_ok) {
+    if (!hip_ok) {
         return 0;
     }
 
     if (required_bytes > (size_t)ULLONG_MAX || free_bytes > (size_t)ULLONG_MAX) {
-        Set_Hamiltonian_abort("OpenACC memory check", "memory size does not fit unsigned long long", myid);
+        Set_Hamiltonian_abort("OpenMP memory check", "memory size does not fit unsigned long long", myid);
     }
 
     local_required = (unsigned long long)required_bytes;
@@ -209,7 +209,7 @@ static int Set_Hamiltonian_DeviceMemoryOK(size_t required_bytes, const char *whe
             fprintf(stderr,
                     "Set_Hamiltonian: %s: GPU device %d is shared by %d rank(s), has %.3f MiB free "
                     "(%.3f MiB total on rank %d), but %.3f MiB is required in total; switching to CPU path.\n",
-                    where, cuda_device, device_ranks, (double)group_free / (1024.0 * 1024.0),
+                    where, hip_device, device_ranks, (double)group_free / (1024.0 * 1024.0),
                     (double)total_bytes / (1024.0 * 1024.0), myid,
                     (double)group_required / (1024.0 * 1024.0));
             fflush(stderr);
@@ -220,39 +220,39 @@ static int Set_Hamiltonian_DeviceMemoryOK(size_t required_bytes, const char *whe
     return 1;
 }
 
-static int Set_Hamiltonian_Base_Use_OpenACC(int SCF_iter, int myid)
+static int Set_Hamiltonian_Base_Use_OpenMP(int SCF_iter, int myid)
 {
     size_t required_bytes;
     int memory_ok;
 
-    if (!Set_Hamiltonian_OpenACC_Enabled()) {
+    if (!Set_Hamiltonian_OpenMP_Enabled()) {
         return 0;
     }
 
-    required_bytes = Set_Hamiltonian_OpenACC_Rank_Selected ?
-        Set_Hamiltonian_Base_OpenACC_DeviceBytes(SCF_iter, myid) : 0;
-    memory_ok = Set_Hamiltonian_DeviceMemoryOK(required_bytes, "base OpenACC path", myid,
-                                               Set_Hamiltonian_OpenACC_Rank_Selected);
+    required_bytes = Set_Hamiltonian_OpenMP_Rank_Selected ?
+        Set_Hamiltonian_Base_OpenMP_DeviceBytes(SCF_iter, myid) : 0;
+    memory_ok = Set_Hamiltonian_DeviceMemoryOK(required_bytes, "base OpenMP path", myid,
+                                               Set_Hamiltonian_OpenMP_Rank_Selected);
 
-    return Set_Hamiltonian_OpenACC_Rank_Selected && memory_ok;
+    return Set_Hamiltonian_OpenMP_Rank_Selected && memory_ok;
 }
 
-static int Set_Hamiltonian_MatrixElements_Use_OpenACC(int Cnt_kind, int myid)
+static int Set_Hamiltonian_MatrixElements_Use_OpenMP(int Cnt_kind, int myid)
 {
     size_t required_bytes;
     int memory_ok;
 
-    if (!Set_Hamiltonian_OpenACC_Enabled() ||
-        !Set_Hamiltonian_MatrixElements_OpenACC_Enabled()) {
+    if (!Set_Hamiltonian_OpenMP_Enabled() ||
+        !Set_Hamiltonian_MatrixElements_OpenMP_Enabled()) {
         return 0;
     }
 
-    required_bytes = Set_Hamiltonian_OpenACC_Rank_Selected ?
-        Set_Hamiltonian_MatrixElements_OpenACC_DeviceBytes(Cnt_kind, myid) : 0;
-    memory_ok = Set_Hamiltonian_DeviceMemoryOK(required_bytes, "matrix-elements OpenACC path", myid,
-                                               Set_Hamiltonian_OpenACC_Rank_Selected);
+    required_bytes = Set_Hamiltonian_OpenMP_Rank_Selected ?
+        Set_Hamiltonian_MatrixElements_OpenMP_DeviceBytes(Cnt_kind, myid) : 0;
+    memory_ok = Set_Hamiltonian_DeviceMemoryOK(required_bytes, "matrix-elements OpenMP path", myid,
+                                               Set_Hamiltonian_OpenMP_Rank_Selected);
 
-    return Set_Hamiltonian_OpenACC_Rank_Selected && memory_ok;
+    return Set_Hamiltonian_OpenMP_Rank_Selected && memory_ok;
 }
 
 static void *Set_Hamiltonian_malloc(size_t bytes, const char *name, int myid)
@@ -267,7 +267,7 @@ static void *Set_Hamiltonian_malloc(size_t bytes, const char *name, int myid)
     if (p == NULL) {
         char message[256];
         snprintf(message, sizeof(message), "failed to allocate %s", name);
-        Set_Hamiltonian_abort("OpenACC", message, myid);
+        Set_Hamiltonian_abort("OpenMP", message, myid);
     }
 
     return p;
@@ -459,7 +459,7 @@ void Set_Hamiltonian_Build_GpuSolver_HS_Cache(int use_contracted)
 
     order_mode = (SpinP_switch == 3) ? SET_HAMILTONIAN_PACK_ORDER_NONCOL : SET_HAMILTONIAN_PACK_ORDER_COL;
     spin_count = (SpinP_switch == 3) ? 4 : (SpinP_switch + 1);
-    local_selected = Set_Hamiltonian_OpenACC_Rank_Selected ? 1 : 0;
+    local_selected = Set_Hamiltonian_OpenMP_Rank_Selected ? 1 : 0;
     local_size = Set_Hamiltonian_GpuSolver_LocalPackedSize(myid);
     local_matomnum = Matomnum;
 
@@ -638,7 +638,7 @@ double Set_Hamiltonian(char * mode, int MD_iter, int SCF_iter, int SCF_iter0, in
     int    numprocs, myid;
     double time0, time1, time2, mflops;
     long   Num_C0, Num_C1;
-    int    use_base_openacc;
+    int    use_base_openmp;
 
     MPI_Comm_size(mpi_comm_level1, &numprocs);
     MPI_Comm_rank(mpi_comm_level1, &myid);
@@ -653,11 +653,10 @@ double Set_Hamiltonian(char * mode, int MD_iter, int SCF_iter, int SCF_iter0, in
         Set_Hamiltonian_abort("Set_Hamiltonian", "SpinP_switch must be 0, 1, or 3", myid);
     }
 
-    use_base_openacc = Set_Hamiltonian_Base_Use_OpenACC(SCF_iter, myid);
+    use_base_openmp = Set_Hamiltonian_Base_Use_OpenMP(SCF_iter, myid);
 
     if (myid == Host_ID && mode != NULL && strcasecmp(mode, "stdout") == 0 && 0 < level_stdout) {
-        printf("<Set_Hamiltonian>  Hamiltonian matrix for VNA+dVH+Vxc%s...\n",
-               use_base_openacc ? " (GPU-accelerated)" : "");
+        printf("<Set_Hamiltonian>  Hamiltonian matrix for VNA+dVH+Vxc...\n");
         fflush(stdout);
     }
 
@@ -668,8 +667,8 @@ double Set_Hamiltonian(char * mode, int MD_iter, int SCF_iter, int SCF_iter0, in
     if (measure_time)
         dtime(&time1);
 
-    if (use_base_openacc) {
-        Set_Hamiltonian_Base_OpenACC(SCF_iter, H0, HNL, H);
+    if (use_base_openmp) {
+        Set_Hamiltonian_Base_OpenMP(SCF_iter, H0, HNL, H);
     }
 
     /* spin non-collinear */
@@ -820,14 +819,14 @@ void Calc_MatrixElements_dVH_Vxc_VNA(int Cnt_kind)
 
     MPI_Comm_rank(mpi_comm_level1, &myid);
 
-    if (Set_Hamiltonian_MatrixElements_Use_OpenACC(Cnt_kind, myid)) {
-        Calc_MatrixElements_dVH_Vxc_VNA_OpenACC(Cnt_kind);
+    if (Set_Hamiltonian_MatrixElements_Use_OpenMP(Cnt_kind, myid)) {
+        Calc_MatrixElements_dVH_Vxc_VNA_OpenMP(Cnt_kind);
     } else {
         Calc_MatrixElements_dVH_Vxc_VNA_CPU(Cnt_kind);
     }
 }
 
-static size_t Set_Hamiltonian_Base_OpenACC_DeviceBytes(int SCF_iter, int myid)
+static size_t Set_Hamiltonian_Base_OpenMP_DeviceBytes(int SCF_iter, int myid)
 {
     int Mc_AN, h_AN;
     int spin_count, pair_count;
@@ -876,14 +875,14 @@ static size_t Set_Hamiltonian_Base_OpenACC_DeviceBytes(int SCF_iter, int myid)
     return bytes;
 }
 
-static size_t Set_Hamiltonian_MatrixElements_OpenACC_DeviceBytes(int Cnt_kind, int myid)
+static size_t Set_Hamiltonian_MatrixElements_OpenMP_DeviceBytes(int Cnt_kind, int myid)
 {
     int Mc_AN, h_AN;
     int spin_count, pair_count;
     size_t total_h, total_nolg, total_orbs0, total_orbs1, bytes;
 
     if (Cnt_kind != 0 && Cnt_kind != 1) {
-        Set_Hamiltonian_abort("Calc_MatrixElements_dVH_Vxc_VNA_OpenACC", "Cnt_kind must be 0 or 1", myid);
+        Set_Hamiltonian_abort("Calc_MatrixElements_dVH_Vxc_VNA_OpenMP", "Cnt_kind must be 0 or 1", myid);
     }
 
     spin_count = (SpinP_switch == 3) ? 4 : (SpinP_switch + 1);
@@ -955,7 +954,7 @@ static size_t Set_Hamiltonian_MatrixElements_OpenACC_DeviceBytes(int Cnt_kind, i
     return bytes;
 }
 
-static void Set_Hamiltonian_Base_OpenACC(int SCF_iter, double *****H0, double *****HNL, double *****H)
+static void Set_Hamiltonian_Base_OpenMP(int SCF_iter, double *****H0, double *****HNL, double *****H)
 {
     int Mc_AN, h_AN, Gc_AN, Gh_AN, Cwan, Hwan;
     int numprocs, myid;
@@ -998,21 +997,21 @@ static void Set_Hamiltonian_Base_OpenACC(int SCF_iter, double *****H0, double **
         }
     }
 
-    pair_Mc_AN = (int *)Set_Hamiltonian_malloc(sizeof(int) * (size_t)pair_count, "openacc pair_Mc_AN", myid);
-    pair_h_AN = (int *)Set_Hamiltonian_malloc(sizeof(int) * (size_t)pair_count, "openacc pair_h_AN", myid);
-    pair_NO0 = (int *)Set_Hamiltonian_malloc(sizeof(int) * (size_t)pair_count, "openacc pair_NO0", myid);
-    pair_NO1 = (int *)Set_Hamiltonian_malloc(sizeof(int) * (size_t)pair_count, "openacc pair_NO1", myid);
+    pair_Mc_AN = (int *)Set_Hamiltonian_malloc(sizeof(int) * (size_t)pair_count, "openmp pair_Mc_AN", myid);
+    pair_h_AN = (int *)Set_Hamiltonian_malloc(sizeof(int) * (size_t)pair_count, "openmp pair_h_AN", myid);
+    pair_NO0 = (int *)Set_Hamiltonian_malloc(sizeof(int) * (size_t)pair_count, "openmp pair_NO0", myid);
+    pair_NO1 = (int *)Set_Hamiltonian_malloc(sizeof(int) * (size_t)pair_count, "openmp pair_NO1", myid);
     pair_mat_offset =
-        (size_t *)Set_Hamiltonian_malloc(sizeof(size_t) * (size_t)pair_count, "openacc pair_mat_offset", myid);
+        (size_t *)Set_Hamiltonian_malloc(sizeof(size_t) * (size_t)pair_count, "openmp pair_mat_offset", myid);
     pair_h_offset =
-        (size_t *)Set_Hamiltonian_malloc(sizeof(size_t) * (size_t)pair_count, "openacc pair_h_offset", myid);
-    hbuf = (double *)Set_Hamiltonian_malloc(sizeof(double) * total_h, "openacc base hbuf", myid);
-    h0buf = (double *)Set_Hamiltonian_malloc(sizeof(double) * total_mat, "openacc base h0buf", myid);
-    hnlbuf = (double *)Set_Hamiltonian_malloc(sizeof(double) * total_h, "openacc base hnlbuf", myid);
+        (size_t *)Set_Hamiltonian_malloc(sizeof(size_t) * (size_t)pair_count, "openmp pair_h_offset", myid);
+    hbuf = (double *)Set_Hamiltonian_malloc(sizeof(double) * total_h, "openmp base hbuf", myid);
+    h0buf = (double *)Set_Hamiltonian_malloc(sizeof(double) * total_mat, "openmp base h0buf", myid);
+    hnlbuf = (double *)Set_Hamiltonian_malloc(sizeof(double) * total_h, "openmp base hnlbuf", myid);
     hvnabuf =
-        (double *)Set_Hamiltonian_malloc(sizeof(double) * (use_vna ? total_mat : 1), "openacc base hvnabuf", myid);
-    hhubbuf = (double *)Set_Hamiltonian_malloc(sizeof(double) * (add_hub ? total_h : 1), "openacc base hhubbuf", myid);
-    hchbuf = (double *)Set_Hamiltonian_malloc(sizeof(double) * (add_hch ? total_h : 1), "openacc base hchbuf", myid);
+        (double *)Set_Hamiltonian_malloc(sizeof(double) * (use_vna ? total_mat : 1), "openmp base hvnabuf", myid);
+    hhubbuf = (double *)Set_Hamiltonian_malloc(sizeof(double) * (add_hub ? total_h : 1), "openmp base hhubbuf", myid);
+    hchbuf = (double *)Set_Hamiltonian_malloc(sizeof(double) * (add_hch ? total_h : 1), "openmp base hchbuf", myid);
 
     pair = 0;
     total_mat = 0;
@@ -1065,15 +1064,12 @@ static void Set_Hamiltonian_Base_OpenACC(int SCF_iter, double *****H0, double **
         }
     }
 
-#pragma acc data copyout(hbuf[0:total_h])                                                                                   \
-    copyin(pair_NO0[0:pair_count], pair_NO1[0:pair_count], pair_mat_offset[0:pair_count], pair_h_offset[0:pair_count],      \
-           h0buf[0:total_mat], hnlbuf[0:total_h], hvnabuf[0:use_vna ? total_mat : 1], hhubbuf[0:add_hub ? total_h : 1],      \
-           hchbuf[0:add_hch ? total_h : 1])
+    int SpinP_switch_dev = SpinP_switch;
+    size_t hvna_len = use_vna ? total_mat : (size_t)1;
+    size_t hhub_len = add_hub ? total_h : (size_t)1;
+    size_t hch_len  = add_hch ? total_h : (size_t)1;
     {
-#pragma acc parallel loop gang present(hbuf[0:total_h], pair_NO0[0:pair_count], pair_NO1[0:pair_count],                     \
-                                           pair_mat_offset[0:pair_count], pair_h_offset[0:pair_count], h0buf[0:total_mat],   \
-                                           hnlbuf[0:total_h], hvnabuf[0:use_vna ? total_mat : 1],                            \
-                                           hhubbuf[0:add_hub ? total_h : 1], hchbuf[0:add_hch ? total_h : 1])
+#pragma omp parallel for
         for (pair = 0; pair < pair_count; pair++) {
             int NO1 = pair_NO1[pair];
             size_t mat_size = (size_t)pair_NO0[pair] * (size_t)NO1;
@@ -1081,14 +1077,13 @@ static void Set_Hamiltonian_Base_OpenACC(int SCF_iter, double *****H0, double **
             size_t h_off = pair_h_offset[pair];
             size_t e;
 
-#pragma acc loop vector
             for (e = 0; e < (size_t)spin_count * mat_size; e++) {
                 int spin = (int)(e / mat_size);
                 size_t ij = e - (size_t)spin * mat_size;
                 size_t idx = h_off + e;
                 double v;
 
-                if (SpinP_switch == 3) {
+                if (SpinP_switch_dev == 3) {
                     if (spin == 0 || spin == 1) {
                         v = f_kin * h0buf[mat_off + ij] + (use_vna ? f_vna * hvnabuf[mat_off + ij] : 0.0) +
                             f_nl * hnlbuf[idx];
@@ -1153,7 +1148,7 @@ static void Set_Hamiltonian_Base_OpenACC(int SCF_iter, double *****H0, double **
     free(pair_Mc_AN);
 }
 
-static void Calc_MatrixElements_dVH_Vxc_VNA_OpenACC(int Cnt_kind)
+static void Calc_MatrixElements_dVH_Vxc_VNA_OpenMP(int Cnt_kind)
 {
     int Mc_AN, Gc_AN, h_AN, Gh_AN, Mh_AN, Cwan, Hwan;
     int numprocs, myid;
@@ -1168,11 +1163,11 @@ static void Calc_MatrixElements_dVH_Vxc_VNA_OpenACC(int Cnt_kind)
     MPI_Comm_rank(mpi_comm_level1, &myid);
 
     if (Cnt_kind != 0 && Cnt_kind != 1) {
-        Set_Hamiltonian_abort("Calc_MatrixElements_dVH_Vxc_VNA_OpenACC", "Cnt_kind must be 0 or 1", myid);
+        Set_Hamiltonian_abort("Calc_MatrixElements_dVH_Vxc_VNA_OpenMP", "Cnt_kind must be 0 or 1", myid);
     }
 
     if (SpinP_switch != 0 && SpinP_switch != 1 && SpinP_switch != 3) {
-        Set_Hamiltonian_abort("Calc_MatrixElements_dVH_Vxc_VNA_OpenACC", "SpinP_switch must be 0, 1, or 3", myid);
+        Set_Hamiltonian_abort("Calc_MatrixElements_dVH_Vxc_VNA_OpenMP", "SpinP_switch must be 0, 1, or 3", myid);
     }
 
     spin_count = (SpinP_switch == 3) ? 4 : (SpinP_switch + 1);
@@ -1209,25 +1204,25 @@ static void Calc_MatrixElements_dVH_Vxc_VNA_OpenACC(int Cnt_kind)
         }
     }
 
-    pair_Mc_AN = (int *)Set_Hamiltonian_malloc(sizeof(int) * (size_t)pair_count, "openacc pair_Mc_AN", myid);
-    pair_h_AN = (int *)Set_Hamiltonian_malloc(sizeof(int) * (size_t)pair_count, "openacc pair_h_AN", myid);
-    pair_NO0 = (int *)Set_Hamiltonian_malloc(sizeof(int) * (size_t)pair_count, "openacc pair_NO0", myid);
-    pair_NO1 = (int *)Set_Hamiltonian_malloc(sizeof(int) * (size_t)pair_count, "openacc pair_NO1", myid);
-    pair_NOLG = (int *)Set_Hamiltonian_malloc(sizeof(int) * (size_t)pair_count, "openacc pair_NOLG", myid);
+    pair_Mc_AN = (int *)Set_Hamiltonian_malloc(sizeof(int) * (size_t)pair_count, "openmp pair_Mc_AN", myid);
+    pair_h_AN = (int *)Set_Hamiltonian_malloc(sizeof(int) * (size_t)pair_count, "openmp pair_h_AN", myid);
+    pair_NO0 = (int *)Set_Hamiltonian_malloc(sizeof(int) * (size_t)pair_count, "openmp pair_NO0", myid);
+    pair_NO1 = (int *)Set_Hamiltonian_malloc(sizeof(int) * (size_t)pair_count, "openmp pair_NO1", myid);
+    pair_NOLG = (int *)Set_Hamiltonian_malloc(sizeof(int) * (size_t)pair_count, "openmp pair_NOLG", myid);
     pair_h_offset =
-        (size_t *)Set_Hamiltonian_malloc(sizeof(size_t) * (size_t)pair_count, "openacc pair_h_offset", myid);
+        (size_t *)Set_Hamiltonian_malloc(sizeof(size_t) * (size_t)pair_count, "openmp pair_h_offset", myid);
     pair_nolg_offset =
-        (size_t *)Set_Hamiltonian_malloc(sizeof(size_t) * (size_t)pair_count, "openacc pair_nolg_offset", myid);
+        (size_t *)Set_Hamiltonian_malloc(sizeof(size_t) * (size_t)pair_count, "openmp pair_nolg_offset", myid);
     pair_orbs0_offset =
-        (size_t *)Set_Hamiltonian_malloc(sizeof(size_t) * (size_t)pair_count, "openacc pair_orbs0_offset", myid);
+        (size_t *)Set_Hamiltonian_malloc(sizeof(size_t) * (size_t)pair_count, "openmp pair_orbs0_offset", myid);
     pair_orbs1_offset =
-        (size_t *)Set_Hamiltonian_malloc(sizeof(size_t) * (size_t)pair_count, "openacc pair_orbs1_offset", myid);
-    hbuf = (double *)Set_Hamiltonian_malloc(sizeof(double) * total_h, "openacc hbuf", myid);
-    vpotbuf = (double *)Set_Hamiltonian_malloc(sizeof(double) * (size_t)spin_count * total_nolg, "openacc vpotbuf", myid);
+        (size_t *)Set_Hamiltonian_malloc(sizeof(size_t) * (size_t)pair_count, "openmp pair_orbs1_offset", myid);
+    hbuf = (double *)Set_Hamiltonian_malloc(sizeof(double) * total_h, "openmp hbuf", myid);
+    vpotbuf = (double *)Set_Hamiltonian_malloc(sizeof(double) * (size_t)spin_count * total_nolg, "openmp vpotbuf", myid);
     orbs0buf =
-        (Type_Orbs_Grid *)Set_Hamiltonian_malloc(sizeof(Type_Orbs_Grid) * total_orbs0, "openacc orbs0buf", myid);
+        (Type_Orbs_Grid *)Set_Hamiltonian_malloc(sizeof(Type_Orbs_Grid) * total_orbs0, "openmp orbs0buf", myid);
     orbs1buf =
-        (Type_Orbs_Grid *)Set_Hamiltonian_malloc(sizeof(Type_Orbs_Grid) * total_orbs1, "openacc orbs1buf", myid);
+        (Type_Orbs_Grid *)Set_Hamiltonian_malloc(sizeof(Type_Orbs_Grid) * total_orbs1, "openmp orbs1buf", myid);
 
     total_nolg_all = total_nolg;
 
@@ -1305,16 +1300,8 @@ static void Calc_MatrixElements_dVH_Vxc_VNA_OpenACC(int Cnt_kind)
         }
     }
 
-#pragma acc data copy(hbuf[0:total_h])                                                                                      \
-    copyin(pair_NO0[0:pair_count], pair_NO1[0:pair_count], pair_NOLG[0:pair_count], pair_h_offset[0:pair_count],            \
-           pair_nolg_offset[0:pair_count], pair_orbs0_offset[0:pair_count], pair_orbs1_offset[0:pair_count],                \
-           orbs0buf[0:total_orbs0], orbs1buf[0:total_orbs1], vpotbuf[0:(size_t)spin_count * total_nolg])
     {
-#pragma acc parallel loop gang present(hbuf[0:total_h], pair_NO0[0:pair_count], pair_NO1[0:pair_count],                     \
-                                           pair_NOLG[0:pair_count], pair_h_offset[0:pair_count],                            \
-                                           pair_nolg_offset[0:pair_count], pair_orbs0_offset[0:pair_count],                  \
-                                           pair_orbs1_offset[0:pair_count], orbs0buf[0:total_orbs0],                        \
-                                           orbs1buf[0:total_orbs1], vpotbuf[0:(size_t)spin_count * total_nolg])
+#pragma omp parallel for
         for (pair = 0; pair < pair_count; pair++) {
             int NO0 = pair_NO0[pair];
             int NO1 = pair_NO1[pair];
@@ -1326,7 +1313,6 @@ static void Calc_MatrixElements_dVH_Vxc_VNA_OpenACC(int Cnt_kind)
             size_t orbs1_off = pair_orbs1_offset[pair];
             size_t e;
 
-#pragma acc loop vector
             for (e = 0; e < (size_t)spin_count * mat_size; e++) {
                 int spin = (int)(e / mat_size);
                 size_t ij = e - (size_t)spin * mat_size;
@@ -1336,7 +1322,6 @@ static void Calc_MatrixElements_dVH_Vxc_VNA_OpenACC(int Cnt_kind)
                 double sum = hbuf[hidx];
                 int Nog;
 
-#pragma acc loop seq
                 for (Nog = 0; Nog < NOLG; Nog++) {
                     sum += vpotbuf[(size_t)spin * total_nolg + nolg_off + (size_t)Nog] *
                            orbs0buf[orbs0_off + (size_t)Nog * (size_t)NO0 + (size_t)i] *

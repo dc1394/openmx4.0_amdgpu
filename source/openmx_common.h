@@ -3,9 +3,9 @@
 
 /* CUDA / cuBLAS / cuSOLVER for GPU acceleration (added by H.Kawai) */
 #include <stdio.h>
-#include <cublas_v2.h>
-#include <cuda_runtime.h>
-#include <cusolverDn.h>
+#include "hipblas_compat.h"
+#include "hip_runtime_compat.h"
+#include "hipsolver_compat.h"
 #include <stdbool.h>
 
 static char Version_OpenMX[30] = "4.0 GPU"; /* version of OpenMX */
@@ -3337,8 +3337,8 @@ double Set_Hamiltonian(char *mode,
                        double *****HNL,
                        double *****CDM,
 		       double *****H);
-void Set_Hamiltonian_Set_OpenACC_Rank_Selected(int selected);
-int Set_Hamiltonian_OpenACC_Rank_Is_Selected(void);
+void Set_Hamiltonian_Set_OpenMP_Rank_Selected(int selected);
+int Set_Hamiltonian_OpenMP_Rank_Is_Selected(void);
 void Set_Hamiltonian_Invalidate_GpuSolver_HS_Cache(void);
 void Set_Hamiltonian_Build_GpuSolver_HS_Cache(int use_contracted);
 void Set_Hamiltonian_GpuSolver_SetMP(int *MP);
@@ -4066,48 +4066,48 @@ void Eigen_lapack(double **a, double *ko, int n, int EVmax);
 void Eigen_lapack2(double *a, int csize, double *ko, int n, int EVmax);
 void Eigen_lapack3(double *a, double *ko, int n, int EVmax);
 void EigenBand_lapack(dcomplex **A, double *W, int N0, int MaxN, int ev_flag);
-void EigenBand_lapack_openacc(dcomplex *A, double *W, int N0, int MaxN);
+void EigenBand_lapack_openmp(dcomplex *A, double *W, int N0, int MaxN);
 
 /* GPU eigensolver prototypes (added by H.Kawai, February 2024) */
 void Eigen_gpusolver_d(double ** a, double * ko, int n, int EVmax);
-void Eigen_gpusolver_x_openacc2(double * a, double * ko, int n0, int EVmax);
-void Eigen_gpusolver_x_complex_openacc(dcomplex ** a, double * ko, int n0, int EVmax);
+void Eigen_gpusolver_x_openmp2(double * a, double * ko, int n0, int EVmax);
+void Eigen_gpusolver_x_complex_openmp(dcomplex ** a, double * ko, int n0, int EVmax);
 int  gpusolver_Syevd(double * A, double * W, int m);
 int  gpusolver_Syevdx(double * A, double * W, int m, int MaxN);
-int  gpusolver_Syevdx_openacc(double * A, double * W, int m, int MaxN);
+int  gpusolver_Syevdx_openmp(double * A, double * W, int m, int MaxN);
 int  gpusolver_Syevdx_Complex(dcomplex * A, double * W, int m, int MaxN);
-int  gpusolver_Syevdx_Complex_openacc(dcomplex * A, double * W, int m, int MaxN);
+int  gpusolver_Syevdx_Complex_openmp(dcomplex * A, double * W, int m, int MaxN);
 
 #define GPU_CPU_SWITCH_NUM 1000
 #define WAITTIME           (10.0 * 1.0E-6)
 
-#define cudacall(call)                                                                                                 \
+#define hipcall(call)                                                                                                 \
     {                                                                                                                  \
-        cudaError_t err = (call);                                                                                      \
-        if (cudaSuccess != err) {                                                                                      \
+        hipError_t err = (call);                                                                                      \
+        if (hipSuccess != err) {                                                                                      \
             fprintf(stderr, "CUDA Error:\nFile = %s\nLine = %d\nReason = %d\n", __FILE__, __LINE__, err);              \
-            cudaDeviceReset();                                                                                         \
+            hipDeviceReset();                                                                                         \
             exit(EXIT_FAILURE);                                                                                        \
         }                                                                                                              \
     }
 
-#define wait_cudafunc(call)                                                                                            \
+#define wait_hipfunc(call)                                                                                            \
     do {                                                                                                               \
-        int wait_cudafunc_status;                                                                                      \
-        int wait_cudafunc_retry = 0;                                                                                   \
+        int wait_hipfunc_status;                                                                                      \
+        int wait_hipfunc_retry = 0;                                                                                   \
         while (true) {                                                                                                 \
-            wait_cudafunc_status = (int)(call);                                                                        \
-            if ((int)cudaSuccess == wait_cudafunc_status) {                                                            \
+            wait_hipfunc_status = (int)(call);                                                                        \
+            if ((int)hipSuccess == wait_hipfunc_status) {                                                            \
                 break;                                                                                                 \
             }                                                                                                          \
-            if (1000 <= wait_cudafunc_retry++) {                                                                       \
-                int wait_cudafunc_mpi_initialized = 0;                                                                 \
+            if (1000 <= wait_hipfunc_retry++) {                                                                       \
+                int wait_hipfunc_mpi_initialized = 0;                                                                 \
                 fprintf(stderr,                                                                                        \
                         "CUDA/HIP call failed after retries:\nFile = %s\nLine = %d\nCall = %s\nStatus = %d\n",        \
-                        __FILE__, __LINE__, #call, wait_cudafunc_status);                                             \
+                        __FILE__, __LINE__, #call, wait_hipfunc_status);                                             \
                 fflush(stderr);                                                                                        \
-                MPI_Initialized(&wait_cudafunc_mpi_initialized);                                                       \
-                if (wait_cudafunc_mpi_initialized) {                                                                   \
+                MPI_Initialized(&wait_hipfunc_mpi_initialized);                                                       \
+                if (wait_hipfunc_mpi_initialized) {                                                                   \
                     MPI_Abort(MPI_COMM_WORLD, 1);                                                                      \
                 }                                                                                                      \
                 exit(1);                                                                                               \
@@ -4121,24 +4121,24 @@ int  gpusolver_Syevdx_Complex_openacc(dcomplex * A, double * W, int m, int MaxN)
         }                                                                                                              \
     } while (0)
 
-void my_cublasDgemm(cublasOperation_t transa, cublasOperation_t transb, int m, int n, int k, double const * A,
+void my_hipblasDgemm(hipblasOperation_t transa, hipblasOperation_t transb, int m, int n, int k, double const * A,
                     double const * B, double * C);
 
-void my_cublasDgemm_openacc(cublasOperation_t transa, cublasOperation_t transb, int m, int n, int k, double const * A,
-                            double const * B, double * C);
+void my_hipblasDgemm_openmp(hipblasOperation_t transa, hipblasOperation_t transb, int m, int n, int k, double const * A,
+                           double const * B, double * C);
 
-void my_cublasZgemm(cublasOperation_t transa, cublasOperation_t transb, int m, int n, int k, dcomplex const * A,
+void my_hipblasZgemm(hipblasOperation_t transa, hipblasOperation_t transb, int m, int n, int k, dcomplex const * A,
                     dcomplex const * B, dcomplex * C);
 
-void my_cublasZgemm_openacc(cublasOperation_t transa, cublasOperation_t transb, int m, int n, int k, dcomplex const * A,
-                            dcomplex const * B, dcomplex * C);
+void my_hipblasZgemm_openmp(hipblasOperation_t transa, hipblasOperation_t transb, int m, int n, int k, dcomplex const * A,
+                           dcomplex const * B, dcomplex * C);
 
-cublasStatus_t openmx_gemmul8Dgemm(cublasHandle_t handle, cublasOperation_t transa, cublasOperation_t transb, int m,
+hipblasStatus_t openmx_gemmul8Dgemm(hipblasHandle_t handle, hipblasOperation_t transa, hipblasOperation_t transb, int m,
                                    int n, int k, const double *alpha, const double *A, int lda, const double *B,
                                    int ldb, const double *beta, double *C, int ldc);
-cublasStatus_t openmx_gemmul8Zgemm(cublasHandle_t handle, cublasOperation_t transa, cublasOperation_t transb, int m,
-                                   int n, int k, const cuDoubleComplex *alpha, const cuDoubleComplex *A, int lda,
-                                   const cuDoubleComplex *B, int ldb, const cuDoubleComplex *beta, cuDoubleComplex *C,
+hipblasStatus_t openmx_gemmul8Zgemm(hipblasHandle_t handle, hipblasOperation_t transa, hipblasOperation_t transb, int m,
+                                   int n, int k, const hipDoubleComplex *alpha, const hipDoubleComplex *A, int lda,
+                                   const hipDoubleComplex *B, int ldb, const hipDoubleComplex *beta, hipDoubleComplex *C,
                                    int ldc);
 void openmx_gemmul8ReleaseWorkspaces(void);
 

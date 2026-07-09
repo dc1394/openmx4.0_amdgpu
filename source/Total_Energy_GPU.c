@@ -1,7 +1,7 @@
 /**********************************************************************
   Total_Energy_GPU.c:
 
-     OpenACC helper kernels for grid reductions in Total_Energy.c.
+     OpenMP helper kernels for grid reductions in Total_Energy.c.
 
 ***********************************************************************/
 
@@ -11,7 +11,7 @@
 #include "openmx_common.h"
 
 
-void TotalEnergy_EXC_EH1_Grid_OpenACC(int spinmax, double *My_Ena, double *My_Eef,
+void TotalEnergy_EXC_EH1_Grid_OpenMP(int spinmax, double *My_Ena, double *My_Eef,
                                       double *My_EH1, double My_EXC[2])
 {
   int BN,grid_count,vna_grid_count,vef_grid_count;
@@ -36,14 +36,13 @@ void TotalEnergy_EXC_EH1_Grid_OpenACC(int spinmax, double *My_Ena, double *My_Ee
   local_EXC0 = My_EXC[0];
   local_EXC1 = My_EXC[1];
 
-#pragma acc data copyin(Density_Grid_B0[0:grid_count], Density_Grid_B1[0:grid_count], \
-                        ADensity_Grid_B[0:grid_count], PCCDensity_Grid_B0[0:grid_count], \
-                        PCCDensity_Grid_B1[0:grid_count], dVHart_Grid_B[0:grid_count], \
-                        Vxc_Grid_B0[0:grid_count], Vxc_Grid_B1[0:grid_count], \
-                        RefVxc_Grid_B[0:grid_count], VNA_Grid_B[0:vna_grid_count], \
-                        VEF_Grid_B[0:vef_grid_count])
+  int l_ProExpn_VNA,l_E_Field_switch,l_Exc0_correction_flag;
+  l_ProExpn_VNA = ProExpn_VNA;
+  l_E_Field_switch = E_Field_switch;
+  l_Exc0_correction_flag = Exc0_correction_flag;
+
   {
-#pragma acc parallel loop reduction(+:local_Ena,local_Eef,local_EH1,local_EXC0,local_EXC1)
+#pragma omp parallel for reduction(+:local_Ena,local_Eef,local_EH1,local_EXC0,local_EXC1)
     for (BN=0; BN<grid_count; BN++){
       double sden0,sden1,tden,aden,pden0,pden1,refvxc;
 
@@ -55,12 +54,12 @@ void TotalEnergy_EXC_EH1_Grid_OpenACC(int spinmax, double *My_Ena, double *My_Ee
       pden1 = PCCDensity_Grid_B1[BN];
       refvxc = RefVxc_Grid_B[BN];
 
-      if (ProExpn_VNA==0) local_Ena += tden*VNA_Grid_B[BN];
-      if (E_Field_switch==1) local_Eef += tden*VEF_Grid_B[BN];
+      if (l_ProExpn_VNA==0) local_Ena += tden*VNA_Grid_B[BN];
+      if (l_E_Field_switch==1) local_Eef += tden*VEF_Grid_B[BN];
 
       local_EH1 += (tden - 2.0*aden)*dVHart_Grid_B[BN];
 
-      if (Exc0_correction_flag==1){
+      if (l_Exc0_correction_flag==1){
         local_EXC0 += (sden0+pden0)*Vxc_Grid_B0[BN] - (aden+pden0)*refvxc;
         if (0<spinmax) local_EXC1 += (sden1+pden1)*Vxc_Grid_B1[BN] - (aden+pden1)*refvxc;
       }
@@ -79,7 +78,7 @@ void TotalEnergy_EXC_EH1_Grid_OpenACC(int spinmax, double *My_Ena, double *My_Ee
 }
 
 
-void TotalEnergy_Dipole_Grid_OpenACC(int GNs, double *My_E_dpx, double *My_E_dpy,
+void TotalEnergy_Dipole_Grid_OpenMP(int GNs, double *My_E_dpx, double *My_E_dpy,
                                      double *My_E_dpz, double *My_E_dpx_BG,
                                      double *My_E_dpy_BG, double *My_E_dpz_BG)
 {
@@ -113,17 +112,20 @@ void TotalEnergy_Dipole_Grid_OpenACC(int GNs, double *My_E_dpx, double *My_E_dpy
   local_E_dpy_BG = *My_E_dpy_BG;
   local_E_dpz_BG = *My_E_dpz_BG;
 
-#pragma acc data copyin(Density_Grid_B0[0:grid_count], Density_Grid_B1[0:grid_count])
+  int l_Ngrid2,l_Ngrid3;
+  l_Ngrid2 = Ngrid2;
+  l_Ngrid3 = Ngrid3;
+
   {
-#pragma acc parallel loop reduction(+:local_E_dpx,local_E_dpy,local_E_dpz,local_E_dpx_BG,local_E_dpy_BG,local_E_dpz_BG)
+#pragma omp parallel for reduction(+:local_E_dpx,local_E_dpy,local_E_dpz,local_E_dpx_BG,local_E_dpy_BG,local_E_dpz_BG)
     for (BN=0; BN<grid_count; BN++){
       int GN,n1,n2,n3;
       double x,y,z,den;
 
       GN = BN + GNs;
-      n1 = GN/(Ngrid2*Ngrid3);
-      n2 = (GN - n1*Ngrid2*Ngrid3)/Ngrid3;
-      n3 = GN - n1*Ngrid2*Ngrid3 - n2*Ngrid3;
+      n1 = GN/(l_Ngrid2*l_Ngrid3);
+      n2 = (GN - n1*l_Ngrid2*l_Ngrid3)/l_Ngrid3;
+      n3 = GN - n1*l_Ngrid2*l_Ngrid3 - n2*l_Ngrid3;
 
       x = (double)n1*gtv11 + (double)n2*gtv21 + (double)n3*gtv31 + grid_origin1;
       y = (double)n1*gtv12 + (double)n2*gtv22 + (double)n3*gtv32 + grid_origin2;
@@ -148,7 +150,7 @@ void TotalEnergy_Dipole_Grid_OpenACC(int GNs, double *My_E_dpx, double *My_E_dpy
 }
 
 
-void TotalEnergy_CWF_Dc_Grid_OpenACC(int spinmax, double My_dcEH1[2], double My_dcEXC[2])
+void TotalEnergy_CWF_Dc_Grid_OpenMP(int spinmax, double My_dcEH1[2], double My_dcEXC[2])
 {
   int BN,grid_count;
   double local_dcEH10,local_dcEH11,local_dcEXC0,local_dcEXC1;
@@ -166,11 +168,8 @@ void TotalEnergy_CWF_Dc_Grid_OpenACC(int spinmax, double My_dcEH1[2], double My_
   local_dcEXC0 = My_dcEXC[0];
   local_dcEXC1 = My_dcEXC[1];
 
-#pragma acc data copyin(Density_Grid_B0[0:grid_count], Density_Grid_B1[0:grid_count], \
-                        ADensity_Grid_B[0:grid_count], dVHart_Grid_B[0:grid_count], \
-                        Vxc_Grid_B0[0:grid_count], Vxc_Grid_B1[0:grid_count])
   {
-#pragma acc parallel loop reduction(+:local_dcEH10,local_dcEH11,local_dcEXC0,local_dcEXC1)
+#pragma omp parallel for reduction(+:local_dcEH10,local_dcEH11,local_dcEXC0,local_dcEXC1)
     for (BN=0; BN<grid_count; BN++){
       double sden0,sden1,aden,dvhart;
 
@@ -196,7 +195,7 @@ void TotalEnergy_CWF_Dc_Grid_OpenACC(int spinmax, double My_dcEH1[2], double My_
 }
 
 
-#pragma acc routine seq
+#pragma omp declare target
 static double TotalEnergy_EH0_VH_AtomF_flat(int spe, int N, double x, double r,
                                             const double *vps_xv_flat,
                                             const double *vps_rv_flat,
@@ -270,9 +269,10 @@ static double TotalEnergy_EH0_VH_AtomF_flat(int spe, int N, double x, double r,
                  +yv[i+1];
   }
 }
+#pragma omp end declare target
 
 
-#pragma acc routine seq
+#pragma omp declare target
 static double TotalEnergy_EH0_Dr_VH_AtomF_flat(int spe, int N, double x, double r,
                                                const double *vps_xv_flat,
                                                const double *vps_rv_flat,
@@ -346,9 +346,10 @@ static double TotalEnergy_EH0_Dr_VH_AtomF_flat(int spe, int N, double x, double 
                 +(yv[i+2]-yv[i]))*tmp/r;
   }
 }
+#pragma omp end declare target
 
 
-void TotalEnergy_EH0_TwoCenter_Batch_OpenACC(int pair_count, int *pair_ban, int *pair_wan2,
+void TotalEnergy_EH0_TwoCenter_Batch_OpenMP(int pair_count, int *pair_ban, int *pair_wan2,
                                              int *pair_has_deriv, double *pair_dis,
                                              double *pair_dirx, double *pair_diry, double *pair_dirz,
                                              double *out0, double *out1, double *out2, double *out3)
@@ -387,7 +388,7 @@ void TotalEnergy_EH0_TwoCenter_Batch_OpenACC(int pair_count, int *pair_ban, int 
       gridx_flat==NULL || gridy_flat==NULL || gridz_flat==NULL ||
       arho_flat==NULL || wt_flat==NULL ||
       vps_xv_flat==NULL || vps_rv_flat==NULL || vh_atom_flat==NULL){
-    printf("TotalEnergy_EH0_TwoCenter_Batch_OpenACC: malloc failed.\n");
+    printf("TotalEnergy_EH0_TwoCenter_Batch_OpenMP: malloc failed.\n");
     fflush(stdout);
     exit(1);
   }
@@ -428,17 +429,8 @@ void TotalEnergy_EH0_TwoCenter_Batch_OpenACC(int pair_count, int *pair_ban, int 
     }
   }
 
-#pragma acc data copyin(pair_ban[0:pair_count], pair_wan2[0:pair_count], \
-                        pair_has_deriv[0:pair_count], pair_dis[0:pair_count], \
-                        pair_dirx[0:pair_count], pair_diry[0:pair_count], pair_dirz[0:pair_count], \
-                        tgn_flat[0:species_count], vps_n_flat[0:species_count], \
-                        dv_flat[0:species_count], core_charge_flat[0:species_count], \
-                        gridx_flat[0:grid_count], gridy_flat[0:grid_count], \
-                        gridz_flat[0:grid_count], arho_flat[0:grid_count], wt_flat[0:grid_count], \
-                        vps_xv_flat[0:vps_count], vps_rv_flat[0:vps_count], vh_atom_flat[0:vh_count]) \
-                 copyout(out0[0:pair_count], out1[0:pair_count], out2[0:pair_count], out3[0:pair_count])
   {
-#pragma acc parallel loop gang
+#pragma omp parallel for
     for (pair=0; pair<pair_count; pair++){
       int n1,ban,wan2,tgn,has_deriv;
       double dis,dirx,diry,dirz,dv,sum,sumr;
@@ -455,7 +447,6 @@ void TotalEnergy_EH0_TwoCenter_Batch_OpenACC(int pair_count, int *pair_ban, int 
       sum = 0.0;
       sumr = 0.0;
 
-#pragma acc loop vector reduction(+:sum,sumr)
       for (n1=0; n1<tgn; n1++){
         int idx;
         double x,y,z,z2,r2,r,xx,rho0,wt,va0,dr_va0;

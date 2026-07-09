@@ -8,29 +8,29 @@
 #include "tran_prototypes.h"
 
 #include "openmx_common.h"
-#include <cublas_v2.h>
-#include <cuda_runtime.h>
-#include <cusolverDn.h>
-#include <openacc.h>
+#include "hipblas_compat.h"
+#include "hip_runtime_compat.h"
+#include "hipsolver_compat.h"
+#include <omp.h>
 
-#ifndef cudacall
-#define cudacall(call)                                                                                                        \
+#ifndef hipcall
+#define hipcall(call)                                                                                                        \
     do {                                                                                                                      \
-        cudaError_t err = (call);                                                                                             \
-        if (cudaSuccess != err) {                                                                                             \
-            fprintf(stderr, "HIP Error:\nFile = %s\nLine = %d\nReason = %s\n", __FILE__, __LINE__, cudaGetErrorString(err)); \
-            cudaDeviceReset();                                                                                                \
+        hipError_t err = (call);                                                                                             \
+        if (hipSuccess != err) {                                                                                             \
+            fprintf(stderr, "HIP Error:\nFile = %s\nLine = %d\nReason = %s\n", __FILE__, __LINE__, hipGetErrorString(err)); \
+            hipDeviceReset();                                                                                                \
             exit(EXIT_FAILURE);                                                                                               \
         }                                                                                                                     \
     } while (0)
 #endif
 
-#define cublascall(call)                                                                                     \
+#define hipblascall(call)                                                                                     \
     do {                                                                                                     \
-        cublasStatus_t status = (call);                                                                      \
-        if (CUBLAS_STATUS_SUCCESS != status) {                                                               \
+        hipblasStatus_t status = (call);                                                                      \
+        if (HIPBLAS_STATUS_SUCCESS != status) {                                                               \
             fprintf(stderr, "hipBLAS Error:\nFile = %s\nLine = %d\nCode = %d\n", __FILE__, __LINE__, status); \
-            cudaDeviceReset();                                                                               \
+            hipDeviceReset();                                                                               \
             exit(EXIT_FAILURE);                                                                              \
         }                                                                                                    \
                                                                                                              \
@@ -47,7 +47,7 @@
 
 int LU_Zinverse_Kino(int n, dcomplex *A);
 int LU_Zinverse_Ozaki(int n, dcomplex *A);
-int LU_Zinverse_GPU(int n, dcomplex* A, cublasHandle_t handle);
+int LU_Zinverse_GPU(int n, dcomplex* A, hipblasHandle_t handle);
 static dcomplex MyComplex(double re, double im);
 static dcomplex MyCadd(dcomplex a, dcomplex b);
 static dcomplex MyCmul(dcomplex a, dcomplex b);
@@ -60,7 +60,7 @@ int Lapack_LU_Zinverse(int n, dcomplex *A)
 {
 
   LU_Zinverse_Kino(n,A);
-  /* LU_Zinverse_GPU(n, A, handle); */ /* requires cublasHandle_t */
+  /* LU_Zinverse_GPU(n, A, handle); */ /* requires hipblasHandle_t */
 
   return 0;
 }
@@ -344,7 +344,7 @@ int LU_Zinverse_Ozaki(int n, dcomplex *A)
   return 0;
 }
 
-int LU_Zinverse_GPU(int n, dcomplex* A, cublasHandle_t handle)
+int LU_Zinverse_GPU(int n, dcomplex* A, hipblasHandle_t handle)
 #define C_ref(i, j) C[n * (j) + i]
 {
     static char* thisprogram = "Lapack_LU_inverse";
@@ -371,45 +371,37 @@ int LU_Zinverse_GPU(int n, dcomplex* A, cublasHandle_t handle)
 
     int lda = n;
 
-#pragma acc data deviceptr(A)
-#pragma acc data create(P[0 : n], INFO[0 : 1])
-#pragma acc data copyout(Ainv[0 : n * n])
-#pragma acc host_data use_device(Ainv, P, INFO)
     {
         dcomplex* A_[] = { A };
 
-#pragma acc data copyin(A_[0 : 1])
-#pragma acc host_data use_device(A_)
         {
-            cublascall(cublasZgetrfBatched(handle, n, (cuDoubleComplex* const*)A_, lda, P, INFO, 1));
+            hipblascall(hipblasZgetrfBatched(handle, n, (hipDoubleComplex* const*)A_, lda, P, INFO, 1));
 
             int INFOh = 0;
-            cudacall(cudaMemcpy(&INFOh, INFO, sizeof(int), cudaMemcpyDeviceToHost));
+            hipcall(hipMemcpy(&INFOh, INFO, sizeof(int), hipMemcpyDeviceToHost));
 
             if (INFOh == n) {
                 printf("Factorization Failed: Matrix is singular\n");
-                cudaDeviceReset();
+                hipDeviceReset();
                 exit(EXIT_FAILURE);
             }
 
             dcomplex* C_[] = { Ainv };
 
-#pragma acc data copyin(C_[0 : 1])
-#pragma acc host_data use_device(C_)
             {
-                cublascall(cublasZgetriBatched(handle, n, (cuDoubleComplex* const*)A_, lda, P, (cuDoubleComplex* const*)C_, lda, INFO, 1));
+                hipblascall(hipblasZgetriBatched(handle, n, (hipDoubleComplex* const*)A_, lda, P, (hipDoubleComplex* const*)C_, lda, INFO, 1));
             }
 
-            cudacall(cudaMemcpy(&INFOh, INFO, sizeof(int), cudaMemcpyDeviceToHost));
+            hipcall(hipMemcpy(&INFOh, INFO, sizeof(int), hipMemcpyDeviceToHost));
 
             if (INFOh != 0) {
                 printf("Inversion Failed: Matrix is singular\n");
-                cudaDeviceReset();
+                hipDeviceReset();
                 exit(EXIT_FAILURE);
             }
         }
 
-#pragma acc kernels
+#pragma omp parallel for
         for (int i = 0; i < n * n; i++) {
             A[i] = Ainv[i];
         }

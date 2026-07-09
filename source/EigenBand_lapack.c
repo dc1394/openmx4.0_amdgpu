@@ -10,7 +10,7 @@ static void Eigen_zheev(dcomplex **A, double *W, int N0);
 static int Eigen_zheevx(dcomplex **A, double *W, int N0, int MaxN, int ev_flag);
 static void Eigen_HH(dcomplex **ac, double *ko, int n, int EVmax, int ev_flag);
 static int gpusolver_zheevx(dcomplex** A, double* W, int N0, int MaxN, int ev_flag);
-static int gpusolver_zheevx_openacc(dcomplex* A, double* W, int N0, int MaxN);
+static int gpusolver_zheevx_openmp(dcomplex* A, double* W, int N0, int MaxN);
 
 
 void EigenBand_lapack(dcomplex **A, double *W, int N0, int MaxN, int ev_flag)
@@ -648,46 +648,38 @@ int Eigen_zheevx(dcomplex **A, double *W, int N0, int MaxN, int ev_flag)
   return INFO;
 }
 
-void EigenBand_lapack_openacc(dcomplex* A, double* W, int N0, int MaxN)
+void EigenBand_lapack_openmp(dcomplex* A, double* W, int N0, int MaxN)
 {
     int info;
-    info = gpusolver_zheevx_openacc(A, W, N0, MaxN);
+    info = gpusolver_zheevx_openmp(A, W, N0, MaxN);
 }
 
-void Eigen_gpusolver_x_complex_openacc(dcomplex ** a, double * ko, int n0, int EVmax)
+void Eigen_gpusolver_x_complex_openmp(dcomplex ** a, double * ko, int n0, int EVmax)
 {
     int       info;
     int const n = n0;
 
     dcomplex* A = (dcomplex*)malloc(sizeof(dcomplex) * n * n);
 
-#pragma acc data present(a[0 : n][0 : n], ko[0 : n])
-#pragma acc data create(A[0 : n * n])
     {
-#pragma acc kernels
-#pragma acc loop independent
+#pragma omp parallel for collapse(2)
         for (int i = 0; i < n; i++) {
-#pragma acc loop independent
             for (int j = 0; j < n; j++) {
                 A[i * n + j].r = a[i + 1][j + 1].r;
                 A[i * n + j].i = a[i + 1][j + 1].i;
             }
         }
 
-        info = gpusolver_Syevdx_Complex_openacc(A, ko, n, EVmax);
+        info = gpusolver_Syevdx_Complex_openmp(A, ko, n, EVmax);
 
-#pragma acc kernels
-#pragma acc loop independent
+#pragma omp parallel for collapse(2)
         for (int i = 0; i < EVmax; i++) {
-#pragma acc loop independent
             for (int j = 0; j < n; j++) {
                 a[j + 1][i + 1].r = A[i * n + j].r;
                 a[j + 1][i + 1].i = A[i * n + j].i;
             }
         }
 
-#pragma acc kernels
-#pragma acc loop seq
         for (int i = EVmax; i >= 1; i--) {
             ko[i] = ko[i - 1];
         }
@@ -734,16 +726,13 @@ int gpusolver_zheevx(dcomplex** A, double* W, int N0, int MaxN, int ev_flag)
     return info;
 }
 
-int gpusolver_zheevx_openacc(dcomplex* A, double* W, int N0, int MaxN)
+int gpusolver_zheevx_openmp(dcomplex* A, double* W, int N0, int MaxN)
 {
     int info;
 
-    info = gpusolver_Syevdx_Complex_openacc(A, W, N0, MaxN);
+    info = gpusolver_Syevdx_Complex_openmp(A, W, N0, MaxN);
 
-#pragma acc data present(W[0: N0 + 1])
     {
-#pragma acc kernels
-#pragma acc loop seq
         for (int i = N0; i >= 1; i--) {
             W[i] = W[i - 1];
         }

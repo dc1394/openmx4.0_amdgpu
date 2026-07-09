@@ -48,12 +48,12 @@
  */
 
 #include "openmx_common.h"
-#include "set_cuda_default_device_from_local_rank.h"
-#include "set_openacc_device_from_local_rank.h"
+#include "set_hip_default_device_from_local_rank.h"
+#include "set_openmp_device_from_local_rank.h"
 #include <assert.h>
-#include <cuda_runtime.h>
-#include <cusolverDn.h>
-#include <openacc.h>
+#include "hip_runtime_compat.h"
+#include "hipsolver_compat.h"
+#include <omp.h>
 #include <stdint.h>
 #include <stdio.h>
 
@@ -61,8 +61,8 @@ int32_t gpusolver_Syevdx(double * A, double * W, int32_t m, int32_t MaxN)
 {
     int32_t const lda = m;
 
-    cusolverDnHandle_t cusolverH = NULL;
-    cudaStream_t       stream    = NULL;
+    hipsolverDnHandle_t hipsolverH = NULL;
+    hipStream_t       stream    = NULL;
 
     double *  d_A = NULL;
     double *  d_W = NULL;
@@ -80,33 +80,33 @@ int32_t gpusolver_Syevdx(double * A, double * W, int32_t m, int32_t MaxN)
     void * h_work                   = NULL; /* host workspace for */
 
     /* step 1: create gpusolver handle, bind a stream */
-    wait_cudafunc(hipsolverDnCreate(&cusolverH));
+    wait_hipfunc(hipsolverDnCreate(&hipsolverH));
 
-    wait_cudafunc(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
-    wait_cudafunc(hipsolverDnSetStream(cusolverH, stream));
+    wait_hipfunc(hipStreamCreateWithFlags(&stream, hipStreamNonBlocking));
+    wait_hipfunc(hipsolverDnSetStream(hipsolverH, stream));
 
-    wait_cudafunc(cudaMalloc((void **)(&d_A), sizeof(double) * lda * m));
-    wait_cudafunc(cudaMalloc((void **)(&d_W), sizeof(double) * m));
-    wait_cudafunc(cudaMalloc((void **)(&d_info), sizeof(int32_t)));
+    wait_hipfunc(hipMalloc((void **)(&d_A), sizeof(double) * lda * m));
+    wait_hipfunc(hipMalloc((void **)(&d_W), sizeof(double) * m));
+    wait_hipfunc(hipMalloc((void **)(&d_info), sizeof(int32_t)));
 
-    wait_cudafunc(cudaMemcpyAsync(d_A, A, sizeof(double) * lda * m, cudaMemcpyHostToDevice, stream));
+    wait_hipfunc(hipMemcpyAsync(d_A, A, sizeof(double) * lda * m, hipMemcpyHostToDevice, stream));
 
     // step 3: query working space of syevd
-    cusolverEigMode_t  jobz = HIPSOLVER_EIG_MODE_VECTOR;  // compute eigenvalues and eigenvectors.
-    cublasFillMode_t   uplo = CUBLAS_FILL_MODE_LOWER;
-    cusolverEigRange_t range;
+    hipsolverEigMode_t  jobz = HIPSOLVER_EIG_MODE_VECTOR;  // compute eigenvalues and eigenvectors.
+    hipblasFillMode_t   uplo = HIPBLAS_FILL_MODE_LOWER;
+    hipsolverEigRange_t range;
     if (m == MaxN) {
         range = HIPSOLVER_EIG_RANGE_ALL;
     } else {
         range = HIPSOLVER_EIG_RANGE_I;
     }
 
-    wait_cudafunc(hipsolverDnDsyevdx_bufferSize(cusolverH, jobz, range, uplo, m, d_A, lda, vl, vu,
+    wait_hipfunc(hipsolverDnDsyevdx_bufferSize(hipsolverH, jobz, range, uplo, m, d_A, lda, vl, vu,
                                                 1, MaxN, &h_meig, d_W, &lwork));
     workspaceInBytesOnDevice = (size_t)lwork * sizeof(double);
     workspaceInBytesOnHost = 0;
 
-    wait_cudafunc(cudaMalloc((void **)(&d_work), workspaceInBytesOnDevice));
+    wait_hipfunc(hipMalloc((void **)(&d_work), workspaceInBytesOnDevice));
     h_work = (workspaceInBytesOnHost == 0) ? NULL : malloc(workspaceInBytesOnHost);
     if (workspaceInBytesOnHost != 0 && !h_work) {
         fprintf(stderr, "Could not allocate host memory.\n");
@@ -114,56 +114,53 @@ int32_t gpusolver_Syevdx(double * A, double * W, int32_t m, int32_t MaxN)
     }
 
     // step 4: compute spectrum
-    wait_cudafunc(hipsolverDnDsyevdx(cusolverH, jobz, range, uplo, m, d_A, lda, vl, vu, 1, MaxN,
+    wait_hipfunc(hipsolverDnDsyevdx(hipsolverH, jobz, range, uplo, m, d_A, lda, vl, vu, 1, MaxN,
                                      &h_meig, d_W, (double *)d_work, lwork, d_info));
 
-    wait_cudafunc(cudaMemcpyAsync(A, d_A, sizeof(double) * lda * m, cudaMemcpyDeviceToHost, stream));
-    wait_cudafunc(cudaMemcpyAsync(W, d_W, sizeof(double) * MaxN, cudaMemcpyDeviceToHost, stream));
-    wait_cudafunc(cudaMemcpyAsync(&info, d_info, sizeof(int32_t), cudaMemcpyDeviceToHost, stream));
+    wait_hipfunc(hipMemcpyAsync(A, d_A, sizeof(double) * lda * m, hipMemcpyDeviceToHost, stream));
+    wait_hipfunc(hipMemcpyAsync(W, d_W, sizeof(double) * MaxN, hipMemcpyDeviceToHost, stream));
+    wait_hipfunc(hipMemcpyAsync(&info, d_info, sizeof(int32_t), hipMemcpyDeviceToHost, stream));
 
-    wait_cudafunc(cudaStreamSynchronize(stream));
+    wait_hipfunc(hipStreamSynchronize(stream));
     /* free resources */
-    wait_cudafunc(cudaFree(d_A));
-    wait_cudafunc(cudaFree(d_W));
-    wait_cudafunc(cudaFree(d_info));
-    wait_cudafunc(cudaFree(d_work));
+    wait_hipfunc(hipFree(d_A));
+    wait_hipfunc(hipFree(d_W));
+    wait_hipfunc(hipFree(d_info));
+    wait_hipfunc(hipFree(d_work));
     if (h_work != NULL) free(h_work);
 
-    wait_cudafunc(hipsolverDnDestroy(cusolverH));
+    wait_hipfunc(hipsolverDnDestroy(hipsolverH));
 
-    wait_cudafunc(cudaStreamDestroy(stream));
+    wait_hipfunc(hipStreamDestroy(stream));
 
     return info;
 }
 
-int32_t gpusolver_Syevdx_openacc(double * A, double * W, int32_t m, int32_t MaxN)
+int32_t gpusolver_Syevdx_openmp(double * A, double * W, int32_t m, int32_t MaxN)
 {
     int32_t info = 0;
 
     /* step 1: create gpusolver handle, bind a stream */
-#pragma acc data      present(A[0 : m * m])
-#pragma acc data      present(W[0 : MaxN])
-#pragma acc host_data use_device(A, W)
     {
-        cusolverDnHandle_t cusolverH = NULL;
+        hipsolverDnHandle_t hipsolverH = NULL;
 
-        wait_cudafunc(hipsolverDnCreate(&cusolverH));
+        wait_hipfunc(hipsolverDnCreate(&hipsolverH));
 
-        cudaStream_t stream = NULL;
-        wait_cudafunc(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
-        wait_cudafunc(hipsolverDnSetStream(cusolverH, stream));
+        hipStream_t stream = NULL;
+        wait_hipfunc(hipStreamCreateWithFlags(&stream, hipStreamNonBlocking));
+        wait_hipfunc(hipsolverDnSetStream(hipsolverH, stream));
 
-        //  wait_cudafunc(cudaMalloc((void **)(&d_A), sizeof(double) * lda * m));
-        //  wait_cudafunc(cudaMalloc((void **)(&d_W), sizeof(double) * m));
-        // wait_cudafunc(cudaMalloc((void **)(&d_info), sizeof(int32_t)));
+        //  wait_hipfunc(hipMalloc((void **)(&d_A), sizeof(double) * lda * m));
+        //  wait_hipfunc(hipMalloc((void **)(&d_W), sizeof(double) * m));
+        // wait_hipfunc(hipMalloc((void **)(&d_info), sizeof(int32_t)));
 
-        //  wait_cudafunc(cudaMemcpyAsync(d_A, A, sizeof(double) * lda * m, cudaMemcpyHostToDevice,
+        //  wait_hipfunc(hipMemcpyAsync(d_A, A, sizeof(double) * lda * m, hipMemcpyHostToDevice,
         //                             stream));
 
         // step 3: query working space of syevd
-        cusolverEigMode_t const  jobz  = HIPSOLVER_EIG_MODE_VECTOR;  // compute eigenvalues and eigenvectors.
-        cublasFillMode_t const   uplo  = CUBLAS_FILL_MODE_LOWER;
-        cusolverEigRange_t const range = HIPSOLVER_EIG_RANGE_I;
+        hipsolverEigMode_t const  jobz  = HIPSOLVER_EIG_MODE_VECTOR;  // compute eigenvalues and eigenvectors.
+        hipblasFillMode_t const   uplo  = HIPBLAS_FILL_MODE_LOWER;
+        hipsolverEigRange_t const range = HIPSOLVER_EIG_RANGE_I;
 
         int32_t const lda = m;
         double        vl     = 0.0;
@@ -175,15 +172,15 @@ int32_t gpusolver_Syevdx_openacc(double * A, double * W, int32_t m, int32_t MaxN
         size_t workspaceInBytesOnHost   = 0; /* size of workspace */
         int32_t *d_info = NULL;
 
-        wait_cudafunc(hipsolverDnDsyevdx_bufferSize(cusolverH, jobz, range, uplo, m, A, lda, vl, vu,
+        wait_hipfunc(hipsolverDnDsyevdx_bufferSize(hipsolverH, jobz, range, uplo, m, A, lda, vl, vu,
                                                     1, MaxN, &h_meig, W, &lwork));
         workspaceInBytesOnDevice = (size_t)lwork * sizeof(double);
         workspaceInBytesOnHost = 0;
 
         void * d_work = NULL; /* device workspace */
 
-        wait_cudafunc(cudaMalloc((void **)(&d_work), workspaceInBytesOnDevice));
-        wait_cudafunc(cudaMalloc((void **)(&d_info), sizeof(int32_t)));
+        wait_hipfunc(hipMalloc((void **)(&d_work), workspaceInBytesOnDevice));
+        wait_hipfunc(hipMalloc((void **)(&d_info), sizeof(int32_t)));
 
         void * h_work = NULL; /* host workspace for */
 
@@ -194,24 +191,24 @@ int32_t gpusolver_Syevdx_openacc(double * A, double * W, int32_t m, int32_t MaxN
         }
 
         //  step 4: compute spectrum
-        wait_cudafunc(hipsolverDnDsyevdx(cusolverH, jobz, range, uplo, m, A, lda, vl, vu, 1, MaxN,
+        wait_hipfunc(hipsolverDnDsyevdx(hipsolverH, jobz, range, uplo, m, A, lda, vl, vu, 1, MaxN,
                                          &h_meig, W, (double *)d_work, lwork, d_info));
 
-        // wait_cudafunc(cudaMemcpyAsync(A, d_A, sizeof(double) * lda * m, cudaMemcpyDeviceToHost,
+        // wait_hipfunc(hipMemcpyAsync(A, d_A, sizeof(double) * lda * m, hipMemcpyDeviceToHost,
         //                            stream));
-        // wait_cudafunc(cudaMemcpyAsync(W, d_W, sizeof(double) * m, cudaMemcpyDeviceToHost,
+        // wait_hipfunc(hipMemcpyAsync(W, d_W, sizeof(double) * m, hipMemcpyDeviceToHost,
         //                            stream));
-        wait_cudafunc(cudaMemcpyAsync(&info, d_info, sizeof(int32_t), cudaMemcpyDeviceToHost, stream));
-        wait_cudafunc(cudaStreamSynchronize(stream));
+        wait_hipfunc(hipMemcpyAsync(&info, d_info, sizeof(int32_t), hipMemcpyDeviceToHost, stream));
+        wait_hipfunc(hipStreamSynchronize(stream));
         /* free resources */
-        // wait_cudafunc(cudaFree(d_A));
-        // wait_cudafunc(cudaFree(d_W));
-        wait_cudafunc(cudaFree(d_info));
-        wait_cudafunc(cudaFree(d_work));
+        // wait_hipfunc(hipFree(d_A));
+        // wait_hipfunc(hipFree(d_W));
+        wait_hipfunc(hipFree(d_info));
+        wait_hipfunc(hipFree(d_work));
         if (h_work != NULL) free(h_work);
 
-        wait_cudafunc(hipsolverDnDestroy(cusolverH));
-        wait_cudafunc(cudaStreamDestroy(stream));
+        wait_hipfunc(hipsolverDnDestroy(hipsolverH));
+        wait_hipfunc(hipStreamDestroy(stream));
     }
 
     return info;
@@ -221,10 +218,10 @@ int32_t gpusolver_Syevdx_Complex(dcomplex * A, double * W, int32_t m, int32_t Ma
 {
     int32_t const lda = m;
 
-    cusolverDnHandle_t cusolverH = NULL;
-    cudaStream_t       stream    = NULL;
+    hipsolverDnHandle_t hipsolverH = NULL;
+    hipStream_t       stream    = NULL;
 
-    cuDoubleComplex * d_A    = NULL;
+    hipDoubleComplex * d_A    = NULL;
     double *          d_W    = NULL;
     double            vl     = 0.0;
     double            vu     = 0.0;
@@ -240,28 +237,28 @@ int32_t gpusolver_Syevdx_Complex(dcomplex * A, double * W, int32_t m, int32_t Ma
     void * h_work                   = NULL; /* host workspace for */
 
     /* step 1: create gpusolver handle, bind a stream */
-    wait_cudafunc(hipsolverDnCreate(&cusolverH));
+    wait_hipfunc(hipsolverDnCreate(&hipsolverH));
 
-    wait_cudafunc(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
-    wait_cudafunc(hipsolverDnSetStream(cusolverH, stream));
+    wait_hipfunc(hipStreamCreateWithFlags(&stream, hipStreamNonBlocking));
+    wait_hipfunc(hipsolverDnSetStream(hipsolverH, stream));
 
-    wait_cudafunc(cudaMalloc((void **)(&d_A), sizeof(cuDoubleComplex) * lda * m));
-    wait_cudafunc(cudaMalloc((void **)(&d_W), sizeof(double) * m));
-    wait_cudafunc(cudaMalloc((void **)(&d_info), sizeof(int32_t)));
+    wait_hipfunc(hipMalloc((void **)(&d_A), sizeof(hipDoubleComplex) * lda * m));
+    wait_hipfunc(hipMalloc((void **)(&d_W), sizeof(double) * m));
+    wait_hipfunc(hipMalloc((void **)(&d_info), sizeof(int32_t)));
 
-    wait_cudafunc(cudaMemcpyAsync(d_A, A, sizeof(cuDoubleComplex) * lda * m, cudaMemcpyHostToDevice, stream));
+    wait_hipfunc(hipMemcpyAsync(d_A, A, sizeof(hipDoubleComplex) * lda * m, hipMemcpyHostToDevice, stream));
 
     // step 3: query working space of syevd
-    cusolverEigMode_t  jobz  = HIPSOLVER_EIG_MODE_VECTOR;  // compute eigenvalues and eigenvectors.
-    cublasFillMode_t   uplo  = CUBLAS_FILL_MODE_LOWER;
-    cusolverEigRange_t range = HIPSOLVER_EIG_RANGE_I;
+    hipsolverEigMode_t  jobz  = HIPSOLVER_EIG_MODE_VECTOR;  // compute eigenvalues and eigenvectors.
+    hipblasFillMode_t   uplo  = HIPBLAS_FILL_MODE_LOWER;
+    hipsolverEigRange_t range = HIPSOLVER_EIG_RANGE_I;
 
-    wait_cudafunc(hipsolverDnZheevdx_bufferSize(cusolverH, jobz, range, uplo, m, d_A, lda, vl, vu,
+    wait_hipfunc(hipsolverDnZheevdx_bufferSize(hipsolverH, jobz, range, uplo, m, d_A, lda, vl, vu,
                                                 1, MaxN, &h_meig, d_W, &lwork));
-    workspaceInBytesOnDevice = (size_t)lwork * sizeof(cuDoubleComplex);
+    workspaceInBytesOnDevice = (size_t)lwork * sizeof(hipDoubleComplex);
     workspaceInBytesOnHost = 0;
 
-    wait_cudafunc(cudaMalloc((void **)(&d_work), workspaceInBytesOnDevice));
+    wait_hipfunc(hipMalloc((void **)(&d_work), workspaceInBytesOnDevice));
     h_work = (workspaceInBytesOnHost == 0) ? NULL : malloc(workspaceInBytesOnHost);
     if (workspaceInBytesOnHost != 0 && !h_work) {
         fprintf(stderr, "Could not allocate host memory.\n");
@@ -269,40 +266,40 @@ int32_t gpusolver_Syevdx_Complex(dcomplex * A, double * W, int32_t m, int32_t Ma
     }
 
     // step 4: compute spectrum
-    wait_cudafunc(hipsolverDnZheevdx(cusolverH, jobz, range, uplo, m, d_A, lda, vl, vu, 1, MaxN,
-                                     &h_meig, d_W, (cuDoubleComplex *)d_work, lwork, d_info));
+    wait_hipfunc(hipsolverDnZheevdx(hipsolverH, jobz, range, uplo, m, d_A, lda, vl, vu, 1, MaxN,
+                                     &h_meig, d_W, (hipDoubleComplex *)d_work, lwork, d_info));
 
-    wait_cudafunc(cudaMemcpyAsync(A, d_A, sizeof(cuDoubleComplex) * lda * m, cudaMemcpyDeviceToHost, stream));
-    wait_cudafunc(cudaMemcpyAsync(W, d_W, sizeof(double) * MaxN, cudaMemcpyDeviceToHost, stream));
-    wait_cudafunc(cudaMemcpyAsync(&info, d_info, sizeof(int32_t), cudaMemcpyDeviceToHost, stream));
+    wait_hipfunc(hipMemcpyAsync(A, d_A, sizeof(hipDoubleComplex) * lda * m, hipMemcpyDeviceToHost, stream));
+    wait_hipfunc(hipMemcpyAsync(W, d_W, sizeof(double) * MaxN, hipMemcpyDeviceToHost, stream));
+    wait_hipfunc(hipMemcpyAsync(&info, d_info, sizeof(int32_t), hipMemcpyDeviceToHost, stream));
 
-    wait_cudafunc(cudaStreamSynchronize(stream));
+    wait_hipfunc(hipStreamSynchronize(stream));
     /* free resources */
-    wait_cudafunc(cudaFree(d_A));
-    wait_cudafunc(cudaFree(d_W));
-    wait_cudafunc(cudaFree(d_info));
-    wait_cudafunc(cudaFree(d_work));
+    wait_hipfunc(hipFree(d_A));
+    wait_hipfunc(hipFree(d_W));
+    wait_hipfunc(hipFree(d_info));
+    wait_hipfunc(hipFree(d_work));
     if (h_work != NULL) free(h_work);
 
-    wait_cudafunc(hipsolverDnDestroy(cusolverH));
+    wait_hipfunc(hipsolverDnDestroy(hipsolverH));
 
-    wait_cudafunc(cudaStreamDestroy(stream));
+    wait_hipfunc(hipStreamDestroy(stream));
 
     return info;
 }
 
-int32_t gpusolver_Syevdx_Complex_openacc(dcomplex * A, double * W, int32_t m, int32_t MaxN)
+int32_t gpusolver_Syevdx_Complex_openmp(dcomplex * A, double * W, int32_t m, int32_t MaxN)
 {
     int32_t const lda = m;
 
-    cusolverDnHandle_t cusolverH = NULL;
-    cudaStream_t       stream    = NULL;
-    //set_cuda_default_device_from_local_rank();
+    hipsolverDnHandle_t hipsolverH = NULL;
+    hipStream_t       stream    = NULL;
+    //set_hip_default_device_from_local_rank();
 
-    // OpenACC
-    //set_openacc_nvidia_device_from_local_rank();
+    // OpenMP
+    //set_openmp_nvidia_device_from_local_rank();
 
-    // cuDoubleComplex* d_A = NULL;
+    // hipDoubleComplex* d_A = NULL;
     // double* d_W = NULL;
     double  vl     = 0.0;
     double  vu     = 0.0;
@@ -319,38 +316,35 @@ int32_t gpusolver_Syevdx_Complex_openacc(dcomplex * A, double * W, int32_t m, in
     void * h_work                   = NULL; /* host workspace for */
 
     /* step 1: create gpusolver handle, bind a stream */
-#pragma acc data      present(A[0 : m * m])
-#pragma acc data      present(W[0 : MaxN])
-#pragma acc host_data use_device(A, W)
     {
-        wait_cudafunc(hipsolverDnCreate(&cusolverH));
-        wait_cudafunc(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
-        wait_cudafunc(hipsolverDnSetStream(cusolverH, stream));
+        wait_hipfunc(hipsolverDnCreate(&hipsolverH));
+        wait_hipfunc(hipStreamCreateWithFlags(&stream, hipStreamNonBlocking));
+        wait_hipfunc(hipsolverDnSetStream(hipsolverH, stream));
 
-        // wait_cudafunc(cudaMallocAsync((void**)(&d_A), sizeof(cuDoubleComplex) * lda * m, stream));
-        // wait_cudafunc(cudaMallocAsync((void**)(&d_W), sizeof(double) * m, stream));
-        // wait_cudafunc(cudaMallocAsync((void**)(&d_info), sizeof(int32_t), stream));
+        // wait_hipfunc(hipMallocAsync((void**)(&d_A), sizeof(hipDoubleComplex) * lda * m, stream));
+        // wait_hipfunc(hipMallocAsync((void**)(&d_W), sizeof(double) * m, stream));
+        // wait_hipfunc(hipMallocAsync((void**)(&d_info), sizeof(int32_t), stream));
 
-        // wait_cudafunc(cudaMemcpyAsync(d_A, A, sizeof(cuDoubleComplex) * lda * m, cudaMemcpyHostToDevice,
+        // wait_hipfunc(hipMemcpyAsync(d_A, A, sizeof(hipDoubleComplex) * lda * m, hipMemcpyHostToDevice,
         // stream));
 
         // step 3: query working space of syevd
-        cusolverEigMode_t const jobz = HIPSOLVER_EIG_MODE_VECTOR;  // compute eigenvalues and eigenvectors.
-        cublasFillMode_t const  uplo = CUBLAS_FILL_MODE_LOWER;
-        cusolverEigRange_t      range;
+        hipsolverEigMode_t const jobz = HIPSOLVER_EIG_MODE_VECTOR;  // compute eigenvalues and eigenvectors.
+        hipblasFillMode_t const  uplo = HIPBLAS_FILL_MODE_LOWER;
+        hipsolverEigRange_t      range;
         if (m == MaxN) {
             range = HIPSOLVER_EIG_RANGE_ALL;
         } else {
             range = HIPSOLVER_EIG_RANGE_I;
         }
 
-        wait_cudafunc(hipsolverDnZheevdx_bufferSize(cusolverH, jobz, range, uplo, m, (cuDoubleComplex *)A, lda, vl, vu,
+        wait_hipfunc(hipsolverDnZheevdx_bufferSize(hipsolverH, jobz, range, uplo, m, (hipDoubleComplex *)A, lda, vl, vu,
                                                     1, MaxN, &h_meig, W, &lwork));
-        workspaceInBytesOnDevice = (size_t)lwork * sizeof(cuDoubleComplex);
+        workspaceInBytesOnDevice = (size_t)lwork * sizeof(hipDoubleComplex);
         workspaceInBytesOnHost = 0;
 
-        wait_cudafunc(cudaMallocAsync((void **)(&d_work), workspaceInBytesOnDevice, stream));
-        wait_cudafunc(cudaMallocAsync((void **)(&d_info), sizeof(int32_t), stream));
+        wait_hipfunc(hipMallocAsync((void **)(&d_work), workspaceInBytesOnDevice, stream));
+        wait_hipfunc(hipMallocAsync((void **)(&d_info), sizeof(int32_t), stream));
 
         h_work = (workspaceInBytesOnHost == 0) ? NULL : malloc(workspaceInBytesOnHost);
         if (workspaceInBytesOnHost != 0 && !h_work) {
@@ -359,32 +353,32 @@ int32_t gpusolver_Syevdx_Complex_openacc(dcomplex * A, double * W, int32_t m, in
         }
 
         // step 4: compute spectrum
-        wait_cudafunc(hipsolverDnZheevdx(cusolverH, jobz, range, uplo, m, (cuDoubleComplex *)A, lda, vl, vu, 1, MaxN,
-                                         &h_meig, W, (cuDoubleComplex *)d_work, lwork, d_info));
+        wait_hipfunc(hipsolverDnZheevdx(hipsolverH, jobz, range, uplo, m, (hipDoubleComplex *)A, lda, vl, vu, 1, MaxN,
+                                         &h_meig, W, (hipDoubleComplex *)d_work, lwork, d_info));
 
-        // wait_cudafunc(cudaMemcpyAsync(A, d_A, sizeof(cuDoubleComplex) * lda * m, cudaMemcpyDeviceToHost,
+        // wait_hipfunc(hipMemcpyAsync(A, d_A, sizeof(hipDoubleComplex) * lda * m, hipMemcpyDeviceToHost,
         //     stream));
 
-        // wait_cudafunc(cudaMemcpyAsync(W, d_W, sizeof(double) * m, cudaMemcpyDeviceToHost,
+        // wait_hipfunc(hipMemcpyAsync(W, d_W, sizeof(double) * m, hipMemcpyDeviceToHost,
         //     stream));
 
-        wait_cudafunc(cudaMemcpyAsync(&info, d_info, sizeof(int32_t), cudaMemcpyDeviceToHost, stream));
+        wait_hipfunc(hipMemcpyAsync(&info, d_info, sizeof(int32_t), hipMemcpyDeviceToHost, stream));
 
         /* free resources */
-        // wait_cudafunc(cudaFreeAsync(d_A, stream));
-        // wait_cudafunc(cudaFreeAsync(d_W, stream));
-        // wait_cudafunc(cudaFreeAsync(d_info, stream));
-        wait_cudafunc(cudaStreamSynchronize(stream));
+        // wait_hipfunc(hipFreeAsync(d_A, stream));
+        // wait_hipfunc(hipFreeAsync(d_W, stream));
+        // wait_hipfunc(hipFreeAsync(d_info, stream));
+        wait_hipfunc(hipStreamSynchronize(stream));
 
-        wait_cudafunc(cudaFree(d_work));
-        wait_cudafunc(cudaFree(d_info));
+        wait_hipfunc(hipFree(d_work));
+        wait_hipfunc(hipFree(d_info));
 
         if (h_work != NULL) {
             free(h_work);
         }
 
-        wait_cudafunc(hipsolverDnDestroy(cusolverH));
-        wait_cudafunc(cudaStreamDestroy(stream));
+        wait_hipfunc(hipsolverDnDestroy(hipsolverH));
+        wait_hipfunc(hipStreamDestroy(stream));
     }
 
     return info;

@@ -23,7 +23,7 @@
 #include <sys/time.h>
 #include <sys/stat.h>
 #include <unistd.h>
-#include <openacc.h>
+#include <omp.h>
 #include "openmx_common.h"
 #include "mpi.h"
 #include <omp.h>
@@ -220,12 +220,12 @@ static void SetNonlocal_ValidateGlobalState(void)
   }
 }
 
-static int SetNonlocalUseOpenACC(void)
+static int SetNonlocalUseOpenMP(void)
 {
   return (scf_eigen_lib_flag == GPUSOLVER);
 }
 
-static void SetNonlocal_CalcDSNL_OpenACC(double ******DS_NL,
+static void SetNonlocal_CalcDSNL_OpenMP(double ******DS_NL,
                                          double *Normk_grid,
                                          int basis_l_dim,
                                          int basis_m_dim,
@@ -278,143 +278,143 @@ static void SetNonlocal_CalcDSNL_OpenACC(double ******DS_NL,
   size_t sum_cache_elems,sum_valid_elems,sph_valid_elems;
 
   TmpNL = (dcomplex*****)SetNonlocal_MallocArray((size_t)basis_l_dim,sizeof(dcomplex****),
-                                                 "OpenACC TmpNL");
+                                                 "OpenMP TmpNL");
   for (i=0; i<basis_l_dim; i++){
     TmpNL[i] = (dcomplex****)SetNonlocal_MallocArray((size_t)List_YOUSO[24],sizeof(dcomplex***),
-                                                     "OpenACC TmpNL[i]");
+                                                     "OpenMP TmpNL[i]");
     for (j=0; j<List_YOUSO[24]; j++){
       TmpNL[i][j] = (dcomplex***)SetNonlocal_MallocArray((size_t)basis_m_dim,sizeof(dcomplex**),
-                                                         "OpenACC TmpNL[i][j]");
+                                                         "OpenMP TmpNL[i][j]");
       for (k=0; k<basis_m_dim; k++){
         TmpNL[i][j][k] = (dcomplex**)SetNonlocal_MallocArray((size_t)rvps_dim,sizeof(dcomplex*),
-                                                             "OpenACC TmpNL[i][j][k]");
+                                                             "OpenMP TmpNL[i][j][k]");
         for (l=0; l<rvps_dim; l++){
           TmpNL[i][j][k][l] = (dcomplex*)SetNonlocal_MallocArray((size_t)proj_m_dim,sizeof(dcomplex),
-                                                                 "OpenACC TmpNL[i][j][k][l]");
+                                                                 "OpenMP TmpNL[i][j][k][l]");
         }
       }
     }
   }
 
   TmpNLr = (dcomplex*****)SetNonlocal_MallocArray((size_t)basis_l_dim,sizeof(dcomplex****),
-                                                  "OpenACC TmpNLr");
+                                                  "OpenMP TmpNLr");
   for (i=0; i<basis_l_dim; i++){
     TmpNLr[i] = (dcomplex****)SetNonlocal_MallocArray((size_t)List_YOUSO[24],sizeof(dcomplex***),
-                                                      "OpenACC TmpNLr[i]");
+                                                      "OpenMP TmpNLr[i]");
     for (j=0; j<List_YOUSO[24]; j++){
       TmpNLr[i][j] = (dcomplex***)SetNonlocal_MallocArray((size_t)basis_m_dim,sizeof(dcomplex**),
-                                                          "OpenACC TmpNLr[i][j]");
+                                                          "OpenMP TmpNLr[i][j]");
       for (k=0; k<basis_m_dim; k++){
         TmpNLr[i][j][k] = (dcomplex**)SetNonlocal_MallocArray((size_t)rvps_dim,sizeof(dcomplex*),
-                                                              "OpenACC TmpNLr[i][j][k]");
+                                                              "OpenMP TmpNLr[i][j][k]");
         for (l=0; l<rvps_dim; l++){
           TmpNLr[i][j][k][l] = (dcomplex*)SetNonlocal_MallocArray((size_t)proj_m_dim,sizeof(dcomplex),
-                                                                  "OpenACC TmpNLr[i][j][k][l]");
+                                                                  "OpenMP TmpNLr[i][j][k][l]");
         }
       }
     }
   }
 
   TmpNLt = (dcomplex*****)SetNonlocal_MallocArray((size_t)basis_l_dim,sizeof(dcomplex****),
-                                                  "OpenACC TmpNLt");
+                                                  "OpenMP TmpNLt");
   for (i=0; i<basis_l_dim; i++){
     TmpNLt[i] = (dcomplex****)SetNonlocal_MallocArray((size_t)List_YOUSO[24],sizeof(dcomplex***),
-                                                      "OpenACC TmpNLt[i]");
+                                                      "OpenMP TmpNLt[i]");
     for (j=0; j<List_YOUSO[24]; j++){
       TmpNLt[i][j] = (dcomplex***)SetNonlocal_MallocArray((size_t)basis_m_dim,sizeof(dcomplex**),
-                                                          "OpenACC TmpNLt[i][j]");
+                                                          "OpenMP TmpNLt[i][j]");
       for (k=0; k<basis_m_dim; k++){
         TmpNLt[i][j][k] = (dcomplex**)SetNonlocal_MallocArray((size_t)rvps_dim,sizeof(dcomplex*),
-                                                              "OpenACC TmpNLt[i][j][k]");
+                                                              "OpenMP TmpNLt[i][j][k]");
         for (l=0; l<rvps_dim; l++){
           TmpNLt[i][j][k][l] = (dcomplex*)SetNonlocal_MallocArray((size_t)proj_m_dim,sizeof(dcomplex),
-                                                                  "OpenACC TmpNLt[i][j][k][l]");
+                                                                  "OpenMP TmpNLt[i][j][k][l]");
         }
       }
     }
   }
 
   TmpNLp = (dcomplex*****)SetNonlocal_MallocArray((size_t)basis_l_dim,sizeof(dcomplex****),
-                                                  "OpenACC TmpNLp");
+                                                  "OpenMP TmpNLp");
   for (i=0; i<basis_l_dim; i++){
     TmpNLp[i] = (dcomplex****)SetNonlocal_MallocArray((size_t)List_YOUSO[24],sizeof(dcomplex***),
-                                                      "OpenACC TmpNLp[i]");
+                                                      "OpenMP TmpNLp[i]");
     for (j=0; j<List_YOUSO[24]; j++){
       TmpNLp[i][j] = (dcomplex***)SetNonlocal_MallocArray((size_t)basis_m_dim,sizeof(dcomplex**),
-                                                          "OpenACC TmpNLp[i][j]");
+                                                          "OpenMP TmpNLp[i][j]");
       for (k=0; k<basis_m_dim; k++){
         TmpNLp[i][j][k] = (dcomplex**)SetNonlocal_MallocArray((size_t)rvps_dim,sizeof(dcomplex*),
-                                                              "OpenACC TmpNLp[i][j][k]");
+                                                              "OpenMP TmpNLp[i][j][k]");
         for (l=0; l<rvps_dim; l++){
           TmpNLp[i][j][k][l] = (dcomplex*)SetNonlocal_MallocArray((size_t)proj_m_dim,sizeof(dcomplex),
-                                                                  "OpenACC TmpNLp[i][j][k][l]");
+                                                                  "OpenMP TmpNLp[i][j][k][l]");
         }
       }
     }
   }
 
-  CmatNL0 = (dcomplex**)SetNonlocal_MallocArray((size_t)basis_m_dim,sizeof(dcomplex*),"OpenACC CmatNL0");
+  CmatNL0 = (dcomplex**)SetNonlocal_MallocArray((size_t)basis_m_dim,sizeof(dcomplex*),"OpenMP CmatNL0");
   for (i=0; i<basis_m_dim; i++){
     CmatNL0[i] = (dcomplex*)SetNonlocal_MallocArray((size_t)proj_m_dim,sizeof(dcomplex),
-                                                    "OpenACC CmatNL0[i]");
+                                                    "OpenMP CmatNL0[i]");
   }
 
-  CmatNLr = (dcomplex**)SetNonlocal_MallocArray((size_t)basis_m_dim,sizeof(dcomplex*),"OpenACC CmatNLr");
+  CmatNLr = (dcomplex**)SetNonlocal_MallocArray((size_t)basis_m_dim,sizeof(dcomplex*),"OpenMP CmatNLr");
   for (i=0; i<basis_m_dim; i++){
     CmatNLr[i] = (dcomplex*)SetNonlocal_MallocArray((size_t)proj_m_dim,sizeof(dcomplex),
-                                                    "OpenACC CmatNLr[i]");
+                                                    "OpenMP CmatNLr[i]");
   }
 
-  CmatNLt = (dcomplex**)SetNonlocal_MallocArray((size_t)basis_m_dim,sizeof(dcomplex*),"OpenACC CmatNLt");
+  CmatNLt = (dcomplex**)SetNonlocal_MallocArray((size_t)basis_m_dim,sizeof(dcomplex*),"OpenMP CmatNLt");
   for (i=0; i<basis_m_dim; i++){
     CmatNLt[i] = (dcomplex*)SetNonlocal_MallocArray((size_t)proj_m_dim,sizeof(dcomplex),
-                                                    "OpenACC CmatNLt[i]");
+                                                    "OpenMP CmatNLt[i]");
   }
 
-  CmatNLp = (dcomplex**)SetNonlocal_MallocArray((size_t)basis_m_dim,sizeof(dcomplex*),"OpenACC CmatNLp");
+  CmatNLp = (dcomplex**)SetNonlocal_MallocArray((size_t)basis_m_dim,sizeof(dcomplex*),"OpenMP CmatNLp");
   for (i=0; i<basis_m_dim; i++){
     CmatNLp[i] = (dcomplex*)SetNonlocal_MallocArray((size_t)proj_m_dim,sizeof(dcomplex),
-                                                    "OpenACC CmatNLp[i]");
+                                                    "OpenMP CmatNLp[i]");
   }
 
   rf_cache_elems = SetNonlocal_CheckedMulCount(
                      SetNonlocal_CheckedMulCount((size_t)basis_l_dim,(size_t)List_YOUSO[24],
-                                                 "OpenACC RF_BesselCache elements"),
-                     (size_t)grid_dim,"OpenACC RF_BesselCache elements");
+                                                 "OpenMP RF_BesselCache elements"),
+                     (size_t)grid_dim,"OpenMP RF_BesselCache elements");
   RF_BesselCache = (double*)SetNonlocal_MallocArray(rf_cache_elems,sizeof(double),
-                                                    "OpenACC RF_BesselCache");
+                                                    "OpenMP RF_BesselCache");
 
   nlrf_cache_elems = SetNonlocal_CheckedMulCount((size_t)rvps_dim,(size_t)grid_dim,
-                                                 "OpenACC NLRF_BesselCache elements");
+                                                 "OpenMP NLRF_BesselCache elements");
   NLRF_BesselCache[0] = (double*)SetNonlocal_MallocArray(nlrf_cache_elems,sizeof(double),
-                                                         "OpenACC NLRF_BesselCache[0]");
+                                                         "OpenMP NLRF_BesselCache[0]");
   NLRF_BesselCache[1] = (double*)SetNonlocal_MallocArray(nlrf_cache_elems,sizeof(double),
-                                                         "OpenACC NLRF_BesselCache[1]");
+                                                         "OpenMP NLRF_BesselCache[1]");
 
   sph_cache_elems = SetNonlocal_CheckedMulCount((size_t)max_sph_rows,(size_t)grid_dim,
-                                                "OpenACC SphB cache elements");
-  SphB = (double*)SetNonlocal_MallocArray(sph_cache_elems,sizeof(double),"OpenACC SphB");
-  SphBp = (double*)SetNonlocal_MallocArray(sph_cache_elems,sizeof(double),"OpenACC SphBp");
-  tmp_SphB = (double*)SetNonlocal_MallocArray((size_t)max_sph_rows,sizeof(double),"OpenACC tmp_SphB");
-  tmp_SphBp = (double*)SetNonlocal_MallocArray((size_t)max_sph_rows,sizeof(double),"OpenACC tmp_SphBp");
+                                                "OpenMP SphB cache elements");
+  SphB = (double*)SetNonlocal_MallocArray(sph_cache_elems,sizeof(double),"OpenMP SphB");
+  SphBp = (double*)SetNonlocal_MallocArray(sph_cache_elems,sizeof(double),"OpenMP SphBp");
+  tmp_SphB = (double*)SetNonlocal_MallocArray((size_t)max_sph_rows,sizeof(double),"OpenMP tmp_SphB");
+  tmp_SphBp = (double*)SetNonlocal_MallocArray((size_t)max_sph_rows,sizeof(double),"OpenMP tmp_SphBp");
 
   max_combo_elems = SetNonlocal_CheckedMulCount(
                       SetNonlocal_CheckedMulCount((size_t)basis_l_dim,(size_t)List_YOUSO[24],
-                                                  "OpenACC combo count"),
-                      (size_t)rvps_dim,"OpenACC combo count");
-  combo_rf_offset = (int*)SetNonlocal_MallocArray(max_combo_elems,sizeof(int),"OpenACC combo_rf_offset");
-  combo_nlrf_offset = (int*)SetNonlocal_MallocArray(max_combo_elems,sizeof(int),"OpenACC combo_nlrf_offset");
+                                                  "OpenMP combo count"),
+                      (size_t)rvps_dim,"OpenMP combo count");
+  combo_rf_offset = (int*)SetNonlocal_MallocArray(max_combo_elems,sizeof(int),"OpenMP combo_rf_offset");
+  combo_nlrf_offset = (int*)SetNonlocal_MallocArray(max_combo_elems,sizeof(int),"OpenMP combo_nlrf_offset");
 
   combo_lookup_elems = SetNonlocal_CheckedMulCount(
                          SetNonlocal_CheckedMulCount((size_t)basis_l_dim,(size_t)List_YOUSO[24],
-                                                     "OpenACC combo lookup"),
-                         (size_t)rvps_sum_dim,"OpenACC combo lookup");
-  combo_lookup = (int*)SetNonlocal_MallocArray(combo_lookup_elems,sizeof(int),"OpenACC combo_lookup");
+                                                     "OpenMP combo lookup"),
+                         (size_t)rvps_sum_dim,"OpenMP combo lookup");
+  combo_lookup = (int*)SetNonlocal_MallocArray(combo_lookup_elems,sizeof(int),"OpenMP combo_lookup");
 
   sum_cache_elems = SetNonlocal_CheckedMulCount((size_t)(max_Lmax_Four_Int + 1),max_combo_elems,
-                                                "OpenACC sum cache");
-  sum_cache0 = (double*)SetNonlocal_MallocArray(sum_cache_elems,sizeof(double),"OpenACC sum_cache0");
-  sum_cache1 = (double*)SetNonlocal_MallocArray(sum_cache_elems,sizeof(double),"OpenACC sum_cache1");
+                                                "OpenMP sum cache");
+  sum_cache0 = (double*)SetNonlocal_MallocArray(sum_cache_elems,sizeof(double),"OpenMP sum_cache0");
+  sum_cache1 = (double*)SetNonlocal_MallocArray(sum_cache_elems,sizeof(double),"OpenMP sum_cache1");
 
   cached_Cwan = -1;
   cached_Hwan[0] = -1;
@@ -544,13 +544,9 @@ static void SetNonlocal_CalcDSNL_OpenACC(double ******DS_NL,
 
       sum_valid_elems = (size_t)(Lmax_Four_Int + 1)*(size_t)combo_count;
       if (0 < combo_count){
-#pragma acc data copyin(Normk_grid[0:grid_dim], RF_BesselCache[0:rf_cache_elems], \
-                        NLRF_BesselCache[so][0:nlrf_cache_elems], SphB[0:sph_valid_elems], \
-                        SphBp[0:sph_valid_elems], combo_rf_offset[0:combo_count], \
-                        combo_nlrf_offset[0:combo_count]) \
-                 copyout(sum_cache0[0:sum_valid_elems], sum_cache1[0:sum_valid_elems])
+        double *nlrf_cache_so = NLRF_BesselCache[so];
         {
-#pragma acc parallel loop collapse(2)
+#pragma omp parallel for collapse(2) private(Normk,coe0,sj,sjp,Bessel_Pro0,Bessel_Pro1,tmp0,tmp1,tmp2,tmp3,tmp4)
           for (LL=0; LL<=Lmax_Four_Int; LL++){
             for (combo=0; combo<combo_count; combo++){
               double local_sum0,local_sumr;
@@ -561,7 +557,6 @@ static void SetNonlocal_CalcDSNL_OpenACC(double ******DS_NL,
               rf_offset = combo_rf_offset[combo];
               nlrf_offset = combo_nlrf_offset[combo];
 
-#pragma acc loop vector reduction(+:local_sum0,local_sumr)
               for (i=0; i<grid_dim; i++){
                 if (i==0 || i==(grid_dim-1)) coe0 = 0.50;
                 else                         coe0 = 1.00;
@@ -573,7 +568,7 @@ static void SetNonlocal_CalcDSNL_OpenACC(double ******DS_NL,
                 tmp0 = coe0*grid_h*Normk*Normk*Bessel_Pro0;
                 tmp1 = tmp0*sj;
                 tmp2 = tmp0*Normk*sjp;
-                Bessel_Pro1 = NLRF_BesselCache[so][nlrf_offset + i];
+                Bessel_Pro1 = nlrf_cache_so[nlrf_offset + i];
                 tmp3 = tmp1*Bessel_Pro1;
                 tmp4 = tmp2*Bessel_Pro1;
                 local_sum0 += tmp3;
@@ -1050,8 +1045,8 @@ void Nonlocal0(double *****HNL, double ******DS_NL)
   MPI_Barrier(mpi_comm_level1);
   if (measure_time) dtime(&stime);
 
-  if (SetNonlocalUseOpenACC()){
-    SetNonlocal_CalcDSNL_OpenACC(DS_NL,Normk_grid,
+  if (SetNonlocalUseOpenMP()){
+    SetNonlocal_CalcDSNL_OpenMP(DS_NL,Normk_grid,
                                  basis_l_dim,basis_m_dim,rvps_dim,rvps_sum_dim,proj_m_dim,
                                  grid_dim,max_Lmax_Four_Int,max_sph_rows,
                                  OneD2Mc_AN,OneD2h_AN,OneD_Nloop,grid_h);

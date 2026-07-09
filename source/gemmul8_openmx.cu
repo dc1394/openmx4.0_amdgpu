@@ -3,7 +3,7 @@
  *
  * Upstream GEMMul8 builds one object per (routine, type, backend)
  * combination from the cu_recipe sources via its own make system.
- * OpenMX only needs the INT8-backend gemm for double and cuDoubleComplex
+ * OpenMX only needs the INT8-backend gemm for double and hipDoubleComplex
  * plus the matching workSize queries, so this single TU includes the
  * template definitions and instantiates just those four entry points.
  *
@@ -29,8 +29,8 @@
 namespace gemmul8 {
 
 template std::vector<double> gemm<double, Backend::INT8, double, double>(
-    cublasHandle_t,
-    cublasOperation_t, cublasOperation_t,
+    hipblasHandle_t,
+    hipblasOperation_t, hipblasOperation_t,
     size_t, size_t, size_t,
     const double *,
     const double *const, size_t,
@@ -43,15 +43,15 @@ template std::vector<double> gemm<double, Backend::INT8, double, double>(
     void *const,
     bool, bool, bool, bool);
 
-template std::vector<double> gemm<cuDoubleComplex, Backend::INT8, cuDoubleComplex, cuDoubleComplex>(
-    cublasHandle_t,
-    cublasOperation_t, cublasOperation_t,
+template std::vector<double> gemm<hipDoubleComplex, Backend::INT8, hipDoubleComplex, hipDoubleComplex>(
+    hipblasHandle_t,
+    hipblasOperation_t, hipblasOperation_t,
     size_t, size_t, size_t,
-    const cuDoubleComplex *,
-    const cuDoubleComplex *const, size_t,
-    const cuDoubleComplex *const, size_t,
-    const cuDoubleComplex *,
-    cuDoubleComplex *const, size_t,
+    const hipDoubleComplex *,
+    const hipDoubleComplex *const, size_t,
+    const hipDoubleComplex *const, size_t,
+    const hipDoubleComplex *,
+    hipDoubleComplex *const, size_t,
     int, bool,
     void *const,
     void *const,

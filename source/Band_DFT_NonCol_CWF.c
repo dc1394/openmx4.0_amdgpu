@@ -24,18 +24,18 @@
 #include "openmx_gpusolver_dense_utils.h"
 #include "lapack_prototypes.h"
 #include "tran_variables.h"
-#include "set_cuda_default_device_from_local_rank.h"
-#include "set_openacc_device_from_local_rank.h"
+#include "set_hip_default_device_from_local_rank.h"
+#include "set_openmp_device_from_local_rank.h"
 #include <omp.h>
-#include <openacc.h>
+#include <omp.h>
 
 #define  measure_time  0
 
 /* GPU GpuSolver context for Band_DFT_NonCol_CWF (added by H.Kawai, Phase D) */
 typedef struct {
     int                device_id;
-    cublasHandle_t     cublas;
-    cusolverDnHandle_t gpusolver;
+    hipblasHandle_t     hipblas;
+    hipsolverDnHandle_t gpusolver;
 } BandNonColCWFGpuSolverCtx;
 
 static BandNonColCWFGpuSolverCtx BandNonColCWF_gpusolver_ctx = {0};
@@ -43,8 +43,8 @@ static BandNonColCWFGpuSolverCtx BandNonColCWF_gpusolver_ctx = {0};
 static void BandNonColCWF_GpuSolver_Destroy(void)
 {
     BandNonColCWFGpuSolverCtx *ctx = &BandNonColCWF_gpusolver_ctx;
-    if (ctx->gpusolver != NULL) wait_cudafunc(cusolverDnDestroy(ctx->gpusolver));
-    if (ctx->cublas != NULL)   wait_cudafunc(cublasDestroy(ctx->cublas));
+    if (ctx->gpusolver != NULL) wait_hipfunc(hipsolverDnDestroy(ctx->gpusolver));
+    if (ctx->hipblas != NULL)   wait_hipfunc(hipblasDestroy(ctx->hipblas));
     memset(ctx, 0, sizeof(*ctx));
     ctx->device_id = -1;
 }
@@ -53,26 +53,24 @@ static void BandNonColCWF_GpuSolver_Init(void)
 {
     BandNonColCWFGpuSolverCtx *ctx = &BandNonColCWF_gpusolver_ctx;
     int current_device;
-    wait_cudafunc(cudaGetDevice(&current_device));
-    if (ctx->device_id == current_device && ctx->cublas != NULL) return;
-    if (ctx->cublas != NULL) BandNonColCWF_GpuSolver_Destroy();
+    wait_hipfunc(hipGetDevice(&current_device));
+    if (ctx->device_id == current_device && ctx->hipblas != NULL) return;
+    if (ctx->hipblas != NULL) BandNonColCWF_GpuSolver_Destroy();
     ctx->device_id = current_device;
-    wait_cudafunc(cublasCreate(&ctx->cublas));
-    wait_cudafunc(cusolverDnCreate(&ctx->gpusolver));
+    wait_hipfunc(hipblasCreate(&ctx->hipblas));
+    wait_hipfunc(hipsolverDnCreate(&ctx->gpusolver));
 }
 
-static void BandNonColCWF_GEMMul8Zgemm_OpenACC(cublasOperation_t transa, cublasOperation_t transb, int m, int n, int k,
+static void BandNonColCWF_GEMMul8Zgemm_OpenMP(hipblasOperation_t transa, hipblasOperation_t transb, int m, int n, int k,
                                                dcomplex const * A, dcomplex const * B, dcomplex * C)
 {
     BandNonColCWF_GpuSolver_Init();
-#pragma acc data      present(A[0 : m * k], B[0 : k * n], C[0 : m * n])
-#pragma acc host_data use_device(A, B, C)
     {
-        cuDoubleComplex const alpha = make_cuDoubleComplex(1.0, 0.0);
-        cuDoubleComplex const beta  = make_cuDoubleComplex(0.0, 0.0);
-        wait_cudafunc(openmx_gemmul8Zgemm(BandNonColCWF_gpusolver_ctx.cublas, transa, transb, m, n, k, &alpha,
-                                          (cuDoubleComplex const *)A, m, (cuDoubleComplex const *)B, k, &beta,
-                                          (cuDoubleComplex *)C, m));
+        hipDoubleComplex const alpha = make_hipDoubleComplex(1.0, 0.0);
+        hipDoubleComplex const beta  = make_hipDoubleComplex(0.0, 0.0);
+        wait_hipfunc(openmx_gemmul8Zgemm(BandNonColCWF_gpusolver_ctx.hipblas, transa, transb, m, n, k, &alpha,
+                                          (hipDoubleComplex const *)A, m, (hipDoubleComplex const *)B, k, &beta,
+                                          (hipDoubleComplex *)C, m));
     }
 }
 
@@ -381,10 +379,10 @@ double Band_DFT_NonCol_CWF(
   }
   n2 = n*2;
 
-  /* GPU dispatch (added by H.Kawai): assign CUDA/OpenACC device when GPUSOLVER is requested */
+  /* GPU dispatch (added by H.Kawai): assign CUDA/OpenMP device when GPUSOLVER is requested */
   if (scf_eigen_lib_flag == GPUSOLVER && n2 >= GPU_CPU_SWITCH_NUM) {
-      set_cuda_default_device_from_local_rank();
-      set_openacc_nvidia_device_from_local_rank();
+      set_hip_default_device_from_local_rank();
+      set_openmp_nvidia_device_from_local_rank();
   }
 
   /****************************************************

@@ -13,12 +13,10 @@
 #include "mpi.h"
 #include "openmx_common.h"
 #include "lapack_prototypes.h"
-#include "set_cuda_default_device_from_local_rank.h"
-#include "set_openacc_device_from_local_rank.h"
+#include "set_hip_default_device_from_local_rank.h"
 #include <limits.h>
 #include <math.h>
 #include <omp.h>
-#include <openacc.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
@@ -81,26 +79,26 @@ static void *ClusterNonCol_MallocArray(size_t count, size_t elem_size, const cha
     return ptr;
 }
 
-static const char *ClusterNonCol_CublasStatusName(cublasStatus_t status)
+static const char *ClusterNonCol_HipblasStatusName(hipblasStatus_t status)
 {
     switch (status) {
-    case CUBLAS_STATUS_SUCCESS:
+    case HIPBLAS_STATUS_SUCCESS:
         return "HIPBLAS_STATUS_SUCCESS";
-    case CUBLAS_STATUS_NOT_INITIALIZED:
+    case HIPBLAS_STATUS_NOT_INITIALIZED:
         return "HIPBLAS_STATUS_NOT_INITIALIZED";
-    case CUBLAS_STATUS_ALLOC_FAILED:
+    case HIPBLAS_STATUS_ALLOC_FAILED:
         return "HIPBLAS_STATUS_ALLOC_FAILED";
-    case CUBLAS_STATUS_INVALID_VALUE:
+    case HIPBLAS_STATUS_INVALID_VALUE:
         return "HIPBLAS_STATUS_INVALID_VALUE";
-    case CUBLAS_STATUS_ARCH_MISMATCH:
+    case HIPBLAS_STATUS_ARCH_MISMATCH:
         return "HIPBLAS_STATUS_ARCH_MISMATCH";
-    case CUBLAS_STATUS_MAPPING_ERROR:
+    case HIPBLAS_STATUS_MAPPING_ERROR:
         return "HIPBLAS_STATUS_MAPPING_ERROR";
-    case CUBLAS_STATUS_EXECUTION_FAILED:
+    case HIPBLAS_STATUS_EXECUTION_FAILED:
         return "HIPBLAS_STATUS_EXECUTION_FAILED";
-    case CUBLAS_STATUS_INTERNAL_ERROR:
+    case HIPBLAS_STATUS_INTERNAL_ERROR:
         return "HIPBLAS_STATUS_INTERNAL_ERROR";
-    case CUBLAS_STATUS_NOT_SUPPORTED:
+    case HIPBLAS_STATUS_NOT_SUPPORTED:
         return "HIPBLAS_STATUS_NOT_SUPPORTED";
     default:
         return "HIPBLAS_STATUS_UNKNOWN";
@@ -133,18 +131,18 @@ static void ClusterNonCol_RequireOpenMPTargetDevice(const char *where)
     }
 }
 
-static char ClusterNonCol_DgemmOpChar(cublasOperation_t op)
+static char ClusterNonCol_DgemmOpChar(hipblasOperation_t op)
 {
-    return (op == CUBLAS_OP_N) ? 'N' : 'T';
+    return (op == HIPBLAS_OP_N) ? 'N' : 'T';
 }
 
-static char ClusterNonCol_ZgemmOpChar(cublasOperation_t op)
+static char ClusterNonCol_ZgemmOpChar(hipblasOperation_t op)
 {
-    if (op == CUBLAS_OP_C) return 'C';
-    return (op == CUBLAS_OP_N) ? 'N' : 'T';
+    if (op == HIPBLAS_OP_C) return 'C';
+    return (op == HIPBLAS_OP_N) ? 'N' : 'T';
 }
 
-static void ClusterNonCol_DgemmCPU(cublasOperation_t transa, cublasOperation_t transb, int m, int n, int k,
+static void ClusterNonCol_DgemmCPU(hipblasOperation_t transa, hipblasOperation_t transb, int m, int n, int k,
                                    const double *A, const double *B, double *C)
 {
     char ta = ClusterNonCol_DgemmOpChar(transa);
@@ -155,7 +153,7 @@ static void ClusterNonCol_DgemmCPU(cublasOperation_t transa, cublasOperation_t t
     F77_NAME(dgemm, DGEMM)(&ta, &tb, &mi, &ni, &ki, &alpha, (double *)A, &lda, (double *)B, &ldb, &beta, C, &ldc);
 }
 
-static void ClusterNonCol_ZgemmCPU(cublasOperation_t transa, cublasOperation_t transb, int m, int n, int k,
+static void ClusterNonCol_ZgemmCPU(hipblasOperation_t transa, hipblasOperation_t transb, int m, int n, int k,
                                    const dcomplex *A, const dcomplex *B, dcomplex *C)
 {
     char ta = ClusterNonCol_ZgemmOpChar(transa);
@@ -168,35 +166,35 @@ static void ClusterNonCol_ZgemmCPU(cublasOperation_t transa, cublasOperation_t t
                            &ldc);
 }
 
-static void ClusterNonCol_LogGemmul8Retry(const char *where, const char *kind, cublasStatus_t status, int m, int n,
+static void ClusterNonCol_LogGemmul8Retry(const char *where, const char *kind, hipblasStatus_t status, int m, int n,
                                           int k)
 {
     fprintf(stderr,
             "<GEMM> rank %d: GEMMul8 failed in %s for %sGEMM(m=%d,n=%d,k=%d): %s (%d). "
             "Retrying with native hipBLAS.\n",
-            ClusterNonCol_MpiRankForLog(), where, kind, m, n, k, ClusterNonCol_CublasStatusName(status),
+            ClusterNonCol_MpiRankForLog(), where, kind, m, n, k, ClusterNonCol_HipblasStatusName(status),
             (int)status);
     fflush(stderr);
 }
 
 static void ClusterNonCol_LogGemmCpuFallback(const char *where, const char *kind, const char *backend,
-                                             cublasStatus_t status, int m, int n, int k)
+                                             hipblasStatus_t status, int m, int n, int k)
 {
     fprintf(stderr,
             "<GEMM> rank %d: %s failed in %s for %sGEMM(m=%d,n=%d,k=%d): %s (%d). "
             "Falling back to CPU BLAS for this GEMM.\n",
-            ClusterNonCol_MpiRankForLog(), backend, where, kind, m, n, k, ClusterNonCol_CublasStatusName(status),
+            ClusterNonCol_MpiRankForLog(), backend, where, kind, m, n, k, ClusterNonCol_HipblasStatusName(status),
             (int)status);
     fflush(stderr);
 }
 
-static void ClusterNonCol_LogCudaCpuFallback(const char *where, const char *kind, cudaError_t status, int m, int n,
+static void ClusterNonCol_LogHipCpuFallback(const char *where, const char *kind, hipError_t status, int m, int n,
                                              int k)
 {
     fprintf(stderr,
             "<GEMM> rank %d: GPU setup/transfer failed in %s for %sGEMM(m=%d,n=%d,k=%d): %s (%d). "
             "Falling back to CPU BLAS for this GEMM.\n",
-            ClusterNonCol_MpiRankForLog(), where, kind, m, n, k, cudaGetErrorString(status), (int)status);
+            ClusterNonCol_MpiRankForLog(), where, kind, m, n, k, hipGetErrorString(status), (int)status);
     fflush(stderr);
 }
 
@@ -230,48 +228,48 @@ static void ClusterNonCol_LogGemmBackendOnce(const char *kind, const char *backe
     *logged = 1;
 }
 
-static cublasStatus_t ClusterNonCol_TryDeviceDgemm(cublasHandle_t handle, cublasOperation_t transa,
-                                                   cublasOperation_t transb, int m, int n, int k, const double *A,
+static hipblasStatus_t ClusterNonCol_TryDeviceDgemm(hipblasHandle_t handle, hipblasOperation_t transa,
+                                                   hipblasOperation_t transb, int m, int n, int k, const double *A,
                                                    const double *B, double *C, const char *where)
 {
     const double alpha = 1.0;
     const double beta = 0.0;
-    cublasStatus_t status;
+    hipblasStatus_t status;
 
     status = openmx_gemmul8Dgemm(handle, transa, transb, m, n, k, &alpha, A, m, B, k, &beta, C, m);
-    if (status == CUBLAS_STATUS_SUCCESS) {
+    if (status == HIPBLAS_STATUS_SUCCESS) {
         ClusterNonCol_LogGemmBackendOnce("D", "GEMMul8", m, n, k);
         return status;
     }
 
     ClusterNonCol_LogGemmul8Retry(where, "D", status, m, n, k);
-    status = cublasDgemm(handle, transa, transb, m, n, k, &alpha, A, m, B, k, &beta, C, m);
-    if (status == CUBLAS_STATUS_SUCCESS) {
+    status = hipblasDgemm(handle, transa, transb, m, n, k, &alpha, A, m, B, k, &beta, C, m);
+    if (status == HIPBLAS_STATUS_SUCCESS) {
         ClusterNonCol_LogGemmBackendOnce("D", "native hipBLAS", m, n, k);
     }
     return status;
 }
 
-static cublasStatus_t ClusterNonCol_TryDeviceZgemm(cublasHandle_t handle, cublasOperation_t transa,
-                                                   cublasOperation_t transb, int m, int n, int k,
+static hipblasStatus_t ClusterNonCol_TryDeviceZgemm(hipblasHandle_t handle, hipblasOperation_t transa,
+                                                   hipblasOperation_t transb, int m, int n, int k,
                                                    const dcomplex *A, const dcomplex *B, dcomplex *C,
                                                    const char *where)
 {
-    const cuDoubleComplex alpha = make_cuDoubleComplex(1.0, 0.0);
-    const cuDoubleComplex beta = make_cuDoubleComplex(0.0, 0.0);
-    cublasStatus_t status;
+    const hipDoubleComplex alpha = make_hipDoubleComplex(1.0, 0.0);
+    const hipDoubleComplex beta = make_hipDoubleComplex(0.0, 0.0);
+    hipblasStatus_t status;
 
-    status = openmx_gemmul8Zgemm(handle, transa, transb, m, n, k, &alpha, (const cuDoubleComplex *)A, m,
-                                 (const cuDoubleComplex *)B, k, &beta, (cuDoubleComplex *)C, m);
-    if (status == CUBLAS_STATUS_SUCCESS) {
+    status = openmx_gemmul8Zgemm(handle, transa, transb, m, n, k, &alpha, (const hipDoubleComplex *)A, m,
+                                 (const hipDoubleComplex *)B, k, &beta, (hipDoubleComplex *)C, m);
+    if (status == HIPBLAS_STATUS_SUCCESS) {
         ClusterNonCol_LogGemmBackendOnce("Z", "GEMMul8", m, n, k);
         return status;
     }
 
     ClusterNonCol_LogGemmul8Retry(where, "Z", status, m, n, k);
-    status = cublasZgemm(handle, transa, transb, m, n, k, &alpha, (const cuDoubleComplex *)A, m,
-                         (const cuDoubleComplex *)B, k, &beta, (cuDoubleComplex *)C, m);
-    if (status == CUBLAS_STATUS_SUCCESS) {
+    status = hipblasZgemm(handle, transa, transb, m, n, k, &alpha, (const hipDoubleComplex *)A, m,
+                         (const hipDoubleComplex *)B, k, &beta, (hipDoubleComplex *)C, m);
+    if (status == HIPBLAS_STATUS_SUCCESS) {
         ClusterNonCol_LogGemmBackendOnce("Z", "native hipBLAS", m, n, k);
     }
     return status;
@@ -280,49 +278,49 @@ static cublasStatus_t ClusterNonCol_TryDeviceZgemm(cublasHandle_t handle, cublas
 static void ClusterNonCol_TransformRealDenseMatricesGPU(int n, const double *S, double **matrices, int matrix_count,
                                                         double *work)
 {
-    cublasHandle_t handle = NULL;
+    hipblasHandle_t handle = NULL;
     double *d_S = NULL;
     double *d_A = NULL;
     double *d_C = NULL;
     size_t bytes = ClusterNonCol_CheckedMulCount((size_t)n * (size_t)n, sizeof(double), "real GEMM bytes");
-    cudaError_t cuda_status;
-    cublasStatus_t blas_status;
+    hipError_t hip_status;
+    hipblasStatus_t blas_status;
 
-    blas_status = cublasCreate(&handle);
-    if (blas_status != CUBLAS_STATUS_SUCCESS) {
+    blas_status = hipblasCreate(&handle);
+    if (blas_status != HIPBLAS_STATUS_SUCCESS) {
         for (int i = 0; i < matrix_count; i++) {
             ClusterNonCol_LogGemmCpuFallback("ClusterNonCol_TransformRealDenseMatricesGPU:create", "D",
                                              "native hipBLAS", blas_status, n, n, n);
-            ClusterNonCol_DgemmCPU(CUBLAS_OP_N, CUBLAS_OP_N, n, n, n, matrices[i], S, work);
-            ClusterNonCol_DgemmCPU(CUBLAS_OP_T, CUBLAS_OP_N, n, n, n, S, work, matrices[i]);
+            ClusterNonCol_DgemmCPU(HIPBLAS_OP_N, HIPBLAS_OP_N, n, n, n, matrices[i], S, work);
+            ClusterNonCol_DgemmCPU(HIPBLAS_OP_T, HIPBLAS_OP_N, n, n, n, S, work, matrices[i]);
         }
         return;
     }
 
-    cuda_status = cudaMalloc((void **)&d_S, bytes);
-    if (cuda_status != cudaSuccess) goto setup_failed;
-    cuda_status = cudaMalloc((void **)&d_A, bytes);
-    if (cuda_status != cudaSuccess) goto setup_failed;
-    cuda_status = cudaMalloc((void **)&d_C, bytes);
-    if (cuda_status != cudaSuccess) goto setup_failed;
-    cuda_status = cudaMemcpy(d_S, S, bytes, cudaMemcpyHostToDevice);
-    if (cuda_status != cudaSuccess) goto setup_failed;
+    hip_status = hipMalloc((void **)&d_S, bytes);
+    if (hip_status != hipSuccess) goto setup_failed;
+    hip_status = hipMalloc((void **)&d_A, bytes);
+    if (hip_status != hipSuccess) goto setup_failed;
+    hip_status = hipMalloc((void **)&d_C, bytes);
+    if (hip_status != hipSuccess) goto setup_failed;
+    hip_status = hipMemcpy(d_S, S, bytes, hipMemcpyHostToDevice);
+    if (hip_status != hipSuccess) goto setup_failed;
 
     for (int i = 0; i < matrix_count; i++) {
         int use_cpu = 0;
 
-        cuda_status = cudaMemcpy(d_A, matrices[i], bytes, cudaMemcpyHostToDevice);
-        if (cuda_status != cudaSuccess) {
-            ClusterNonCol_LogCudaCpuFallback("ClusterNonCol_TransformRealDenseMatricesGPU:copyin", "D",
-                                             cuda_status, n, n, n);
+        hip_status = hipMemcpy(d_A, matrices[i], bytes, hipMemcpyHostToDevice);
+        if (hip_status != hipSuccess) {
+            ClusterNonCol_LogHipCpuFallback("ClusterNonCol_TransformRealDenseMatricesGPU:copyin", "D",
+                                             hip_status, n, n, n);
             use_cpu = 1;
         }
 
         if (!use_cpu) {
-            blas_status = ClusterNonCol_TryDeviceDgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N, n, n, n,
+            blas_status = ClusterNonCol_TryDeviceDgemm(handle, HIPBLAS_OP_N, HIPBLAS_OP_N, n, n, n,
                                                        d_A, d_S, d_C,
                                                        "ClusterNonCol_TransformRealDenseMatricesGPU:H*S");
-            if (blas_status != CUBLAS_STATUS_SUCCESS) {
+            if (blas_status != HIPBLAS_STATUS_SUCCESS) {
                 ClusterNonCol_LogGemmCpuFallback("ClusterNonCol_TransformRealDenseMatricesGPU:H*S", "D",
                                                  "native hipBLAS", blas_status, n, n, n);
                 use_cpu = 1;
@@ -330,10 +328,10 @@ static void ClusterNonCol_TransformRealDenseMatricesGPU(int n, const double *S, 
         }
 
         if (!use_cpu) {
-            blas_status = ClusterNonCol_TryDeviceDgemm(handle, CUBLAS_OP_T, CUBLAS_OP_N, n, n, n,
+            blas_status = ClusterNonCol_TryDeviceDgemm(handle, HIPBLAS_OP_T, HIPBLAS_OP_N, n, n, n,
                                                        d_S, d_C, d_A,
                                                        "ClusterNonCol_TransformRealDenseMatricesGPU:S^T*(H*S)");
-            if (blas_status != CUBLAS_STATUS_SUCCESS) {
+            if (blas_status != HIPBLAS_STATUS_SUCCESS) {
                 ClusterNonCol_LogGemmCpuFallback("ClusterNonCol_TransformRealDenseMatricesGPU:S^T*(H*S)", "D",
                                                  "native hipBLAS", blas_status, n, n, n);
                 use_cpu = 1;
@@ -341,98 +339,98 @@ static void ClusterNonCol_TransformRealDenseMatricesGPU(int n, const double *S, 
         }
 
         if (!use_cpu) {
-            cuda_status = cudaMemcpy(matrices[i], d_A, bytes, cudaMemcpyDeviceToHost);
-            if (cuda_status != cudaSuccess) {
-                ClusterNonCol_LogCudaCpuFallback("ClusterNonCol_TransformRealDenseMatricesGPU:copyout", "D",
-                                                 cuda_status, n, n, n);
+            hip_status = hipMemcpy(matrices[i], d_A, bytes, hipMemcpyDeviceToHost);
+            if (hip_status != hipSuccess) {
+                ClusterNonCol_LogHipCpuFallback("ClusterNonCol_TransformRealDenseMatricesGPU:copyout", "D",
+                                                 hip_status, n, n, n);
                 use_cpu = 1;
             }
         }
 
         if (use_cpu) {
-            ClusterNonCol_DgemmCPU(CUBLAS_OP_N, CUBLAS_OP_N, n, n, n, matrices[i], S, work);
-            ClusterNonCol_DgemmCPU(CUBLAS_OP_T, CUBLAS_OP_N, n, n, n, S, work, matrices[i]);
+            ClusterNonCol_DgemmCPU(HIPBLAS_OP_N, HIPBLAS_OP_N, n, n, n, matrices[i], S, work);
+            ClusterNonCol_DgemmCPU(HIPBLAS_OP_T, HIPBLAS_OP_N, n, n, n, S, work, matrices[i]);
         }
     }
 
-    if (d_C != NULL) wait_cudafunc(cudaFree(d_C));
-    if (d_A != NULL) wait_cudafunc(cudaFree(d_A));
-    if (d_S != NULL) wait_cudafunc(cudaFree(d_S));
-    wait_cudafunc(cublasDestroy(handle));
+    if (d_C != NULL) wait_hipfunc(hipFree(d_C));
+    if (d_A != NULL) wait_hipfunc(hipFree(d_A));
+    if (d_S != NULL) wait_hipfunc(hipFree(d_S));
+    wait_hipfunc(hipblasDestroy(handle));
     return;
 
 setup_failed:
-    ClusterNonCol_LogCudaCpuFallback("ClusterNonCol_TransformRealDenseMatricesGPU:setup", "D", cuda_status, n, n, n);
-    if (d_C != NULL) cudaFree(d_C);
-    if (d_A != NULL) cudaFree(d_A);
-    if (d_S != NULL) cudaFree(d_S);
-    if (handle != NULL) cublasDestroy(handle);
+    ClusterNonCol_LogHipCpuFallback("ClusterNonCol_TransformRealDenseMatricesGPU:setup", "D", hip_status, n, n, n);
+    if (d_C != NULL) hipFree(d_C);
+    if (d_A != NULL) hipFree(d_A);
+    if (d_S != NULL) hipFree(d_S);
+    if (handle != NULL) hipblasDestroy(handle);
     for (int i = 0; i < matrix_count; i++) {
-        ClusterNonCol_DgemmCPU(CUBLAS_OP_N, CUBLAS_OP_N, n, n, n, matrices[i], S, work);
-        ClusterNonCol_DgemmCPU(CUBLAS_OP_T, CUBLAS_OP_N, n, n, n, S, work, matrices[i]);
+        ClusterNonCol_DgemmCPU(HIPBLAS_OP_N, HIPBLAS_OP_N, n, n, n, matrices[i], S, work);
+        ClusterNonCol_DgemmCPU(HIPBLAS_OP_T, HIPBLAS_OP_N, n, n, n, S, work, matrices[i]);
     }
 }
 
 static void ClusterNonCol_BackTransformDenseEVecGPU(int n2, const dcomplex *evec_transformed,
                                                     const dcomplex *ss2, dcomplex *dense_evec)
 {
-    cublasHandle_t handle = NULL;
+    hipblasHandle_t handle = NULL;
     dcomplex *d_A = NULL;
     dcomplex *d_B = NULL;
     dcomplex *d_C = NULL;
     size_t bytes = ClusterNonCol_CheckedMulCount((size_t)n2 * (size_t)n2, sizeof(dcomplex), "complex GEMM bytes");
-    cudaError_t cuda_status;
-    cublasStatus_t blas_status;
+    hipError_t hip_status;
+    hipblasStatus_t blas_status;
 
-    blas_status = cublasCreate(&handle);
-    if (blas_status != CUBLAS_STATUS_SUCCESS) {
+    blas_status = hipblasCreate(&handle);
+    if (blas_status != HIPBLAS_STATUS_SUCCESS) {
         ClusterNonCol_LogGemmCpuFallback("ClusterNonCol_BackTransformDenseEVecGPU:create", "Z",
                                          "native hipBLAS", blas_status, n2, n2, n2);
-        ClusterNonCol_ZgemmCPU(CUBLAS_OP_T, CUBLAS_OP_T, n2, n2, n2, evec_transformed, ss2, dense_evec);
+        ClusterNonCol_ZgemmCPU(HIPBLAS_OP_T, HIPBLAS_OP_T, n2, n2, n2, evec_transformed, ss2, dense_evec);
         return;
     }
 
-    cuda_status = cudaMalloc((void **)&d_A, bytes);
-    if (cuda_status != cudaSuccess) goto setup_failed;
-    cuda_status = cudaMalloc((void **)&d_B, bytes);
-    if (cuda_status != cudaSuccess) goto setup_failed;
-    cuda_status = cudaMalloc((void **)&d_C, bytes);
-    if (cuda_status != cudaSuccess) goto setup_failed;
-    cuda_status = cudaMemcpy(d_A, evec_transformed, bytes, cudaMemcpyHostToDevice);
-    if (cuda_status != cudaSuccess) goto setup_failed;
-    cuda_status = cudaMemcpy(d_B, ss2, bytes, cudaMemcpyHostToDevice);
-    if (cuda_status != cudaSuccess) goto setup_failed;
+    hip_status = hipMalloc((void **)&d_A, bytes);
+    if (hip_status != hipSuccess) goto setup_failed;
+    hip_status = hipMalloc((void **)&d_B, bytes);
+    if (hip_status != hipSuccess) goto setup_failed;
+    hip_status = hipMalloc((void **)&d_C, bytes);
+    if (hip_status != hipSuccess) goto setup_failed;
+    hip_status = hipMemcpy(d_A, evec_transformed, bytes, hipMemcpyHostToDevice);
+    if (hip_status != hipSuccess) goto setup_failed;
+    hip_status = hipMemcpy(d_B, ss2, bytes, hipMemcpyHostToDevice);
+    if (hip_status != hipSuccess) goto setup_failed;
 
-    blas_status = ClusterNonCol_TryDeviceZgemm(handle, CUBLAS_OP_T, CUBLAS_OP_T, n2, n2, n2,
+    blas_status = ClusterNonCol_TryDeviceZgemm(handle, HIPBLAS_OP_T, HIPBLAS_OP_T, n2, n2, n2,
                                                d_A, d_B, d_C,
                                                "ClusterNonCol_BackTransformDenseEVecGPU");
-    if (blas_status != CUBLAS_STATUS_SUCCESS) {
+    if (blas_status != HIPBLAS_STATUS_SUCCESS) {
         ClusterNonCol_LogGemmCpuFallback("ClusterNonCol_BackTransformDenseEVecGPU", "Z",
                                          "native hipBLAS", blas_status, n2, n2, n2);
         goto cpu_fallback;
     }
 
-    cuda_status = cudaMemcpy(dense_evec, d_C, bytes, cudaMemcpyDeviceToHost);
-    if (cuda_status != cudaSuccess) {
-        ClusterNonCol_LogCudaCpuFallback("ClusterNonCol_BackTransformDenseEVecGPU:copyout", "Z",
-                                         cuda_status, n2, n2, n2);
+    hip_status = hipMemcpy(dense_evec, d_C, bytes, hipMemcpyDeviceToHost);
+    if (hip_status != hipSuccess) {
+        ClusterNonCol_LogHipCpuFallback("ClusterNonCol_BackTransformDenseEVecGPU:copyout", "Z",
+                                         hip_status, n2, n2, n2);
         goto cpu_fallback;
     }
 
-    if (d_C != NULL) wait_cudafunc(cudaFree(d_C));
-    if (d_B != NULL) wait_cudafunc(cudaFree(d_B));
-    if (d_A != NULL) wait_cudafunc(cudaFree(d_A));
-    wait_cudafunc(cublasDestroy(handle));
+    if (d_C != NULL) wait_hipfunc(hipFree(d_C));
+    if (d_B != NULL) wait_hipfunc(hipFree(d_B));
+    if (d_A != NULL) wait_hipfunc(hipFree(d_A));
+    wait_hipfunc(hipblasDestroy(handle));
     return;
 
 setup_failed:
-    ClusterNonCol_LogCudaCpuFallback("ClusterNonCol_BackTransformDenseEVecGPU:setup", "Z", cuda_status, n2, n2, n2);
+    ClusterNonCol_LogHipCpuFallback("ClusterNonCol_BackTransformDenseEVecGPU:setup", "Z", hip_status, n2, n2, n2);
 cpu_fallback:
-    if (d_C != NULL) cudaFree(d_C);
-    if (d_B != NULL) cudaFree(d_B);
-    if (d_A != NULL) cudaFree(d_A);
-    if (handle != NULL) cublasDestroy(handle);
-    ClusterNonCol_ZgemmCPU(CUBLAS_OP_T, CUBLAS_OP_T, n2, n2, n2, evec_transformed, ss2, dense_evec);
+    if (d_C != NULL) hipFree(d_C);
+    if (d_B != NULL) hipFree(d_B);
+    if (d_A != NULL) hipFree(d_A);
+    if (handle != NULL) hipblasDestroy(handle);
+    ClusterNonCol_ZgemmCPU(HIPBLAS_OP_T, HIPBLAS_OP_T, n2, n2, n2, evec_transformed, ss2, dense_evec);
 }
 
 typedef struct
@@ -678,7 +676,7 @@ static void ClusterNonCol_StoreEDMBuffer(int myid, int size_H1, int *MP, double 
     }
 }
 
-static double ClusterNonCol_CalcDMRootDense_OpenACC(int myid, int size_H1, int *MP, int n, int n2, int max_state,
+static double ClusterNonCol_CalcDMRootDense_OpenMP(int myid, int size_H1, int *MP, int n, int n2, int max_state,
                                                     double *****CDM, double *****iDM0, double *****EDM, double *ko,
                                                     const dcomplex *dense_evec, int calc_edm)
 {
@@ -848,7 +846,7 @@ static void ClusterNonCol_ReleaseGpuSolverCachedEVec(int myid)
     if (myid == Host_ID && dense_evec != NULL) {
         if (ClusterNonCol_CachedGpuSolverDenseOnDevice) {
             size_t evec_count = (size_t)n2 * (size_t)n2;
-#pragma acc exit data delete(dense_evec[0 : evec_count])
+#pragma omp target exit data map(delete: dense_evec[0 : evec_count])
         }
         free(dense_evec);
     }
@@ -899,16 +897,16 @@ double Cluster_DFT_NonCol_ScatterGpuSolverCachedEVec(int n2, int *is2, int *ie2,
 }
 
 /* GPU GEMM wrappers (added by H.Kawai, ported from 3.9.9 GPU) */
-static void ClusterNonCol_GEMMul8Dgemm_OpenACC(cublasOperation_t transa, cublasOperation_t transb, int m, int n,
+static void ClusterNonCol_GEMMul8Dgemm_OpenMP(hipblasOperation_t transa, hipblasOperation_t transb, int m, int n,
                                                int k, double const * A, double const * B, double * C)
 {
-    my_cublasDgemm_openacc(transa, transb, m, n, k, A, B, C);
+    my_hipblasDgemm_openmp(transa, transb, m, n, k, A, B, C);
 }
 
-static void ClusterNonCol_GEMMul8Zgemm_OpenACC(cublasOperation_t transa, cublasOperation_t transb, int m, int n,
+static void ClusterNonCol_GEMMul8Zgemm_OpenMP(hipblasOperation_t transa, hipblasOperation_t transb, int m, int n,
                                                int k, dcomplex const * A, dcomplex const * B, dcomplex * C)
 {
-    my_cublasZgemm_openacc(transa, transb, m, n, k, A, B, C);
+    my_hipblasZgemm_openmp(transa, transb, m, n, k, A, B, C);
 }
 
 static void ClusterNonCol_GpuSolver_DenseDsyevx(double *A, double *Z, double *ko, int n, int maxn,
@@ -918,11 +916,11 @@ static void ClusterNonCol_GpuSolver_DenseDsyevx(double *A, double *Z, double *ko
     double *d_A = NULL;
     size_t bytes = ClusterNonCol_CheckedMulCount((size_t)n * (size_t)n, sizeof(double), "MAGMA real eigensolver matrix");
 
-    wait_cudafunc(cudaMalloc((void **)&d_A, bytes));
-    wait_cudafunc(cudaMemcpy(d_A, A, bytes, cudaMemcpyHostToDevice));
+    wait_hipfunc(hipMalloc((void **)&d_A, bytes));
+    wait_hipfunc(hipMemcpy(d_A, A, bytes, hipMemcpyHostToDevice));
     info = openmx_magma_dsyevdx_gpu(n, maxn, d_A, ko, &mout);
-    wait_cudafunc(cudaMemcpy(A, d_A, bytes, cudaMemcpyDeviceToHost));
-    wait_cudafunc(cudaFree(d_A));
+    wait_hipfunc(hipMemcpy(A, d_A, bytes, hipMemcpyDeviceToHost));
+    wait_hipfunc(hipFree(d_A));
 
     if (info!=0){
         fprintf(stderr,"%s: magma_dsyevdx_gpu failed, info=%d\n",where,info);
@@ -952,11 +950,11 @@ static void ClusterNonCol_GpuSolver_DenseZheevx(dcomplex *A, dcomplex *Z, double
     size_t bytes = ClusterNonCol_CheckedMulCount((size_t)n * (size_t)n, sizeof(dcomplex),
                                                  "MAGMA complex eigensolver matrix");
 
-    wait_cudafunc(cudaMalloc(&d_A, bytes));
-    wait_cudafunc(cudaMemcpy(d_A, A, bytes, cudaMemcpyHostToDevice));
+    wait_hipfunc(hipMalloc(&d_A, bytes));
+    wait_hipfunc(hipMemcpy(d_A, A, bytes, hipMemcpyHostToDevice));
     info = openmx_magma_zheevdx_gpu(n, maxn, d_A, ko, &mout);
-    wait_cudafunc(cudaMemcpy(A, d_A, bytes, cudaMemcpyDeviceToHost));
-    wait_cudafunc(cudaFree(d_A));
+    wait_hipfunc(hipMemcpy(A, d_A, bytes, hipMemcpyDeviceToHost));
+    wait_hipfunc(hipFree(d_A));
 
     if (info!=0){
         fprintf(stderr,"%s: magma_zheevdx_gpu failed, info=%d\n",where,info);
@@ -1520,9 +1518,8 @@ static void ClusterNonCol_GpuSolverRootDensePath(int SCF_iter, double *ko, doubl
         }
     }
 
-    if (Set_Hamiltonian_OpenACC_Rank_Is_Selected()) {
-        set_cuda_default_device_from_local_rank_noncollective();
-        set_openacc_nvidia_device_from_local_rank_noncollective();
+    if (Set_Hamiltonian_OpenMP_Rank_Is_Selected()) {
+        set_hip_default_device_from_local_rank_noncollective();
     }
 
     if (owns_dense) {
@@ -1837,11 +1834,10 @@ double Cluster_DFT_NonCol(
   }
   n2 = 2*n;
 
-  /* GPU dispatch (added by H.Kawai): assign CUDA/OpenACC device when GPUSOLVER is requested */
+  /* GPU dispatch (added by H.Kawai): assign HIP/OpenMP target device when GPUSOLVER is requested */
     if (scf_eigen_lib_flag == GPUSOLVER && n2 >= GPU_CPU_SWITCH_NUM &&
-        Set_Hamiltonian_OpenACC_Rank_Is_Selected()) {
-      set_cuda_default_device_from_local_rank_noncollective();
-      set_openacc_nvidia_device_from_local_rank_noncollective();
+        Set_Hamiltonian_OpenMP_Rank_Is_Selected()) {
+      set_hip_default_device_from_local_rank_noncollective();
     }
 
   use_gpusolver_direct_cluster_dm =
@@ -2643,7 +2639,7 @@ double Cluster_DFT_NonCol(
         ClusterNonCol_AbortWithMessage("GPU solver device eigenvectors are not available in Cluster_DFT_NonCol.c.");
       }
 
-      time6 += ClusterNonCol_CalcDMRootDense_OpenACC(myid,size_H1,MP,n,n2,MaxN,CDM,iDM[0],EDM,ko,
+      time6 += ClusterNonCol_CalcDMRootDense_OpenMP(myid,size_H1,MP,n,n2,MaxN,CDM,iDM[0],EDM,ko,
                                                      gpusolver_dense_evec,(Cnt_switch==1));
 
       /* Keep the latest direct gpuSOLVER eigenvectors for the post-SCF EDM/force

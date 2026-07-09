@@ -14,7 +14,7 @@
 #include "openmx_common.h"
 #include <math.h>
 #include <omp.h>
-#include <openacc.h>
+#include <omp.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
@@ -137,7 +137,7 @@ static void Force_accumulate_atom_time_from_terms(const size_t* atom_terms, size
     }
 }
 
-static void Force_openacc_reduce_xyz(int num_atoms,
+static void Force_openmp_reduce_xyz(int num_atoms,
     const size_t* atom_offsets,
     size_t total_terms,
     const double* weights,
@@ -160,10 +160,8 @@ static void Force_openacc_reduce_xyz(int num_atoms,
         return;
     }
 
-#pragma acc data copyin(atom_offsets[0 : num_atoms + 1], weights[0 : total_terms], vx[0 : total_terms], vy[0 : total_terms], vz[0 : total_terms]) \
-    copyout(Fx[0 : num_atoms + 1], Fy[0 : num_atoms + 1], Fz[0 : num_atoms + 1])
     {
-#pragma acc parallel loop gang
+#pragma omp parallel for
         for (Mc_AN = 0; Mc_AN <= num_atoms; Mc_AN++) {
             double sumx = 0.0;
             double sumy = 0.0;
@@ -174,7 +172,6 @@ static void Force_openacc_reduce_xyz(int num_atoms,
                 size_t end = atom_offsets[Mc_AN];
                 size_t idx;
 
-#pragma acc loop vector reduction(+:sumx, sumy, sumz)
                 for (idx = start; idx < end; idx++) {
                     double weight = weights[idx];
                     sumx += weight * vx[idx];
@@ -190,7 +187,7 @@ static void Force_openacc_reduce_xyz(int num_atoms,
     }
 }
 
-static size_t Force2_Kinetic_OpenACC(double***** H0_src,
+static size_t Force2_Kinetic_OpenMP(double***** H0_src,
     double***** CDM0,
     double* Fx,
     double* Fy,
@@ -245,7 +242,7 @@ static size_t Force2_Kinetic_OpenACC(double***** H0_src,
     }
 
     if (total_terms == 0) {
-        Force_openacc_reduce_xyz(Matomnum, atom_offsets, 0, NULL, NULL, NULL, NULL, Fx, Fy, Fz);
+        Force_openmp_reduce_xyz(Matomnum, atom_offsets, 0, NULL, NULL, NULL, NULL, Fx, Fy, Fz);
         free(atom_offsets);
         return 0;
     }
@@ -295,7 +292,7 @@ static size_t Force2_Kinetic_OpenACC(double***** H0_src,
         }
     }
 
-    Force_openacc_reduce_xyz(Matomnum, atom_offsets, total_terms, weights, hx, hy, hz, Fx, Fy, Fz);
+    Force_openmp_reduce_xyz(Matomnum, atom_offsets, total_terms, weights, hx, hy, hz, Fx, Fy, Fz);
 
     free(hz);
     free(hy);
@@ -306,7 +303,7 @@ static size_t Force2_Kinetic_OpenACC(double***** H0_src,
     return total_terms;
 }
 
-static size_t Force5_OpenACC(double***** OLP1,
+static size_t Force5_OpenMP(double***** OLP1,
     double***** EDM1,
     double* Fx,
     double* Fy,
@@ -352,7 +349,7 @@ static size_t Force5_OpenACC(double***** OLP1,
     }
 
     if (total_terms == 0) {
-        Force_openacc_reduce_xyz(Matomnum, atom_offsets, 0, NULL, NULL, NULL, NULL, Fx, Fy, Fz);
+        Force_openmp_reduce_xyz(Matomnum, atom_offsets, 0, NULL, NULL, NULL, NULL, Fx, Fy, Fz);
         free(atom_offsets);
         return 0;
     }
@@ -388,7 +385,7 @@ static size_t Force5_OpenACC(double***** OLP1,
         }
     }
 
-    Force_openacc_reduce_xyz(Matomnum, atom_offsets, total_terms, weights, hx, hy, hz, Fx, Fy, Fz);
+    Force_openmp_reduce_xyz(Matomnum, atom_offsets, total_terms, weights, hx, hy, hz, Fx, Fy, Fz);
 
     free(hz);
     free(hy);
@@ -399,7 +396,7 @@ static size_t Force5_OpenACC(double***** OLP1,
     return total_terms;
 }
 
-static size_t Force4_OpenACC(double* Fx,
+static size_t Force4_OpenMP(double* Fx,
     double* Fy,
     double* Fz,
     size_t* atom_terms)
@@ -432,7 +429,7 @@ static size_t Force4_OpenACC(double* Fx,
     }
 
     if (total_terms == 0) {
-        Force_openacc_reduce_xyz(Matomnum, atom_offsets, 0, NULL, NULL, NULL, NULL, Fx, Fy, Fz);
+        Force_openmp_reduce_xyz(Matomnum, atom_offsets, 0, NULL, NULL, NULL, NULL, Fx, Fy, Fz);
         free(atom_offsets);
         return 0;
     }
@@ -491,7 +488,7 @@ static size_t Force4_OpenACC(double* Fx,
         }
     }
 
-    Force_openacc_reduce_xyz(Matomnum, atom_offsets, total_terms, weights, vx, vy, vz, Fx, Fy, Fz);
+    Force_openmp_reduce_xyz(Matomnum, atom_offsets, total_terms, weights, vx, vy, vz, Fx, Fy, Fz);
 
     free(vz);
     free(vy);
@@ -502,7 +499,7 @@ static size_t Force4_OpenACC(double* Fx,
     return total_terms;
 }
 
-static void Force_openacc_reduce_terms(size_t total_terms,
+static void Force_openmp_reduce_terms(size_t total_terms,
     const double* weights,
     const double* vx,
     const double* vy,
@@ -530,9 +527,8 @@ static void Force_openacc_reduce_terms(size_t total_terms,
         return;
     }
 
-#pragma acc data copyin(weights[0 : total_terms], vx[0 : total_terms], vy[0 : total_terms], vz[0 : total_terms]) copy(sx, sy, sz)
     {
-#pragma acc parallel loop reduction(+:sx, sy, sz)
+#pragma omp parallel for reduction(+:sx, sy, sz)
         for (idx = 0; idx < total_terms; idx++) {
             double weight = weights[idx];
             sx += weight * vx[idx];
@@ -664,7 +660,7 @@ static void dHCH_SO(double* sumx0r, double* sumx0i, double* sumy0r, double* sumy
 static void MPI_OLP(double***** OLP1);
 static void Force3();
 static void Force4();
-static size_t Force4_OpenACC(double* Fx, double* Fy, double* Fz, size_t* atom_terms);
+static size_t Force4_OpenMP(double* Fx, double* Fy, double* Fz, size_t* atom_terms);
 static void Force4B(double***** CDM0);
 
 static void Force_HNL(double***** CDM0, double***** iDM0);
@@ -724,11 +720,11 @@ double Force(double***** H0,
     double***** Force5_source = NULL;
     size_t* gpu_atom_terms = NULL;
     size_t gpu_total_terms;
-    const int use_force_openacc = (scf_eigen_lib_flag == GPUSOLVER);
-    const int use_force4_openacc = (use_force_openacc
+    const int use_force_openmp = (scf_eigen_lib_flag == GPUSOLVER);
+    const int use_force4_openmp = (use_force_openmp
         && F_VNA_flag == 1
         && (ProExpn_VNA == 0 || ProExpn_VNA == 1));
-    const int use_force2_openacc = (use_force_openacc
+    const int use_force2_openmp = (use_force_openmp
         && F_Kin_flag == 1
         && SO_switch == 0
         && Hub_U_switch == 0
@@ -1501,13 +1497,13 @@ double Force(double***** H0,
         fflush(stdout);
     }
 
-    if (use_force2_openacc) {
+    if (use_force2_openmp) {
 
         Force2_source = (Cnt_switch == 0) ? H0 : CntH0;
         gpu_atom_terms = (size_t*)malloc(sizeof(size_t) * (Matomnum + 1));
 
         dtime(&Stime_atom);
-        gpu_total_terms = Force2_Kinetic_OpenACC(Force2_source, CDM0, Fx, Fy, Fz, gpu_atom_terms);
+        gpu_total_terms = Force2_Kinetic_OpenMP(Force2_source, CDM0, Fx, Fy, Fz, gpu_atom_terms);
         dtime(&Etime_atom);
         Force_accumulate_atom_time_from_terms(gpu_atom_terms, gpu_total_terms, Etime_atom - Stime_atom);
 
@@ -2092,16 +2088,16 @@ double Force(double***** H0,
     dtime(&stime);
 
     if (myid == Host_ID && 0 < level_stdout) {
-        printf("  Force calculation #4%s\n", use_force4_openacc ? " (GPU-accelerated)" : "");
+        printf("  Force calculation #4\n");
         fflush(stdout);
     }
 
     if (ProExpn_VNA == 0 && F_VNA_flag == 1) {
-        if (use_force_openacc) {
+        if (use_force_openmp) {
             gpu_atom_terms = (size_t*)malloc(sizeof(size_t) * (Matomnum + 1));
 
             dtime(&Stime_atom);
-            gpu_total_terms = Force4_OpenACC(Fx, Fy, Fz, gpu_atom_terms);
+            gpu_total_terms = Force4_OpenMP(Fx, Fy, Fz, gpu_atom_terms);
             dtime(&Etime_atom);
             Force_accumulate_atom_time_from_terms(gpu_atom_terms, gpu_total_terms, Etime_atom - Stime_atom);
 
@@ -2136,7 +2132,7 @@ double Force(double***** H0,
     dtime(&stime);
 
     if (myid == Host_ID && 0 < level_stdout) {
-        printf("  Force calculation #5%s\n", use_force_openacc ? " (GPU-accelerated)" : "");
+        printf("  Force calculation #5\n");
         fflush(stdout);
     }
 
@@ -2145,12 +2141,12 @@ double Force(double***** H0,
         Fy[Mc_AN] = 0.0;
         Fz[Mc_AN] = 0.0;
     }
-    if (use_force_openacc) {
+    if (use_force_openmp) {
         Force5_source = (Cnt_switch == 0) ? OLP : CntOLP;
         gpu_atom_terms = (size_t*)malloc(sizeof(size_t) * (Matomnum + 1));
 
         dtime(&Stime_atom);
-        gpu_total_terms = Force5_OpenACC(Force5_source, EDM, Fx, Fy, Fz, gpu_atom_terms);
+        gpu_total_terms = Force5_OpenMP(Force5_source, EDM, Fx, Fy, Fz, gpu_atom_terms);
         dtime(&Etime_atom);
         Force_accumulate_atom_time_from_terms(gpu_atom_terms, gpu_total_terms, Etime_atom - Stime_atom);
 
@@ -5586,14 +5582,14 @@ void Force4B(double***** CDM0)
     ActiveHVNA2 = (Cnt_switch == 0) ? HVNA2 : CntHVNA2;
     ActiveHVNA3 = (Cnt_switch == 0) ? HVNA3 : CntHVNA3;
     /*
-     * The OpenACC Force4B path packs host-side dHVNA products into large
+     * The OpenMP Force4B path packs host-side dHVNA products into large
      * temporary arrays and copies them to the device for a scalar reduction.
      * In DC-LNO/GPUSOLVER runs many MPI ranks can share one GPU while GPUSOLVER
      * still owns most device memory, so these transient copies can exhaust
      * device memory.  Keep Force4B on the CPU trace path, which avoids those
      * device buffers and matches the original contraction.
      */
-    const int use_force4b_openacc = 0;
+    const int use_force4b_openmp = 0;
 
     dtime(&etime);
     if (myid == 0 && measure_time) {
@@ -5857,7 +5853,7 @@ void Force4B(double***** CDM0)
                        multiplying overlap integrals
                 *****************************************/
 
-                if (use_force4b_openacc) {
+                if (use_force4b_openmp) {
                     for (Mc_AN = 1; Mc_AN <= Matomnum; Mc_AN++) {
                         size_t atom_terms = 0;
                         size_t idx = 0;
@@ -5944,7 +5940,7 @@ void Force4B(double***** CDM0)
                                     HVNAx, HVNAy, HVNAz, idx, weights, hx, hy, hz);
                             }
 
-                            Force_openacc_reduce_terms(atom_terms, weights, hx, hy, hz, &dEx, &dEy, &dEz);
+                            Force_openmp_reduce_terms(atom_terms, weights, hx, hy, hz, &dEx, &dEy, &dEz);
 
                             Force_free_double_matrix(HVNAx);
                             Force_free_double_matrix(HVNAy);
@@ -6130,7 +6126,7 @@ void Force4B(double***** CDM0)
 
     dtime(&stime);
 
-    if (use_force4b_openacc) {
+    if (use_force4b_openmp) {
         for (Mc_AN = 1; Mc_AN <= Matomnum; Mc_AN++) {
             size_t atom_terms = 0;
             size_t idx = 0;
@@ -6203,7 +6199,7 @@ void Force4B(double***** CDM0)
                     }
                 }
 
-                Force_openacc_reduce_terms(atom_terms, weights, hx, hy, hz, &dEx, &dEy, &dEz);
+                Force_openmp_reduce_terms(atom_terms, weights, hx, hy, hz, &dEx, &dEy, &dEz);
 
                 Force_free_double_matrix(HVNAx);
                 Force_free_double_matrix(HVNAy);
@@ -6604,7 +6600,7 @@ void Force4B(double***** CDM0)
             dEy = 0.0;
             dEz = 0.0;
 
-            if (use_force4b_openacc) {
+            if (use_force4b_openmp) {
                 size_t atom_terms = 0;
                 size_t idx = 0;
                 double* weights = NULL;
@@ -6666,7 +6662,7 @@ void Force4B(double***** CDM0)
                             HVNAx, HVNAy, HVNAz, idx, weights, hx, hy, hz);
                     }
 
-                    Force_openacc_reduce_terms(atom_terms, weights, hx, hy, hz, &dEx, &dEy, &dEz);
+                    Force_openmp_reduce_terms(atom_terms, weights, hx, hy, hz, &dEx, &dEy, &dEz);
 
                     Force_free_double_matrix(HVNAx);
                     Force_free_double_matrix(HVNAy);

@@ -1,4 +1,5 @@
-#include "set_openacc_device_from_local_rank.h"
+#include "set_openmp_device_from_local_rank.h"
+#include <omp.h>
 #include <stdlib.h>
 
 static int get_local_rank_noncollective(void)
@@ -28,7 +29,7 @@ static int get_local_rank_noncollective(void)
     }
 }
 
-int set_openacc_device_from_local_rank(acc_device_t devtype)
+int set_openmp_device_from_local_rank(void)
 {
     // MPI_COMM_WORLD 内でノード共有 communicator を作り、ノード内 local rank を得る。
     // この関数は MPI_COMM_WORLD 上の全 rank が collective に呼ぶ前提。
@@ -38,42 +39,39 @@ int set_openacc_device_from_local_rank(acc_device_t devtype)
     int local_rank = 0;
     MPI_Comm_rank(shmcomm, &local_rank);
 
-    int ndev = acc_get_num_devices(devtype);
+    int ndev = omp_get_num_devices();
     int dev  = -1;
 
     if (ndev > 0) {
         dev = local_rank % ndev;
-        acc_set_device_num(dev, devtype);
-
-        // 必要なら明示初期化（好み/実装依存）
-        // acc_init(devtype);
+        omp_set_default_device(dev);
     }
 
     MPI_Comm_free(&shmcomm);
     return dev;  // -1: デバイス無し
 }
 
-/* 便利ラッパ（NVIDIA 固定で良ければ） */
-int set_openacc_nvidia_device_from_local_rank(void)
+/* 便利ラッパ（従来の nvidia 固定版と同じ呼び出し規約） */
+int set_openmp_nvidia_device_from_local_rank(void)
 {
-    return set_openacc_device_from_local_rank(acc_device_nvidia);
+    return set_openmp_device_from_local_rank();
 }
 
-int set_openacc_device_from_local_rank_noncollective(acc_device_t devtype)
+int set_openmp_device_from_local_rank_noncollective(void)
 {
-    int ndev = acc_get_num_devices(devtype);
+    int ndev = omp_get_num_devices();
     int dev  = -1;
 
     if (ndev > 0) {
         int local_rank = get_local_rank_noncollective();
         dev = local_rank % ndev;
-        acc_set_device_num(dev, devtype);
+        omp_set_default_device(dev);
     }
 
     return dev;
 }
 
-int set_openacc_nvidia_device_from_local_rank_noncollective(void)
+int set_openmp_nvidia_device_from_local_rank_noncollective(void)
 {
-    return set_openacc_device_from_local_rank_noncollective(acc_device_nvidia);
+    return set_openmp_device_from_local_rank_noncollective();
 }

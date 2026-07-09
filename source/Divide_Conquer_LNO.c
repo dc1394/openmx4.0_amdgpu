@@ -18,7 +18,7 @@
 
 #include "openmx_common.h"
 #include "lapack_prototypes.h"
-#include "set_cuda_default_device_from_local_rank.h"
+#include "set_hip_default_device_from_local_rank.h"
 #include <math.h>
 #include <mpi.h>
 #include <omp.h>
@@ -157,7 +157,7 @@ static void DCLNO_GPUProxy_Init(void)
 {
     MPI_Comm base_comm;
     int color;
-    cudaError_t cuda_err;
+    hipError_t hip_err;
 
     if (DCLNO_gpu_proxy_initialized) return;
 
@@ -168,10 +168,10 @@ static void DCLNO_GPUProxy_Init(void)
     MPI_Comm_rank(DCLNO_node_comm, &DCLNO_node_rank);
     MPI_Comm_size(DCLNO_node_comm, &DCLNO_node_size);
 
-    cuda_err = cudaGetDeviceCount(&DCLNO_ngpu);
-    if (cuda_err != cudaSuccess || DCLNO_ngpu <= 0) {
+    hip_err = hipGetDeviceCount(&DCLNO_ngpu);
+    if (hip_err != hipSuccess || DCLNO_ngpu <= 0) {
         fprintf(stderr, "DC-LNO GPU proxy: failed to detect HIP devices (err=%d, count=%d).\n",
-                (int)cuda_err, DCLNO_ngpu);
+                (int)hip_err, DCLNO_ngpu);
         fflush(stderr);
         MPI_Abort(base_comm, 1);
     }
@@ -188,11 +188,11 @@ static void DCLNO_GPUProxy_Init(void)
     if (DCLNO_is_gpu_owner) {
         /*
          * Only the GPU owners enter this branch.
-         * set_cuda_default_device_from_local_rank() internally calls
+         * set_hip_default_device_from_local_rank() internally calls
          * MPI_Comm_split_type(comm, ...), which is collective on comm and
          * deadlocks if only a subset of ranks calls it.
          */
-        wait_cudafunc(cudaSetDevice(DCLNO_gpu_id));
+        wait_hipfunc(hipSetDevice(DCLNO_gpu_id));
     }
 
     DCLNO_gpu_proxy_initialized = 1;
@@ -299,8 +299,8 @@ static void DCLNO_Eigen_lapack_d_reuse(double **a,
 typedef struct {
     int                initialized;
     int                max_num;
-    cudaStream_t       stream;
-    cublasHandle_t     cublas;
+    hipStream_t       stream;
+    hipblasHandle_t     hipblas;
     double *           d_S;
     double *           d_H;
     double *           d_tmp;
@@ -313,13 +313,13 @@ static void DCLNO_GpuSolver_Destroy(void)
 {
     DCLNO_GpuSolverCtx *ctx = &DCLNO_gpusolver_ctx;
 
-    if (ctx->stream != NULL) wait_cudafunc(cudaStreamSynchronize(ctx->stream));
-    if (ctx->d_S    != NULL) wait_cudafunc(cudaFree(ctx->d_S));
-    if (ctx->d_H    != NULL) wait_cudafunc(cudaFree(ctx->d_H));
-    if (ctx->d_tmp  != NULL) wait_cudafunc(cudaFree(ctx->d_tmp));
-    if (ctx->d_W    != NULL) wait_cudafunc(cudaFree(ctx->d_W));
-    if (ctx->cublas   != NULL) wait_cudafunc(cublasDestroy(ctx->cublas));
-    if (ctx->stream   != NULL) wait_cudafunc(cudaStreamDestroy(ctx->stream));
+    if (ctx->stream != NULL) wait_hipfunc(hipStreamSynchronize(ctx->stream));
+    if (ctx->d_S    != NULL) wait_hipfunc(hipFree(ctx->d_S));
+    if (ctx->d_H    != NULL) wait_hipfunc(hipFree(ctx->d_H));
+    if (ctx->d_tmp  != NULL) wait_hipfunc(hipFree(ctx->d_tmp));
+    if (ctx->d_W    != NULL) wait_hipfunc(hipFree(ctx->d_W));
+    if (ctx->hipblas   != NULL) wait_hipfunc(hipblasDestroy(ctx->hipblas));
+    if (ctx->stream   != NULL) wait_hipfunc(hipStreamDestroy(ctx->stream));
 
     memset(ctx, 0, sizeof(*ctx));
 }
@@ -355,9 +355,9 @@ static void DCLNO_GpuSolver_Init(void)
 
     if (ctx->initialized) return;
 
-    wait_cudafunc(cudaStreamCreateWithFlags(&ctx->stream, cudaStreamNonBlocking));
-    wait_cudafunc(cublasCreate(&ctx->cublas));
-    wait_cudafunc(cublasSetStream(ctx->cublas, ctx->stream));
+    wait_hipfunc(hipStreamCreateWithFlags(&ctx->stream, hipStreamNonBlocking));
+    wait_hipfunc(hipblasCreate(&ctx->hipblas));
+    wait_hipfunc(hipblasSetStream(ctx->hipblas, ctx->stream));
 
     ctx->initialized = 1;
 }
@@ -375,20 +375,20 @@ static void DCLNO_GpuSolver_EnsureMatrixCapacity(int num)
 
     if (num <= ctx->max_num) return;
 
-    if (ctx->d_S    != NULL) wait_cudafunc(cudaFree(ctx->d_S));
-    if (ctx->d_H    != NULL) wait_cudafunc(cudaFree(ctx->d_H));
-    if (ctx->d_tmp  != NULL) wait_cudafunc(cudaFree(ctx->d_tmp));
-    if (ctx->d_W    != NULL) wait_cudafunc(cudaFree(ctx->d_W));
+    if (ctx->d_S    != NULL) wait_hipfunc(hipFree(ctx->d_S));
+    if (ctx->d_H    != NULL) wait_hipfunc(hipFree(ctx->d_H));
+    if (ctx->d_tmp  != NULL) wait_hipfunc(hipFree(ctx->d_tmp));
+    if (ctx->d_W    != NULL) wait_hipfunc(hipFree(ctx->d_W));
 
     matrix_bytes = DCLNO_CheckedArrayBytes(DCLNO_CheckedMulCount((size_t)num, (size_t)num,
                                                                  "GPU solver dense matrix dimensions"),
                                            sizeof(double),
                                            "GPU solver dense matrix buffer");
 
-    wait_cudafunc(cudaMalloc((void**)&ctx->d_S, matrix_bytes));
-    wait_cudafunc(cudaMalloc((void**)&ctx->d_H, matrix_bytes));
-    wait_cudafunc(cudaMalloc((void**)&ctx->d_tmp, matrix_bytes));
-    wait_cudafunc(cudaMalloc((void**)&ctx->d_W,
+    wait_hipfunc(hipMalloc((void**)&ctx->d_S, matrix_bytes));
+    wait_hipfunc(hipMalloc((void**)&ctx->d_H, matrix_bytes));
+    wait_hipfunc(hipMalloc((void**)&ctx->d_tmp, matrix_bytes));
+    wait_hipfunc(hipMalloc((void**)&ctx->d_W,
                              DCLNO_CheckedArrayBytes((size_t)num, sizeof(double), "GPU solver eigenvalue buffer")));
 
     ctx->max_num = num;
@@ -406,7 +406,7 @@ static void DCLNO_GpuSolver_Eigen(double *d_A, int m, int maxn, double *W)
     }
 
     DCLNO_GpuSolver_EnsureMatrixCapacity(m);
-    wait_cudafunc(cudaStreamSynchronize(ctx->stream));
+    wait_hipfunc(hipStreamSynchronize(ctx->stream));
 
     info = openmx_magma_dsyevdx_gpu(m, maxn, d_A, W, &mout);
     if (info != 0) {
@@ -443,8 +443,8 @@ static void DCLNO_Solve_Col_GpuSolver(int NUM, int NUM2, double *Smat, double *H
 
     DCLNO_GpuSolver_EnsureMatrixCapacity(NUM);
 
-    wait_cudafunc(cudaMemcpyAsync(ctx->d_S, Smat, full_bytes, cudaMemcpyHostToDevice, ctx->stream));
-    wait_cudafunc(cudaMemcpyAsync(ctx->d_H, Hmat, full_bytes, cudaMemcpyHostToDevice, ctx->stream));
+    wait_hipfunc(hipMemcpyAsync(ctx->d_S, Smat, full_bytes, hipMemcpyHostToDevice, ctx->stream));
+    wait_hipfunc(hipMemcpyAsync(ctx->d_H, Hmat, full_bytes, hipMemcpyHostToDevice, ctx->stream));
 
     DCLNO_GpuSolver_Eigen(ctx->d_S, NUM, NUM, ko + 1);
 
@@ -452,28 +452,28 @@ static void DCLNO_Solve_Col_GpuSolver(int NUM, int NUM2, double *Smat, double *H
         ko[l] = 1.0 / sqrt(fabs(ko[l]));
     }
 
-    wait_cudafunc(cudaMemcpyAsync(ctx->d_W, ko + 1,
+    wait_hipfunc(hipMemcpyAsync(ctx->d_W, ko + 1,
                                   DCLNO_CheckedArrayBytes((size_t)NUM, sizeof(double),
                                                           "GPU solver host-to-device eigenvalue scale"),
-                                  cudaMemcpyHostToDevice, ctx->stream));
+                                  hipMemcpyHostToDevice, ctx->stream));
 
-    wait_cudafunc(cublasDdgmm(ctx->cublas, CUBLAS_SIDE_RIGHT, NUM, NUM,
+    wait_hipfunc(hipblasDdgmm(ctx->hipblas, HIPBLAS_SIDE_RIGHT, NUM, NUM,
                               ctx->d_S, NUM, ctx->d_W, 1, ctx->d_tmp, NUM));
 
-    wait_cudafunc(openmx_gemmul8Dgemm(ctx->cublas, CUBLAS_OP_N, CUBLAS_OP_N, NUM, NUM, NUM, &alpha, ctx->d_H, NUM,
+    wait_hipfunc(openmx_gemmul8Dgemm(ctx->hipblas, HIPBLAS_OP_N, HIPBLAS_OP_N, NUM, NUM, NUM, &alpha, ctx->d_H, NUM,
                                      ctx->d_tmp, NUM, &beta, ctx->d_S, NUM));
 
-    wait_cudafunc(openmx_gemmul8Dgemm(ctx->cublas, CUBLAS_OP_C, CUBLAS_OP_N, NUM, NUM, NUM, &alpha, ctx->d_tmp, NUM,
+    wait_hipfunc(openmx_gemmul8Dgemm(ctx->hipblas, HIPBLAS_OP_C, HIPBLAS_OP_N, NUM, NUM, NUM, &alpha, ctx->d_tmp, NUM,
                                      ctx->d_S, NUM, &beta, ctx->d_H, NUM));
 
     DCLNO_GpuSolver_Eigen(ctx->d_H, NUM, NUM2, ko + 1);
 
-    wait_cudafunc(openmx_gemmul8Dgemm(ctx->cublas, CUBLAS_OP_N, CUBLAS_OP_N, NUM, NUM2, NUM, &alpha, ctx->d_tmp,
+    wait_hipfunc(openmx_gemmul8Dgemm(ctx->hipblas, HIPBLAS_OP_N, HIPBLAS_OP_N, NUM, NUM2, NUM, &alpha, ctx->d_tmp,
                                      NUM, ctx->d_H, NUM, &beta, ctx->d_S, NUM));
 
-    wait_cudafunc(cudaMemcpyAsync(Hmat, ctx->d_S, partial_bytes,
-                                  cudaMemcpyDeviceToHost, ctx->stream));
-    wait_cudafunc(cudaStreamSynchronize(ctx->stream));
+    wait_hipfunc(hipMemcpyAsync(Hmat, ctx->d_S, partial_bytes,
+                                  hipMemcpyDeviceToHost, ctx->stream));
+    wait_hipfunc(hipStreamSynchronize(ctx->stream));
 }
 
 /* ------------------------------------------------------------------ */

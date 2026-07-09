@@ -1,6 +1,6 @@
 #include "openmx_common.h"
-#include "set_cuda_default_device_from_local_rank.h"
-#include <cuda_runtime.h>
+#include "set_hip_default_device_from_local_rank.h"
+#include "hip_runtime_compat.h"
 #include <mpi.h>
 #include <omp.h>
 #include <stdlib.h>
@@ -32,7 +32,7 @@ static int get_local_rank_noncollective(void)
     }
 }
 
-int set_cuda_default_device_from_local_rank()
+int set_hip_default_device_from_local_rank()
 {
     // MPI_COMM_WORLD 内でノード共有 communicator を作り、ノード内 local rank を得る。
     // この関数は MPI_COMM_WORLD 上の全 rank が collective に呼ぶ前提。
@@ -40,7 +40,7 @@ int set_cuda_default_device_from_local_rank()
     MPI_Comm_split_type(MPI_COMM_WORLD, MPI_COMM_TYPE_SHARED, 0, MPI_INFO_NULL, &shmcomm);
 
     int deviceCount;
-    wait_cudafunc(cudaGetDeviceCount(&deviceCount));
+    wait_hipfunc(hipGetDeviceCount(&deviceCount));
 
     int local_rank;
     MPI_Comm_rank(shmcomm, &local_rank);
@@ -48,7 +48,7 @@ int set_cuda_default_device_from_local_rank()
     int dev = -1;
     if (deviceCount > 0) {
         dev = local_rank % deviceCount;
-        wait_cudafunc(cudaSetDevice(dev));
+        wait_hipfunc(hipSetDevice(dev));
         omp_set_default_device(dev);
     }
 
@@ -57,18 +57,18 @@ int set_cuda_default_device_from_local_rank()
     return dev;
 }
 
-int set_cuda_default_device_from_local_rank_noncollective(void)
+int set_hip_default_device_from_local_rank_noncollective(void)
 {
     int deviceCount;
     int local_rank;
     int dev = -1;
 
-    wait_cudafunc(cudaGetDeviceCount(&deviceCount));
+    wait_hipfunc(hipGetDeviceCount(&deviceCount));
 
     if (deviceCount > 0) {
         local_rank = get_local_rank_noncollective();
         dev = local_rank % deviceCount;
-        wait_cudafunc(cudaSetDevice(dev));
+        wait_hipfunc(hipSetDevice(dev));
         omp_set_default_device(dev);
     }
 

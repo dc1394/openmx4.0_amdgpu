@@ -13,12 +13,11 @@
 #include "mpi.h"
 #include "lapack_prototypes.h"
 #include "openmx_common.h"
-#include "set_cuda_default_device_from_local_rank.h"
-#include "set_openacc_device_from_local_rank.h"
+#include "set_hip_default_device_from_local_rank.h"
 #include "tran_variables.h"
 #include <limits.h>
 #include <math.h>
-#include <openacc.h>
+#include <omp.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -58,8 +57,8 @@ typedef struct
     int                transformed_s_dim;
     size_t             d_work_bytes;
     size_t             h_work_bytes;
-    cublasHandle_t     cublas;
-    cusolverDnHandle_t gpusolver;
+    hipblasHandle_t     hipblas;
+    hipsolverDnHandle_t gpusolver;
     dcomplex *         d_S;
     dcomplex *         d_H;
     dcomplex *         d_tmp;
@@ -180,7 +179,7 @@ static int BandCol_DefaultGpuTurnGroup(void)
 {
     int device_count = 0;
 
-    if (cudaGetDeviceCount(&device_count) == cudaSuccess && 0 < device_count) {
+    if (hipGetDeviceCount(&device_count) == hipSuccess && 0 < device_count) {
         return device_count;
     }
     return 1;
@@ -225,7 +224,7 @@ static int BandCol_GpuPersistentDecide(void)
                 }
             }
 
-            if (cudaMemGetInfo(&free_bytes, &total_bytes) != cudaSuccess) {
+            if (hipMemGetInfo(&free_bytes, &total_bytes) != hipSuccess) {
                 decided = 0;
             } else if (free_bytes < min_free) {
                 fprintf(stderr,
@@ -317,10 +316,10 @@ static void BandCol_ConstructCache_Reset(void)
         int                    phase_count   = BandCol_construct_cache.dense_phase_count;
 
         if (dense_entries != NULL && 0 < dense_count) {
-#pragma acc exit data delete(dense_entries[0 : dense_count])
+#pragma omp target exit data map(delete: dense_entries[0 : dense_count])
         }
         if (phase_r != NULL && phase_i != NULL && 0 < phase_count) {
-#pragma acc exit data delete(phase_r[0 : phase_count], phase_i[0 : phase_count])
+#pragma omp target exit data map(delete: phase_r[0 : phase_count], phase_i[0 : phase_count])
         }
     }
 
@@ -574,14 +573,14 @@ static void BandCol_ConstructCache_EnsureDenseDevice(void)
     if (0 < cache->dense_count) {
         BandColConstructEntry *entries = cache->dense_entries;
         int count = cache->dense_count;
-#pragma acc enter data copyin(entries[0 : count])
+#pragma omp target enter data map(to: entries[0 : count])
     }
 
     if (0 < cache->dense_phase_count) {
         double *phase_r = cache->dense_phase_r;
         double *phase_i = cache->dense_phase_i;
         int phase_count = cache->dense_phase_count;
-#pragma acc enter data create(phase_r[0 : phase_count], phase_i[0 : phase_count])
+#pragma omp target enter data map(alloc: phase_r[0 : phase_count], phase_i[0 : phase_count])
     }
 
     cache->dense_device_valid = 1;
@@ -929,29 +928,29 @@ static void BandCol_GpuSolver_ReleaseDeviceMemory(void)
     BandColGpuSolverCtx * ctx = &BandCol_gpusolver_ctx;
 
     if (ctx->d_S != NULL)
-        wait_cudafunc(cudaFree(ctx->d_S));
+        wait_hipfunc(hipFree(ctx->d_S));
     if (ctx->d_H != NULL)
-        wait_cudafunc(cudaFree(ctx->d_H));
+        wait_hipfunc(hipFree(ctx->d_H));
     if (ctx->d_tmp != NULL)
-        wait_cudafunc(cudaFree(ctx->d_tmp));
+        wait_hipfunc(hipFree(ctx->d_tmp));
     if (ctx->d_evec != NULL)
-        wait_cudafunc(cudaFree(ctx->d_evec));
+        wait_hipfunc(hipFree(ctx->d_evec));
     if (ctx->d_scale != NULL)
-        wait_cudafunc(cudaFree(ctx->d_scale));
+        wait_hipfunc(hipFree(ctx->d_scale));
     if (ctx->d_W != NULL)
-        wait_cudafunc(cudaFree(ctx->d_W));
+        wait_hipfunc(hipFree(ctx->d_W));
     if (ctx->d_info != NULL)
-        wait_cudafunc(cudaFree(ctx->d_info));
+        wait_hipfunc(hipFree(ctx->d_info));
     if (ctx->d_work != NULL)
-        wait_cudafunc(cudaFree(ctx->d_work));
+        wait_hipfunc(hipFree(ctx->d_work));
     if (ctx->h_work != NULL)
         free(ctx->h_work);
     if (ctx->h_scale != NULL)
         free(ctx->h_scale);
     if (ctx->gpusolver != NULL)
-        wait_cudafunc(cusolverDnDestroy(ctx->gpusolver));
-    if (ctx->cublas != NULL)
-        wait_cudafunc(cublasDestroy(ctx->cublas));
+        wait_hipfunc(hipsolverDnDestroy(ctx->gpusolver));
+    if (ctx->hipblas != NULL)
+        wait_hipfunc(hipblasDestroy(ctx->hipblas));
 
     ctx->initialized         = 0;
     ctx->device_id           = -1;
@@ -964,7 +963,7 @@ static void BandCol_GpuSolver_ReleaseDeviceMemory(void)
     ctx->transformed_s_dim   = 0;
     ctx->d_work_bytes        = 0;
     ctx->h_work_bytes        = 0;
-    ctx->cublas              = NULL;
+    ctx->hipblas              = NULL;
     ctx->gpusolver            = NULL;
     ctx->d_S                 = NULL;
     ctx->d_H                 = NULL;
@@ -1015,7 +1014,7 @@ static dcomplex *BandCol_GpuSolver_SaveDeviceEigenvectors(dcomplex *evec_device,
     ctx->h_evec_dim = n;
     ctx->h_evec_stride = stride;
 
-    wait_cudafunc(cudaMemcpy(ctx->h_evec, evec_device, sizeof(dcomplex) * evec_count, cudaMemcpyDeviceToHost));
+    wait_hipfunc(hipMemcpy(ctx->h_evec, evec_device, sizeof(dcomplex) * evec_count, hipMemcpyDeviceToHost));
     return ctx->h_evec;
 }
 
@@ -1042,15 +1041,15 @@ static dcomplex *BandCol_GpuSolver_UploadHostEigenvectors(int n)
 
     if (ctx->d_evec_count < evec_count) {
         if (ctx->d_evec != NULL) {
-            wait_cudafunc(cudaFree(ctx->d_evec));
+            wait_hipfunc(hipFree(ctx->d_evec));
         }
-        wait_cudafunc(cudaMalloc((void **)&ctx->d_evec, sizeof(dcomplex) * evec_count));
+        wait_hipfunc(hipMalloc((void **)&ctx->d_evec, sizeof(dcomplex) * evec_count));
         ctx->d_evec_count = evec_count;
     }
     ctx->d_evec_dim = n;
     ctx->d_evec_stride = stride;
 
-    wait_cudafunc(cudaMemcpy(ctx->d_evec, ctx->h_evec, sizeof(dcomplex) * evec_count, cudaMemcpyHostToDevice));
+    wait_hipfunc(hipMemcpy(ctx->d_evec, ctx->h_evec, sizeof(dcomplex) * evec_count, hipMemcpyHostToDevice));
     return ctx->d_evec;
 }
 
@@ -1097,7 +1096,7 @@ static void BandCol_GpuSolver_SaveTransformedS(int n)
         ctx->h_transformed_s_dim = n;
     }
 
-    wait_cudafunc(cudaMemcpy(ctx->h_transformed_s, ctx->d_S, sizeof(dcomplex) * matrix_count, cudaMemcpyDeviceToHost));
+    wait_hipfunc(hipMemcpy(ctx->h_transformed_s, ctx->d_S, sizeof(dcomplex) * matrix_count, hipMemcpyDeviceToHost));
 }
 
 static void BandCol_GpuSolver_LoadTransformedS(int n)
@@ -1111,7 +1110,7 @@ static void BandCol_GpuSolver_LoadTransformedS(int n)
 
     matrix_count = (size_t)n * (size_t)n;
     BandCol_GpuSolver_EnsureMatrixCapacity(n);
-    wait_cudafunc(cudaMemcpy(ctx->d_S, ctx->h_transformed_s, sizeof(dcomplex) * matrix_count, cudaMemcpyHostToDevice));
+    wait_hipfunc(hipMemcpy(ctx->d_S, ctx->h_transformed_s, sizeof(dcomplex) * matrix_count, hipMemcpyHostToDevice));
     ctx->transformed_s_valid = 1;
     ctx->transformed_s_dim   = n;
 }
@@ -1132,7 +1131,7 @@ static void BandCol_GpuSolver_Init(void)
     BandColGpuSolverCtx * ctx = &BandCol_gpusolver_ctx;
     int                  current_device;
 
-    wait_cudafunc(cudaGetDevice(&current_device));
+    wait_hipfunc(hipGetDevice(&current_device));
 
     if (ctx->initialized && ctx->device_id == current_device) {
         return;
@@ -1142,7 +1141,7 @@ static void BandCol_GpuSolver_Init(void)
         BandCol_GpuSolver_Destroy();
     }
 
-    wait_cudafunc(cublasCreate(&ctx->cublas));
+    wait_hipfunc(hipblasCreate(&ctx->hipblas));
     ctx->gpusolver = NULL;
 
     ctx->initialized = 1;
@@ -1166,27 +1165,27 @@ static void BandCol_GpuSolver_EnsureMatrixCapacity(int n)
     }
 
     if (ctx->d_S != NULL)
-        wait_cudafunc(cudaFree(ctx->d_S));
+        wait_hipfunc(hipFree(ctx->d_S));
     if (ctx->d_H != NULL)
-        wait_cudafunc(cudaFree(ctx->d_H));
+        wait_hipfunc(hipFree(ctx->d_H));
     if (ctx->d_tmp != NULL)
-        wait_cudafunc(cudaFree(ctx->d_tmp));
+        wait_hipfunc(hipFree(ctx->d_tmp));
     if (ctx->d_scale != NULL)
-        wait_cudafunc(cudaFree(ctx->d_scale));
+        wait_hipfunc(hipFree(ctx->d_scale));
     if (ctx->d_W != NULL)
-        wait_cudafunc(cudaFree(ctx->d_W));
+        wait_hipfunc(hipFree(ctx->d_W));
     if (ctx->d_info != NULL)
-        wait_cudafunc(cudaFree(ctx->d_info));
+        wait_hipfunc(hipFree(ctx->d_info));
 
     matrix_bytes = sizeof(dcomplex) * (size_t)n * (size_t)n;
     vector_bytes = sizeof(dcomplex) * (size_t)n;
 
-    wait_cudafunc(cudaMalloc((void **)&ctx->d_S, matrix_bytes));
-    wait_cudafunc(cudaMalloc((void **)&ctx->d_H, matrix_bytes));
-    wait_cudafunc(cudaMalloc((void **)&ctx->d_tmp, matrix_bytes));
-    wait_cudafunc(cudaMalloc((void **)&ctx->d_scale, vector_bytes));
-    wait_cudafunc(cudaMalloc((void **)&ctx->d_W, sizeof(double) * (size_t)n));
-    wait_cudafunc(cudaMalloc((void **)&ctx->d_info, sizeof(int32_t)));
+    wait_hipfunc(hipMalloc((void **)&ctx->d_S, matrix_bytes));
+    wait_hipfunc(hipMalloc((void **)&ctx->d_H, matrix_bytes));
+    wait_hipfunc(hipMalloc((void **)&ctx->d_tmp, matrix_bytes));
+    wait_hipfunc(hipMalloc((void **)&ctx->d_scale, vector_bytes));
+    wait_hipfunc(hipMalloc((void **)&ctx->d_W, sizeof(double) * (size_t)n));
+    wait_hipfunc(hipMalloc((void **)&ctx->d_info, sizeof(int32_t)));
 
     ctx->matrix_dim          = n;
     ctx->transformed_s_valid = 0;
@@ -1235,7 +1234,7 @@ static void BandCol_GpuSolver_PrepareTransformedS(int build_from_overlap, int n,
 
     if (build_from_overlap) {
         if (Ss != NULL) {
-            wait_cudafunc(cudaMemcpy(ctx->d_S, Ss, matrix_bytes, cudaMemcpyHostToDevice));
+            wait_hipfunc(hipMemcpy(ctx->d_S, Ss, matrix_bytes, hipMemcpyHostToDevice));
         }
         BandCol_GpuSolver_Eigen(ctx->d_S, n, n, ko + 1);
 
@@ -1257,10 +1256,10 @@ static void BandCol_GpuSolver_PrepareTransformedS(int build_from_overlap, int n,
             ctx->h_scale[l - 1].i = 0.0;
         }
 
-        wait_cudafunc(cudaMemcpy(ctx->d_scale, ctx->h_scale, sizeof(dcomplex) * (size_t)n, cudaMemcpyHostToDevice));
+        wait_hipfunc(hipMemcpy(ctx->d_scale, ctx->h_scale, sizeof(dcomplex) * (size_t)n, hipMemcpyHostToDevice));
 
-        wait_cudafunc(cublasZdgmm(ctx->cublas, CUBLAS_SIDE_RIGHT, n, n, (cuDoubleComplex *)ctx->d_S, n,
-                                  (cuDoubleComplex *)ctx->d_scale, 1, (cuDoubleComplex *)ctx->d_tmp, n));
+        wait_hipfunc(hipblasZdgmm(ctx->hipblas, HIPBLAS_SIDE_RIGHT, n, n, (hipDoubleComplex *)ctx->d_S, n,
+                                  (hipDoubleComplex *)ctx->d_scale, 1, (hipDoubleComplex *)ctx->d_tmp, n));
 
         {
             dcomplex * swap_tmp = ctx->d_S;
@@ -1270,7 +1269,7 @@ static void BandCol_GpuSolver_PrepareTransformedS(int build_from_overlap, int n,
 
     } else {
         if (Ss != NULL) {
-            wait_cudafunc(cudaMemcpy(ctx->d_S, Ss, matrix_bytes, cudaMemcpyHostToDevice));
+            wait_hipfunc(hipMemcpy(ctx->d_S, Ss, matrix_bytes, hipMemcpyHostToDevice));
         } else if (!(ctx->transformed_s_valid && ctx->transformed_s_dim == n)) {
             BandCol_AbortWithMessage("Device overlap is not ready in BandCol_GpuSolver_PrepareTransformedS.");
         }
@@ -1280,7 +1279,7 @@ static void BandCol_GpuSolver_PrepareTransformedS(int build_from_overlap, int n,
     ctx->transformed_s_dim   = n;
 }
 
-static void BandCol_ZgemmLogCpuFallbackOnce(cublasStatus_t status, int m, int n, int k)
+static void BandCol_ZgemmLogCpuFallbackOnce(hipblasStatus_t status, int m, int n, int k)
 {
     static int logged = 0;
 
@@ -1295,11 +1294,11 @@ static void BandCol_ZgemmLogCpuFallbackOnce(cublasStatus_t status, int m, int n,
     logged = 1;
 }
 
-static void BandCol_ZgemmCpu(cublasOperation_t transa, cublasOperation_t transb, int m, int n, int k,
+static void BandCol_ZgemmCpu(hipblasOperation_t transa, hipblasOperation_t transb, int m, int n, int k,
                              dcomplex const *A, dcomplex const *B, dcomplex *C)
 {
-    char transa_cpu = (transa == CUBLAS_OP_C) ? 'C' : ((transa == CUBLAS_OP_T) ? 'T' : 'N');
-    char transb_cpu = (transb == CUBLAS_OP_C) ? 'C' : ((transb == CUBLAS_OP_T) ? 'T' : 'N');
+    char transa_cpu = (transa == HIPBLAS_OP_C) ? 'C' : ((transa == HIPBLAS_OP_T) ? 'T' : 'N');
+    char transb_cpu = (transb == HIPBLAS_OP_C) ? 'C' : ((transb == HIPBLAS_OP_T) ? 'T' : 'N');
     int mi = m;
     int ni = n;
     int ki = k;
@@ -1315,19 +1314,19 @@ static void BandCol_ZgemmCpu(cublasOperation_t transa, cublasOperation_t transb,
 /* ZGEMM on device pointers: GEMMul8 first (which itself falls back to MAGMA when the
    GPU workspace cannot be allocated); if both fail, copy the operands to the host
    and run CPU BLAS zgemm, then copy the result back to the device. */
-static void BandCol_GpuSolver_ZgemmDevice(cublasOperation_t transa, cublasOperation_t transb, int m, int n, int k,
+static void BandCol_GpuSolver_ZgemmDevice(hipblasOperation_t transa, hipblasOperation_t transb, int m, int n, int k,
                                          dcomplex const *d_A, dcomplex const *d_B, dcomplex *d_C)
 {
     BandColGpuSolverCtx *ctx = &BandCol_gpusolver_ctx;
-    cuDoubleComplex     alpha = make_cuDoubleComplex(1.0, 0.0);
-    cuDoubleComplex     beta  = make_cuDoubleComplex(0.0, 0.0);
-    cublasStatus_t      status;
+    hipDoubleComplex     alpha = make_hipDoubleComplex(1.0, 0.0);
+    hipDoubleComplex     beta  = make_hipDoubleComplex(0.0, 0.0);
+    hipblasStatus_t      status;
     size_t              a_bytes, b_bytes, c_bytes;
     dcomplex           *A, *B, *C;
 
-    status = openmx_gemmul8Zgemm(ctx->cublas, transa, transb, m, n, k, &alpha, (cuDoubleComplex const *)d_A, m,
-                                 (cuDoubleComplex const *)d_B, k, &beta, (cuDoubleComplex *)d_C, m);
-    if (status == CUBLAS_STATUS_SUCCESS) {
+    status = openmx_gemmul8Zgemm(ctx->hipblas, transa, transb, m, n, k, &alpha, (hipDoubleComplex const *)d_A, m,
+                                 (hipDoubleComplex const *)d_B, k, &beta, (hipDoubleComplex *)d_C, m);
+    if (status == HIPBLAS_STATUS_SUCCESS) {
         return;
     }
 
@@ -1344,41 +1343,41 @@ static void BandCol_GpuSolver_ZgemmDevice(cublasOperation_t transa, cublasOperat
         BandCol_AbortWithMessage("Out of host memory in CPU ZGEMM fallback in Band_DFT_Col.c.");
     }
 
-    wait_cudafunc(cudaMemcpy(A, d_A, a_bytes, cudaMemcpyDeviceToHost));
-    wait_cudafunc(cudaMemcpy(B, d_B, b_bytes, cudaMemcpyDeviceToHost));
+    wait_hipfunc(hipMemcpy(A, d_A, a_bytes, hipMemcpyDeviceToHost));
+    wait_hipfunc(hipMemcpy(B, d_B, b_bytes, hipMemcpyDeviceToHost));
 
     BandCol_ZgemmCpu(transa, transb, m, n, k, A, B, C);
 
-    wait_cudafunc(cudaMemcpy(d_C, C, c_bytes, cudaMemcpyHostToDevice));
+    wait_hipfunc(hipMemcpy(d_C, C, c_bytes, hipMemcpyHostToDevice));
 
     free(C);
     free(B);
     free(A);
 }
 
-static void BandCol_GpuSolver_Zgemm_OpenACC(cublasOperation_t transa, cublasOperation_t transb, int m, int n, int k,
+static void BandCol_GpuSolver_Zgemm_OpenMP(hipblasOperation_t transa, hipblasOperation_t transb, int m, int n, int k,
                                            dcomplex const * A, dcomplex const * B, dcomplex * C)
 {
     BandColGpuSolverCtx *ctx = &BandCol_gpusolver_ctx;
-    cuDoubleComplex     alpha = make_cuDoubleComplex(1.0, 0.0);
-    cuDoubleComplex     beta  = make_cuDoubleComplex(0.0, 0.0);
-    cublasStatus_t      status = CUBLAS_STATUS_SUCCESS;
+    hipDoubleComplex     alpha = make_hipDoubleComplex(1.0, 0.0);
+    hipDoubleComplex     beta  = make_hipDoubleComplex(0.0, 0.0);
+    hipblasStatus_t      status = HIPBLAS_STATUS_SUCCESS;
 
     BandCol_GpuSolver_Init();
 
-#pragma acc data present(A[0 : m * k], B[0 : k * n], C[0 : m * n])
+#pragma omp target data map(present, alloc: A[0 : m * k], B[0 : k * n], C[0 : m * n])
     {
-#pragma acc host_data use_device(A, B, C)
+#pragma omp target data use_device_ptr(A, B, C)
         {
-            status = openmx_gemmul8Zgemm(ctx->cublas, transa, transb, m, n, k, &alpha, (cuDoubleComplex const *)A, m,
-                                         (cuDoubleComplex const *)B, k, &beta, (cuDoubleComplex *)C, m);
+            status = openmx_gemmul8Zgemm(ctx->hipblas, transa, transb, m, n, k, &alpha, (hipDoubleComplex const *)A, m,
+                                         (hipDoubleComplex const *)B, k, &beta, (hipDoubleComplex *)C, m);
         }
 
-        if (status != CUBLAS_STATUS_SUCCESS) {
+        if (status != HIPBLAS_STATUS_SUCCESS) {
             BandCol_ZgemmLogCpuFallbackOnce(status, m, n, k);
-#pragma acc update self(A[0 : m * k], B[0 : k * n])
+#pragma omp target update from(A[0 : m * k], B[0 : k * n])
             BandCol_ZgemmCpu(transa, transb, m, n, k, A, B, C);
-#pragma acc update device(C[0 : m * n])
+#pragma omp target update to(C[0 : m * n])
         }
     }
 }
@@ -1396,13 +1395,13 @@ static void BandCol_GpuSolver_EigenHost(dcomplex *A, double *ko, int n, int maxn
     }
 
     bytes = sizeof(dcomplex) * (size_t)n * (size_t)n;
-    wait_cudafunc(cudaMalloc((void **)&d_A, bytes));
-    wait_cudafunc(cudaMemcpy(d_A, A, bytes, cudaMemcpyHostToDevice));
+    wait_hipfunc(hipMalloc((void **)&d_A, bytes));
+    wait_hipfunc(hipMemcpy(d_A, A, bytes, hipMemcpyHostToDevice));
 
     info = openmx_magma_zheevdx_gpu(n, maxn, d_A, ko, &mout);
 
-    wait_cudafunc(cudaMemcpy(A, d_A, bytes, cudaMemcpyDeviceToHost));
-    wait_cudafunc(cudaFree(d_A));
+    wait_hipfunc(hipMemcpy(A, d_A, bytes, hipMemcpyDeviceToHost));
+    wait_hipfunc(hipFree(d_A));
 
     if (info != 0) {
         snprintf(msg, sizeof(msg), "magma_zheevdx_gpu failed in Band_DFT_Col.c host path: info=%d", info);
@@ -1431,9 +1430,9 @@ static dcomplex *BandCol_GpuSolver_EnsureEigenvectorCapacity(int n, int stride)
     evec_count = (size_t)n * (size_t)stride;
     if (ctx->d_evec_count < evec_count) {
         if (ctx->d_evec != NULL) {
-            wait_cudafunc(cudaFree(ctx->d_evec));
+            wait_hipfunc(hipFree(ctx->d_evec));
         }
-        wait_cudafunc(cudaMalloc((void **)&ctx->d_evec, sizeof(dcomplex) * evec_count));
+        wait_hipfunc(hipMalloc((void **)&ctx->d_evec, sizeof(dcomplex) * evec_count));
         ctx->d_evec_count = evec_count;
     }
 
@@ -1448,8 +1447,8 @@ static dcomplex *BandCol_GpuSolver_SolveHamiltonianImpl(int n, int maxn, const d
     BandColGpuSolverCtx * ctx = &BandCol_gpusolver_ctx;
     size_t               matrix_bytes;
     dcomplex            *evec_t;
-    cuDoubleComplex      alpha = make_cuDoubleComplex(1.0, 0.0);
-    cuDoubleComplex      beta = make_cuDoubleComplex(0.0, 0.0);
+    hipDoubleComplex      alpha = make_hipDoubleComplex(1.0, 0.0);
+    hipDoubleComplex      beta = make_hipDoubleComplex(0.0, 0.0);
 
     if (!(ctx->transformed_s_valid && ctx->transformed_s_dim == n)) {
         BandCol_AbortWithMessage("Transformed overlap is not ready in BandCol_GpuSolver_SolveHamiltonian.");
@@ -1458,12 +1457,12 @@ static dcomplex *BandCol_GpuSolver_SolveHamiltonianImpl(int n, int maxn, const d
     matrix_bytes = sizeof(dcomplex) * (size_t)n * (size_t)n;
 
     if (H_in != NULL) {
-        wait_cudafunc(cudaMemcpy(ctx->d_H, H_in, matrix_bytes, cudaMemcpyHostToDevice));
+        wait_hipfunc(hipMemcpy(ctx->d_H, H_in, matrix_bytes, hipMemcpyHostToDevice));
     }
 
-    BandCol_GpuSolver_ZgemmDevice(CUBLAS_OP_N, CUBLAS_OP_N, n, n, n, ctx->d_H, ctx->d_S, ctx->d_tmp);
+    BandCol_GpuSolver_ZgemmDevice(HIPBLAS_OP_N, HIPBLAS_OP_N, n, n, n, ctx->d_H, ctx->d_S, ctx->d_tmp);
 
-    BandCol_GpuSolver_ZgemmDevice(CUBLAS_OP_C, CUBLAS_OP_N, n, n, n, ctx->d_S, ctx->d_tmp, ctx->d_H);
+    BandCol_GpuSolver_ZgemmDevice(HIPBLAS_OP_C, HIPBLAS_OP_N, n, n, n, ctx->d_S, ctx->d_tmp, ctx->d_H);
 
     BandCol_GpuSolver_Eigen(ctx->d_H, n, maxn, ko + 1);
 
@@ -1472,14 +1471,14 @@ static dcomplex *BandCol_GpuSolver_SolveHamiltonianImpl(int n, int maxn, const d
     }
 
     evec_t = BandCol_GpuSolver_EnsureEigenvectorCapacity(n, maxn);
-    wait_cudafunc(cublasZgemm(ctx->cublas, CUBLAS_OP_T, CUBLAS_OP_T, maxn, n, n,
-                              &alpha, (cuDoubleComplex *)ctx->d_H, n,
-                              (cuDoubleComplex *)ctx->d_S, n, &beta,
-                              (cuDoubleComplex *)evec_t, maxn));
+    wait_hipfunc(hipblasZgemm(ctx->hipblas, HIPBLAS_OP_T, HIPBLAS_OP_T, maxn, n, n,
+                              &alpha, (hipDoubleComplex *)ctx->d_H, n,
+                              (hipDoubleComplex *)ctx->d_S, n, &beta,
+                              (hipDoubleComplex *)evec_t, maxn));
 
     if (C_out != NULL) {
-        wait_cudafunc(cudaMemcpy(C_out, evec_t, sizeof(dcomplex) * (size_t)n * (size_t)maxn,
-                                 cudaMemcpyDeviceToHost));
+        wait_hipfunc(hipMemcpy(C_out, evec_t, sizeof(dcomplex) * (size_t)n * (size_t)maxn,
+                                 hipMemcpyDeviceToHost));
     }
 
     return evec_t;
@@ -2121,7 +2120,7 @@ double Band_DFT_Col(int SCF_iter, int knum_i, int knum_j, int knum_k, int SpinP_
         all_knum = 0;
     }
 
-    owns_dense_k_rank = (use_gpusolver_dense && Set_Hamiltonian_OpenACC_Rank_Is_Selected());
+    owns_dense_k_rank = (use_gpusolver_dense && Set_Hamiltonian_OpenMP_Rank_Is_Selected());
     owns_global_dense_rank = (all_knum == 1 && owns_dense_k_rank);
     use_setham_packed_cache =
         (use_gpusolver_dense && all_knum == 1 && Set_Hamiltonian_GpuSolver_Packed_CacheReady() &&
@@ -2135,17 +2134,13 @@ double Band_DFT_Col(int SCF_iter, int knum_i, int knum_j, int knum_k, int SpinP_
         }
     }
 
-    // Set the device to be used by OpenACC and CUDA
-    if (use_gpusolver_dense && Set_Hamiltonian_OpenACC_Rank_Is_Selected()) {
-        // CUDA
-        set_cuda_default_device_from_local_rank_noncollective();
-
-        // OpenACC
-        set_openacc_nvidia_device_from_local_rank_noncollective();
+    // Set the device to be used by HIP and OpenMP target offload.
+    if (use_gpusolver_dense && Set_Hamiltonian_OpenMP_Rank_Is_Selected()) {
+        set_hip_default_device_from_local_rank_noncollective();
     }
 
     /***********************************************
-                cublasmp & cusolverMp initialize
+                hipblasmp & hipsolverMp initialize
     ***********************************************/
 
     // Options opts = {
@@ -2183,7 +2178,7 @@ double Band_DFT_Col(int SCF_iter, int knum_i, int knum_j, int knum_k, int SpinP_
 
     // Options4 opts4;
     // if (all_knum == 1) {
-    //     init_cublasmp(myworld2, MPI_CommWD2, &opts, &opts2);
+    //     init_hipblasmp(myworld2, MPI_CommWD2, &opts, &opts2);
     //     init_gpusolvermp(myworld2, MPI_CommWD2, &opts2, &opts3, &opts4);
     // }
 
@@ -2471,8 +2466,6 @@ diagonalize1:
 
                 /* make S and H */
 
-            // #pragma acc kernels
-            // #pragma acc loop independent
                 Construct_Band_CsHs(SCF_iter, all_knum, use_setham_packed_cache ? setham_order_GA : order_GA, MP,
                                     use_setham_packed_cache ? setham_S1 : S1,
                                     use_setham_packed_cache ? setham_H1 : H1, k1, k2, k3, Ss, Hs, n,
@@ -2684,7 +2677,6 @@ diagonalize1:
                     }
                 }
 
-                // #pragma acc update device(Hs[0 : na_rows * na_cols], Cs[0 : na_rows * na_cols])
 
                 /* diagonalize S */
 
@@ -2732,8 +2724,6 @@ diagonalize1:
 
                     /* minus eigenvalues to 1.0e-10 */
 
-                    // #pragma acc kernels
-                    // #pragma acc loop independent
                     for (l = 1; l <= n; l++) {
                         if (ko[l] < 0.0) {
                             ko[l] = 1.0e-10;
@@ -2743,16 +2733,12 @@ diagonalize1:
 
                     /* calculate S*1/sqrt(ko) */
 
-                    // #pragma acc kernels
-                    // #pragma acc loop independent
                     for (l = 1; l <= n; l++) {
                         ko[l] = 1.0 / sqrt(ko[l]);
                     }
 
                     /* S * 1.0/sqrt(ko[l]) */
 
-                    // #pragma acc kernels
-                    // #pragma acc loop independent
                     for (j = 0; j < na_cols; j++) {
                         const int jg = np_cols * nblk * (j / nblk) + (j % nblk) + ((np_cols + my_pcol) % np_cols) * nblk + 1;
                         const double scale = ko[jg];
@@ -2788,7 +2774,7 @@ diagonalize1:
 
                 /* H * U * 1.0/sqrt(ko[l]) */
 
-                // cublasmp_zgemm(CUBLAS_OP_N, CUBLAS_OP_N, Hs, Ss, Cs, &opts, &opts2);
+                // hipblasmp_zgemm(HIPBLAS_OP_N, HIPBLAS_OP_N, Hs, Ss, Cs, &opts, &opts2);
 
                 BandCol_ZeroComplex(Cs, (size_t)na_rows_max * (size_t)na_cols_max);
 
@@ -2801,7 +2787,7 @@ diagonalize1:
 
                 /* 1.0/sqrt(ko[l]) * U^+ H * U * 1.0/sqrt(ko[l]) */
 
-                // cublasmp_zgemm(CUBLAS_OP_C, CUBLAS_OP_N, Ss, Cs, Hs, &opts, &opts2);
+                // hipblasmp_zgemm(HIPBLAS_OP_C, HIPBLAS_OP_N, Ss, Cs, Hs, &opts, &opts2);
 
                 BandCol_ZeroComplex(Hs, (size_t)na_rows * (size_t)na_cols);
 
@@ -2847,10 +2833,6 @@ diagonalize1:
                     }
                 }
 
-                //             if (numprocs0 < n / 2) {
-                // //#pragma acc update self(ko[0 : n + 1])
-                //             }
-
                 for (l = 1; l <= MaxN; l++) {
                     EIGEN[spin][kloop][l] = ko[l];
                 }
@@ -2876,8 +2858,7 @@ diagonalize1:
                     dtime(&Stime);
 
                 if (all_knum == 1) {
-                    // cublasmp_zgemm(CUBLAS_OP_T, CUBLAS_OP_T, Cs, Ss, Hs, &opts, &opts2);
-                    // #pragma acc update self(Ss[0 : na_rows * na_cols], Hs[0 : na_rows * na_cols], Cs[0 : na_rows * na_cols])
+                    // hipblasmp_zgemm(HIPBLAS_OP_T, HIPBLAS_OP_T, Cs, Ss, Hs, &opts, &opts2);
 
                     BandCol_ZeroComplex(Hs, (size_t)na_rows * (size_t)na_cols);
                     F77_NAME(pzgemm, PZGEMM)
@@ -3944,7 +3925,6 @@ diagonalize1:
                                     use_setham_packed_cache ? setham_H1 : H1, k1, k2, k3, Cs, Hs, n,
                                     owns_global_dense_rank);
 
-                // #pragma acc update device(Hs[0 : na_rows * na_cols], Cs[0 : na_rows * na_cols])
 
                 /* diagonalize S */
 
@@ -3980,8 +3960,6 @@ diagonalize1:
 
                 /* minus eigenvalues to 1.0e-14 */
 
-                // #pragma acc kernels
-                // #pragma acc loop independent
                 for (l = 1; l <= n; l++) {
                     if (ko[l] < 0.0) {
                         ko[l] = 1.0e-10;
@@ -3990,16 +3968,12 @@ diagonalize1:
 
                 /* calculate S*1/sqrt(ko) */
 
-                // #pragma acc kernels
-                // #pragma acc loop independent
                 for (l = 1; l <= n; l++) {
                     ko[l] = 1.0 / sqrt(ko[l]);
                 }
 
                 /* S * 1.0/sqrt(ko[l])  */
 
-                // #pragma acc kernels
-                // #pragma acc loop independent
                 for (j = 0; j < na_cols; j++) {
                     const int jg = np_cols * nblk * (j / nblk) + (j % nblk) + ((np_cols + my_pcol) % np_cols) * nblk + 1;
                     const double scale = ko[jg];
@@ -4019,7 +3993,7 @@ diagonalize1:
 
                 /* H * U * 1/sqrt(ko) */
 
-                // cublasmp_zgemm(CUBLAS_OP_N, CUBLAS_OP_N, Hs, Ss, Cs, &opts, &opts2);
+                // hipblasmp_zgemm(HIPBLAS_OP_N, HIPBLAS_OP_N, Hs, Ss, Cs, &opts, &opts2);
 
                 BandCol_ZeroComplex(Cs, (size_t)na_rows_max * (size_t)na_cols_max);
 
@@ -4030,7 +4004,7 @@ diagonalize1:
 
                 /* 1/sqrt(ko) * U^+ H * U * 1/sqrt(ko) */
 
-                // cublasmp_zgemm(CUBLAS_OP_C, CUBLAS_OP_N, Ss, Cs, Hs, &opts, &opts2);
+                // hipblasmp_zgemm(HIPBLAS_OP_C, HIPBLAS_OP_N, Ss, Cs, Hs, &opts, &opts2);
 
                 BandCol_ZeroComplex(Hs, (size_t)na_rows * (size_t)na_cols);
 
@@ -4076,7 +4050,7 @@ diagonalize1:
                    NOTE JRCAT-244p and JAIST-2122p
                 ****************************************************/
 
-                // cublasmp_zgemm(CUBLAS_OP_T, CUBLAS_OP_T, Cs, Ss, Hs, &opts, &opts2);
+                // hipblasmp_zgemm(HIPBLAS_OP_T, HIPBLAS_OP_T, Cs, Ss, Hs, &opts, &opts2);
 
                 BandCol_ZeroComplex(Hs, (size_t)na_rows * (size_t)na_cols);
                 F77_NAME(pzgemm, PZGEMM)
@@ -4414,10 +4388,10 @@ diagonalize1:
         }
     }
 
-    // Destroy cublasmp & cusolverMp
+    // Destroy hipblasmp & hipsolverMp
     // if (all_knum == 1) {
     //     destroy_gpusolvermp(&opts4);
-    //     destroy_cublasmp(&opts2);
+    //     destroy_hipblasmp(&opts2);
     // }
 
     /****************************************************
@@ -4588,7 +4562,7 @@ void Construct_Band_CsHs(int SCF_iter, int all_knum, int * order_GA, int * MP, d
     const int dense_gpusolver_owner =
         (use_gpusolver_dense &&
          ((all_knum == 1 && owns_global_dense_rank) ||
-          (all_knum != 1 && Set_Hamiltonian_OpenACC_Rank_Is_Selected())));
+          (all_knum != 1 && Set_Hamiltonian_OpenMP_Rank_Is_Selected())));
 
     BandCol_last_construct_on_device = 0;
 

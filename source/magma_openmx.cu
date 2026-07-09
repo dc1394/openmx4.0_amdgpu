@@ -1,5 +1,5 @@
 #include <magma_v2.h>
-#include <cuda_runtime.h>
+#include "hip_runtime_compat.h"
 
 #include <cstdio>
 #include <mutex>
@@ -215,7 +215,7 @@ extern "C" int openmx_magma_dsyevdx_gpu(int n, int maxn, double *d_A, double *w,
                             0.0, 0.0, il, iu, &mout, w,
                             g_host_matrix, mn,
                             g_work, lwork, g_iwork, liwork, &info);
-    cudaDeviceSynchronize();
+    hipDeviceSynchronize();
 
     if (mout_out != nullptr) {
         *mout_out = static_cast<int>(mout);
@@ -299,7 +299,7 @@ extern "C" int openmx_magma_zheevdx_gpu(int n, int maxn, void *d_A, double *w, i
                             g_z_work, lwork,
                             g_z_rwork, lrwork,
                             g_z_iwork, liwork, &info);
-    cudaDeviceSynchronize();
+    hipDeviceSynchronize();
 
     if (mout_out != nullptr) {
         *mout_out = static_cast<int>(mout);

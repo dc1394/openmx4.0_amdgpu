@@ -14,11 +14,9 @@
 #include "openmx_common.h"
 #include "lapack_prototypes.h"
 #include "tran_variables.h"
-#include "set_cuda_default_device_from_local_rank.h"
-#include "set_openacc_device_from_local_rank.h"
+#include "set_hip_default_device_from_local_rank.h"
 #include <math.h>
 #include <omp.h>
-#include <openacc.h>
 #include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -38,8 +36,8 @@ typedef struct
     int            max_tno;
     int            max_cols;
     int            max_nk;
-    cudaStream_t   stream;
-    cublasHandle_t cublas;
+    hipStream_t   stream;
+    hipblasHandle_t hipblas;
     dcomplex *     d_vec_up;
     dcomplex *     d_vec_up_e;
     dcomplex *     d_vec_dn;
@@ -107,8 +105,8 @@ typedef struct
     int                matrix_dim;
     size_t             d_work_bytes;
     size_t             h_work_bytes;
-    cudaStream_t       stream;
-    cusolverDnHandle_t gpusolver;
+    hipStream_t       stream;
+    hipsolverDnHandle_t gpusolver;
     dcomplex *         d_A;
     double *           d_W;
     int32_t *          d_info;
@@ -124,7 +122,7 @@ typedef struct
     int            device_id;
     int            n_dim;
     int            n2_dim;
-    cublasHandle_t cublas;
+    hipblasHandle_t hipblas;
     dcomplex *     d_S;
     dcomplex *     d_H11;
     dcomplex *     d_H22;
@@ -139,23 +137,23 @@ typedef struct
 
 static BandNonColDenseGpuWorkspace BandNonCol_dense_gpu_workspace = {0};
 
-static void BandNonCol_DenseGpu_EnsureCublas(void)
+static void BandNonCol_DenseGpu_EnsureHipblas(void)
 {
     BandNonColDenseGpuWorkspace *w = &BandNonCol_dense_gpu_workspace;
 
-    if (w->cublas==NULL){
-        wait_cudafunc(cublasCreate(&w->cublas));
+    if (w->hipblas==NULL){
+        wait_hipfunc(hipblasCreate(&w->hipblas));
     }
 }
 
-static void BandNonCol_DenseGpu_ReleaseCublas(void)
+static void BandNonCol_DenseGpu_ReleaseHipblas(void)
 {
     BandNonColDenseGpuWorkspace *w = &BandNonCol_dense_gpu_workspace;
 
-    if (w->cublas!=NULL){
-        wait_cudafunc(cudaDeviceSynchronize());
-        wait_cudafunc(cublasDestroy(w->cublas));
-        w->cublas = NULL;
+    if (w->hipblas!=NULL){
+        wait_hipfunc(hipDeviceSynchronize());
+        wait_hipfunc(hipblasDestroy(w->hipblas));
+        w->hipblas = NULL;
     }
 }
 
@@ -163,16 +161,16 @@ static void BandNonCol_DenseGpu_Destroy(void)
 {
     BandNonColDenseGpuWorkspace *w = &BandNonCol_dense_gpu_workspace;
 
-    if (w->d_S     != NULL) wait_cudafunc(cudaFree(w->d_S));
-    if (w->d_H11   != NULL) wait_cudafunc(cudaFree(w->d_H11));
-    if (w->d_H22   != NULL) wait_cudafunc(cudaFree(w->d_H22));
-    if (w->d_H12   != NULL) wait_cudafunc(cudaFree(w->d_H12));
-    if (w->d_tmp   != NULL) wait_cudafunc(cudaFree(w->d_tmp));
-    if (w->d_H2    != NULL) wait_cudafunc(cudaFree(w->d_H2));
-    if (w->d_S2    != NULL) wait_cudafunc(cudaFree(w->d_S2));
-    if (w->d_C2    != NULL) wait_cudafunc(cudaFree(w->d_C2));
-    if (w->d_scale != NULL) wait_cudafunc(cudaFree(w->d_scale));
-    if (w->cublas  != NULL) wait_cudafunc(cublasDestroy(w->cublas));
+    if (w->d_S     != NULL) wait_hipfunc(hipFree(w->d_S));
+    if (w->d_H11   != NULL) wait_hipfunc(hipFree(w->d_H11));
+    if (w->d_H22   != NULL) wait_hipfunc(hipFree(w->d_H22));
+    if (w->d_H12   != NULL) wait_hipfunc(hipFree(w->d_H12));
+    if (w->d_tmp   != NULL) wait_hipfunc(hipFree(w->d_tmp));
+    if (w->d_H2    != NULL) wait_hipfunc(hipFree(w->d_H2));
+    if (w->d_S2    != NULL) wait_hipfunc(hipFree(w->d_S2));
+    if (w->d_C2    != NULL) wait_hipfunc(hipFree(w->d_C2));
+    if (w->d_scale != NULL) wait_hipfunc(hipFree(w->d_scale));
+    if (w->hipblas  != NULL) wait_hipfunc(hipblasDestroy(w->hipblas));
     free(w->h_scale);
 
     memset(w,0,sizeof(*w));
@@ -190,7 +188,7 @@ static void BandNonCol_DenseGpu_Ensure(int n, int n2)
         BandNonCol_AbortWithMessage("Invalid dense GPU workspace dimensions in Band_DFT_NonCol.c.");
     }
 
-    wait_cudafunc(cudaGetDevice(&current_device));
+    wait_hipfunc(hipGetDevice(&current_device));
     if (!(w->initialized && w->device_id==current_device && n<=w->n_dim && n2<=w->n2_dim)){
       if (w->initialized){
         BandNonCol_DenseGpu_Destroy();
@@ -203,13 +201,13 @@ static void BandNonCol_DenseGpu_Ensure(int n, int n2)
     nn = (size_t)n*(size_t)n;
     n2n2 = (size_t)n2*(size_t)n2;
 
-    if (w->d_S     == NULL) wait_cudafunc(cudaMalloc((void**)&w->d_S,     sizeof(dcomplex)*nn));
-    if (w->d_H11   == NULL) wait_cudafunc(cudaMalloc((void**)&w->d_H11,   sizeof(dcomplex)*nn));
-    if (w->d_H22   == NULL) wait_cudafunc(cudaMalloc((void**)&w->d_H22,   sizeof(dcomplex)*nn));
-    if (w->d_H12   == NULL) wait_cudafunc(cudaMalloc((void**)&w->d_H12,   sizeof(dcomplex)*nn));
-    if (w->d_tmp   == NULL) wait_cudafunc(cudaMalloc((void**)&w->d_tmp,   sizeof(dcomplex)*nn));
-    if (w->d_H2    == NULL) wait_cudafunc(cudaMalloc((void**)&w->d_H2,    sizeof(dcomplex)*n2n2));
-    if (w->d_scale == NULL) wait_cudafunc(cudaMalloc((void**)&w->d_scale, sizeof(dcomplex)*(size_t)n2));
+    if (w->d_S     == NULL) wait_hipfunc(hipMalloc((void**)&w->d_S,     sizeof(dcomplex)*nn));
+    if (w->d_H11   == NULL) wait_hipfunc(hipMalloc((void**)&w->d_H11,   sizeof(dcomplex)*nn));
+    if (w->d_H22   == NULL) wait_hipfunc(hipMalloc((void**)&w->d_H22,   sizeof(dcomplex)*nn));
+    if (w->d_H12   == NULL) wait_hipfunc(hipMalloc((void**)&w->d_H12,   sizeof(dcomplex)*nn));
+    if (w->d_tmp   == NULL) wait_hipfunc(hipMalloc((void**)&w->d_tmp,   sizeof(dcomplex)*nn));
+    if (w->d_H2    == NULL) wait_hipfunc(hipMalloc((void**)&w->d_H2,    sizeof(dcomplex)*n2n2));
+    if (w->d_scale == NULL) wait_hipfunc(hipMalloc((void**)&w->d_scale, sizeof(dcomplex)*(size_t)n2));
 
     if (w->h_scale == NULL) w->h_scale = (dcomplex*)malloc(sizeof(dcomplex)*(size_t)n2);
     if (w->h_scale==NULL){
@@ -222,7 +220,7 @@ static void BandNonCol_DenseGpu_Ensure(int n, int n2)
     if (w->n_dim<n) w->n_dim = n;
     if (w->n2_dim<n2) w->n2_dim = n2;
 
-    BandNonCol_DenseGpu_EnsureCublas();
+    BandNonCol_DenseGpu_EnsureHipblas();
 }
 
 static void BandNonCol_DenseGpu_ReleaseWaveBuffers(void)
@@ -230,11 +228,11 @@ static void BandNonCol_DenseGpu_ReleaseWaveBuffers(void)
     BandNonColDenseGpuWorkspace *w = &BandNonCol_dense_gpu_workspace;
 
     if (w->d_S2 != NULL){
-        wait_cudafunc(cudaFree(w->d_S2));
+        wait_hipfunc(hipFree(w->d_S2));
         w->d_S2 = NULL;
     }
     if (w->d_C2 != NULL){
-        wait_cudafunc(cudaFree(w->d_C2));
+        wait_hipfunc(hipFree(w->d_C2));
         w->d_C2 = NULL;
     }
 }
@@ -243,31 +241,31 @@ static void BandNonCol_DenseGpu_ReleaseOverlapMagmaScratch(void)
 {
     BandNonColDenseGpuWorkspace *w = &BandNonCol_dense_gpu_workspace;
 
-    wait_cudafunc(cudaDeviceSynchronize());
+    wait_hipfunc(hipDeviceSynchronize());
     BandNonCol_DenseGpu_ReleaseWaveBuffers();
 
     if (w->d_H11 != NULL){
-        wait_cudafunc(cudaFree(w->d_H11));
+        wait_hipfunc(hipFree(w->d_H11));
         w->d_H11 = NULL;
     }
     if (w->d_H22 != NULL){
-        wait_cudafunc(cudaFree(w->d_H22));
+        wait_hipfunc(hipFree(w->d_H22));
         w->d_H22 = NULL;
     }
     if (w->d_H12 != NULL){
-        wait_cudafunc(cudaFree(w->d_H12));
+        wait_hipfunc(hipFree(w->d_H12));
         w->d_H12 = NULL;
     }
     if (w->d_tmp != NULL){
-        wait_cudafunc(cudaFree(w->d_tmp));
+        wait_hipfunc(hipFree(w->d_tmp));
         w->d_tmp = NULL;
     }
     if (w->d_H2 != NULL){
-        wait_cudafunc(cudaFree(w->d_H2));
+        wait_hipfunc(hipFree(w->d_H2));
         w->d_H2 = NULL;
     }
 
-    BandNonCol_DenseGpu_ReleaseCublas();
+    BandNonCol_DenseGpu_ReleaseHipblas();
 }
 
 static void BandNonCol_DenseGpu_EnsureWaveBuffers(int n2)
@@ -276,10 +274,10 @@ static void BandNonCol_DenseGpu_EnsureWaveBuffers(int n2)
     size_t n2n2 = (size_t)n2*(size_t)n2;
 
     if (w->d_S2==NULL){
-        wait_cudafunc(cudaMalloc((void**)&w->d_S2,sizeof(dcomplex)*n2n2));
+        wait_hipfunc(hipMalloc((void**)&w->d_S2,sizeof(dcomplex)*n2n2));
     }
     if (w->d_C2==NULL){
-        wait_cudafunc(cudaMalloc((void**)&w->d_C2,sizeof(dcomplex)*n2n2));
+        wait_hipfunc(hipMalloc((void**)&w->d_C2,sizeof(dcomplex)*n2n2));
     }
 }
 
@@ -287,31 +285,31 @@ static void BandNonCol_DenseGpu_ReleasePreMagmaBuffers(int release_s)
 {
     BandNonColDenseGpuWorkspace *w = &BandNonCol_dense_gpu_workspace;
 
-    wait_cudafunc(cudaDeviceSynchronize());
+    wait_hipfunc(hipDeviceSynchronize());
     BandNonCol_DenseGpu_ReleaseWaveBuffers();
 
     if (w->d_H11 != NULL){
-        wait_cudafunc(cudaFree(w->d_H11));
+        wait_hipfunc(hipFree(w->d_H11));
         w->d_H11 = NULL;
     }
     if (w->d_H22 != NULL){
-        wait_cudafunc(cudaFree(w->d_H22));
+        wait_hipfunc(hipFree(w->d_H22));
         w->d_H22 = NULL;
     }
     if (w->d_H12 != NULL){
-        wait_cudafunc(cudaFree(w->d_H12));
+        wait_hipfunc(hipFree(w->d_H12));
         w->d_H12 = NULL;
     }
     if (w->d_tmp != NULL){
-        wait_cudafunc(cudaFree(w->d_tmp));
+        wait_hipfunc(hipFree(w->d_tmp));
         w->d_tmp = NULL;
     }
     if (w->d_scale != NULL){
-        wait_cudafunc(cudaFree(w->d_scale));
+        wait_hipfunc(hipFree(w->d_scale));
         w->d_scale = NULL;
     }
     if (release_s && w->d_S != NULL){
-        wait_cudafunc(cudaFree(w->d_S));
+        wait_hipfunc(hipFree(w->d_S));
         w->d_S = NULL;
     }
     if (w->h_scale != NULL){
@@ -319,7 +317,7 @@ static void BandNonCol_DenseGpu_ReleasePreMagmaBuffers(int release_s)
         w->h_scale = NULL;
     }
 
-    BandNonCol_DenseGpu_ReleaseCublas();
+    BandNonCol_DenseGpu_ReleaseHipblas();
 }
 
 static void BandNonCol_DenseGpu_RestoreS(int n, const dcomplex *h_S)
@@ -331,27 +329,27 @@ static void BandNonCol_DenseGpu_RestoreS(int n, const dcomplex *h_S)
         BandNonCol_AbortWithMessage("Missing cached overlap transform in Band_DFT_NonCol.c.");
     }
     if (w->d_S==NULL){
-        wait_cudafunc(cudaMalloc((void**)&w->d_S,sizeof(dcomplex)*nn));
+        wait_hipfunc(hipMalloc((void**)&w->d_S,sizeof(dcomplex)*nn));
     }
-    wait_cudafunc(cudaMemcpy(w->d_S,h_S,sizeof(dcomplex)*nn,cudaMemcpyHostToDevice));
+    wait_hipfunc(hipMemcpy(w->d_S,h_S,sizeof(dcomplex)*nn,hipMemcpyHostToDevice));
 }
 
 static void BandNonCol_DMGpu_Destroy(void)
 {
     BandNonColDMGpuWorkspace * w = &BandNonCol_dm_gpu_workspace;
-    if (w->d_vec_up   != NULL) wait_cudafunc(cudaFree(w->d_vec_up));
-    if (w->d_vec_up_e != NULL) wait_cudafunc(cudaFree(w->d_vec_up_e));
-    if (w->d_vec_dn   != NULL) wait_cudafunc(cudaFree(w->d_vec_dn));
-    if (w->d_vec_dn_e != NULL) wait_cudafunc(cudaFree(w->d_vec_dn_e));
-    if (w->d_cols_up  != NULL) wait_cudafunc(cudaFree(w->d_cols_up));
-    if (w->d_cols_dn  != NULL) wait_cudafunc(cudaFree(w->d_cols_dn));
-    if (w->d_mat11    != NULL) wait_cudafunc(cudaFree(w->d_mat11));
-    if (w->d_mat22    != NULL) wait_cudafunc(cudaFree(w->d_mat22));
-    if (w->d_mat12    != NULL) wait_cudafunc(cudaFree(w->d_mat12));
-    if (w->d_mat11e   != NULL) wait_cudafunc(cudaFree(w->d_mat11e));
-    if (w->d_mat22e   != NULL) wait_cudafunc(cudaFree(w->d_mat22e));
-    if (w->cublas     != NULL) wait_cudafunc(cublasDestroy(w->cublas));
-    if (w->stream     != NULL) wait_cudafunc(cudaStreamDestroy(w->stream));
+    if (w->d_vec_up   != NULL) wait_hipfunc(hipFree(w->d_vec_up));
+    if (w->d_vec_up_e != NULL) wait_hipfunc(hipFree(w->d_vec_up_e));
+    if (w->d_vec_dn   != NULL) wait_hipfunc(hipFree(w->d_vec_dn));
+    if (w->d_vec_dn_e != NULL) wait_hipfunc(hipFree(w->d_vec_dn_e));
+    if (w->d_cols_up  != NULL) wait_hipfunc(hipFree(w->d_cols_up));
+    if (w->d_cols_dn  != NULL) wait_hipfunc(hipFree(w->d_cols_dn));
+    if (w->d_mat11    != NULL) wait_hipfunc(hipFree(w->d_mat11));
+    if (w->d_mat22    != NULL) wait_hipfunc(hipFree(w->d_mat22));
+    if (w->d_mat12    != NULL) wait_hipfunc(hipFree(w->d_mat12));
+    if (w->d_mat11e   != NULL) wait_hipfunc(hipFree(w->d_mat11e));
+    if (w->d_mat22e   != NULL) wait_hipfunc(hipFree(w->d_mat22e));
+    if (w->hipblas     != NULL) wait_hipfunc(hipblasDestroy(w->hipblas));
+    if (w->stream     != NULL) wait_hipfunc(hipStreamDestroy(w->stream));
     memset(w, 0, sizeof(*w));
     w->device_id = -1;
 }
@@ -360,13 +358,13 @@ static void BandNonCol_GpuSolver_Destroy(void)
 {
     BandNonColGpuSolverWorkspace * w = &BandNonCol_gpusolver_workspace;
 
-    if (w->d_A      != NULL) wait_cudafunc(cudaFree(w->d_A));
-    if (w->d_W      != NULL) wait_cudafunc(cudaFree(w->d_W));
-    if (w->d_info   != NULL) wait_cudafunc(cudaFree(w->d_info));
-    if (w->d_work   != NULL) wait_cudafunc(cudaFree(w->d_work));
+    if (w->d_A      != NULL) wait_hipfunc(hipFree(w->d_A));
+    if (w->d_W      != NULL) wait_hipfunc(hipFree(w->d_W));
+    if (w->d_info   != NULL) wait_hipfunc(hipFree(w->d_info));
+    if (w->d_work   != NULL) wait_hipfunc(hipFree(w->d_work));
     if (w->h_work   != NULL) free(w->h_work);
-    if (w->gpusolver != NULL) wait_cudafunc(cusolverDnDestroy(w->gpusolver));
-    if (w->stream   != NULL) wait_cudafunc(cudaStreamDestroy(w->stream));
+    if (w->gpusolver != NULL) wait_hipfunc(hipsolverDnDestroy(w->gpusolver));
+    if (w->stream   != NULL) wait_hipfunc(hipStreamDestroy(w->stream));
 
     memset(w, 0, sizeof(*w));
     w->device_id = -1;
@@ -376,12 +374,12 @@ static void BandNonCol_DMGpu_Init(void)
 {
     BandNonColDMGpuWorkspace * w = &BandNonCol_dm_gpu_workspace;
     int current_device;
-    wait_cudafunc(cudaGetDevice(&current_device));
+    wait_hipfunc(hipGetDevice(&current_device));
     if (w->initialized && w->device_id == current_device) return;
     if (w->initialized) BandNonCol_DMGpu_Destroy();
-    wait_cudafunc(cudaStreamCreateWithFlags(&w->stream, cudaStreamNonBlocking));
-    wait_cudafunc(cublasCreate(&w->cublas));
-    wait_cudafunc(cublasSetStream(w->cublas, w->stream));
+    wait_hipfunc(hipStreamCreateWithFlags(&w->stream, hipStreamNonBlocking));
+    wait_hipfunc(hipblasCreate(&w->hipblas));
+    wait_hipfunc(hipblasSetStream(w->hipblas, w->stream));
     w->initialized = 1;
     w->device_id   = current_device;
 }
@@ -391,13 +389,13 @@ static void BandNonCol_GpuSolver_Init(void)
     BandNonColGpuSolverWorkspace * w = &BandNonCol_gpusolver_workspace;
     int current_device;
 
-    wait_cudafunc(cudaGetDevice(&current_device));
+    wait_hipfunc(hipGetDevice(&current_device));
     if (w->initialized && w->device_id == current_device) return;
     if (w->initialized) BandNonCol_GpuSolver_Destroy();
 
-    wait_cudafunc(cudaStreamCreateWithFlags(&w->stream, cudaStreamNonBlocking));
-    wait_cudafunc(cusolverDnCreate(&w->gpusolver));
-    wait_cudafunc(cusolverDnSetStream(w->gpusolver, w->stream));
+    wait_hipfunc(hipStreamCreateWithFlags(&w->stream, hipStreamNonBlocking));
+    wait_hipfunc(hipsolverDnCreate(&w->gpusolver));
+    wait_hipfunc(hipsolverDnSetStream(w->gpusolver, w->stream));
 
     w->initialized = 1;
     w->device_id   = current_device;
@@ -408,14 +406,14 @@ static void BandNonCol_GpuSolver_EnsureInfo(void)
     BandNonColGpuSolverWorkspace * w = &BandNonCol_gpusolver_workspace;
 
     BandNonCol_GpuSolver_Init();
-    if (w->d_info==NULL) wait_cudafunc(cudaMalloc((void**)&w->d_info,sizeof(int32_t)));
+    if (w->d_info==NULL) wait_hipfunc(hipMalloc((void**)&w->d_info,sizeof(int32_t)));
 }
 
 static void BandNonCol_GpuSolver_ReleaseDeviceWorkspace(void)
 {
     BandNonColGpuSolverWorkspace * w = &BandNonCol_gpusolver_workspace;
 
-    if (w->d_work!=NULL) wait_cudafunc(cudaFree(w->d_work));
+    if (w->d_work!=NULL) wait_hipfunc(hipFree(w->d_work));
     w->d_work = NULL;
     w->d_work_bytes = 0;
 }
@@ -432,7 +430,7 @@ static int BandNonCol_DefaultGpuTurnGroup(void)
 {
     int device_count = 0;
 
-    if (cudaGetDeviceCount(&device_count) == cudaSuccess && 0 < device_count) {
+    if (hipGetDeviceCount(&device_count) == hipSuccess && 0 < device_count) {
         return device_count;
     }
     return 1;
@@ -517,14 +515,14 @@ static void BandNonCol_GpuSolver_EnsureMatrixCapacity(int n)
     BandNonCol_GpuSolver_Init();
     if (n<=w->matrix_dim) return;
 
-    if (w->d_A    != NULL) wait_cudafunc(cudaFree(w->d_A));
-    if (w->d_W    != NULL) wait_cudafunc(cudaFree(w->d_W));
-    if (w->d_info != NULL) wait_cudafunc(cudaFree(w->d_info));
+    if (w->d_A    != NULL) wait_hipfunc(hipFree(w->d_A));
+    if (w->d_W    != NULL) wait_hipfunc(hipFree(w->d_W));
+    if (w->d_info != NULL) wait_hipfunc(hipFree(w->d_info));
 
     nn = (size_t)n*(size_t)n;
-    wait_cudafunc(cudaMalloc((void**)&w->d_A,    sizeof(dcomplex)*nn));
-    wait_cudafunc(cudaMalloc((void**)&w->d_W,    sizeof(double)*(size_t)n));
-    wait_cudafunc(cudaMalloc((void**)&w->d_info, sizeof(int32_t)));
+    wait_hipfunc(hipMalloc((void**)&w->d_A,    sizeof(dcomplex)*nn));
+    wait_hipfunc(hipMalloc((void**)&w->d_W,    sizeof(double)*(size_t)n));
+    wait_hipfunc(hipMalloc((void**)&w->d_info, sizeof(int32_t)));
 
     w->matrix_dim = n;
 }
@@ -532,9 +530,9 @@ static void BandNonCol_GpuSolver_EnsureMatrixCapacity(int n)
 static void BandNonCol_GpuSolver_EnsureWorkspace(int n, int maxn)
 {
     BandNonColGpuSolverWorkspace * w = &BandNonCol_gpusolver_workspace;
-    cusolverEigMode_t  jobz = CUSOLVER_EIG_MODE_VECTOR;
-    cublasFillMode_t   uplo = CUBLAS_FILL_MODE_LOWER;
-    cusolverEigRange_t range;
+    hipsolverEigMode_t  jobz = HIPSOLVER_EIG_MODE_VECTOR;
+    hipblasFillMode_t   uplo = HIPBLAS_FILL_MODE_LOWER;
+    hipsolverEigRange_t range;
     double vl = 0.0;
     double vu = 0.0;
     int64_t h_meig = 0;
@@ -546,16 +544,16 @@ static void BandNonCol_GpuSolver_EnsureWorkspace(int n, int maxn)
     }
 
     BandNonCol_GpuSolver_EnsureMatrixCapacity(n);
-    range = (n==maxn) ? CUSOLVER_EIG_RANGE_ALL : CUSOLVER_EIG_RANGE_I;
+    range = (n==maxn) ? HIPSOLVER_EIG_RANGE_ALL : HIPSOLVER_EIG_RANGE_I;
 
-    wait_cudafunc(cusolverDnXsyevdx_bufferSize(w->gpusolver,NULL,jobz,range,uplo,n,
-                                               CUDA_C_64F,(cuDoubleComplex*)w->d_A,n,&vl,&vu,1L,maxn,&h_meig,
-                                               CUDA_R_64F,w->d_W,CUDA_C_64F,&d_bytes,&h_bytes));
+    wait_hipfunc(hipsolverDnXsyevdx_bufferSize(w->gpusolver,NULL,jobz,range,uplo,n,
+                                               HIP_C_64F,(hipDoubleComplex*)w->d_A,n,&vl,&vu,1L,maxn,&h_meig,
+                                               HIP_R_64F,w->d_W,HIP_C_64F,&d_bytes,&h_bytes));
 
     if (w->d_work_bytes<d_bytes){
-        if (w->d_work!=NULL) wait_cudafunc(cudaFree(w->d_work));
+        if (w->d_work!=NULL) wait_hipfunc(hipFree(w->d_work));
         w->d_work = NULL;
-        if (0<d_bytes) wait_cudafunc(cudaMalloc((void**)&w->d_work,d_bytes));
+        if (0<d_bytes) wait_hipfunc(hipMalloc((void**)&w->d_work,d_bytes));
         w->d_work_bytes = d_bytes;
     }
 
@@ -572,6 +570,12 @@ static void BandNonCol_GpuSolver_EnsureWorkspace(int n, int maxn)
     }
 }
 
+static int BandNonCol_OmpTargetIsPresent(const void *ptr, size_t bytes)
+{
+    if (ptr == NULL || bytes == 0) return 0;
+    return omp_target_is_present(ptr, omp_get_default_device()) != 0;
+}
+
 static void BandNonCol_GpuSolver_DenseZheevx_Device(dcomplex *A, double *ko, int n, int maxn,
                                                    const char *where)
 {
@@ -586,14 +590,13 @@ static void BandNonCol_GpuSolver_DenseZheevx_Device(dcomplex *A, double *ko, int
         BandNonCol_AbortWithMessage("Invalid MAGMA eigensolver dimensions in Band_DFT_NonCol.c.");
     }
 
-#pragma acc wait
-#pragma acc update self(A[0 : nn])
+#pragma omp target update from(A[0 : nn])
 
-    wait_cudafunc(cudaMalloc((void**)&d_A,bytes));
-    wait_cudafunc(cudaMemcpy(d_A,A,bytes,cudaMemcpyHostToDevice));
+    wait_hipfunc(hipMalloc((void**)&d_A,bytes));
+    wait_hipfunc(hipMemcpy(d_A,A,bytes,hipMemcpyHostToDevice));
     info = openmx_magma_zheevdx_gpu(n,maxn,d_A,ko,&mout);
-    wait_cudafunc(cudaMemcpy(A,d_A,bytes,cudaMemcpyDeviceToHost));
-    wait_cudafunc(cudaFree(d_A));
+    wait_hipfunc(hipMemcpy(A,d_A,bytes,hipMemcpyDeviceToHost));
+    wait_hipfunc(hipFree(d_A));
 
     if (info!=0){
         fprintf(stderr,"%s: magma_zheevdx_gpu failed, info=%d\n",where,info);
@@ -609,47 +612,48 @@ static void BandNonCol_GpuSolver_DenseZheevx_Device(dcomplex *A, double *ko, int
 
     for (l=maxn; 1<=l; l--) ko[l] = ko[l-1];
 
-#pragma acc update device(A[0 : nn])
-#pragma acc update device(ko[0 : n + 1])
-#pragma acc wait
+#pragma omp target update to(A[0 : nn])
+#pragma omp target update to(ko[0 : n + 1])
 }
 
-static void BandNonCol_GEMMul8Zgemm_OpenACC(cublasOperation_t transa, cublasOperation_t transb, int m, int n, int k,
+static void BandNonCol_GEMMul8Zgemm_OpenMP(hipblasOperation_t transa, hipblasOperation_t transb, int m, int n, int k,
                                             dcomplex const * A, dcomplex const * B, dcomplex * C)
 {
-    cublasHandle_t handle;
+    hipblasHandle_t handle;
 
-    wait_cudafunc(cublasCreate(&handle));
-#pragma acc data      present(A[0 : m * k], B[0 : k * n], C[0 : m * n])
-#pragma acc host_data use_device(A, B, C)
+    wait_hipfunc(hipblasCreate(&handle));
+#pragma omp target data map(present, alloc: A[0 : m * k], B[0 : k * n], C[0 : m * n])
+#pragma omp target data use_device_ptr(A, B, C)
     {
-        cuDoubleComplex const alpha = make_cuDoubleComplex(1.0, 0.0);
-        cuDoubleComplex const beta  = make_cuDoubleComplex(0.0, 0.0);
-        wait_cudafunc(openmx_gemmul8Zgemm(handle, transa, transb, m, n, k, &alpha,
-                                          (cuDoubleComplex const *)A, m, (cuDoubleComplex const *)B, k, &beta,
-                                          (cuDoubleComplex *)C, m));
+        hipDoubleComplex const alpha = make_hipDoubleComplex(1.0, 0.0);
+        hipDoubleComplex const beta  = make_hipDoubleComplex(0.0, 0.0);
+        wait_hipfunc(openmx_gemmul8Zgemm(handle, transa, transb, m, n, k, &alpha,
+                                          (hipDoubleComplex const *)A, m, (hipDoubleComplex const *)B, k, &beta,
+                                          (hipDoubleComplex *)C, m));
     }
-    wait_cudafunc(cublasDestroy(handle));
+    wait_hipfunc(hipblasDestroy(handle));
 }
 
-static void BandNonCol_CublasZgemm_OpenACC(cublasOperation_t transa, cublasOperation_t transb, int m, int n, int k,
+static void BandNonCol_HipblasZgemm_OpenMP(hipblasOperation_t transa, hipblasOperation_t transb, int m, int n, int k,
                                            dcomplex const *A, dcomplex const *B, dcomplex *C)
 {
-    const int lda = (transa==CUBLAS_OP_N) ? m : k;
-    const int ldb = (transb==CUBLAS_OP_N) ? k : n;
+    const int lda = (transa==HIPBLAS_OP_N) ? m : k;
+    const int ldb = (transb==HIPBLAS_OP_N) ? k : n;
+    const size_t a_count = (size_t)lda * (size_t)((transa==HIPBLAS_OP_N) ? k : m);
+    const size_t b_count = (size_t)ldb * (size_t)((transb==HIPBLAS_OP_N) ? n : k);
+    const size_t c_count = (size_t)m * (size_t)n;
 
     BandNonCol_DMGpu_Init();
-#pragma acc data      present(A[0 : lda * ((transa==CUBLAS_OP_N) ? k : m)], \
-                              B[0 : ldb * ((transb==CUBLAS_OP_N) ? n : k)], C[0 : m * n])
-#pragma acc host_data use_device(A, B, C)
+#pragma omp target data map(present, alloc: A[0 : a_count], B[0 : b_count], C[0 : c_count])
+#pragma omp target data use_device_ptr(A, B, C)
     {
-        cuDoubleComplex const alpha = make_cuDoubleComplex(1.0, 0.0);
-        cuDoubleComplex const beta  = make_cuDoubleComplex(0.0, 0.0);
-        wait_cudafunc(cublasZgemm(BandNonCol_dm_gpu_workspace.cublas, transa, transb, m, n, k, &alpha,
-                                  (cuDoubleComplex const *)A, lda,
-                                  (cuDoubleComplex const *)B, ldb,
-                                  &beta, (cuDoubleComplex *)C, m));
-        wait_cudafunc(cudaStreamSynchronize(BandNonCol_dm_gpu_workspace.stream));
+        hipDoubleComplex const alpha = make_hipDoubleComplex(1.0, 0.0);
+        hipDoubleComplex const beta  = make_hipDoubleComplex(0.0, 0.0);
+        wait_hipfunc(hipblasZgemm(BandNonCol_dm_gpu_workspace.hipblas, transa, transb, m, n, k, &alpha,
+                                  (hipDoubleComplex const *)A, lda,
+                                  (hipDoubleComplex const *)B, ldb,
+                                  &beta, (hipDoubleComplex *)C, m));
+        wait_hipfunc(hipStreamSynchronize(BandNonCol_dm_gpu_workspace.stream));
     }
 }
 
@@ -659,52 +663,49 @@ static int BandNonCol_UseDenseGpuMatrix(int n, int n2)
             na_rows == n && na_cols == n && na_rows2 == n2 && na_cols2 == n2);
 }
 
-static void BandNonCol_DenseTripleTransform_OpenACC(int n, dcomplex *A, dcomplex *S, dcomplex *Work)
+static void BandNonCol_DenseTripleTransform_OpenMP(int n, dcomplex *A, dcomplex *S, dcomplex *Work)
 {
     size_t nn = (size_t)n * (size_t)n;
 
-#pragma acc data copy(A[0 : nn]) copyin(S[0 : nn]) create(Work[0 : nn])
+#pragma omp target data map(tofrom: A[0 : nn]) map(to: S[0 : nn]) map(alloc: Work[0 : nn])
     {
-#pragma acc parallel loop
+#pragma omp target teams distribute parallel for
         for (size_t idx = 0; idx < nn; idx++) {
             Work[idx].r = 0.0;
             Work[idx].i = 0.0;
         }
 
-        BandNonCol_CublasZgemm_OpenACC(CUBLAS_OP_N, CUBLAS_OP_N, n, n, n, A, S, Work);
+        BandNonCol_HipblasZgemm_OpenMP(HIPBLAS_OP_N, HIPBLAS_OP_N, n, n, n, A, S, Work);
 
-#pragma acc parallel loop
+#pragma omp target teams distribute parallel for
         for (size_t idx = 0; idx < nn; idx++) {
             A[idx].r = 0.0;
             A[idx].i = 0.0;
         }
 
-        BandNonCol_CublasZgemm_OpenACC(CUBLAS_OP_C, CUBLAS_OP_N, n, n, n, S, Work, A);
+        BandNonCol_HipblasZgemm_OpenMP(HIPBLAS_OP_C, HIPBLAS_OP_N, n, n, n, S, Work, A);
     }
-#pragma acc wait
 }
 
-static void BandNonCol_DenseTripleTransform_PresentOpenACC(int n, dcomplex *A, dcomplex *S, dcomplex *Work)
+static void BandNonCol_DenseTripleTransform_PresentOpenMP(int n, dcomplex *A, dcomplex *S, dcomplex *Work)
 {
     int nn = n*n;
 
-#pragma acc parallel loop present(Work[0 : nn])
+#pragma omp target teams distribute parallel for map(present, alloc: Work[0 : nn])
     for (int idx=0; idx<nn; idx++){
         Work[idx].r = 0.0;
         Work[idx].i = 0.0;
     }
 
-    BandNonCol_GEMMul8Zgemm_OpenACC(CUBLAS_OP_N,CUBLAS_OP_N,n,n,n,A,S,Work);
+    BandNonCol_GEMMul8Zgemm_OpenMP(HIPBLAS_OP_N,HIPBLAS_OP_N,n,n,n,A,S,Work);
 
-#pragma acc parallel loop present(A[0 : nn])
+#pragma omp target teams distribute parallel for map(present, alloc: A[0 : nn])
     for (int idx=0; idx<nn; idx++){
         A[idx].r = 0.0;
         A[idx].i = 0.0;
     }
 
-    BandNonCol_GEMMul8Zgemm_OpenACC(CUBLAS_OP_C,CUBLAS_OP_N,n,n,n,S,Work,A);
-
-#pragma acc wait
+    BandNonCol_GEMMul8Zgemm_OpenMP(HIPBLAS_OP_C,HIPBLAS_OP_N,n,n,n,S,Work,A);
 }
 
 static void BandNonCol_SymmetrizeDenseHermitian(int n, dcomplex *A)
@@ -724,16 +725,16 @@ static void BandNonCol_SymmetrizeDenseHermitian(int n, dcomplex *A)
     }
 }
 
-static void BandNonCol_SymmetrizeDenseHermitian_OpenACC(int n, dcomplex *A)
+static void BandNonCol_SymmetrizeDenseHermitian_OpenMP(int n, dcomplex *A)
 {
     int nn = n*n;
 
-#pragma acc parallel loop present(A[0 : nn])
+#pragma omp target teams distribute parallel for map(present, alloc: A[0 : nn])
     for (int i=0; i<n; i++){
         A[(size_t)i + (size_t)i*(size_t)n].i = 0.0;
     }
 
-#pragma acc parallel loop present(A[0 : nn])
+#pragma omp target teams distribute parallel for map(present, alloc: A[0 : nn])
     for (int idx=0; idx<nn; idx++){
         int j = idx/n;
         int i = idx - j*n;
@@ -751,47 +752,44 @@ static void BandNonCol_SymmetrizeDenseHermitian_OpenACC(int n, dcomplex *A)
     }
 }
 
-static void BandNonCol_DenseWavefunctions_OpenACC(int n2, dcomplex *Cs2, dcomplex *Ss2, dcomplex *Hs2)
+static void BandNonCol_DenseWavefunctions_OpenMP(int n2, dcomplex *Cs2, dcomplex *Ss2, dcomplex *Hs2)
 {
     size_t nn = (size_t)n2 * (size_t)n2;
 
-#pragma acc data copyin(Cs2[0 : nn], Ss2[0 : nn]) copyout(Hs2[0 : nn])
+#pragma omp target data map(to: Cs2[0 : nn], Ss2[0 : nn]) map(from: Hs2[0 : nn])
     {
-#pragma acc parallel loop
+#pragma omp target teams distribute parallel for
         for (size_t idx = 0; idx < nn; idx++) {
             Hs2[idx].r = 0.0;
             Hs2[idx].i = 0.0;
         }
 
-        BandNonCol_CublasZgemm_OpenACC(CUBLAS_OP_T, CUBLAS_OP_T, n2, n2, n2, Cs2, Ss2, Hs2);
+        BandNonCol_HipblasZgemm_OpenMP(HIPBLAS_OP_T, HIPBLAS_OP_T, n2, n2, n2, Cs2, Ss2, Hs2);
     }
-#pragma acc wait
 }
 
-static void BandNonCol_DenseWavefunctions_PresentOpenACC(int n2, dcomplex *Cs2, dcomplex *Ss2, dcomplex *Hs2)
+static void BandNonCol_DenseWavefunctions_PresentOpenMP(int n2, dcomplex *Cs2, dcomplex *Ss2, dcomplex *Hs2)
 {
     int nn = n2*n2;
 
-    if (!acc_is_present(Hs2,sizeof(dcomplex)*(size_t)nn)){
-#pragma acc enter data create(Hs2[0 : nn])
+    if (!BandNonCol_OmpTargetIsPresent(Hs2,sizeof(dcomplex)*(size_t)nn)){
+#pragma omp target enter data map(alloc: Hs2[0 : nn])
     }
 
-#pragma acc parallel loop present(Hs2[0 : nn])
+#pragma omp target teams distribute parallel for map(present, alloc: Hs2[0 : nn])
     for (int idx=0; idx<nn; idx++){
         Hs2[idx].r = 0.0;
         Hs2[idx].i = 0.0;
     }
 
-    BandNonCol_GEMMul8Zgemm_OpenACC(CUBLAS_OP_T,CUBLAS_OP_T,n2,n2,n2,Cs2,Ss2,Hs2);
-
-#pragma acc wait
+    BandNonCol_GEMMul8Zgemm_OpenMP(HIPBLAS_OP_T,HIPBLAS_OP_T,n2,n2,n2,Cs2,Ss2,Hs2);
 }
 
-static void BandNonCol_AddDense_OpenACC(int n, dcomplex *dst, const dcomplex *src)
+static void BandNonCol_AddDense_OpenMP(int n, dcomplex *dst, const dcomplex *src)
 {
     int nn = n*n;
 
-#pragma acc parallel loop present(dst[0 : nn], src[0 : nn])
+#pragma omp target teams distribute parallel for map(present, alloc: dst[0 : nn], src[0 : nn])
     for (int idx=0; idx<nn; idx++){
         dst[idx].r += src[idx].r;
         dst[idx].i += src[idx].i;
@@ -816,11 +814,11 @@ static void BandNonCol_GpuSolver_DenseZheevx(dcomplex *A, dcomplex *Z, double *k
     nn = (size_t)n*(size_t)n;
     bytes = sizeof(dcomplex)*nn;
 
-    wait_cudafunc(cudaMalloc((void**)&d_A,bytes));
-    wait_cudafunc(cudaMemcpy(d_A,A,bytes,cudaMemcpyHostToDevice));
+    wait_hipfunc(hipMalloc((void**)&d_A,bytes));
+    wait_hipfunc(hipMemcpy(d_A,A,bytes,hipMemcpyHostToDevice));
     info = openmx_magma_zheevdx_gpu(n,maxn,d_A,ko,&mout);
-    wait_cudafunc(cudaMemcpy(A,d_A,bytes,cudaMemcpyDeviceToHost));
-    wait_cudafunc(cudaFree(d_A));
+    wait_hipfunc(hipMemcpy(A,d_A,bytes,hipMemcpyDeviceToHost));
+    wait_hipfunc(hipFree(d_A));
 
     if (info!=0){
         fprintf(stderr,"%s: magma_zheevdx_gpu failed, info=%d\n",where,info);
@@ -931,13 +929,13 @@ static size_t BandNonCol_GpuSolverWorkFallbackBytes(int n)
 
 static size_t BandNonCol_QueryGpuSolverWorkBytes(int n, int maxn)
 {
-    cusolverDnHandle_t handle = NULL;
-    cudaStream_t stream = NULL;
-    cudaError_t cuda_status;
-    cusolverStatus_t solver_status;
-    cusolverEigMode_t jobz = CUSOLVER_EIG_MODE_VECTOR;
-    cublasFillMode_t uplo = CUBLAS_FILL_MODE_LOWER;
-    cusolverEigRange_t range = (n==maxn) ? CUSOLVER_EIG_RANGE_ALL : CUSOLVER_EIG_RANGE_I;
+    hipsolverDnHandle_t handle = NULL;
+    hipStream_t stream = NULL;
+    hipError_t hip_status;
+    hipsolverStatus_t solver_status;
+    hipsolverEigMode_t jobz = HIPSOLVER_EIG_MODE_VECTOR;
+    hipblasFillMode_t uplo = HIPBLAS_FILL_MODE_LOWER;
+    hipsolverEigRange_t range = (n==maxn) ? HIPSOLVER_EIG_RANGE_ALL : HIPSOLVER_EIG_RANGE_I;
     double vl = 0.0;
     double vu = 0.0;
     int64_t h_meig = 0;
@@ -945,24 +943,24 @@ static size_t BandNonCol_QueryGpuSolverWorkBytes(int n, int maxn)
     size_t h_bytes = 0;
     size_t fallback = BandNonCol_GpuSolverWorkFallbackBytes(n);
 
-    cuda_status = cudaStreamCreateWithFlags(&stream,cudaStreamNonBlocking);
-    if (cuda_status!=cudaSuccess) return fallback;
+    hip_status = hipStreamCreateWithFlags(&stream,hipStreamNonBlocking);
+    if (hip_status!=hipSuccess) return fallback;
 
-    solver_status = cusolverDnCreate(&handle);
-    if (solver_status==CUSOLVER_STATUS_SUCCESS){
-        solver_status = cusolverDnSetStream(handle,stream);
+    solver_status = hipsolverDnCreate(&handle);
+    if (solver_status==HIPSOLVER_STATUS_SUCCESS){
+        solver_status = hipsolverDnSetStream(handle,stream);
     }
 
-    if (solver_status==CUSOLVER_STATUS_SUCCESS){
-        solver_status = cusolverDnXsyevdx_bufferSize(handle,NULL,jobz,range,uplo,n,
-                                                     CUDA_C_64F,NULL,n,&vl,&vu,1L,maxn,&h_meig,
-                                                     CUDA_R_64F,NULL,CUDA_C_64F,&d_bytes,&h_bytes);
+    if (solver_status==HIPSOLVER_STATUS_SUCCESS){
+        solver_status = hipsolverDnXsyevdx_bufferSize(handle,NULL,jobz,range,uplo,n,
+                                                     HIP_C_64F,NULL,n,&vl,&vu,1L,maxn,&h_meig,
+                                                     HIP_R_64F,NULL,HIP_C_64F,&d_bytes,&h_bytes);
     }
 
-    if (handle!=NULL) cusolverDnDestroy(handle);
-    cudaStreamDestroy(stream);
+    if (handle!=NULL) hipsolverDnDestroy(handle);
+    hipStreamDestroy(stream);
 
-    if (solver_status!=CUSOLVER_STATUS_SUCCESS || d_bytes==0) return fallback;
+    if (solver_status!=HIPSOLVER_STATUS_SUCCESS || d_bytes==0) return fallback;
 
     return d_bytes;
 }
@@ -1039,8 +1037,8 @@ static int BandNonCol_RootDenseParallelKWorldsFit(int n, int n2, int MaxN, int s
     MPI_Comm device_comm = MPI_COMM_NULL;
     int potential_owner;
     int selected_owner;
-    int cuda_ok = 0;
-    int cuda_device = -1;
+    int hip_ok = 0;
+    int hip_device = -1;
     int local_fit = 1;
     int global_fit = 1;
     size_t required_bytes = 0;
@@ -1053,14 +1051,14 @@ static int BandNonCol_RootDenseParallelKWorldsFit(int n, int n2, int MaxN, int s
     potential_owner =
       (0<=myworld2 && myworld2<Num_Comm_World2 &&
        myid0==Comm_World_StartID2[myworld2]);
-    selected_owner = potential_owner && Set_Hamiltonian_OpenACC_Rank_Is_Selected();
+    selected_owner = potential_owner && Set_Hamiltonian_OpenMP_Rank_Is_Selected();
 
     if (potential_owner && !selected_owner){
         if (myid0==Comm_World_StartID2[myworld2]){
             if (BandNonCol_GpuVerbose()) {
                 fprintf(stderr,
                         "<Band>  Rank %d is a non-collinear dense GPU solver k-world owner, "
-                        "but it is not selected for HIP/OpenACC; using serialized k-worlds.\n",
+                        "but it is not selected for HIP/OpenMP target offload; using serialized k-worlds.\n",
                         myid0);
                 fflush(stderr);
             }
@@ -1069,33 +1067,33 @@ static int BandNonCol_RootDenseParallelKWorldsFit(int n, int n2, int MaxN, int s
     }
 
     if (selected_owner){
-        cudaError_t cuda_status;
+        hipError_t hip_status;
 
-        cuda_status = cudaGetDevice(&cuda_device);
-        if (cuda_status==cudaSuccess){
+        hip_status = hipGetDevice(&hip_device);
+        if (hip_status==hipSuccess){
             required_bytes = BandNonCol_RootDenseDeviceBytes(n,n2,MaxN,size_H1);
-            cuda_status = cudaMemGetInfo(&free_bytes,&total_bytes);
+            hip_status = hipMemGetInfo(&free_bytes,&total_bytes);
         }
 
-        if (cuda_status==cudaSuccess){
+        if (hip_status==hipSuccess){
             reserve_bytes = BandNonCol_RootDenseReserveBytes(total_bytes,required_bytes);
-            cuda_ok = 1;
+            hip_ok = 1;
         }
         else {
             fprintf(stderr,
                     "<Band>  Rank %d failed to query GPU memory for non-collinear dense GPU solver (%s); "
                     "using serialized k-worlds.\n",
-                    myid0,cudaGetErrorString(cuda_status));
+                    myid0,hipGetErrorString(hip_status));
             fflush(stderr);
             local_fit = 0;
         }
     }
 
     MPI_Comm_split_type(mpi_comm_level1,MPI_COMM_TYPE_SHARED,0,MPI_INFO_NULL,&node_comm);
-    MPI_Comm_split(node_comm,cuda_ok ? cuda_device : MPI_UNDEFINED,0,&device_comm);
+    MPI_Comm_split(node_comm,hip_ok ? hip_device : MPI_UNDEFINED,0,&device_comm);
     MPI_Comm_free(&node_comm);
 
-    if (cuda_ok){
+    if (hip_ok){
         unsigned long long local_required = (unsigned long long)required_bytes;
         unsigned long long group_required = 0ULL;
         unsigned long long local_free = (unsigned long long)free_bytes;
@@ -1116,7 +1114,7 @@ static int BandNonCol_RootDenseParallelKWorldsFit(int n, int n2, int MaxN, int s
             if (BandNonCol_GpuVerbose() && device_rank==0){
                 printf("<Band>  Serializing non-collinear dense GPU solver k-worlds: GPU device %d is shared by %d owner rank(s), "
                        "free %.3f MiB, need %.3f MiB plus %.3f MiB reserve.\n",
-                       cuda_device,device_ranks,
+                       hip_device,device_ranks,
                        (double)group_free/(1024.0*1024.0),
                        (double)group_required/(1024.0*1024.0),
                        (double)group_reserve/(1024.0*1024.0));
@@ -1151,10 +1149,10 @@ static void BandNonCol_ConstructCache_Reset(void)
         int phase_count = cache->phase_count;
 
         if (entries!=NULL && 0<dense_count){
-#pragma acc exit data delete(entries[0 : dense_count])
+#pragma omp target exit data map(delete: entries[0 : dense_count])
         }
         if (phase_r!=NULL && phase_i!=NULL && 0<phase_count){
-#pragma acc exit data delete(phase_r[0 : phase_count], phase_i[0 : phase_count])
+#pragma omp target exit data map(delete: phase_r[0 : phase_count], phase_i[0 : phase_count])
         }
     }
 
@@ -1283,20 +1281,20 @@ static void BandNonCol_ConstructCache_EnsureDenseDevice(void)
     if (0<cache->dense_count){
         BandNonColConstructEntry *entries = cache->dense_entries;
         int dense_count = cache->dense_count;
-#pragma acc enter data copyin(entries[0 : dense_count])
+#pragma omp target enter data map(to: entries[0 : dense_count])
     }
 
     if (0<cache->phase_count){
         double *phase_r = cache->phase_r;
         double *phase_i = cache->phase_i;
         int phase_count = cache->phase_count;
-#pragma acc enter data create(phase_r[0 : phase_count], phase_i[0 : phase_count])
+#pragma omp target enter data map(alloc: phase_r[0 : phase_count], phase_i[0 : phase_count])
     }
 
     cache->dense_device_valid = 1;
 }
 
-static void BandNonCol_ConstructDenseMs_OpenACC(int cpx_flag, int n, double k1, double k2, double k3,
+static void BandNonCol_ConstructDenseMs_OpenMP(int cpx_flag, int n, double k1, double k2, double k3,
                                                 const double *M2, dcomplex *Ms)
 {
     BandNonColConstructCache *cache = &BandNonCol_construct_cache;
@@ -1319,22 +1317,22 @@ static void BandNonCol_ConstructDenseMs_OpenACC(int cpx_flag, int n, double k1, 
     }
 
     if (0<phase_count){
-#pragma acc update device(phase_r[0 : phase_count], phase_i[0 : phase_count])
+#pragma omp target update to(phase_r[0 : phase_count], phase_i[0 : phase_count])
     }
 
-    if (!acc_is_present(Ms,sizeof(dcomplex)*(size_t)matrix_count)){
-#pragma acc enter data create(Ms[0 : matrix_count])
+    if (!BandNonCol_OmpTargetIsPresent(Ms,sizeof(dcomplex)*(size_t)matrix_count)){
+#pragma omp target enter data map(alloc: Ms[0 : matrix_count])
     }
 
-#pragma acc data copyin(M2[0 : h_count]) present(Ms[0 : matrix_count], entries[0 : dense_count], phase_r[0 : phase_count], phase_i[0 : phase_count])
+#pragma omp target data map(to: M2[0 : h_count]) map(present, alloc: Ms[0 : matrix_count], entries[0 : dense_count], phase_r[0 : phase_count], phase_i[0 : phase_count])
     {
-#pragma acc parallel loop
+#pragma omp target teams distribute parallel for
         for (int idx=0; idx<matrix_count; idx++){
             Ms[idx].r = 0.0;
             Ms[idx].i = 0.0;
         }
 
-#pragma acc parallel loop
+#pragma omp target teams distribute parallel for
         for (int idx=0; idx<dense_count; idx++){
             int m_index = entries[idx].m_index;
             int dense_index = entries[idx].dense_index;
@@ -1353,14 +1351,12 @@ static void BandNonCol_ConstructDenseMs_OpenACC(int cpx_flag, int n, double k1, 
                 val_i =  M2[m_index]*pr;
             }
 
-#pragma acc atomic update
+#pragma omp atomic update
             Ms[dense_index].r += val_r;
-#pragma acc atomic update
+#pragma omp atomic update
             Ms[dense_index].i += val_i;
         }
     }
-
-#pragma acc wait
 }
 
 static void BandNonCol_DenseGpuEigen(dcomplex *d_A, double *ko, int n, int maxn, const char *where)
@@ -1439,38 +1435,38 @@ static void BandNonCol_DenseGpuPrepareOverlap(int rebuild_overlap, int n, int n2
             w->h_scale[l-1].i = 0.0;
         }
 
-        wait_cudafunc(cudaMemcpy(w->d_scale,w->h_scale,sizeof(dcomplex)*(size_t)n,cudaMemcpyHostToDevice));
-        BandNonCol_DenseGpu_EnsureCublas();
+        wait_hipfunc(hipMemcpy(w->d_scale,w->h_scale,sizeof(dcomplex)*(size_t)n,hipMemcpyHostToDevice));
+        BandNonCol_DenseGpu_EnsureHipblas();
         if (w->d_tmp==NULL){
-            wait_cudafunc(cudaMalloc((void**)&w->d_tmp,sizeof(dcomplex)*nn));
+            wait_hipfunc(hipMalloc((void**)&w->d_tmp,sizeof(dcomplex)*nn));
         }
-        wait_cudafunc(cublasZdgmm(w->cublas,CUBLAS_SIDE_RIGHT,n,n,
-                                  (const cuDoubleComplex*)w->d_S,n,
-                                  (const cuDoubleComplex*)w->d_scale,1,
-                                  (cuDoubleComplex*)w->d_tmp,n));
-        wait_cudafunc(cudaMemcpy(w->d_S,w->d_tmp,sizeof(dcomplex)*nn,cudaMemcpyDeviceToDevice));
-        wait_cudafunc(cudaMemcpy(h_S,w->d_S,sizeof(dcomplex)*nn,cudaMemcpyDeviceToHost));
+        wait_hipfunc(hipblasZdgmm(w->hipblas,HIPBLAS_SIDE_RIGHT,n,n,
+                                  (const hipDoubleComplex*)w->d_S,n,
+                                  (const hipDoubleComplex*)w->d_scale,1,
+                                  (hipDoubleComplex*)w->d_tmp,n));
+        wait_hipfunc(hipMemcpy(w->d_S,w->d_tmp,sizeof(dcomplex)*nn,hipMemcpyDeviceToDevice));
+        wait_hipfunc(hipMemcpy(h_S,w->d_S,sizeof(dcomplex)*nn,hipMemcpyDeviceToHost));
     }
     else {
-        wait_cudafunc(cudaMemcpy(w->d_S,h_S,sizeof(dcomplex)*nn,cudaMemcpyHostToDevice));
+        wait_hipfunc(hipMemcpy(w->d_S,h_S,sizeof(dcomplex)*nn,hipMemcpyHostToDevice));
     }
 }
 
 static void BandNonCol_DenseGpuTripleTransform(int n, dcomplex *d_A)
 {
     BandNonColDenseGpuWorkspace *w = &BandNonCol_dense_gpu_workspace;
-    const cuDoubleComplex alpha = make_cuDoubleComplex(1.0,0.0);
-    const cuDoubleComplex beta  = make_cuDoubleComplex(0.0,0.0);
+    const hipDoubleComplex alpha = make_hipDoubleComplex(1.0,0.0);
+    const hipDoubleComplex beta  = make_hipDoubleComplex(0.0,0.0);
 
-    BandNonCol_DenseGpu_EnsureCublas();
-    wait_cudafunc(openmx_gemmul8Zgemm(w->cublas,CUBLAS_OP_N,CUBLAS_OP_N,n,n,n,&alpha,
-                                      (const cuDoubleComplex*)d_A,n,
-                                      (const cuDoubleComplex*)w->d_S,n,&beta,
-                                      (cuDoubleComplex*)w->d_tmp,n));
-    wait_cudafunc(openmx_gemmul8Zgemm(w->cublas,CUBLAS_OP_C,CUBLAS_OP_N,n,n,n,&alpha,
-                                      (const cuDoubleComplex*)w->d_S,n,
-                                      (const cuDoubleComplex*)w->d_tmp,n,&beta,
-                                      (cuDoubleComplex*)d_A,n));
+    BandNonCol_DenseGpu_EnsureHipblas();
+    wait_hipfunc(openmx_gemmul8Zgemm(w->hipblas,HIPBLAS_OP_N,HIPBLAS_OP_N,n,n,n,&alpha,
+                                      (const hipDoubleComplex*)d_A,n,
+                                      (const hipDoubleComplex*)w->d_S,n,&beta,
+                                      (hipDoubleComplex*)w->d_tmp,n));
+    wait_hipfunc(openmx_gemmul8Zgemm(w->hipblas,HIPBLAS_OP_C,HIPBLAS_OP_N,n,n,n,&alpha,
+                                      (const hipDoubleComplex*)w->d_S,n,
+                                      (const hipDoubleComplex*)w->d_tmp,n,&beta,
+                                      (hipDoubleComplex*)d_A,n));
 }
 
 static unsigned long long BandNonCol_DMLayoutFingerprint(int *MP, int n)
@@ -1663,7 +1659,7 @@ static int BandNonCol_BuildOccupationWeightsDense(int kmin, int kmax, const doub
     return nk;
 }
 
-static void BandNonCol_AccumulateDMKPoint_OpenACC(int myid2, int *is2, int *ie2, int *MP,
+static void BandNonCol_AccumulateDMKPoint_OpenMP(int myid2, int *is2, int *ie2, int *MP,
                                                   int n, int n2, int size_H1,
                                                   double k1, double k2, double k3, const double *ko,
                                                   const dcomplex *EVec1,
@@ -1714,7 +1710,7 @@ static void BandNonCol_AccumulateDMKPoint_OpenACC(int myid2, int *is2, int *ie2,
     pair_count = cache->pair_count;
     evec_count = (size_t)n2*(size_t)basis_stride;
 
-#pragma acc data copyin(evec_ptr[0:evec_count], phase_r[0:pair_count], phase_i[0:pair_count], occ[0:nk], eig_occ[0:nk])
+#pragma omp target data map(to: evec_ptr[0:evec_count], phase_r[0:pair_count], phase_i[0:pair_count], occ[0:nk], eig_occ[0:nk])
     {
         const int dm_chunk_size = 131072;
 
@@ -1732,13 +1728,12 @@ static void BandNonCol_AccumulateDMKPoint_OpenACC(int myid2, int *is2, int *ie2,
             double *rEDM11_chunk = rEDM11 + offset;
             double *rEDM22_chunk = rEDM22 + offset;
 
-#pragma acc data copyin(basis0_chunk[0:chunk_count], basis1_chunk[0:chunk_count], phase_index_chunk[0:chunk_count]) \
-                 copyout(rDM11_chunk[0:chunk_count], rDM22_chunk[0:chunk_count], rDM12_chunk[0:chunk_count], \
-                         iDM12_chunk[0:chunk_count], iDM11_chunk[0:chunk_count], iDM22_chunk[0:chunk_count], \
-                         rEDM11_chunk[0:chunk_count], rEDM22_chunk[0:chunk_count])
+#pragma omp target data map(to: basis0_chunk[0:chunk_count], basis1_chunk[0:chunk_count], phase_index_chunk[0:chunk_count]) \
+                        map(from: rDM11_chunk[0:chunk_count], rDM22_chunk[0:chunk_count], rDM12_chunk[0:chunk_count], \
+                                  iDM12_chunk[0:chunk_count], iDM11_chunk[0:chunk_count], iDM22_chunk[0:chunk_count], \
+                                  rEDM11_chunk[0:chunk_count], rEDM22_chunk[0:chunk_count])
             {
-#pragma acc parallel loop gang present(evec_ptr[0:evec_count], phase_r[0:pair_count], phase_i[0:pair_count], \
-                                       occ[0:nk], eig_occ[0:nk])
+#pragma omp target teams distribute parallel for
                 for (int p=0; p<chunk_count; p++){
                     const int ia = basis0_chunk[p];
                     const int ib = basis1_chunk[p];
@@ -1751,7 +1746,6 @@ static void BandNonCol_AccumulateDMKPoint_OpenACC(int myid2, int *is2, int *ie2,
                     double edm11_r = 0.0, edm11_i = 0.0;
                     double edm22_r = 0.0, edm22_i = 0.0;
 
-#pragma acc loop seq
                     for (int k=0; k<nk; k++){
                         const double w = occ[k];
                         const double ew = eig_occ[k];
@@ -1792,7 +1786,7 @@ static void BandNonCol_AccumulateDMKPoint_OpenACC(int myid2, int *is2, int *ie2,
     }
 }
 
-static void BandNonCol_AccumulateDMRootDense_OpenACC(int *MP, int n, int n2, int max_state, int size_H1,
+static void BandNonCol_AccumulateDMRootDense_OpenMP(int *MP, int n, int n2, int max_state, int size_H1,
                                                      double k1, double k2, double k3, const double *ko,
                                                      const dcomplex *dense_evec,
                                                      double *rDM11, double *rDM22, double *rDM12,
@@ -1840,7 +1834,7 @@ static void BandNonCol_AccumulateDMRootDense_OpenACC(int *MP, int n, int n2, int
     pair_count = cache->pair_count;
     evec_count = (size_t)n2*(size_t)n2;
 
-#pragma acc data copyin(dense_evec[0:evec_count], phase_r[0:pair_count], phase_i[0:pair_count], occ[0:nk], eig_occ[0:nk])
+#pragma omp target data map(to: dense_evec[0:evec_count], phase_r[0:pair_count], phase_i[0:pair_count], occ[0:nk], eig_occ[0:nk])
     {
         const int dm_chunk_size = 131072;
 
@@ -1858,13 +1852,12 @@ static void BandNonCol_AccumulateDMRootDense_OpenACC(int *MP, int n, int n2, int
             double *rEDM11_chunk = rEDM11 + offset;
             double *rEDM22_chunk = rEDM22 + offset;
 
-#pragma acc data copyin(basis0_chunk[0:chunk_count], basis1_chunk[0:chunk_count], phase_index_chunk[0:chunk_count]) \
-                 copyout(rDM11_chunk[0:chunk_count], rDM22_chunk[0:chunk_count], rDM12_chunk[0:chunk_count], \
-                         iDM12_chunk[0:chunk_count], iDM11_chunk[0:chunk_count], iDM22_chunk[0:chunk_count], \
-                         rEDM11_chunk[0:chunk_count], rEDM22_chunk[0:chunk_count])
+#pragma omp target data map(to: basis0_chunk[0:chunk_count], basis1_chunk[0:chunk_count], phase_index_chunk[0:chunk_count]) \
+                        map(from: rDM11_chunk[0:chunk_count], rDM22_chunk[0:chunk_count], rDM12_chunk[0:chunk_count], \
+                                  iDM12_chunk[0:chunk_count], iDM11_chunk[0:chunk_count], iDM22_chunk[0:chunk_count], \
+                                  rEDM11_chunk[0:chunk_count], rEDM22_chunk[0:chunk_count])
             {
-#pragma acc parallel loop gang present(dense_evec[0:evec_count], phase_r[0:pair_count], phase_i[0:pair_count], \
-                                       occ[0:nk], eig_occ[0:nk])
+#pragma omp target teams distribute parallel for
                 for (int p=0; p<chunk_count; p++){
                     const int ia = basis0_chunk[p];
                     const int ib = basis1_chunk[p];
@@ -1877,7 +1870,6 @@ static void BandNonCol_AccumulateDMRootDense_OpenACC(int *MP, int n, int n2, int
                     double edm11_r = 0.0, edm11_i = 0.0;
                     double edm22_r = 0.0, edm22_i = 0.0;
 
-#pragma acc loop seq
                     for (int k=0; k<nk; k++){
                         const double w = occ[k];
                         const double ew = eig_occ[k];
@@ -2077,7 +2069,7 @@ static void BandNonCol_AccumulateDMRootDenseK_HIP(int size_H1, int *MP, int n, i
     free(dm_buffer);
 }
 
-static void BandNonCol_CalcDMAllK1_OpenACC(int myid0, int myid2, int size_H1,
+static void BandNonCol_CalcDMAllK1_OpenMP(int myid0, int myid2, int size_H1,
                                            int *is2, int *ie2, int *MP, int n, int n2,
                                            double k1, double k2, double k3,
                                            double *****CDM, double *****iDM0, double *****EDM,
@@ -2097,7 +2089,7 @@ static void BandNonCol_CalcDMAllK1_OpenACC(int myid0, int myid2, int size_H1,
     memset(rEDM11,0,sizeof(double)*(size_t)size_H1);
     memset(rEDM22,0,sizeof(double)*(size_t)size_H1);
 
-    BandNonCol_AccumulateDMKPoint_OpenACC(myid2,is2,ie2,MP,n,n2,size_H1,k1,k2,k3,ko,EVec1,
+    BandNonCol_AccumulateDMKPoint_OpenMP(myid2,is2,ie2,MP,n,n2,size_H1,k1,k2,k3,ko,EVec1,
                                           rDM11,rDM22,rDM12,iDM12,iDM11,iDM22,rEDM11,rEDM22);
 
     MPI_Allreduce(MPI_IN_PLACE,rDM11, size_H1,MPI_DOUBLE,MPI_SUM,mpi_comm_level1);
@@ -2234,8 +2226,8 @@ static void BandNonCol_RootDenseSolveOneK_HIP(int rebuild_overlap,
                                               BandNonColRootDenseWorkspace *rdw)
 {
     BandNonColDenseGpuWorkspace *w = &BandNonCol_dense_gpu_workspace;
-    const cuDoubleComplex alpha = make_cuDoubleComplex(1.0,0.0);
-    const cuDoubleComplex beta  = make_cuDoubleComplex(0.0,0.0);
+    const hipDoubleComplex alpha = make_hipDoubleComplex(1.0,0.0);
+    const hipDoubleComplex beta  = make_hipDoubleComplex(0.0,0.0);
 
     BandNonCol_DenseGpu_Ensure(n,n2);
 
@@ -2295,12 +2287,12 @@ static void BandNonCol_RootDenseSolveOneK_HIP(int rebuild_overlap,
         BandNonCol_AbortWithMessage("Band_DFT_NonCol HIP Ss2 build failed.");
     }
 
-    BandNonCol_DenseGpu_EnsureCublas();
-    wait_cudafunc(openmx_gemmul8Zgemm(w->cublas,CUBLAS_OP_T,CUBLAS_OP_T,MaxN,n2,n2,&alpha,
-                                      (const cuDoubleComplex*)w->d_H2,n2,
-                                      (const cuDoubleComplex*)w->d_S2,n2,&beta,
-                                      (cuDoubleComplex*)w->d_C2,n2));
-    wait_cudafunc(hipMemcpy2D(rdw->cs2,sizeof(dcomplex)*(size_t)n2,
+    BandNonCol_DenseGpu_EnsureHipblas();
+    wait_hipfunc(openmx_gemmul8Zgemm(w->hipblas,HIPBLAS_OP_T,HIPBLAS_OP_T,MaxN,n2,n2,&alpha,
+                                      (const hipDoubleComplex*)w->d_H2,n2,
+                                      (const hipDoubleComplex*)w->d_S2,n2,&beta,
+                                      (hipDoubleComplex*)w->d_C2,n2));
+    wait_hipfunc(hipMemcpy2D(rdw->cs2,sizeof(dcomplex)*(size_t)n2,
                               w->d_C2,sizeof(dcomplex)*(size_t)n2,
                               sizeof(dcomplex)*(size_t)MaxN,(size_t)n2,
                               hipMemcpyDeviceToHost));
@@ -2417,16 +2409,16 @@ static void BandNonCol_BuildDenseSs2(int n, int n2, const dcomplex *S, dcomplex 
     }
 }
 
-static void BandNonCol_BuildDenseSs2_OpenACC(int n, int n2, const dcomplex *S, dcomplex *S2)
+static void BandNonCol_BuildDenseSs2_OpenMP(int n, int n2, const dcomplex *S, dcomplex *S2)
 {
     int nn = n*n;
     int n2n2 = n2*n2;
 
-    if (!acc_is_present(S2,sizeof(dcomplex)*(size_t)n2n2)){
-#pragma acc enter data create(S2[0 : n2n2])
+    if (!BandNonCol_OmpTargetIsPresent(S2,sizeof(dcomplex)*(size_t)n2n2)){
+#pragma omp target enter data map(alloc: S2[0 : n2n2])
     }
 
-#pragma acc parallel loop collapse(2) present(S[0 : nn], S2[0 : n2n2])
+#pragma omp target teams distribute parallel for collapse(2) map(present, alloc: S[0 : nn], S2[0 : n2n2])
     for (int i=0; i<n2; i++){
         for (int j=0; j<n2; j++){
             int idx2 = n2*i + j;
@@ -2480,18 +2472,18 @@ static void BandNonCol_BuildDenseHs2(int n, int n2, const dcomplex *H11,
     }
 }
 
-static void BandNonCol_BuildDenseHs2_OpenACC(int n, int n2, const dcomplex *H11,
+static void BandNonCol_BuildDenseHs2_OpenMP(int n, int n2, const dcomplex *H11,
                                              const dcomplex *H22, const dcomplex *H12,
                                              dcomplex *H2)
 {
     int nn = n*n;
     int n2n2 = n2*n2;
 
-    if (!acc_is_present(H2,sizeof(dcomplex)*(size_t)n2n2)){
-#pragma acc enter data create(H2[0 : n2n2])
+    if (!BandNonCol_OmpTargetIsPresent(H2,sizeof(dcomplex)*(size_t)n2n2)){
+#pragma omp target enter data map(alloc: H2[0 : n2n2])
     }
 
-#pragma acc parallel loop collapse(2) present(H11[0 : nn], H22[0 : nn], H12[0 : nn], H2[0 : n2n2])
+#pragma omp target teams distribute parallel for collapse(2) map(present, alloc: H11[0 : nn], H22[0 : nn], H12[0 : nn], H2[0 : n2n2])
     for (int j=0; j<n2; j++){
         for (int i=0; i<n2; i++){
             int idx2 = i + j*n2;
@@ -2775,11 +2767,10 @@ double Band_DFT_NonCol(
   }
   n2 = n*2;
 
-  /* GPU dispatch (added by H.Kawai): assign CUDA/OpenACC device when GPUSOLVER is requested */
+  /* GPU dispatch (added by H.Kawai): assign HIP/OpenMP target device when GPUSOLVER is requested */
   if (scf_eigen_lib_flag == GPUSOLVER && n2 >= GPU_CPU_SWITCH_NUM &&
-      Set_Hamiltonian_OpenACC_Rank_Is_Selected()) {
-      set_cuda_default_device_from_local_rank_noncollective();
-      set_openacc_nvidia_device_from_local_rank_noncollective();
+      Set_Hamiltonian_OpenMP_Rank_Is_Selected()) {
+      set_hip_default_device_from_local_rank_noncollective();
   }
 
 
@@ -3149,7 +3140,7 @@ double Band_DFT_NonCol(
 			  use_root_dense_gpusolver = (scf_eigen_lib_flag==GPUSOLVER && all_knum==1 && GPU_CPU_SWITCH_NUM<=n2);
 			  use_k_dense_gpusolver = (scf_eigen_lib_flag==GPUSOLVER && all_knum!=1 &&
 			                          GPU_CPU_SWITCH_NUM<=n2 && strcasecmp(mode,"scf")==0);
-			  owns_dense_k_rank = (use_k_dense_gpusolver && Set_Hamiltonian_OpenACC_Rank_Is_Selected());
+			  owns_dense_k_rank = (use_k_dense_gpusolver && Set_Hamiltonian_OpenMP_Rank_Is_Selected());
 			  if (use_k_dense_gpusolver){
 			    dense_k_owner = (int*)malloc(sizeof(int)*(size_t)T_knum);
 			    if (dense_k_owner==NULL){
@@ -3782,9 +3773,9 @@ double Band_DFT_NonCol(
       if (measure_time) dtime(&Stime);
 
       if (BandNonCol_UseDenseGpuMatrix(n,n2)){
-        BandNonCol_DenseTripleTransform_OpenACC(n,Hs11,Ss,Cs);
-        BandNonCol_DenseTripleTransform_OpenACC(n,Hs12,Ss,Cs);
-        BandNonCol_DenseTripleTransform_OpenACC(n,Hs22,Ss,Cs);
+        BandNonCol_DenseTripleTransform_OpenMP(n,Hs11,Ss,Cs);
+        BandNonCol_DenseTripleTransform_OpenMP(n,Hs12,Ss,Cs);
+        BandNonCol_DenseTripleTransform_OpenMP(n,Hs22,Ss,Cs);
       }
       else {
         /* S^t x Hs11 x S */
@@ -3913,7 +3904,7 @@ double Band_DFT_NonCol(
     if (all_knum==1){
 
       if (BandNonCol_UseDenseGpuMatrix(n,n2)){
-        BandNonCol_DenseWavefunctions_OpenACC(n2,Cs2,Ss2,Hs2);
+        BandNonCol_DenseWavefunctions_OpenMP(n2,Cs2,Ss2,Hs2);
       }
       else {
         for(k=0; k<na_rows2*na_cols2; k++){
@@ -4326,7 +4317,7 @@ double Band_DFT_NonCol(
 					    rEDM11,rEDM22 );
 	      }
       else if (scf_eigen_lib_flag==GPUSOLVER && GPU_CPU_SWITCH_NUM<=n2){
-        BandNonCol_CalcDMAllK1_OpenACC( myid0,myid2,size_H1,
+        BandNonCol_CalcDMAllK1_OpenMP( myid0,myid2,size_H1,
 					is2,ie2,MP,n,n2,k1,k2,k3,
 					CDM,iDM[0],EDM,EIGEN[0][kloop],
 					EVec1[0],
@@ -4690,9 +4681,9 @@ double Band_DFT_NonCol(
       if (kloop0<num_kloop0){
 
         if (BandNonCol_UseDenseGpuMatrix(n,n2)){
-          BandNonCol_DenseTripleTransform_OpenACC(n,Hs11,Ss,Cs);
-          BandNonCol_DenseTripleTransform_OpenACC(n,Hs12,Ss,Cs);
-          BandNonCol_DenseTripleTransform_OpenACC(n,Hs22,Ss,Cs);
+          BandNonCol_DenseTripleTransform_OpenMP(n,Hs11,Ss,Cs);
+          BandNonCol_DenseTripleTransform_OpenMP(n,Hs12,Ss,Cs);
+          BandNonCol_DenseTripleTransform_OpenMP(n,Hs22,Ss,Cs);
         }
         else {
 	  /* S^t x Hs11 x S */
@@ -4805,7 +4796,7 @@ double Band_DFT_NonCol(
         **************************************************/
 
         if (BandNonCol_UseDenseGpuMatrix(n,n2)){
-          BandNonCol_DenseWavefunctions_OpenACC(n2,Cs2,Ss2,Hs2);
+          BandNonCol_DenseWavefunctions_OpenMP(n2,Cs2,Ss2,Hs2);
         }
         else {
 	  for(k=0; k<na_rows2*na_cols2; k++){
@@ -5313,7 +5304,7 @@ static void BandNonCol_ConstructDenseMsFromPacked( int cpx_flag, const double *M
 
   if (scf_eigen_lib_flag==GPUSOLVER && GPU_CPU_SWITCH_NUM<=2*n){
     BandNonCol_ConstructCache_Ensure(order_GA,MP,n);
-    BandNonCol_ConstructDenseMs_OpenACC(cpx_flag,n,k1,k2,k3,M1,Ms);
+    BandNonCol_ConstructDenseMs_OpenMP(cpx_flag,n,k1,k2,k3,M1,Ms);
     return;
   }
 
@@ -5474,7 +5465,7 @@ static void Construct_Band_DenseMs( int cpx_flag, double ****Mat, double *M1, dc
 
   if (owns_dense && scf_eigen_lib_flag==GPUSOLVER && GPU_CPU_SWITCH_NUM<=2*n){
     BandNonCol_ConstructCache_Ensure(order_GA,MP,n);
-    BandNonCol_ConstructDenseMs_OpenACC(cpx_flag,n,k1,k2,k3,M1,Ms);
+    BandNonCol_ConstructDenseMs_OpenMP(cpx_flag,n,k1,k2,k3,M1,Ms);
   }
   else if (owns_dense){
     k = 0;

@@ -22,10 +22,10 @@
 #include "tran_prototypes.h"
 #include "lapack_prototypes.h"
 #include "flpq_dm.h"
-#include "set_cuda_default_device_from_local_rank.h"
-#include "set_openacc_device_from_local_rank.h"
+#include "set_hip_default_device_from_local_rank.h"
+#include "set_openmp_device_from_local_rank.h"
 #include <omp.h>
-#include <openacc.h>
+#include <omp.h>
 
 
 int TRAN_SCF_Iter_Band;
@@ -65,27 +65,27 @@ static void DFT_GPU_DeviceInit(int basis_count)
     }
 
     MPI_Comm node_comm, device_comm = MPI_COMM_NULL;
-    int local_rank, cuda_device_count = 0;
-    int cuda_device = -1, cuda_ok = 0;
-    cudaError_t cuda_err;
+    int local_rank, hip_device_count = 0;
+    int hip_device = -1, hip_ok = 0;
+    hipError_t hip_err;
 
     MPI_Comm_split_type(mpi_comm_level1, MPI_COMM_TYPE_SHARED, 0, MPI_INFO_NULL, &node_comm);
     MPI_Comm_rank(node_comm, &local_rank);
 
-    cuda_err = cudaGetDeviceCount(&cuda_device_count);
-    if (cuda_err == cudaSuccess && cuda_device_count > 0) {
-        cuda_device = local_rank % cuda_device_count;
-        if (cudaSetDevice(cuda_device) == cudaSuccess) {
-            omp_set_default_device(cuda_device);
-            cuda_ok = 1;
+    hip_err = hipGetDeviceCount(&hip_device_count);
+    if (hip_err == hipSuccess && hip_device_count > 0) {
+        hip_device = local_rank % hip_device_count;
+        if (hipSetDevice(hip_device) == hipSuccess) {
+            omp_set_default_device(hip_device);
+            hip_ok = 1;
         }
     }
 
-    MPI_Comm_split(node_comm, cuda_ok ? cuda_device : MPI_UNDEFINED, 0, &device_comm);
+    MPI_Comm_split(node_comm, hip_ok ? hip_device : MPI_UNDEFINED, 0, &device_comm);
     MPI_Comm_free(&node_comm);
     if (device_comm != MPI_COMM_NULL) MPI_Comm_free(&device_comm);
 
-    if (!cuda_ok) {
+    if (!hip_ok) {
         scf_eigen_lib_flag = ELPA2;
         if (myid0==Host_ID && 0<level_stdout) {
             printf("<DFT> gpusolver requested, but no HIP device is available; using ELPA2.\n");
@@ -152,7 +152,7 @@ double ****His_CntCoes,****His_D_CntCoes;
 double ****His_CntCoes_Species,****His_D_CntCoes_Species;
 double **OrbOpt_Hessian,*His_OrbOpt_Etot;
 
-static int DFT_SetHamiltonianOpenACCSelectedRank(int myid0)
+static int DFT_SetHamiltonianOpenMPSelectedRank(int myid0)
 {
     if (scf_eigen_lib_flag != GPUSOLVER) {
         return 1;
@@ -195,9 +195,9 @@ static int DFT_SetHamiltonianOpenACCSelectedRank(int myid0)
     return 1;
 }
 
-static void DFT_ConfigureSetHamiltonianOpenACC(int myid0)
+static void DFT_ConfigureSetHamiltonianOpenMP(int myid0)
 {
-    Set_Hamiltonian_Set_OpenACC_Rank_Selected(DFT_SetHamiltonianOpenACCSelectedRank(myid0));
+    Set_Hamiltonian_Set_OpenMP_Rank_Selected(DFT_SetHamiltonianOpenMPSelectedRank(myid0));
 }
 
 static void DFT_PrepareGpuSolverHSPackedCache(void)
@@ -328,7 +328,7 @@ double DFT(int MD_iter, int Cnt_Now)
   else if (Solver==12 && SpinP_switch<=1) Allocate_Free_Cluster_Col_LNO(1);
 
   DFT_GPU_DeviceInit(DFT_GPU_BasisCount());
-  DFT_ConfigureSetHamiltonianOpenACC(myid0);
+  DFT_ConfigureSetHamiltonianOpenMP(myid0);
 
   Allocate_Free_GridData(1);
   if (Cnt_switch==1) Allocate_Free_OrbOpt(1);
@@ -379,16 +379,14 @@ double DFT(int MD_iter, int Cnt_Now)
   ****************************************************/
 
   if (MYID_MPI_COMM_WORLD==Host_ID  && 0<level_stdout){
-    printf("<MD=%2d>  Calculation of the overlap matrix%s\n",MD_iter,
-           DFT_SetOLPKinUseGPU() ? " (GPU-accelerated)" : "");
+    printf("<MD=%2d>  Calculation of the overlap matrix\n",MD_iter);
     fflush(stdout);
   }
 
   time1 = Set_OLP_Kin(OLP,H0);
 
   if (MYID_MPI_COMM_WORLD==Host_ID && 0<level_stdout){
-    printf("<MD=%2d>  Calculation of the nonlocal matrix%s\n",MD_iter,
-           (scf_eigen_lib_flag==GPUSOLVER) ? " (GPU-accelerated)" : "");
+    printf("<MD=%2d>  Calculation of the nonlocal matrix\n",MD_iter);
     fflush(stdout);
   }
 

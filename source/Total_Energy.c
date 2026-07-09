@@ -46,14 +46,14 @@ static void EH0_TwoCenter(int Gc_AN, int h_AN, double VH0ij[4]);
 static void EH0_TwoCenter_at_Cutoff(int wan1, int wan2, double VH0ij[4]);
 static void Energy_Decomposition(double ECE[]);
 static void Energy_Decomposition_CWF(double ECE[]);
-static int TotalEnergyUseOpenACC(void);
-void TotalEnergy_EXC_EH1_Grid_OpenACC(int spinmax, double *My_Ena, double *My_Eef,
+static int TotalEnergyUseOpenMP(void);
+void TotalEnergy_EXC_EH1_Grid_OpenMP(int spinmax, double *My_Ena, double *My_Eef,
                                       double *My_EH1, double My_EXC[2]);
-void TotalEnergy_Dipole_Grid_OpenACC(int GNs, double *My_E_dpx, double *My_E_dpy,
+void TotalEnergy_Dipole_Grid_OpenMP(int GNs, double *My_E_dpx, double *My_E_dpy,
                                      double *My_E_dpz, double *My_E_dpx_BG,
                                      double *My_E_dpy_BG, double *My_E_dpz_BG);
-void TotalEnergy_CWF_Dc_Grid_OpenACC(int spinmax, double My_dcEH1[2], double My_dcEXC[2]);
-void TotalEnergy_EH0_TwoCenter_Batch_OpenACC(int pair_count, int *pair_ban, int *pair_wan2,
+void TotalEnergy_CWF_Dc_Grid_OpenMP(int spinmax, double My_dcEH1[2], double My_dcEXC[2]);
+void TotalEnergy_EH0_TwoCenter_Batch_OpenMP(int pair_count, int *pair_ban, int *pair_wan2,
                                              int *pair_has_deriv, double *pair_dis,
                                              double *pair_dirx, double *pair_diry, double *pair_dirz,
                                              double *out0, double *out1, double *out2, double *out3);
@@ -62,7 +62,7 @@ void TotalEnergy_EH0_TwoCenter_Batch_OpenACC(int pair_count, int *pair_ban, int 
 int OneD_Nloop,*OneD2Mc_AN,*OneD2h_AN;
 
 
-static int TotalEnergyUseOpenACC(void)
+static int TotalEnergyUseOpenMP(void)
 {
   if (SpinP_switch==3) return 0;
   return (scf_eigen_lib_flag == GPUSOLVER);
@@ -1014,7 +1014,7 @@ double Calc_Ecore()
 
   if (MYID_MPI_COMM_WORLD==Host_ID && 0<level_stdout){
     printf("  Force calculation #6%s\n",
-           TotalEnergyUseOpenACC() ? " (GPU-accelerated)" : "");fflush(stdout);
+           TotalEnergyUseOpenMP() ? " (GPU-accelerated)" : "");fflush(stdout);
   }
 
   /* get Nthrds0 */  
@@ -1331,7 +1331,7 @@ double Calc_EH0(int MD_iter)
 
   My_EH0 = 0.0;
 
-  if (TotalEnergyUseOpenACC()){
+  if (TotalEnergyUseOpenMP()){
     int pair_count,pair_index,pair_has_d;
     int Gc2_AN,h2_AN,Gh2_AN,Rn;
     int *pair_ban,*pair_wan2,*pair_has_deriv;
@@ -1360,7 +1360,7 @@ double Calc_EH0(int MD_iter)
     if (pair_ban==NULL || pair_wan2==NULL || pair_has_deriv==NULL ||
         pair_dis==NULL || pair_dirx==NULL || pair_diry==NULL || pair_dirz==NULL ||
         out0==NULL || out1==NULL || out2==NULL || out3==NULL){
-      printf("Calc_EH0: malloc failed for OpenACC EH0 pair batch.\n");
+      printf("Calc_EH0: malloc failed for OpenMP EH0 pair batch.\n");
       fflush(stdout);
       exit(1);
     }
@@ -1434,7 +1434,7 @@ double Calc_EH0(int MD_iter)
     }
 
     dtime(&Stime_atom);
-    TotalEnergy_EH0_TwoCenter_Batch_OpenACC(pair_count, pair_ban, pair_wan2,
+    TotalEnergy_EH0_TwoCenter_Batch_OpenMP(pair_count, pair_ban, pair_wan2,
                                             pair_has_deriv, pair_dis,
                                             pair_dirx, pair_diry, pair_dirz,
                                             out0, out1, out2, out3);
@@ -1593,7 +1593,7 @@ double Calc_EH0(int MD_iter)
 
   if (MYID_MPI_COMM_WORLD==Host_ID && 0<level_stdout){
     printf("  Force calculation #7%s\n",
-           TotalEnergyUseOpenACC() ? " (GPU-accelerated)" : "");fflush(stdout);
+           TotalEnergyUseOpenMP() ? " (GPU-accelerated)" : "");fflush(stdout);
   }
 
   for (Mc_AN=1; Mc_AN<=Matomnum; Mc_AN++){
@@ -1911,8 +1911,8 @@ void Calc_EXC_EH1(double ECE[])
   My_EXC[0] = 0.0;
   My_EXC[1] = 0.0;
 
-  if (TotalEnergyUseOpenACC()){
-    TotalEnergy_EXC_EH1_Grid_OpenACC(spinmax, &My_Ena, &My_Eef, &My_EH1, My_EXC);
+  if (TotalEnergyUseOpenMP()){
+    TotalEnergy_EXC_EH1_Grid_OpenMP(spinmax, &My_Ena, &My_Eef, &My_EH1, My_EXC);
   }
   else{
     for (BN=0; BN<My_NumGridB_AB; BN++){
@@ -2364,8 +2364,8 @@ void Calc_EXC_EH1(double ECE[])
     My_E_dpy_BG = 0.0;
     My_E_dpz_BG = 0.0; 
 
-    if (TotalEnergyUseOpenACC()){
-      TotalEnergy_Dipole_Grid_OpenACC(GNs, &My_E_dpx, &My_E_dpy, &My_E_dpz,
+    if (TotalEnergyUseOpenMP()){
+      TotalEnergy_Dipole_Grid_OpenMP(GNs, &My_E_dpx, &My_E_dpy, &My_E_dpz,
                                       &My_E_dpx_BG, &My_E_dpy_BG, &My_E_dpz_BG);
     }
     else{
@@ -4381,8 +4381,8 @@ void Energy_Decomposition_CWF(double ECE[])
   My_dcEXC[0] = 0.0;
   My_dcEXC[1] = 0.0;
 
-  if (TotalEnergyUseOpenACC()){
-    TotalEnergy_CWF_Dc_Grid_OpenACC(spinmax, My_dcEH1, My_dcEXC);
+  if (TotalEnergyUseOpenMP()){
+    TotalEnergy_CWF_Dc_Grid_OpenMP(spinmax, My_dcEH1, My_dcEXC);
   }
   else{
     for (BN=0; BN<My_NumGridB_AB; BN++){

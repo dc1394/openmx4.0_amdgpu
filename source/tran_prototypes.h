@@ -38,10 +38,10 @@ typedef float Type_Orbs_Grid; /* type of Orbs_Grid */
 #endif
 
 // CUDA API error checking (added by H.Kawai, February 2024)
-#define CUDA_CHECK(err)                                                            \
+#define HIP_CHECK(err)                                                            \
     do {                                                                           \
-        cudaError_t err_ = (err);                                                  \
-        if (err_ != cudaSuccess) {                                                 \
+        hipError_t err_ = (err);                                                  \
+        if (err_ != hipSuccess) {                                                 \
             fprintf(stderr, "HIP error %d at %s:%d\n", err_, __FILE__, __LINE__); \
             exit(1);                                                               \
         }                                                                          \

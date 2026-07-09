@@ -27,7 +27,7 @@ static void Eigen_lapack_r(double **a, double *ko, int n, int EVmax);
 static void Eigen_HHQR(double **ac, double *ko, int n, int EVmax);
 static void Eigen_HH(double **ac, double *ko, int n, int EVmax);
 static void Eigen_gpusolver_x(double ** a, double * ko, int n, int EVmax);
-static void Eigen_gpusolver_x_openacc(double ** a, double * ko, int n, int EVmax);
+static void Eigen_gpusolver_x_openmp(double ** a, double * ko, int n, int EVmax);
 
 void Eigen_lapack(double **a, double *ko, int n, int EVmax)
 {
@@ -1595,38 +1595,30 @@ static void Eigen_gpusolver_x(double ** a, double * ko, int n0, int EVmax)
     free(A);
 }
 
-void Eigen_gpusolver_x_openacc(double ** a, double * ko, int n0, int EVmax)
+void Eigen_gpusolver_x_openmp(double ** a, double * ko, int n0, int EVmax)
 {
     int       info;
     int const n = n0;
 
     double * A = (double *)malloc(sizeof(double) * n * n);
 
-#pragma acc data present(a[0 : n][0 : n], ko[0 : n])
-#pragma acc data create(A[0 : n * n])
     {
-#pragma acc kernels
-#pragma acc loop independent
+#pragma omp parallel for collapse(2)
         for (int i = 0; i < n; i++) {
-#pragma acc loop independent
             for (int j = 0; j < n; j++) {
                 A[i * n + j] = a[i + 1][j + 1];
             }
         }
 
-        info = gpusolver_Syevdx_openacc(A, ko, n, EVmax);
+        info = gpusolver_Syevdx_openmp(A, ko, n, EVmax);
 
-#pragma acc kernels
-#pragma acc loop independent
+#pragma omp parallel for collapse(2)
         for (int i = 0; i < EVmax; i++) {
-#pragma acc loop independent
             for (int j = 0; j < n; j++) {
                 a[j + 1][i + 1] = A[i * n + j];
             }
         }
 
-#pragma acc kernels
-#pragma acc loop seq
         for (int i = EVmax; i >= 1; i--) {
             ko[i] = ko[i - 1];
         }
@@ -1640,14 +1632,11 @@ void Eigen_gpusolver_x_openacc(double ** a, double * ko, int n0, int EVmax)
     free(A);
 }
 
-void Eigen_gpusolver_x_openacc2(double * a, double * ko, int n0, int EVmax)
+void Eigen_gpusolver_x_openmp2(double * a, double * ko, int n0, int EVmax)
 {
-    gpusolver_Syevdx_openacc(a, ko, n0, EVmax);
+    gpusolver_Syevdx_openmp(a, ko, n0, EVmax);
 
-#pragma acc data present(ko[0 : n0 + 1])
     {
-#pragma acc kernels
-#pragma acc loop seq
         for (int i = n0; i >= 1; i--) {
             ko[i] = ko[i - 1];
         }

@@ -157,9 +157,9 @@ OBJS    = openmx.o openmx_common.o Input_std.o Inputtools.o init.o LU_inverse.o 
           Get_Cnt_dOrbitals.o Gaunt.o Find_CGrids.o MD_pac.o \
           RestartFileDFT.o Output_CompTime.o Merge_LogFile.o Make_FracCoord.o \
           Make_InputFile_with_FinalCoord.o Output_Energy_Decomposition.o \
-          Divide_Conquer.o Divide_Conquer_LNO.o my_cublasDgemm.o my_cublasZgemm.o gemmul8_bridge.o magma_openmx.o Krylov.o \
+          Divide_Conquer.o Divide_Conquer_LNO.o my_hipblasDgemm.o my_hipblasZgemm.o gemmul8_bridge.o magma_openmx.o Krylov.o \
           Divide_Conquer_Dosout.o EGAC_DFT.o LNO.o Calc_LNAO.o Calc_LNBO.o \
-          Eigen_lapack.o gpusolver_Syevd.o gpusolver_Syevdx.o set_cuda_default_device_from_local_rank.o set_openacc_device_from_local_rank.o Eigen_lapack2.o Eigen_lapack3.o EigenBand_lapack.o \
+          Eigen_lapack.o gpusolver_Syevd.o gpusolver_Syevdx.o set_hip_default_device_from_local_rank.o set_openmp_device_from_local_rank.o Eigen_lapack2.o Eigen_lapack3.o EigenBand_lapack.o \
           Eigen_PReHH.o BroadCast_ReMatrix.o \
           Eigen_PHH.o BroadCast_ComplexMatrix.o \
           lapack_dstedc1.o lapack_dstedc2.o lapack_dstedc3.o\
@@ -603,10 +603,10 @@ gpusolver_Syevd.o: gpusolver_Syevd.c openmx_common.h
 	$(CC) -c gpusolver_Syevd.c
 gpusolver_Syevdx.o: gpusolver_Syevdx.c openmx_common.h
 	$(CC) -c gpusolver_Syevdx.c
-set_cuda_default_device_from_local_rank.o: set_cuda_default_device_from_local_rank.c openmx_common.h
-	$(CC) -c set_cuda_default_device_from_local_rank.c
-set_openacc_device_from_local_rank.o: set_openacc_device_from_local_rank.c openmx_common.h
-	$(CC) -c set_openacc_device_from_local_rank.c
+set_hip_default_device_from_local_rank.o: set_hip_default_device_from_local_rank.c openmx_common.h
+	$(CC) -c set_hip_default_device_from_local_rank.c
+set_openmp_device_from_local_rank.o: set_openmp_device_from_local_rank.c openmx_common.h
+	$(CC) -c set_openmp_device_from_local_rank.c
 Eigen_lapack2.o: Eigen_lapack2.c openmx_common.h lapack_prototypes.h
 	$(CC) -c Eigen_lapack2.c
 Eigen_lapack3.o: Eigen_lapack3.c openmx_common.h lapack_prototypes.h
@@ -681,10 +681,10 @@ Divide_Conquer.o: Divide_Conquer.c openmx_common.h
 	$(CC3) -c Divide_Conquer.c
 Divide_Conquer_LNO.o: Divide_Conquer_LNO.c openmx_common.h
 	$(CC) -c Divide_Conquer_LNO.c
-my_cublasDgemm.o: my_cublasDgemm.c openmx_common.h
-	$(CC) -c my_cublasDgemm.c
-my_cublasZgemm.o: my_cublasZgemm.c openmx_common.h
-	$(CC) -c my_cublasZgemm.c
+my_hipblasDgemm.o: my_hipblasDgemm.c openmx_common.h
+	$(CC) -c my_hipblasDgemm.c
+my_hipblasZgemm.o: my_hipblasZgemm.c openmx_common.h
+	$(CC) -c my_hipblasZgemm.c
 gemmul8_bridge.o: gemmul8_bridge.cu openmx_common.h $(GEMMUL8_DIR)/include/gemmul8.hpp $(GEMMUL8_LIB)
 	$(HIPCC) $(HIPCC_GEMMUL8_FLAGS) -c gemmul8_bridge.cu -o gemmul8_bridge.o
 $(GEMMUL8_DIR)/Makefile:
