@@ -36,13 +36,14 @@ void TotalEnergy_EXC_EH1_Grid_OpenMP(int spinmax, double *My_Ena, double *My_Eef
   local_EXC0 = My_EXC[0];
   local_EXC1 = My_EXC[1];
 
-  int l_ProExpn_VNA,l_E_Field_switch,l_Exc0_correction_flag;
-  l_ProExpn_VNA = ProExpn_VNA;
-  l_E_Field_switch = E_Field_switch;
-  l_Exc0_correction_flag = Exc0_correction_flag;
-
+#pragma omp target data map(to:Density_Grid_B0[0:grid_count], Density_Grid_B1[0:grid_count], \
+                        ADensity_Grid_B[0:grid_count], PCCDensity_Grid_B0[0:grid_count], \
+                        PCCDensity_Grid_B1[0:grid_count], dVHart_Grid_B[0:grid_count], \
+                        Vxc_Grid_B0[0:grid_count], Vxc_Grid_B1[0:grid_count], \
+                        RefVxc_Grid_B[0:grid_count], VNA_Grid_B[0:vna_grid_count], \
+                        VEF_Grid_B[0:vef_grid_count])
   {
-#pragma omp parallel for reduction(+:local_Ena,local_Eef,local_EH1,local_EXC0,local_EXC1)
+#pragma omp target teams distribute parallel for map(tofrom:local_Ena,local_Eef,local_EH1,local_EXC0,local_EXC1)
     for (BN=0; BN<grid_count; BN++){
       double sden0,sden1,tden,aden,pden0,pden1,refvxc;
 
@@ -54,18 +55,33 @@ void TotalEnergy_EXC_EH1_Grid_OpenMP(int spinmax, double *My_Ena, double *My_Eef
       pden1 = PCCDensity_Grid_B1[BN];
       refvxc = RefVxc_Grid_B[BN];
 
-      if (l_ProExpn_VNA==0) local_Ena += tden*VNA_Grid_B[BN];
-      if (l_E_Field_switch==1) local_Eef += tden*VEF_Grid_B[BN];
+      if (ProExpn_VNA==0){
+#pragma omp atomic update
+        local_Ena += tden*VNA_Grid_B[BN];
+      }
+      if (E_Field_switch==1){
+#pragma omp atomic update
+        local_Eef += tden*VEF_Grid_B[BN];
+      }
 
+#pragma omp atomic update
       local_EH1 += (tden - 2.0*aden)*dVHart_Grid_B[BN];
 
-      if (l_Exc0_correction_flag==1){
+      if (Exc0_correction_flag==1){
+#pragma omp atomic update
         local_EXC0 += (sden0+pden0)*Vxc_Grid_B0[BN] - (aden+pden0)*refvxc;
-        if (0<spinmax) local_EXC1 += (sden1+pden1)*Vxc_Grid_B1[BN] - (aden+pden1)*refvxc;
+        if (0<spinmax){
+#pragma omp atomic update
+          local_EXC1 += (sden1+pden1)*Vxc_Grid_B1[BN] - (aden+pden1)*refvxc;
+        }
       }
       else{
+#pragma omp atomic update
         local_EXC0 += (sden0+pden0)*Vxc_Grid_B0[BN];
-        if (0<spinmax) local_EXC1 += (sden1+pden1)*Vxc_Grid_B1[BN];
+        if (0<spinmax){
+#pragma omp atomic update
+          local_EXC1 += (sden1+pden1)*Vxc_Grid_B1[BN];
+        }
       }
     }
   }
@@ -112,31 +128,34 @@ void TotalEnergy_Dipole_Grid_OpenMP(int GNs, double *My_E_dpx, double *My_E_dpy,
   local_E_dpy_BG = *My_E_dpy_BG;
   local_E_dpz_BG = *My_E_dpz_BG;
 
-  int l_Ngrid2,l_Ngrid3;
-  l_Ngrid2 = Ngrid2;
-  l_Ngrid3 = Ngrid3;
-
+#pragma omp target data map(to:Density_Grid_B0[0:grid_count], Density_Grid_B1[0:grid_count])
   {
-#pragma omp parallel for reduction(+:local_E_dpx,local_E_dpy,local_E_dpz,local_E_dpx_BG,local_E_dpy_BG,local_E_dpz_BG)
+#pragma omp target teams distribute parallel for map(tofrom:local_E_dpx,local_E_dpy,local_E_dpz,local_E_dpx_BG,local_E_dpy_BG,local_E_dpz_BG)
     for (BN=0; BN<grid_count; BN++){
       int GN,n1,n2,n3;
       double x,y,z,den;
 
       GN = BN + GNs;
-      n1 = GN/(l_Ngrid2*l_Ngrid3);
-      n2 = (GN - n1*l_Ngrid2*l_Ngrid3)/l_Ngrid3;
-      n3 = GN - n1*l_Ngrid2*l_Ngrid3 - n2*l_Ngrid3;
+      n1 = GN/(Ngrid2*Ngrid3);
+      n2 = (GN - n1*Ngrid2*Ngrid3)/Ngrid3;
+      n3 = GN - n1*Ngrid2*Ngrid3 - n2*Ngrid3;
 
       x = (double)n1*gtv11 + (double)n2*gtv21 + (double)n3*gtv31 + grid_origin1;
       y = (double)n1*gtv12 + (double)n2*gtv22 + (double)n3*gtv32 + grid_origin2;
       z = (double)n1*gtv13 + (double)n2*gtv23 + (double)n3*gtv33 + grid_origin3;
       den = Density_Grid_B0[BN] + Density_Grid_B1[BN];
 
+#pragma omp atomic update
       local_E_dpx += den*x;
+#pragma omp atomic update
       local_E_dpy += den*y;
+#pragma omp atomic update
       local_E_dpz += den*z;
+#pragma omp atomic update
       local_E_dpx_BG += x;
+#pragma omp atomic update
       local_E_dpy_BG += y;
+#pragma omp atomic update
       local_E_dpz_BG += z;
     }
   }
@@ -168,8 +187,11 @@ void TotalEnergy_CWF_Dc_Grid_OpenMP(int spinmax, double My_dcEH1[2], double My_d
   local_dcEXC0 = My_dcEXC[0];
   local_dcEXC1 = My_dcEXC[1];
 
+#pragma omp target data map(to:Density_Grid_B0[0:grid_count], Density_Grid_B1[0:grid_count], \
+                        ADensity_Grid_B[0:grid_count], dVHart_Grid_B[0:grid_count], \
+                        Vxc_Grid_B0[0:grid_count], Vxc_Grid_B1[0:grid_count])
   {
-#pragma omp parallel for reduction(+:local_dcEH10,local_dcEH11,local_dcEXC0,local_dcEXC1)
+#pragma omp target teams distribute parallel for map(tofrom:local_dcEH10,local_dcEH11,local_dcEXC0,local_dcEXC1)
     for (BN=0; BN<grid_count; BN++){
       double sden0,sden1,aden,dvhart;
 
@@ -178,11 +200,15 @@ void TotalEnergy_CWF_Dc_Grid_OpenMP(int spinmax, double My_dcEH1[2], double My_d
       aden = ADensity_Grid_B[BN];
       dvhart = dVHart_Grid_B[BN];
 
+#pragma omp atomic update
       local_dcEH10 += (sden0 + aden)*dvhart;
+#pragma omp atomic update
       local_dcEXC0 += sden0*Vxc_Grid_B0[BN];
 
       if (0<spinmax){
+#pragma omp atomic update
         local_dcEH11 += (sden1 + aden)*dvhart;
+#pragma omp atomic update
         local_dcEXC1 += sden1*Vxc_Grid_B1[BN];
       }
     }
@@ -195,7 +221,7 @@ void TotalEnergy_CWF_Dc_Grid_OpenMP(int spinmax, double My_dcEH1[2], double My_d
 }
 
 
-#pragma omp declare target
+
 static double TotalEnergy_EH0_VH_AtomF_flat(int spe, int N, double x, double r,
                                             const double *vps_xv_flat,
                                             const double *vps_rv_flat,
@@ -269,10 +295,9 @@ static double TotalEnergy_EH0_VH_AtomF_flat(int spe, int N, double x, double r,
                  +yv[i+1];
   }
 }
-#pragma omp end declare target
 
 
-#pragma omp declare target
+
 static double TotalEnergy_EH0_Dr_VH_AtomF_flat(int spe, int N, double x, double r,
                                                const double *vps_xv_flat,
                                                const double *vps_rv_flat,
@@ -346,7 +371,6 @@ static double TotalEnergy_EH0_Dr_VH_AtomF_flat(int spe, int N, double x, double 
                 +(yv[i+2]-yv[i]))*tmp/r;
   }
 }
-#pragma omp end declare target
 
 
 void TotalEnergy_EH0_TwoCenter_Batch_OpenMP(int pair_count, int *pair_ban, int *pair_wan2,
@@ -429,8 +453,16 @@ void TotalEnergy_EH0_TwoCenter_Batch_OpenMP(int pair_count, int *pair_ban, int *
     }
   }
 
+#pragma omp target data map(to:pair_ban[0:pair_count], pair_wan2[0:pair_count], \
+                        pair_has_deriv[0:pair_count], pair_dis[0:pair_count], \
+                        pair_dirx[0:pair_count], pair_diry[0:pair_count], pair_dirz[0:pair_count], \
+                        tgn_flat[0:species_count], vps_n_flat[0:species_count], \
+                        dv_flat[0:species_count], core_charge_flat[0:species_count], \
+                        gridx_flat[0:grid_count], gridy_flat[0:grid_count], \
+                        gridz_flat[0:grid_count], arho_flat[0:grid_count], wt_flat[0:grid_count], \
+                        vps_xv_flat[0:vps_count], vps_rv_flat[0:vps_count], vh_atom_flat[0:vh_count]) map(from:out0[0:pair_count], out1[0:pair_count], out2[0:pair_count], out3[0:pair_count])
   {
-#pragma omp parallel for
+#pragma omp target teams distribute parallel for
     for (pair=0; pair<pair_count; pair++){
       int n1,ban,wan2,tgn,has_deriv;
       double dis,dirx,diry,dirz,dv,sum,sumr;
@@ -447,6 +479,7 @@ void TotalEnergy_EH0_TwoCenter_Batch_OpenMP(int pair_count, int *pair_ban, int *
       sum = 0.0;
       sumr = 0.0;
 
+#pragma omp parallel for reduction(+:sum,sumr)
       for (n1=0; n1<tgn; n1++){
         int idx;
         double x,y,z,z2,r2,r,xx,rho0,wt,va0,dr_va0;
@@ -505,4 +538,548 @@ void TotalEnergy_EH0_TwoCenter_Batch_OpenMP(int pair_count, int *pair_ban, int *
   free(vps_xv_flat);
   free(vps_rv_flat);
   free(vh_atom_flat);
+}
+
+
+
+static double TotalEnergy_Exc0_XC_CA(double den, int P_switch)
+{
+  /* device copy of XC_Ceperly_Alder() */
+
+  double dum,rs,coe;
+  double Ex,Ec,dEx,dEc;
+  double tmp0,tmp1;
+  double result;
+
+  if (den<=1.0e-15){
+    result = 0.0;
+  }
+  else{
+
+    coe = 0.6203504908994;  /* pow(3.0/4.0/PI,1.0/3.0); */
+    rs = coe*pow(den,-0.3333333333333333333);
+
+    tmp0 = 0.458165293632163/rs;
+    Ex = -tmp0;
+    dEx = tmp0/rs;
+
+    if (1.0<=rs){
+      tmp0 = sqrt(rs);
+      dum = (1.0 + 1.0529*tmp0 + 0.3334*rs);
+      tmp1 = 0.1423/dum;
+      Ec = -tmp1;
+      dEc = tmp1/dum*(0.52645/tmp0 + 0.3334);
+    }
+    else{
+      tmp0 = log(rs);
+      Ec = -0.0480 + 0.0311*tmp0 + rs*(0.0020*tmp0 - 0.0116);
+      dEc = 0.0311/rs + 0.0020*tmp0 - 0.0096;
+    }
+
+    if      (P_switch==0)
+      result = Ex + Ec;
+    else if (P_switch==1)
+      result = Ex + Ec - 0.33333333333333333333*rs*(dEx + dEc);
+    else if (P_switch==2)
+      result = 0.3333333333333333333*rs*(dEx + dEc);
+    else
+      result = -0.3333333333333333333/(coe*coe*coe)*rs*rs*rs*rs*(dEx + dEc);
+  }
+
+  return result;
+}
+
+
+
+static double TotalEnergy_Exc0_KumoF_flat(int N, double x,
+                                          const double *xv, const double *rv,
+                                          const double *yv)
+{
+  /* device copy of KumoF() */
+
+  if (x<xv[0]){
+
+    int m;
+    double rm,h1,h2,h3,f1,f2,f3,f4,f,df,r;
+    double g1,g2,x1,x2,y1,y2,y12,y22,a,b;
+
+    r = exp(x);
+
+    m = 4;
+    rm = rv[m];
+
+    h1 = rv[m-1] - rv[m-2];
+    h2 = rv[m]   - rv[m-1];
+    h3 = rv[m+1] - rv[m];
+
+    f1 = yv[m-2];
+    f2 = yv[m-1];
+    f3 = yv[m];
+    f4 = yv[m+1];
+
+    g1 = ((f3-f2)*h1/h2 + (f2-f1)*h2/h1)/(h1+h2);
+    g2 = ((f4-f3)*h2/h3 + (f3-f2)*h3/h2)/(h2+h3);
+
+    x1 = rm - rv[m-1];
+    x2 = rm - rv[m];
+    y1 = x1/h2;
+    y2 = x2/h2;
+    y12 = y1*y1;
+    y22 = y2*y2;
+
+    f =  y22*(3.0*f2 + h2*g1 + (2.0*f2 + h2*g1)*y2)
+       + y12*(3.0*f3 - h2*g2 - (2.0*f3 - h2*g2)*y1);
+
+    df = 2.0*y2/h2*(3.0*f2 + h2*g1 + (2.0*f2 + h2*g1)*y2)
+       + y22*(2.0*f2 + h2*g1)/h2
+       + 2.0*y1/h2*(3.0*f3 - h2*g2 - (2.0*f3 - h2*g2)*y1)
+       - y12*(2.0*f3 - h2*g2)/h2;
+
+    a = 0.5*df/rm;
+    b = f - a*rm*rm;
+    return a*r*r + b;
+  }
+
+  else{
+
+    int i;
+    double t,dt;
+    double xmin,xmax;
+
+    xmin = xv[0];
+    xmax = xv[N-1];
+    if (xmax<x) x = xmax;
+    if (x<xmin) x = xmin;
+    t = ((double)N-1.0)*(x-xmin)/(xmax-xmin);
+    i = (int)floor(t);
+    dt = t - (double)i;
+
+    return 0.5*( ((yv[i+3]-yv[i]-3.0*(yv[i+2]-yv[i+1]))*dt
+		  -yv[i+3]+4.0*yv[i+2]-5.0*yv[i+1]+2.0*yv[i])*dt
+		 +(yv[i+2]-yv[i]))*dt
+                 +yv[i+1];
+  }
+}
+
+
+
+static double TotalEnergy_Exc0_Dr_KumoF_flat(int N, double x, double r,
+                                             const double *xv, const double *rv,
+                                             const double *yv)
+{
+  /* device copy of Dr_KumoF() */
+
+  if (x<xv[0]){
+
+    int m;
+    double rm,h1,h2,h3,f1,f2,f3,f4,a,b;
+    double g1,g2,x1,x2,y1,y2,y12,y22,f,df;
+
+    r = exp(x);
+
+    m = 4;
+    rm = rv[m];
+
+    h1 = rv[m-1] - rv[m-2];
+    h2 = rv[m]   - rv[m-1];
+    h3 = rv[m+1] - rv[m];
+
+    f1 = yv[m-2];
+    f2 = yv[m-1];
+    f3 = yv[m];
+    f4 = yv[m+1];
+
+    g1 = ((f3-f2)*h1/h2 + (f2-f1)*h2/h1)/(h1+h2);
+    g2 = ((f4-f3)*h2/h3 + (f3-f2)*h3/h2)/(h2+h3);
+
+    x1 = rm - rv[m-1];
+    x2 = rm - rv[m];
+    y1 = x1/h2;
+    y2 = x2/h2;
+    y12 = y1*y1;
+    y22 = y2*y2;
+
+    f =  y22*(3.0*f2 + h2*g1 + (2.0*f2 + h2*g1)*y2)
+       + y12*(3.0*f3 - h2*g2 - (2.0*f3 - h2*g2)*y1);
+
+    df = 2.0*y2/h2*(3.0*f2 + h2*g1 + (2.0*f2 + h2*g1)*y2)
+       + y22*(2.0*f2 + h2*g1)/h2
+       + 2.0*y1/h2*(3.0*f3 - h2*g2 - (2.0*f3 - h2*g2)*y1)
+       - y12*(2.0*f3 - h2*g2)/h2;
+
+    a = 0.5*df/rm;
+    b = f - a*rm*rm;
+    return 2.0*a*r;
+  }
+
+  else{
+
+    int i;
+    double t,dt,tmp;
+    double xmin,xmax;
+
+    xmin = xv[0];
+    xmax = xv[N-1];
+    if (xmax<x) x = xmax;
+    if (x<xmin) x = xmin;
+
+    tmp = ((double)N-1.0)/(xmax-xmin);
+    t = (x-xmin)*tmp;
+    i = (int)floor(t);
+    dt = t - (double)i;
+
+    return 0.5*(( 3.0*(yv[i+3]-yv[i]-3.0*(yv[i+2]-yv[i+1]))*dt
+		  +2.0*(-yv[i+3]+4.0*yv[i+2]-5.0*yv[i+1]+2.0*yv[i]))*dt
+		+(yv[i+2]-yv[i]))*tmp/r;
+  }
+}
+
+
+void TotalEnergy_Exc0_Batch_OpenMP(int Num_Leb, double **Leb_Grid_XYZW, double *sum_out)
+{
+  /* fine-mesh Exc^0 correction of Calc_EXC_EH1: for every local atom,
+     integrate den0*exc(den) over the atom-centred Gauss-Legendre x
+     Lebedev grid, together with the density-gradient force terms.
+     One flattened point kernel accumulates the energy and stores the
+     per-point force prefactor; a second pair kernel contracts the
+     prefactors with the neighbour density gradients. */
+
+  int spe,Mc_AN,Gc_AN,h_AN,i,n;
+  int nr,na,npt_atom,nb_total;
+  size_t npt_total;
+  int pao_stride,den_stride;
+  int vxc_flag;
+  int *pao_n_flat,*at_fnan,*nb_off,*nb_wan;
+  double *pao_xv_flat,*pao_rv_flat,*den2_flat;
+  double *at_cx,*at_cy,*at_cz,*at_dr;
+  double *nb_x,*nb_y,*nb_z,*nb_rcut2;
+  double *leb_x,*leb_y,*leb_z,*leb_w;
+  double *pref;
+  double energy_sum;
+
+  *sum_out = 0.0;
+  if (Matomnum<1) return;
+
+  nr = CoarseGL_Mesh;
+  na = Num_Leb;
+  npt_atom = nr*na;
+  npt_total = (size_t)Matomnum*(size_t)npt_atom;
+
+  pao_stride = List_YOUSO[21];
+  den_stride = List_YOUSO[21] + 2;
+  vxc_flag = F_Vxc_flag;
+
+  /* species tables */
+
+  pao_n_flat = (int*)malloc(sizeof(int)*SpeciesNum);
+  pao_xv_flat = (double*)malloc(sizeof(double)*(size_t)SpeciesNum*pao_stride);
+  pao_rv_flat = (double*)malloc(sizeof(double)*(size_t)SpeciesNum*pao_stride);
+  den2_flat = (double*)malloc(sizeof(double)*(size_t)SpeciesNum*den_stride);
+
+  /* local atoms and their neighbour lists */
+
+  at_fnan = (int*)malloc(sizeof(int)*(Matomnum+1));
+  nb_off = (int*)malloc(sizeof(int)*(Matomnum+1));
+  at_cx = (double*)malloc(sizeof(double)*(Matomnum+1));
+  at_cy = (double*)malloc(sizeof(double)*(Matomnum+1));
+  at_cz = (double*)malloc(sizeof(double)*(Matomnum+1));
+  at_dr = (double*)malloc(sizeof(double)*(Matomnum+1));
+
+  nb_total = 0;
+  for (Mc_AN=1; Mc_AN<=Matomnum; Mc_AN++){
+    nb_total += FNAN[M2G[Mc_AN]] + 1;
+  }
+
+  nb_wan = (int*)malloc(sizeof(int)*nb_total);
+  nb_x = (double*)malloc(sizeof(double)*nb_total);
+  nb_y = (double*)malloc(sizeof(double)*nb_total);
+  nb_z = (double*)malloc(sizeof(double)*nb_total);
+  nb_rcut2 = (double*)malloc(sizeof(double)*nb_total);
+
+  leb_x = (double*)malloc(sizeof(double)*na);
+  leb_y = (double*)malloc(sizeof(double)*na);
+  leb_z = (double*)malloc(sizeof(double)*na);
+  leb_w = (double*)malloc(sizeof(double)*na);
+
+  /* device-resident via create(); the host allocation is only address space */
+  pref = (double*)malloc(sizeof(double)*npt_total);
+
+  if (pao_n_flat==NULL || pao_xv_flat==NULL || pao_rv_flat==NULL || den2_flat==NULL ||
+      at_fnan==NULL || nb_off==NULL || at_cx==NULL || at_cy==NULL || at_cz==NULL ||
+      at_dr==NULL || nb_wan==NULL || nb_x==NULL || nb_y==NULL || nb_z==NULL ||
+      nb_rcut2==NULL || leb_x==NULL || leb_y==NULL || leb_z==NULL || leb_w==NULL ||
+      pref==NULL){
+    printf("TotalEnergy_Exc0_Batch_OpenMP: malloc failed.\n");
+    fflush(stdout);
+    exit(1);
+  }
+
+  for (spe=0; spe<SpeciesNum; spe++){
+    pao_n_flat[spe] = Spe_Num_Mesh_PAO[spe];
+    for (n=0; n<pao_stride; n++){
+      pao_xv_flat[(size_t)spe*pao_stride+n] = Spe_PAO_XV[spe][n];
+      pao_rv_flat[(size_t)spe*pao_stride+n] = Spe_PAO_RV[spe][n];
+    }
+    for (n=0; n<den_stride; n++){
+      den2_flat[(size_t)spe*den_stride+n] = Spe_Atomic_Den2[spe][n];
+    }
+  }
+
+  n = 0;
+  for (Mc_AN=1; Mc_AN<=Matomnum; Mc_AN++){
+    int Cwan;
+
+    Gc_AN = M2G[Mc_AN];
+    Cwan = WhatSpecies[Gc_AN];
+
+    at_fnan[Mc_AN] = FNAN[Gc_AN];
+    nb_off[Mc_AN] = n;
+    at_cx[Mc_AN] = Gxyz[Gc_AN][1];
+    at_cy[Mc_AN] = Gxyz[Gc_AN][2];
+    at_cz[Mc_AN] = Gxyz[Gc_AN][3];
+    at_dr[Mc_AN] = Spe_Atom_Cut1[Cwan];
+
+    for (h_AN=0; h_AN<=FNAN[Gc_AN]; h_AN++){
+      int Gh_AN = natn[Gc_AN][h_AN];
+      int Rn = ncn[Gc_AN][h_AN];
+      int Hwan = WhatSpecies[Gh_AN];
+
+      nb_wan[n] = Hwan;
+      nb_x[n] = Gxyz[Gh_AN][1] + atv[Rn][1];
+      nb_y[n] = Gxyz[Gh_AN][2] + atv[Rn][2];
+      nb_z[n] = Gxyz[Gh_AN][3] + atv[Rn][3];
+      nb_rcut2[n] = Spe_Atom_Cut1[Hwan]*Spe_Atom_Cut1[Hwan];
+      n++;
+    }
+  }
+
+  for (i=0; i<na; i++){
+    leb_x[i] = Leb_Grid_XYZW[i][0];
+    leb_y[i] = Leb_Grid_XYZW[i][1];
+    leb_z[i] = Leb_Grid_XYZW[i][2];
+    leb_w[i] = Leb_Grid_XYZW[i][3];
+  }
+
+  energy_sum = 0.0;
+
+#pragma omp target data map(to:pao_n_flat[0:SpeciesNum], \
+                        pao_xv_flat[0:(size_t)SpeciesNum*pao_stride], \
+                        pao_rv_flat[0:(size_t)SpeciesNum*pao_stride], \
+                        den2_flat[0:(size_t)SpeciesNum*den_stride], \
+                        at_fnan[0:Matomnum+1], nb_off[0:Matomnum+1], \
+                        at_cx[0:Matomnum+1], at_cy[0:Matomnum+1], \
+                        at_cz[0:Matomnum+1], at_dr[0:Matomnum+1], \
+                        nb_wan[0:nb_total], nb_x[0:nb_total], nb_y[0:nb_total], \
+                        nb_z[0:nb_total], nb_rcut2[0:nb_total], \
+                        leb_x[0:na], leb_y[0:na], leb_z[0:na], leb_w[0:na], \
+                        CoarseGL_Abscissae[0:nr], CoarseGL_Weight[0:nr]) map(from:pref[0:npt_total])
+  {
+
+    /* pass 1: energy and per-point force prefactors */
+
+#pragma omp target teams distribute parallel for thread_limit(128) map(tofrom:energy_sum)
+    for (size_t pt=0; pt<npt_total; pt++){
+      int mc,ir,ia,rem,k,koff,fnan;
+      double r,x0,y0,z0,den,den0,exc0,dexc0,wpt,dr_atom;
+
+      mc = (int)(pt/(size_t)npt_atom) + 1;
+      rem = (int)(pt - (size_t)(mc-1)*(size_t)npt_atom);
+      ir = rem/na;
+      ia = rem - ir*na;
+
+      dr_atom = at_dr[mc];
+      r = 0.50*(dr_atom*CoarseGL_Abscissae[ir] + dr_atom);
+
+      x0 = r*leb_x[ia] + at_cx[mc];
+      y0 = r*leb_y[ia] + at_cy[mc];
+      z0 = r*leb_z[ia] + at_cz[mc];
+
+      koff = nb_off[mc];
+      fnan = at_fnan[mc];
+
+      den = 0.0;
+      den0 = 0.0;
+
+      for (k=0; k<=fnan; k++){
+        double dx,dy,dz,r2;
+
+        dx = nb_x[koff+k] - x0;
+        dy = nb_y[koff+k] - y0;
+        dz = nb_z[koff+k] - z0;
+        r2 = dx*dx + dy*dy + dz*dz;
+
+        if (r2<nb_rcut2[koff+k]){
+          int wan = nb_wan[koff+k];
+          double contrib;
+
+          contrib = TotalEnergy_Exc0_KumoF_flat(pao_n_flat[wan], 0.5*log(r2),
+                                                pao_xv_flat + (size_t)wan*pao_stride,
+                                                pao_rv_flat + (size_t)wan*pao_stride,
+                                                den2_flat + (size_t)wan*den_stride)
+                    *(double)vxc_flag;
+          den += contrib;
+          if (k==0) den0 = contrib;
+        }
+      }
+
+      exc0 = TotalEnergy_Exc0_XC_CA(den,0);
+      dexc0 = TotalEnergy_Exc0_XC_CA(den,3);
+
+      wpt = leb_w[ia]*r*r*CoarseGL_Weight[ir];
+
+      pref[pt] = wpt*den0*dexc0;
+#pragma omp atomic update
+      energy_sum += 2.0*PI*dr_atom*wpt*den0*exc0;
+    }
+  }
+
+  /* pass 2: contract the prefactors with the neighbour gradients.
+     Keep this in a separate target data region.  ROCm clang 18 can emit
+     invalid LLVM IR when this region is nested in the pass-1 target-data
+     region and uses present mappings for the shared arrays. */
+
+    {
+      int nitems = nb_total - Matomnum; /* h_AN != 0 entries */
+      int nitems_alloc = nitems==0 ? 1 : nitems;
+      int *item_mc,*item_k;
+      double *item_fx,*item_fy,*item_fz;
+      int p;
+
+      item_mc = (int*)malloc(sizeof(int)*nitems_alloc);
+      item_k = (int*)malloc(sizeof(int)*nitems_alloc);
+      item_fx = (double*)malloc(sizeof(double)*nitems_alloc);
+      item_fy = (double*)malloc(sizeof(double)*nitems_alloc);
+      item_fz = (double*)malloc(sizeof(double)*nitems_alloc);
+
+      if (item_mc==NULL || item_k==NULL || item_fx==NULL || item_fy==NULL || item_fz==NULL){
+        printf("TotalEnergy_Exc0_Batch_OpenMP: malloc failed (pass 2).\n");
+        fflush(stdout);
+        exit(1);
+      }
+
+      p = 0;
+      for (Mc_AN=1; Mc_AN<=Matomnum; Mc_AN++){
+        for (h_AN=1; h_AN<=at_fnan[Mc_AN]; h_AN++){
+          item_mc[p] = Mc_AN;
+          item_k[p] = h_AN;
+          p++;
+        }
+      }
+
+#pragma omp target data map(to:item_mc[0:nitems_alloc], item_k[0:nitems_alloc], \
+            pao_n_flat[0:SpeciesNum], pao_xv_flat[0:(size_t)SpeciesNum*pao_stride], \
+            pao_rv_flat[0:(size_t)SpeciesNum*pao_stride], den2_flat[0:(size_t)SpeciesNum*den_stride], \
+            at_fnan[0:Matomnum+1], nb_off[0:Matomnum+1], \
+            at_cx[0:Matomnum+1], at_cy[0:Matomnum+1], at_cz[0:Matomnum+1], at_dr[0:Matomnum+1], \
+            nb_wan[0:nb_total], nb_x[0:nb_total], nb_y[0:nb_total], nb_z[0:nb_total], \
+            nb_rcut2[0:nb_total], leb_x[0:na], leb_y[0:na], leb_z[0:na], leb_w[0:na], \
+            CoarseGL_Abscissae[0:nr], CoarseGL_Weight[0:nr], pref[0:npt_total]) \
+        map(from:item_fx[0:nitems_alloc], item_fy[0:nitems_alloc], item_fz[0:nitems_alloc])
+      {
+#pragma omp target teams distribute parallel for thread_limit(128)
+        for (int pp=0; pp<nitems; pp++){
+          const int mc = item_mc[pp];
+          const int k = item_k[pp];
+          const int koff = nb_off[mc];
+          const int wan = nb_wan[koff+k];
+          const int pao_n = pao_n_flat[wan];
+          const double rcut2 = nb_rcut2[koff+k];
+          const double hx = nb_x[koff+k];
+          const double hy = nb_y[koff+k];
+          const double hz = nb_z[koff+k];
+          const double cx = at_cx[mc];
+          const double cy = at_cy[mc];
+          const double cz = at_cz[mc];
+          const double dr_atom = at_dr[mc];
+          const size_t pt0 = (size_t)(mc-1)*(size_t)npt_atom;
+          double sx = 0.0, sy = 0.0, sz = 0.0;
+
+          for (int pt2=0; pt2<npt_atom; pt2++){
+            int ir,ia;
+            double r,x0,y0,z0,dx,dy,dz,r2;
+
+            ir = pt2/na;
+            ia = pt2 - ir*na;
+
+            r = 0.50*(dr_atom*CoarseGL_Abscissae[ir] + dr_atom);
+            x0 = r*leb_x[ia] + cx;
+            y0 = r*leb_y[ia] + cy;
+            z0 = r*leb_z[ia] + cz;
+
+            dx = hx - x0;
+            dy = hy - y0;
+            dz = hz - z0;
+            r2 = dx*dx + dy*dy + dz*dz;
+
+            if (r2<rcut2){
+              double r1,gden0,gscale;
+
+              r1 = sqrt(r2);
+              gden0 = TotalEnergy_Exc0_Dr_KumoF_flat(pao_n, 0.5*log(r2), r1,
+                                                     pao_xv_flat + (size_t)wan*pao_stride,
+                                                     pao_rv_flat + (size_t)wan*pao_stride,
+                                                     den2_flat + (size_t)wan*den_stride)
+                     *(double)vxc_flag;
+              gscale = pref[pt0 + (size_t)pt2]*gden0/r1;
+
+              sx += gscale*dx;
+              sy += gscale*dy;
+              sz += gscale*dz;
+            }
+          }
+
+          item_fx[pp] = 2.0*PI*dr_atom*sx;
+          item_fy[pp] = 2.0*PI*dr_atom*sy;
+          item_fz[pp] = 2.0*PI*dr_atom*sz;
+        }
+      }
+
+      /* host accumulation into the temporary force slots */
+
+      p = 0;
+      for (Mc_AN=1; Mc_AN<=Matomnum; Mc_AN++){
+        Gc_AN = M2G[Mc_AN];
+        for (h_AN=1; h_AN<=at_fnan[Mc_AN]; h_AN++){
+          int Gh_AN = natn[Gc_AN][h_AN];
+
+          Gxyz[Gh_AN][41] += item_fx[p];
+          Gxyz[Gh_AN][42] += item_fy[p];
+          Gxyz[Gh_AN][43] += item_fz[p];
+
+          Gxyz[Gc_AN][41] -= item_fx[p];
+          Gxyz[Gc_AN][42] -= item_fy[p];
+          Gxyz[Gc_AN][43] -= item_fz[p];
+          p++;
+        }
+      }
+
+      free(item_mc);
+      free(item_k);
+      free(item_fx);
+      free(item_fy);
+      free(item_fz);
+    }
+
+  *sum_out = energy_sum;
+
+  free(pao_n_flat);
+  free(pao_xv_flat);
+  free(pao_rv_flat);
+  free(den2_flat);
+  free(at_fnan);
+  free(nb_off);
+  free(at_cx);
+  free(at_cy);
+  free(at_cz);
+  free(at_dr);
+  free(nb_wan);
+  free(nb_x);
+  free(nb_y);
+  free(nb_z);
+  free(nb_rcut2);
+  free(leb_x);
+  free(leb_y);
+  free(leb_z);
+  free(leb_w);
+  free(pref);
 }

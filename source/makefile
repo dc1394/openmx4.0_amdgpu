@@ -113,7 +113,8 @@ GEMMUL8_REPO_URL ?= https://github.com/RIKEN-RCCS/GEMMul8.git
 GEMMUL8_REPO_DIR ?= third_party/GEMMul8
 # gemmul8_openmx.cu instantiates GEMMul8 internals directly, so the
 # checkout must stay pinned to a commit whose internal layout it matches.
-GEMMUL8_COMMIT ?= 884a28750f28ae39a20475db8c2ebe4130b4d4ef
+# 6bf409b is the v3.1.1 release.
+GEMMUL8_COMMIT ?= 6bf409bdc69a638970ad5f91948a8b3e44c5378b
 GEMMUL8_DIR ?= $(GEMMUL8_REPO_DIR)
 GEMMUL8_LIB ?= $(GEMMUL8_DIR)/lib/libgemmul8.a
 GEMMUL8_OPENMX_OBJ ?= $(GEMMUL8_DIR)/src/gemmul8_openmx.o
@@ -144,7 +145,7 @@ OBJS    = openmx.o openmx_common.o Input_std.o Inputtools.o init.o LU_inverse.o 
           Cluster_DFT_Col.o Cluster_DFT_Col_dm_hip.o Cluster_DFT_NonCol.o Cluster_DFT_NonCol_dm_hip.o Cluster_DFT_Dosout.o Cluster_DFT_ON2.o Cluster_DFT_Col_LNO.o \
           Band_DFT_Col.o Band_DFT_NonCol.o Band_DFT_NonCol_GB.o Band_DFT_kpath.o Band_DFT_kpath_LNO.o Band_DFT_MO.o \
           Cluster_DFT_Col_CWF.o Cluster_DFT_NonCol_CWF.o Band_DFT_Col_CWF.o Band_DFT_NonCol_CWF.o \
-          Unfolding_Bands.o Band_DFT_Dosout.o Set_Density_Grid.o Set_Orbitals_Grid.o Set_Aden_Grid.o \
+          Unfolding_Bands.o Band_DFT_Dosout.o Set_Density_Grid.o Set_Density_Grid_GPU.o Set_Orbitals_Grid.o Set_Aden_Grid.o \
           Gauss_Legendre.o zero_cfrac.o xyz2spherical.o AngularF.o RadialF.o Dr_RadialF.o PhiF.o \
           VNAF.o Dr_VNAF.o VH_AtomF.o Dr_VH_AtomF.o RF_BesselF.o QuickSort.o Nonlocal_RadialF.o \
           KumoF.o Dr_KumoF.o Mulliken_Charge.o Occupation_Number_LDA_U.o Eff_Hub_Pot.o Coulomb_Interaction.o \
@@ -167,7 +168,7 @@ OBJS    = openmx.o openmx_common.o Input_std.o Inputtools.o init.o LU_inverse.o 
           lapack_dstevx1.o lapack_dstevx2.o lapack_dstevx3.o \
           lapack_dstevx4.o lapack_dstevx5.o lapack_dsteqr1.o \
           Nonlocal_Basis.o Set_OLP_Kin.o Set_Nonlocal.o Set_ProExpn_VNA.o \
-          Set_CoreHoleMatrix.o Set_XMCD_penalty.o Set_OLP_p.o Set_Hamiltonian.o Set_Vpot.o \
+          Set_CoreHoleMatrix.o Set_XMCD_penalty.o Set_OLP_p.o Set_Hamiltonian.o set_hamiltonian_hip.o Set_Vpot.o \
           Voronoi_Charge.o Voronoi_Orbital_Moment.o Fuzzy_Weight.o \
           dampingF.o deri_dampingF.o Spherical_Bessel.o \
           iterout.o iterout_md.o Allocate_Arrays.o Free_Arrays.o \
@@ -289,7 +290,7 @@ magma-clean:
 	find "$(MAGMA_DIR)" -mindepth 1 -maxdepth 1 ! -name "$(MAGMA_ARCHIVE_BASENAME)" -exec rm -rf {} +
 	rm -f magma_openmx.o
 
-FFTW3_USERS = Poisson.o Stress.o Poisson_ESM.o TRAN_Poisson.o TRAN_CDen_Main.o TRAN_Set_Electrode_Grid.o
+FFTW3_USERS = Poisson.o Stress.o Poisson_ESM.o TRAN_Poisson.o TRAN_CDen_Main.o TRAN_Set_Electrode_Grid.o Cluster_DFT_Col.o
 $(FFTW3_USERS): | $(FFTW3_LIB)
 
 #
@@ -326,7 +327,7 @@ LU_inverse.o: LU_inverse.c openmx_common.h
 	$(CC) -c LU_inverse.c
 ReLU_inverse.o: ReLU_inverse.c openmx_common.h
 	$(CC) -c ReLU_inverse.c
-truncation.o: truncation.c openmx_common.h tran_prototypes.h 
+truncation.o: truncation.c openmx_common.h set_hip_default_device_from_local_rank.h tran_prototypes.h
 	$(CC2) -c truncation.c
 Find_CGrids.o: Find_CGrids.c openmx_common.h
 	$(CC) -c Find_CGrids.c
@@ -386,7 +387,7 @@ XC_EX.o: XC_EX.c openmx_common.h
 # SCF
 #
 
-DFT.o: DFT.c openmx_common.h tran_prototypes.h
+DFT.o: DFT.c openmx_common.h tran_prototypes.h set_hip_default_device_from_local_rank.h
 	$(CC) -c DFT.c
 Cluster_DFT_Col.o: Cluster_DFT_Col.c openmx_common.h
 	$(CC) -c Cluster_DFT_Col.c
@@ -514,10 +515,12 @@ RF_BesselF.o: RF_BesselF.c openmx_common.h
 Nonlocal_RadialF.o: Nonlocal_RadialF.c openmx_common.h
 	$(CC) -c Nonlocal_RadialF.c
 
-Set_Orbitals_Grid.o: Set_Orbitals_Grid.c openmx_common.h
+Set_Orbitals_Grid.o: Set_Orbitals_Grid.c openmx_common.h set_hip_default_device_from_local_rank.h
 	$(CC) -c Set_Orbitals_Grid.c
 Set_Density_Grid.o: Set_Density_Grid.c openmx_common.h
 	$(CC) -c Set_Density_Grid.c
+Set_Density_Grid_GPU.o: Set_Density_Grid_GPU.c openmx_common.h set_hip_default_device_from_local_rank.h
+	$(CC) -c Set_Density_Grid_GPU.c
 Set_Aden_Grid.o: Set_Aden_Grid.c openmx_common.h
 	$(CC) -c Set_Aden_Grid.c
 
@@ -540,7 +543,7 @@ Kerker_Mixing_Rhok.o: Kerker_Mixing_Rhok.c openmx_common.h
 DIIS_Mixing_Rhok.o: DIIS_Mixing_Rhok.c openmx_common.h
 	$(CC) -c DIIS_Mixing_Rhok.c
 # Same LDA+U Type2/cFLL workaround as above.
-Total_Energy.o: Total_Energy.c openmx_common.h
+Total_Energy.o: Total_Energy.c openmx_common.h set_hip_default_device_from_local_rank.h
 	$(CC_NOACC) -c Total_Energy.c
 Total_Energy_GPU.o: Total_Energy_GPU.c openmx_common.h
 	$(CC) -c Total_Energy_GPU.c
@@ -599,13 +602,13 @@ QuickSort.o: QuickSort.c openmx_common.h
 	$(CC) -c QuickSort.c
 Eigen_lapack.o: Eigen_lapack.c openmx_common.h lapack_prototypes.h
 	$(CC) -c Eigen_lapack.c
-gpusolver_Syevd.o: gpusolver_Syevd.c openmx_common.h
+gpusolver_Syevd.o: gpusolver_Syevd.c openmx_common.h set_hip_default_device_from_local_rank.h
 	$(CC) -c gpusolver_Syevd.c
 gpusolver_Syevdx.o: gpusolver_Syevdx.c openmx_common.h
 	$(CC) -c gpusolver_Syevdx.c
-set_hip_default_device_from_local_rank.o: set_hip_default_device_from_local_rank.c openmx_common.h
+set_hip_default_device_from_local_rank.o: set_hip_default_device_from_local_rank.c openmx_common.h set_hip_default_device_from_local_rank.h
 	$(CC) -c set_hip_default_device_from_local_rank.c
-set_openmp_device_from_local_rank.o: set_openmp_device_from_local_rank.c openmx_common.h
+set_openmp_device_from_local_rank.o: set_openmp_device_from_local_rank.c openmx_common.h set_openmp_device_from_local_rank.h set_hip_default_device_from_local_rank.h
 	$(CC) -c set_openmp_device_from_local_rank.c
 Eigen_lapack2.o: Eigen_lapack2.c openmx_common.h lapack_prototypes.h
 	$(CC) -c Eigen_lapack2.c
@@ -647,7 +650,7 @@ lapack_dsteqr1.o: lapack_dsteqr1.c openmx_common.h lapack_prototypes.h
 	$(CC) -c lapack_dsteqr1.c
 Nonlocal_Basis.o: Nonlocal_Basis.c openmx_common.h
 	$(CC) -c Nonlocal_Basis.c
-Set_OLP_Kin.o: Set_OLP_Kin.c openmx_common.h 
+Set_OLP_Kin.o: Set_OLP_Kin.c openmx_common.h set_hip_default_device_from_local_rank.h
 	$(CC) -c Set_OLP_Kin.c
 Set_Nonlocal.o: Set_Nonlocal.c openmx_common.h
 	$(CC) -c Set_Nonlocal.c
@@ -657,8 +660,10 @@ Set_CoreHoleMatrix.o: Set_CoreHoleMatrix.c openmx_common.h
 	$(CC) -c Set_CoreHoleMatrix.c
 Set_OLP_p.o: Set_OLP_p.c openmx_common.h 
 	$(CC) -c Set_OLP_p.c
-Set_Hamiltonian.o: Set_Hamiltonian.c openmx_common.h
+Set_Hamiltonian.o: Set_Hamiltonian.c openmx_common.h set_hip_default_device_from_local_rank.h
 	$(CC) -c Set_Hamiltonian.c
+set_hamiltonian_hip.o: set_hamiltonian_hip.cu
+	$(HIPCC) $(HIPCC_GEMMUL8_FLAGS) -c set_hamiltonian_hip.cu -o set_hamiltonian_hip.o
 Set_Vpot.o: Set_Vpot.c openmx_common.h
 	$(CC) -c Set_Vpot.c
 #
@@ -694,6 +699,8 @@ $(GEMMUL8_DIR)/Makefile:
 	  { git remote get-url origin >/dev/null 2>&1 || git remote add origin $(GEMMUL8_REPO_URL); } && \
 	  git fetch --depth 1 origin $(GEMMUL8_COMMIT) && \
 	  git checkout -q $(GEMMUL8_COMMIT)
+$(GEMMUL8_DIR)/include/gemmul8.hpp: | $(GEMMUL8_DIR)/Makefile
+	@:
 $(GEMMUL8_OPENMX_OBJ): gemmul8_openmx.cu $(GEMMUL8_DIR)/Makefile
 	$(HIPCC) $(HIPCC_GEMMUL8_FLAGS) -c gemmul8_openmx.cu -o $(GEMMUL8_OPENMX_OBJ)
 $(GEMMUL8_LIB): $(GEMMUL8_OPENMX_OBJ)
@@ -1188,9 +1195,9 @@ mod_precision.o: $(LIBELPADIR)/mod_precision.F90
 	$(FC) -c $(LIBELPADIR)/mod_precision.F90
 elpa_utilities.o: $(LIBELPADIR)/elpa_utilities.F90
 	$(FC) -c $(LIBELPADIR)/elpa_utilities.F90
-elpa1_compute_real.o: $(LIBELPADIR)/elpa1_compute_real.F90 elpa_utilities.o
+elpa1_compute_real.o: $(LIBELPADIR)/elpa1_compute_real.F90 elpa_utilities.o mod_precision.o
 	$(FC) -c $(LIBELPADIR)/elpa1_compute_real.F90
-elpa1_compute_complex.o: $(LIBELPADIR)/elpa1_compute_complex.F90 elpa_utilities.o
+elpa1_compute_complex.o: $(LIBELPADIR)/elpa1_compute_complex.F90 elpa_utilities.o mod_precision.o
 	$(FC) -c $(LIBELPADIR)/elpa1_compute_complex.F90
 aligned_mem.o: $(LIBELPADIR)/aligned_mem.F90
 	$(FC) -c $(LIBELPADIR)/aligned_mem.F90
@@ -1210,13 +1217,13 @@ complex.o: $(LIBELPADIR)/complex.F90 mod_precision.o
 	$(FC) -c $(LIBELPADIR)/complex.F90
 mod_single_hh_trafo_real.o: $(LIBELPADIR)/mod_single_hh_trafo_real.F90 mod_precision.o
 	$(FC) -c $(LIBELPADIR)/mod_single_hh_trafo_real.F90
-mod_compute_hh_trafo_real.o: $(LIBELPADIR)/mod_compute_hh_trafo_real.F90 mod_precision.o mod_single_hh_trafo_real.o real.o
+mod_compute_hh_trafo_real.o: $(LIBELPADIR)/mod_compute_hh_trafo_real.F90 mod_precision.o mod_single_hh_trafo_real.o real.o complex.o
 	$(FC) -c $(LIBELPADIR)/mod_compute_hh_trafo_real.F90
-mod_compute_hh_trafo_complex.o: $(LIBELPADIR)/mod_compute_hh_trafo_complex.F90 mod_precision.o complex.o
+mod_compute_hh_trafo_complex.o: $(LIBELPADIR)/mod_compute_hh_trafo_complex.F90 mod_precision.o complex.o real.o mod_single_hh_trafo_real.o
 	$(FC) -c $(LIBELPADIR)/mod_compute_hh_trafo_complex.F90
 elpa2_compute_real.o: $(LIBELPADIR)/elpa2_compute_real.F90 elpa_utilities.o elpa1_compute_real.o mod_precision.o aligned_mem.o elpa2_determine_workload.o mod_redist_band_real.o mod_pack_unpack_cpu_real.o mod_compute_hh_trafo_real.o
 	$(FC) -c $(LIBELPADIR)/elpa2_compute_real.F90
-elpa2_compute_complex.o: $(LIBELPADIR)/elpa2_compute_complex.F90 elpa_utilities.o elpa1_compute_complex.o mod_precision.o aligned_mem.o mod_redist_band_complex.o mod_pack_unpack_cpu_complex.o mod_compute_hh_trafo_complex.o
+elpa2_compute_complex.o: $(LIBELPADIR)/elpa2_compute_complex.F90 elpa_utilities.o elpa1_compute_complex.o elpa1_compute_real.o mod_precision.o aligned_mem.o elpa2_determine_workload.o mod_redist_band_complex.o mod_redist_band_real.o mod_pack_unpack_cpu_complex.o mod_pack_unpack_cpu_real.o mod_compute_hh_trafo_complex.o mod_compute_hh_trafo_real.o
 	$(FC) -c $(LIBELPADIR)/elpa2_compute_complex.F90
 elpa_solve_evp_real_2stage_double_impl.o: $(LIBELPADIR)/elpa_solve_evp_real_2stage_double_impl.F90 elpa2_compute_real.o elpa1_compute_real.o mod_precision.o
 	$(FC) -c $(LIBELPADIR)/elpa_solve_evp_real_2stage_double_impl.F90

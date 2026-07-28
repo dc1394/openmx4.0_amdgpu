@@ -674,9 +674,17 @@ static void BandNonCol_HipblasZgemm_OpenMP(hipblasOperation_t transa, hipblasOpe
     }
 }
 
+static int BandNonCol_GpuThreshold(void)
+{
+    const char *env=getenv("OPENMX_BAND_GPU_THRESHOLD");
+    int threshold=GPU_CPU_SWITCH_NUM;
+    if (env!=NULL && env[0]!='\0') { int v=atoi(env); if (0<v) threshold=v; }
+    return threshold;
+}
+
 static int BandNonCol_UseDenseGpuMatrix(int n, int n2)
 {
-    return (scf_eigen_lib_flag == GPUSOLVER && GPU_CPU_SWITCH_NUM <= n2 &&
+    return (scf_eigen_lib_flag == GPUSOLVER && BandNonCol_GpuThreshold() <= n2 &&
             na_rows == n && na_cols == n && na_rows2 == n2 && na_cols2 == n2);
 }
 
@@ -1121,9 +1129,23 @@ static int BandNonCol_AutoGpuTurnLimit(int requested, int n, int n2, int MaxN, i
 
         {
             int concurrent_ranks = (device_ranks<requested) ? device_ranks : requested;
+            size_t published_required = 0U;
+            size_t published_reserve = 0U;
             int lacks_memory =
               !BandNonCol_GpuTurnMemoryFits(free_bytes,total_bytes,required_bytes,
                                             concurrent_ranks,NULL,NULL);
+
+            /* Tell long-lived GPU caches how much room the full band
+               diagonalization group needs before they decide residency. */
+            (void)BandNonCol_GpuTurnMemoryFits(SIZE_MAX,total_bytes,required_bytes,
+                                               concurrent_ranks,
+                                               &published_required,
+                                               &published_reserve);
+            if (published_required!=SIZE_MAX &&
+                published_required<=SIZE_MAX-published_reserve){
+                OpenMX_GpuPhaseNeed_Register("band_noncol_vec",
+                                             published_required+published_reserve);
+            }
 
             if (lacks_memory){
                 int trial_ranks = (device_ranks<2) ? device_ranks : 2;
@@ -1246,6 +1268,26 @@ static int BandNonCol_RootDenseParallelKWorldsFit(int n, int n2, int MaxN, int s
     MPI_Allreduce(&local_fit,&global_fit,1,MPI_INT,MPI_MIN,mpi_comm_level1);
 
     return global_fit;
+}
+
+static int BandNonCol_GpuDiagFits(int n,int n2,int MaxN,int size_H1,int owns_dense)
+{
+    const char *env=getenv("OPENMX_BAND_GPU_DIAG");
+    size_t required=BandNonCol_RootDenseDeviceBytes(n,n2,MaxN,size_H1);
+    size_t free_bytes=0,total_bytes=0,reserve=0;
+    int local_fit=1,fit=1;
+    if (env!=NULL && atoi(env)==0) local_fit=0;
+    if (required==0 || required==SIZE_MAX) local_fit=0;
+    if (local_fit && owns_dense){
+        if (hipMemGetInfo(&free_bytes,&total_bytes)!=hipSuccess) local_fit=0;
+        else {
+            reserve=BandNonCol_RootDenseReserveBytes(total_bytes,required);
+            if (required>free_bytes || reserve>free_bytes-required) local_fit=0;
+            else OpenMX_GpuPhaseNeed_Register("band_noncol_ev",required+reserve);
+        }
+    }
+    MPI_Allreduce(&local_fit,&fit,1,MPI_INT,MPI_MIN,mpi_comm_level1);
+    return fit;
 }
 
 static unsigned long long BandNonCol_HashInt(unsigned long long h, int value)
@@ -2889,7 +2931,7 @@ double Band_DFT_NonCol(
   n2 = n*2;
 
   /* GPU dispatch (added by H.Kawai): assign HIP/OpenMP target device when GPUSOLVER is requested */
-  if (scf_eigen_lib_flag == GPUSOLVER && n2 >= GPU_CPU_SWITCH_NUM &&
+  if (scf_eigen_lib_flag == GPUSOLVER && n2 >= BandNonCol_GpuThreshold() &&
       Set_Hamiltonian_OpenMP_Rank_Is_Selected()) {
       set_hip_default_device_from_local_rank_noncollective();
   }
@@ -3258,9 +3300,12 @@ double Band_DFT_NonCol(
 	  MPI_Allreduce(&num_kloop0, &all_knum, 1, MPI_INT, MPI_PROD, mpi_comm_level1);
 	  MPI_Allreduce(&num_kloop0, &max_num_kloop0, 1, MPI_INT, MPI_MAX, mpi_comm_level1);
 
-			  use_root_dense_gpusolver = (scf_eigen_lib_flag==GPUSOLVER && all_knum==1 && GPU_CPU_SWITCH_NUM<=n2);
-			  use_k_dense_gpusolver = (scf_eigen_lib_flag==GPUSOLVER && all_knum!=1 &&
-			                          GPU_CPU_SWITCH_NUM<=n2 && strcasecmp(mode,"scf")==0);
+			  {
+			    int gpu_diag_fit=(scf_eigen_lib_flag==GPUSOLVER && BandNonCol_GpuThreshold()<=n2) ?
+			      BandNonCol_GpuDiagFits(n,n2,MaxN,size_H1,Set_Hamiltonian_OpenMP_Rank_Is_Selected()) : 0;
+			    use_root_dense_gpusolver = (gpu_diag_fit && all_knum==1);
+			    use_k_dense_gpusolver = (gpu_diag_fit && all_knum!=1 && strcasecmp(mode,"scf")==0);
+			  }
 			  owns_dense_k_rank = (use_k_dense_gpusolver && Set_Hamiltonian_OpenMP_Rank_Is_Selected());
 			  if (use_k_dense_gpusolver){
 			    dense_k_owner = (int*)malloc(sizeof(int)*(size_t)T_knum);
@@ -3772,7 +3817,7 @@ double Band_DFT_NonCol(
 	mpi_comm_rows_int = MPI_Comm_c2f(mpi_comm_rows);
 	mpi_comm_cols_int = MPI_Comm_c2f(mpi_comm_cols);
 
-	if (scf_eigen_lib_flag==GPUSOLVER && GPU_CPU_SWITCH_NUM<=n2 && na_rows==n && na_cols==n){
+	if (scf_eigen_lib_flag==GPUSOLVER && BandNonCol_GpuThreshold()<=n2 && na_rows==n && na_cols==n){
 	  BandNonCol_GpuSolver_DenseZheevx(Cs,Ss,ko,n,n,"Band_DFT_NonCol overlap");
 	}
 	else if (scf_eigen_lib_flag==1 || (numprocs2<5 && scf_eigen_lib_flag!=GPUSOLVER)){
@@ -3965,7 +4010,7 @@ double Band_DFT_NonCol(
       mpi_comm_rows_int = MPI_Comm_c2f(mpi_comm_rows);
       mpi_comm_cols_int = MPI_Comm_c2f(mpi_comm_cols);
 
-        if (scf_eigen_lib_flag==GPUSOLVER && GPU_CPU_SWITCH_NUM<=n2 && na_rows2==n2 && na_cols2==n2){
+        if (scf_eigen_lib_flag==GPUSOLVER && BandNonCol_GpuThreshold()<=n2 && na_rows2==n2 && na_cols2==n2){
           BandNonCol_GpuSolver_DenseZheevx(Hs2,Cs2,ko,n2,MaxN,"Band_DFT_NonCol Hamiltonian");
         }
         else if (scf_eigen_lib_flag==1 || (numprocs2<5 && scf_eigen_lib_flag!=GPUSOLVER)){
@@ -4452,7 +4497,7 @@ double Band_DFT_NonCol(
 					    rDM11,rDM22,rDM12,iDM12,iDM11,iDM22,
 					    rEDM11,rEDM22 );
 	      }
-      else if (scf_eigen_lib_flag==GPUSOLVER && GPU_CPU_SWITCH_NUM<=n2){
+      else if (scf_eigen_lib_flag==GPUSOLVER && BandNonCol_GpuThreshold()<=n2){
         BandNonCol_CalcDMAllK1_OpenMP( myid0,myid2,size_H1,
 					is2,ie2,MP,n,n2,k1,k2,k3,
 					CDM,iDM[0],EDM,EIGEN[0][kloop],
@@ -4701,7 +4746,7 @@ double Band_DFT_NonCol(
 	mpi_comm_rows_int = MPI_Comm_c2f(mpi_comm_rows);
 	mpi_comm_cols_int = MPI_Comm_c2f(mpi_comm_cols);
 
-        if (scf_eigen_lib_flag==GPUSOLVER && GPU_CPU_SWITCH_NUM<=n2 && na_rows==n && na_cols==n){
+        if (scf_eigen_lib_flag==GPUSOLVER && BandNonCol_GpuThreshold()<=n2 && na_rows==n && na_cols==n){
           BandNonCol_GpuSolver_DenseZheevx(Cs,Ss,ko,n,n,"Band_DFT_NonCol overlap");
         }
         else if (scf_eigen_lib_flag==1 || (numprocs2<5 && scf_eigen_lib_flag!=GPUSOLVER)){
@@ -4879,7 +4924,7 @@ double Band_DFT_NonCol(
 	mpi_comm_rows_int = MPI_Comm_c2f(mpi_comm_rows);
 	mpi_comm_cols_int = MPI_Comm_c2f(mpi_comm_cols);
   
-        if (scf_eigen_lib_flag==GPUSOLVER && GPU_CPU_SWITCH_NUM<=n2 && na_rows2==n2 && na_cols2==n2){
+        if (scf_eigen_lib_flag==GPUSOLVER && BandNonCol_GpuThreshold()<=n2 && na_rows2==n2 && na_cols2==n2){
           BandNonCol_GpuSolver_DenseZheevx(Hs2,Cs2,ko,n2,MaxN,"Band_DFT_NonCol Hamiltonian");
         }
         else if (scf_eigen_lib_flag==1 || (numprocs2<5 && scf_eigen_lib_flag!=GPUSOLVER)){
@@ -5439,7 +5484,7 @@ static void BandNonCol_ConstructDenseMsFromPacked( int cpx_flag, const double *M
     return;
   }
 
-  if (scf_eigen_lib_flag==GPUSOLVER && GPU_CPU_SWITCH_NUM<=2*n){
+  if (scf_eigen_lib_flag==GPUSOLVER && BandNonCol_GpuThreshold()<=2*n){
     BandNonCol_ConstructCache_Ensure(order_GA,MP,n);
     BandNonCol_ConstructDenseMs_OpenMP(cpx_flag,n,k1,k2,k3,M1,Ms);
     return;
@@ -5600,7 +5645,7 @@ static void Construct_Band_DenseMs( int cpx_flag, double ****Mat, double *M1, dc
 
   MPI_Allreduce(MPI_IN_PLACE,&M1[0],tnum,MPI_DOUBLE,MPI_SUM,mpi_comm_level1);
 
-  if (owns_dense && scf_eigen_lib_flag==GPUSOLVER && GPU_CPU_SWITCH_NUM<=2*n){
+  if (owns_dense && scf_eigen_lib_flag==GPUSOLVER && BandNonCol_GpuThreshold()<=2*n){
     BandNonCol_ConstructCache_Ensure(order_GA,MP,n);
     BandNonCol_ConstructDenseMs_OpenMP(cpx_flag,n,k1,k2,k3,M1,Ms);
   }

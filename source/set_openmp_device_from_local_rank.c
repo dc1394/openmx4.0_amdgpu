@@ -1,33 +1,8 @@
+#include "openmx_common.h"
 #include "set_openmp_device_from_local_rank.h"
+#include "set_hip_default_device_from_local_rank.h"
 #include <omp.h>
 #include <stdlib.h>
-
-static int get_local_rank_noncollective(void)
-{
-    const char *env_names[] = {
-        "OMPI_COMM_WORLD_LOCAL_RANK",
-        "MV2_COMM_WORLD_LOCAL_RANK",
-        "SLURM_LOCALID",
-        "PMI_LOCAL_RANK",
-        NULL
-    };
-
-    for (int i = 0; env_names[i] != NULL; i++) {
-        const char *value = getenv(env_names[i]);
-        if (value != NULL && value[0] != '\0') {
-            int local_rank = atoi(value);
-            if (0 <= local_rank) {
-                return local_rank;
-            }
-        }
-    }
-
-    {
-        int rank = 0;
-        MPI_Comm_rank(MPI_COMM_WORLD, &rank);
-        return rank;
-    }
-}
 
 int set_openmp_device_from_local_rank(void)
 {
@@ -36,14 +11,17 @@ int set_openmp_device_from_local_rank(void)
     MPI_Comm shmcomm;
     MPI_Comm_split_type(MPI_COMM_WORLD, MPI_COMM_TYPE_SHARED, 0, MPI_INFO_NULL, &shmcomm);
 
-    int local_rank = 0;
+    int local_rank = 0, local_size = 1;
     MPI_Comm_rank(shmcomm, &local_rank);
+    MPI_Comm_size(shmcomm, &local_size);
 
     int ndev = omp_get_num_devices();
     int dev  = -1;
 
+    if (0 < SCF_Gpu_Num && SCF_Gpu_Num < ndev) ndev = SCF_Gpu_Num;
+
     if (ndev > 0) {
-        dev = local_rank % ndev;
+        dev = openmx_gpu_map_rank_to_device(local_rank, local_size, ndev);
         omp_set_default_device(dev);
     }
 
@@ -62,9 +40,12 @@ int set_openmp_device_from_local_rank_noncollective(void)
     int ndev = omp_get_num_devices();
     int dev  = -1;
 
+    if (0 < SCF_Gpu_Num && SCF_Gpu_Num < ndev) ndev = SCF_Gpu_Num;
+
     if (ndev > 0) {
-        int local_rank = get_local_rank_noncollective();
-        dev = local_rank % ndev;
+        dev = openmx_gpu_map_rank_to_device(openmx_gpu_local_rank_noncollective(),
+                                            openmx_gpu_local_size_noncollective(),
+                                            ndev);
         omp_set_default_device(dev);
     }
 

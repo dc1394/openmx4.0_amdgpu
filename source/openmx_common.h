@@ -3342,6 +3342,48 @@ int Set_Hamiltonian_OpenMP_Rank_Is_Selected(void);
 void Set_Hamiltonian_Invalidate_GpuSolver_HS_Cache(void);
 void Set_Hamiltonian_Build_GpuSolver_HS_Cache(int use_contracted);
 void Set_Hamiltonian_GpuSolver_SetMP(int *MP);
+void Mixing_H_Release_GPU(void);
+void OpenMX_GpuPhaseNeed_Register(const char *phase, size_t group_bytes);
+size_t OpenMX_GpuPhaseNeed_Max(void);
+size_t OpenMX_GpuPhaseNeed_MaxPrefixed(const char *prefix);
+void Set_Hamiltonian_Invalidate_OpenMP_MatrixElements_Cache(void);
+void Set_Density_Grid_GPU_Invalidate(void);
+int Set_Density_Grid_GPU_Service(int Cnt_kind, int Calc_CntOrbital_ON,
+                                 double *****CDM, double **Density_Grid_B0,
+                                 double *elapsed);
+void Cluster_DFT_NonCol_DemoteGpuSolverCachedEVec(void);
+void Cluster_DFT_Col_Release_GPU_Solver(void);
+void Cluster_DFT_NonCol_Release_GPU_Solver(void);
+void Divide_Conquer_Release_GPU_SCache(void);
+void Krylov_Release_GPU_KUCache(void);
+
+typedef struct {
+  int pair_count;
+  int orbs0_resident;
+  int orbs1_resident;
+  int nolg_resident;
+  int meta_resident;
+  size_t total_h;
+  size_t total_nolg;
+  size_t total_orbs0;
+  size_t total_orbs1;
+  const int *pair_Mc_AN;
+  const int *pair_h_AN;
+  const int *pair_NO0;
+  const int *pair_NO1;
+  const int *pair_NOLG;
+  const int *nolg_MN;
+  const int *nolg_Nc;
+  const size_t *pair_h_offset;
+  const size_t *pair_nolg_offset;
+  const size_t *pair_orbs0_offset;
+  const size_t *pair_orbs1_offset;
+  const Type_Orbs_Grid *orbs0buf;
+  const Type_Orbs_Grid *orbs1buf;
+} SetHamiltonianMETables;
+
+int Set_Hamiltonian_GetMatrixElementsTables(int Cnt_kind, SetHamiltonianMETables *tables);
+int Set_Hamiltonian_MatrixElementsTables_Ready(int Cnt_kind);
 int Set_Hamiltonian_GpuSolver_Packed_CacheReady(void);
 int Set_Hamiltonian_GpuSolver_Packed_OwnsCache(void);
 int Set_Hamiltonian_GpuSolver_Packed_OrderMode(void);
@@ -4141,6 +4183,8 @@ hipblasStatus_t openmx_gemmul8Zgemm(hipblasHandle_t handle, hipblasOperation_t t
                                    const hipDoubleComplex *B, int ldb, const hipDoubleComplex *beta, hipDoubleComplex *C,
                                    int ldc);
 void openmx_gemmul8ReleaseWorkspaces(void);
+size_t openmx_gemmul8ZWorkspaceSize(int m, int n, int k);
+size_t openmx_gemmul8DWorkspaceSize(int m, int n, int k);
 
 int getDeviceCount();
 void Eigen_PReHH(MPI_Comm MPI_Current_Comm_WD, 

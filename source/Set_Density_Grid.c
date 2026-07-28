@@ -59,6 +59,7 @@ double Set_Density_Grid(int Cnt_kind, int Calc_CntOrbital_ON, double *****CDM, d
   int numprocs,myid,tag=999,ID,IDS,IDR;
   double Stime_atom, Etime_atom;
   double time0,time1,time2;
+  int use_local_gpu = 0;
 
   MPI_Status stat;
   MPI_Request request;
@@ -75,6 +76,17 @@ double Set_Density_Grid(int Cnt_kind, int Calc_CntOrbital_ON, double *****CDM, d
   MPI_Comm_rank(mpi_comm_level1,&myid);
   
   dtime(&TStime);
+
+  {
+    int local_ok=Set_Density_Grid_GPU_Local_Prepare(Cnt_kind,Calc_CntOrbital_ON);
+    MPI_Allreduce(&local_ok,&use_local_gpu,1,MPI_INT,MPI_MIN,mpi_comm_level1);
+  }
+
+  if (!use_local_gpu){
+    if (Set_Density_Grid_GPU_Service(Cnt_kind,Calc_CntOrbital_ON,CDM,Density_Grid_B0,&time0)){
+      return time0;
+    }
+  }
 
   /* allocation of arrays */
 
@@ -298,6 +310,10 @@ double Set_Density_Grid(int Cnt_kind, int Calc_CntOrbital_ON, double *****CDM, d
   ***********************************************/
     
   dtime(&time1);
+
+  if (use_local_gpu && !Set_Density_Grid_GPU_Local_Run(CDM,Tmp_Den_Grid)) use_local_gpu=0;
+
+  if (!use_local_gpu){
   
   
   /* AITUNE ========================== */ 
@@ -607,6 +623,8 @@ double Set_Density_Grid(int Cnt_kind, int Calc_CntOrbital_ON, double *****CDM, d
   } /* #pragma omp parallel */
   
   free(ai_tmpDG_all);
+
+  } /* !use_local_gpu */
 
   dtime(&time2);
   if(myid==0 && measure_time){

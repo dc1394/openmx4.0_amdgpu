@@ -60,6 +60,53 @@ void Generation_ATV(int N)
 
 }
 
+/* GPU-heavy phases publish their peak per-device group allocation here.
+   Long-lived caches use the maximum to leave enough room for later phases. */
+#define OPENMX_GPU_PHASE_NEED_SLOTS 8
+
+static char OpenMX_GpuPhaseNeed_Name[OPENMX_GPU_PHASE_NEED_SLOTS][32];
+static size_t OpenMX_GpuPhaseNeed_Bytes[OPENMX_GPU_PHASE_NEED_SLOTS];
+
+void OpenMX_GpuPhaseNeed_Register(const char *phase, size_t group_bytes)
+{
+  int i;
+  if (phase==NULL || phase[0]=='\0') return;
+  for (i=0; i<OPENMX_GPU_PHASE_NEED_SLOTS; i++){
+    if (OpenMX_GpuPhaseNeed_Name[i][0]=='\0' ||
+        strncmp(OpenMX_GpuPhaseNeed_Name[i],phase,
+                sizeof(OpenMX_GpuPhaseNeed_Name[i])-1)==0){
+      strncpy(OpenMX_GpuPhaseNeed_Name[i],phase,
+              sizeof(OpenMX_GpuPhaseNeed_Name[i])-1);
+      OpenMX_GpuPhaseNeed_Name[i][sizeof(OpenMX_GpuPhaseNeed_Name[i])-1]='\0';
+      OpenMX_GpuPhaseNeed_Bytes[i]=group_bytes;
+      return;
+    }
+  }
+}
+
+size_t OpenMX_GpuPhaseNeed_Max(void)
+{
+  size_t need=0U;
+  int i;
+  for (i=0; i<OPENMX_GPU_PHASE_NEED_SLOTS; i++)
+    if (OpenMX_GpuPhaseNeed_Name[i][0]!='\0' &&
+        need<OpenMX_GpuPhaseNeed_Bytes[i]) need=OpenMX_GpuPhaseNeed_Bytes[i];
+  return need;
+}
+
+size_t OpenMX_GpuPhaseNeed_MaxPrefixed(const char *prefix)
+{
+  size_t need=0U,plen;
+  int i;
+  if (prefix==NULL || prefix[0]=='\0') return 0U;
+  plen=strlen(prefix);
+  for (i=0; i<OPENMX_GPU_PHASE_NEED_SLOTS; i++)
+    if (OpenMX_GpuPhaseNeed_Name[i][0]!='\0' &&
+        strncmp(OpenMX_GpuPhaseNeed_Name[i],prefix,plen)==0 &&
+        need<OpenMX_GpuPhaseNeed_Bytes[i]) need=OpenMX_GpuPhaseNeed_Bytes[i];
+  return need;
+}
+
 void Cross_Product(double a[4], double b[4], double c[4])
 {
   c[1] = a[2]*b[3] - a[3]*b[2]; 

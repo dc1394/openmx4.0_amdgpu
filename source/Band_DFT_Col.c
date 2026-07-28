@@ -175,6 +175,14 @@ static void BandCol_AbortWithMessage(const char * msg)
     exit(1);
 }
 
+static int BandCol_GpuThreshold(void)
+{
+    const char *env=getenv("OPENMX_BAND_GPU_THRESHOLD");
+    int threshold=GPU_CPU_SWITCH_NUM;
+    if (env!=NULL && env[0]!='\0') { int v=atoi(env); if (0<v) threshold=v; }
+    return threshold;
+}
+
 static int BandCol_DefaultGpuTurnGroup(void)
 {
     /* Upper bound on how many MPI ranks (k-point turns) use the GPU at the same
@@ -304,6 +312,37 @@ static int BandCol_MaxConcurrentKGpuTurns(void)
     }
 
     return BandCol_DefaultGpuTurnGroup();
+}
+
+static int BandCol_GpuDenseFits(int n, int owns_dense)
+{
+    const char *env = getenv("OPENMX_BAND_GPU_DIAG");
+    const char *reserve_env = getenv("OPENMX_BAND_GPU_DIAG_RESERVE_MB");
+    size_t free_bytes=0,total_bytes=0,reserve=(size_t)1024*1024*1024;
+    size_t per_rank,required;
+    int turns=BandCol_MaxConcurrentKGpuTurns();
+    int local_fit=1,fit=1;
+
+    if (env!=NULL && atoi(env)==0) local_fit=0;
+    if (reserve_env!=NULL){
+        long mib=atol(reserve_env);
+        if (0<=mib) reserve=(size_t)mib*1024U*1024U;
+    }
+    if (turns<1) turns=1;
+    if ((size_t)n>SIZE_MAX/(size_t)n/sizeof(dcomplex)/5U){
+        local_fit=0;
+        per_rank=SIZE_MAX;
+    }
+    else per_rank=(size_t)5*(size_t)n*(size_t)n*sizeof(dcomplex)+(size_t)n*sizeof(double);
+    if (per_rank!=SIZE_MAX && (size_t)turns<=(SIZE_MAX-reserve)/per_rank){
+        required=per_rank*(size_t)turns+reserve;
+        OpenMX_GpuPhaseNeed_Register("band_col",required);
+        if (local_fit && owns_dense &&
+            (hipMemGetInfo(&free_bytes,&total_bytes)!=hipSuccess || free_bytes<required)) local_fit=0;
+    }
+    else local_fit=0;
+    MPI_Allreduce(&local_fit,&fit,1,MPI_INT,MPI_MIN,mpi_comm_level1);
+    return fit;
 }
 
 static void BandCol_ConstructCache_Reset(void)
@@ -1723,7 +1762,8 @@ double Band_DFT_Col(int SCF_iter, int knum_i, int knum_j, int knum_k, int SpinP_
         if (max_tno < tnoA)
             max_tno = tnoA;
     }
-    use_gpusolver_dense = (scf_eigen_lib_flag == GPUSOLVER && GPU_CPU_SWITCH_NUM <= n);
+    use_gpusolver_dense = (scf_eigen_lib_flag == GPUSOLVER && BandCol_GpuThreshold() <= n &&
+                           BandCol_GpuDenseFits(n,myid1==0));
 
     /****************************************************
      find TZ
@@ -4558,7 +4598,7 @@ void Construct_Band_CsHs(int SCF_iter, int all_knum, int * order_GA, int * MP, d
                          double k2, double k3, dcomplex * Cs, dcomplex * Hs, int n, int owns_global_dense_rank)
 {
     const int need_s = (SCF_iter == 1 || all_knum != 1);
-    const int use_gpusolver_dense = (scf_eigen_lib_flag == GPUSOLVER && GPU_CPU_SWITCH_NUM <= n);
+    const int use_gpusolver_dense = (scf_eigen_lib_flag == GPUSOLVER && BandCol_GpuThreshold() <= n);
     const int dense_gpusolver_owner =
         (use_gpusolver_dense &&
          ((all_knum == 1 && owns_global_dense_rank) ||

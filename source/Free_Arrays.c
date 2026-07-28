@@ -18,6 +18,11 @@ void array3();
 void Free_Arrays(int wherefrom)
 {
 
+  if (wherefrom==0) {
+    Set_Density_Grid_GPU_Invalidate();
+    Set_Hamiltonian_Invalidate_OpenMP_MatrixElements_Cache();
+  }
+
   if      (wherefrom==0) array0();
   else if (wherefrom==1) array1();
 

@@ -14,6 +14,7 @@
 #include "mpi.h"
 #include "openmx_common.h"
 #include "lapack_prototypes.h"
+#include "set_hip_default_device_from_local_rank.h"
 #include <limits.h>
 #include <math.h>
 #include <omp.h>
@@ -31,8 +32,86 @@ static void Calc_MatrixElements_dVH_Vxc_VNA_OpenMP(int Cnt_kind);
 static void Set_Hamiltonian_Base_OpenMP(int SCF_iter, double *****H0, double *****HNL, double *****H);
 static size_t Set_Hamiltonian_Base_OpenMP_DeviceBytes(int SCF_iter, int myid);
 static size_t Set_Hamiltonian_MatrixElements_OpenMP_DeviceBytes(int Cnt_kind, int myid);
+int Set_Hamiltonian_Hip_MatrixElements(
+    int pair_count, int spin_count, int max_output_count,
+    size_t total_h, size_t total_nolg, size_t total_orbs0, size_t total_orbs1,
+    const int *pair_NO0, const int *pair_NO1, const int *pair_NOLG,
+    const size_t *pair_h_offset, const size_t *pair_nolg_offset,
+    const size_t *pair_orbs0_offset, const size_t *pair_orbs1_offset,
+    const double *vpotbuf, const float *orbs0buf, const float *orbs1buf, double *hbuf);
 
 static int Set_Hamiltonian_OpenMP_Rank_Selected = 1;
+
+typedef struct {
+    int ready, cnt_kind;
+    SetHamiltonianMETables t;
+    int *pair_Mc_AN, *pair_h_AN, *pair_NO0, *pair_NO1, *pair_NOLG;
+    int *nolg_MN, *nolg_Nc;
+    size_t *pair_h_offset, *pair_nolg_offset, *pair_orbs0_offset, *pair_orbs1_offset;
+    Type_Orbs_Grid *orbs0buf, *orbs1buf;
+} SetHamiltonianMETableCache;
+
+static SetHamiltonianMETableCache Set_Hamiltonian_ME_Tables = {0};
+
+static int Set_Hamiltonian_ME_Associate(void *host, size_t bytes)
+{
+    void *dev = NULL;
+    int ompdev = omp_get_default_device();
+    if (bytes == 0) return 1;
+    if (hipMalloc(&dev, bytes) != hipSuccess) return 0;
+    if (hipMemcpy(dev, host, bytes, hipMemcpyHostToDevice) != hipSuccess ||
+        omp_target_associate_ptr(host, dev, bytes, 0, ompdev) != 0) {
+        hipFree(dev);
+        return 0;
+    }
+    return 1;
+}
+
+static void Set_Hamiltonian_ME_Disassociate(void *host)
+{
+    int ompdev = omp_get_default_device();
+    void *dev;
+    if (host == NULL) return;
+    dev = omp_get_mapped_ptr(host, ompdev);
+    if (dev != NULL) {
+        omp_target_disassociate_ptr(host, ompdev);
+        hipFree(dev);
+    }
+}
+
+void Set_Hamiltonian_Invalidate_OpenMP_MatrixElements_Cache(void)
+{
+    SetHamiltonianMETableCache *c = &Set_Hamiltonian_ME_Tables;
+    Set_Hamiltonian_ME_Disassociate(c->pair_NO0);
+    Set_Hamiltonian_ME_Disassociate(c->pair_NO1);
+    Set_Hamiltonian_ME_Disassociate(c->pair_NOLG);
+    Set_Hamiltonian_ME_Disassociate(c->nolg_MN);
+    Set_Hamiltonian_ME_Disassociate(c->nolg_Nc);
+    Set_Hamiltonian_ME_Disassociate(c->pair_h_offset);
+    Set_Hamiltonian_ME_Disassociate(c->pair_nolg_offset);
+    Set_Hamiltonian_ME_Disassociate(c->pair_orbs0_offset);
+    Set_Hamiltonian_ME_Disassociate(c->pair_orbs1_offset);
+    Set_Hamiltonian_ME_Disassociate(c->orbs0buf);
+    Set_Hamiltonian_ME_Disassociate(c->orbs1buf);
+    free(c->pair_Mc_AN); free(c->pair_h_AN); free(c->pair_NO0); free(c->pair_NO1);
+    free(c->pair_NOLG); free(c->nolg_MN); free(c->nolg_Nc);
+    free(c->pair_h_offset); free(c->pair_nolg_offset);
+    free(c->pair_orbs0_offset); free(c->pair_orbs1_offset);
+    free(c->orbs0buf); free(c->orbs1buf);
+    memset(c, 0, sizeof(*c));
+}
+
+int Set_Hamiltonian_MatrixElementsTables_Ready(int Cnt_kind)
+{ return Set_Hamiltonian_ME_Tables.ready && Set_Hamiltonian_ME_Tables.cnt_kind==Cnt_kind; }
+
+int Set_Hamiltonian_GetMatrixElementsTables(int Cnt_kind, SetHamiltonianMETables *tables)
+{
+    if (tables==NULL) return 0;
+    memset(tables,0,sizeof(*tables));
+    if (!Set_Hamiltonian_MatrixElementsTables_Ready(Cnt_kind)) return 0;
+    *tables = Set_Hamiltonian_ME_Tables.t;
+    return 1;
+}
 
 void Set_Hamiltonian_Set_OpenMP_Rank_Selected(int selected)
 {
@@ -124,13 +203,16 @@ static int Set_Hamiltonian_MatrixElements_OpenMP_Enabled(void)
      * host-device copies for the current cluster workloads.  Keep the kernel
      * available for future tuning, but use the CPU path for this phase.
      */
-    return 0;
+    const char *value = getenv("OPENMX_SETHAM_GPU");
+    return scf_eigen_lib_flag == GPUSOLVER &&
+           gpu_rank_device_usable() &&
+           (value == NULL || atoi(value) != 0);
 }
 
 static int Set_Hamiltonian_DeviceMemoryOK(size_t required_bytes, const char *where, int myid, int use_device)
 {
     MPI_Comm node_comm, device_comm;
-    int local_rank, hip_device_count, device_rank, device_ranks;
+    int local_rank, local_size, hip_device_count, device_rank, device_ranks;
     int hip_device;
     size_t free_bytes, total_bytes;
     hipError_t hip_err;
@@ -139,6 +221,7 @@ static int Set_Hamiltonian_DeviceMemoryOK(size_t required_bytes, const char *whe
 
     MPI_Comm_split_type(mpi_comm_level1, MPI_COMM_TYPE_SHARED, 0, MPI_INFO_NULL, &node_comm);
     MPI_Comm_rank(node_comm, &local_rank);
+    MPI_Comm_size(node_comm, &local_size);
 
     hip_device = -1;
     free_bytes = 0;
@@ -156,7 +239,15 @@ static int Set_Hamiltonian_DeviceMemoryOK(size_t required_bytes, const char *whe
             }
         }
         else {
-            hip_device = local_rank % hip_device_count;
+            int omp_device_count = omp_get_num_devices();
+            if (0 < omp_device_count && omp_device_count < hip_device_count) {
+                hip_device_count = omp_device_count;
+            }
+            if (0 < SCF_Gpu_Num && SCF_Gpu_Num < hip_device_count) {
+                hip_device_count = SCF_Gpu_Num;
+            }
+            hip_device = openmx_gpu_map_rank_to_device(local_rank, local_size,
+                                                       hip_device_count);
 
             hip_err = hipSetDevice(hip_device);
             if (hip_err != hipSuccess) {
@@ -242,8 +333,7 @@ static int Set_Hamiltonian_MatrixElements_Use_OpenMP(int Cnt_kind, int myid)
     size_t required_bytes;
     int memory_ok;
 
-    if (!Set_Hamiltonian_OpenMP_Enabled() ||
-        !Set_Hamiltonian_MatrixElements_OpenMP_Enabled()) {
+    if (!Set_Hamiltonian_MatrixElements_OpenMP_Enabled()) {
         return 0;
     }
 
@@ -1154,13 +1244,17 @@ static void Calc_MatrixElements_dVH_Vxc_VNA_OpenMP(int Cnt_kind)
     int numprocs, myid;
     int spin_count, pair_count, pair;
     int *pair_Mc_AN, *pair_h_AN, *pair_NO0, *pair_NO1, *pair_NOLG;
+    int *nolg_MN, *nolg_Nc;
     size_t *pair_h_offset, *pair_nolg_offset, *pair_orbs0_offset, *pair_orbs1_offset;
     size_t total_h, total_nolg, total_nolg_all, total_orbs0, total_orbs1;
+    size_t packed_total_h, packed_total_orbs0, packed_total_orbs1;
+    int max_output_count = 0;
     double *hbuf, *vpotbuf;
     Type_Orbs_Grid *orbs0buf, *orbs1buf;
 
     MPI_Comm_size(mpi_comm_level1, &numprocs);
     MPI_Comm_rank(mpi_comm_level1, &myid);
+    Set_Hamiltonian_Invalidate_OpenMP_MatrixElements_Cache();
 
     if (Cnt_kind != 0 && Cnt_kind != 1) {
         Set_Hamiltonian_abort("Calc_MatrixElements_dVH_Vxc_VNA_OpenMP", "Cnt_kind must be 0 or 1", myid);
@@ -1197,6 +1291,7 @@ static void Calc_MatrixElements_dVH_Vxc_VNA_OpenMP(int Cnt_kind)
             }
 
             total_h += (size_t)spin_count * (size_t)NO0 * (size_t)NO1;
+            if (max_output_count < spin_count * NO0 * NO1) max_output_count = spin_count * NO0 * NO1;
             total_nolg += (size_t)NOLG;
             total_orbs0 += (size_t)NOLG * (size_t)NO0;
             total_orbs1 += (size_t)NOLG * (size_t)NO1;
@@ -1223,8 +1318,13 @@ static void Calc_MatrixElements_dVH_Vxc_VNA_OpenMP(int Cnt_kind)
         (Type_Orbs_Grid *)Set_Hamiltonian_malloc(sizeof(Type_Orbs_Grid) * total_orbs0, "openmp orbs0buf", myid);
     orbs1buf =
         (Type_Orbs_Grid *)Set_Hamiltonian_malloc(sizeof(Type_Orbs_Grid) * total_orbs1, "openmp orbs1buf", myid);
+    nolg_MN = (int *)Set_Hamiltonian_malloc(sizeof(int) * total_nolg, "openmp nolg_MN", myid);
+    nolg_Nc = (int *)Set_Hamiltonian_malloc(sizeof(int) * total_nolg, "openmp nolg_Nc", myid);
 
     total_nolg_all = total_nolg;
+    packed_total_h = total_h;
+    packed_total_orbs0 = total_orbs0;
+    packed_total_orbs1 = total_orbs1;
 
     pair = 0;
     total_h = 0;
@@ -1280,6 +1380,9 @@ static void Calc_MatrixElements_dVH_Vxc_VNA_OpenMP(int Cnt_kind)
                 int Nh = GListTAtoms2[Mc_AN][h_AN][Nog];
                 Type_Orbs_Grid *orbs1 = (G2ID[Gh_AN] == myid) ? Orbs_Grid[Mh_AN][Nh] : Orbs_Grid_FNAN[Mc_AN][h_AN][Nog];
 
+                nolg_MN[total_nolg + (size_t)Nog] = MN;
+                nolg_Nc[total_nolg + (size_t)Nog] = Nc;
+
                 for (i = 0; i < NO0; i++) {
                     orbs0buf[total_orbs0 + (size_t)Nog * (size_t)NO0 + (size_t)i] = Orbs_Grid[Mc_AN][Nc][i];
                 }
@@ -1300,7 +1403,12 @@ static void Calc_MatrixElements_dVH_Vxc_VNA_OpenMP(int Cnt_kind)
         }
     }
 
-    {
+    if (Set_Hamiltonian_Hip_MatrixElements(
+            pair_count, spin_count, max_output_count,
+            packed_total_h, total_nolg_all, packed_total_orbs0, packed_total_orbs1,
+            pair_NO0, pair_NO1, pair_NOLG, pair_h_offset, pair_nolg_offset,
+            pair_orbs0_offset, pair_orbs1_offset, vpotbuf,
+            (const float *)orbs0buf, (const float *)orbs1buf, hbuf) != 0) {
 #pragma omp parallel for
         for (pair = 0; pair < pair_count; pair++) {
             int NO0 = pair_NO0[pair];
@@ -1356,19 +1464,48 @@ static void Calc_MatrixElements_dVH_Vxc_VNA_OpenMP(int Cnt_kind)
         }
     }
 
-    free(orbs1buf);
-    free(orbs0buf);
+    {
+        SetHamiltonianMETableCache *c = &Set_Hamiltonian_ME_Tables;
+        int resident_ok = 1;
+
+        c->ready = 1; c->cnt_kind = Cnt_kind;
+        c->pair_Mc_AN=pair_Mc_AN; c->pair_h_AN=pair_h_AN;
+        c->pair_NO0=pair_NO0; c->pair_NO1=pair_NO1; c->pair_NOLG=pair_NOLG;
+        c->nolg_MN=nolg_MN; c->nolg_Nc=nolg_Nc;
+        c->pair_h_offset=pair_h_offset; c->pair_nolg_offset=pair_nolg_offset;
+        c->pair_orbs0_offset=pair_orbs0_offset; c->pair_orbs1_offset=pair_orbs1_offset;
+        c->orbs0buf=orbs0buf; c->orbs1buf=orbs1buf;
+
+        c->t.pair_count=pair_count; c->t.total_h=packed_total_h;
+        c->t.total_nolg=total_nolg_all; c->t.total_orbs0=packed_total_orbs0;
+        c->t.total_orbs1=packed_total_orbs1;
+        c->t.pair_Mc_AN=pair_Mc_AN; c->t.pair_h_AN=pair_h_AN;
+        c->t.pair_NO0=pair_NO0; c->t.pair_NO1=pair_NO1; c->t.pair_NOLG=pair_NOLG;
+        c->t.nolg_MN=nolg_MN; c->t.nolg_Nc=nolg_Nc;
+        c->t.pair_h_offset=pair_h_offset; c->t.pair_nolg_offset=pair_nolg_offset;
+        c->t.pair_orbs0_offset=pair_orbs0_offset; c->t.pair_orbs1_offset=pair_orbs1_offset;
+        c->t.orbs0buf=orbs0buf; c->t.orbs1buf=orbs1buf;
+
+        resident_ok &= Set_Hamiltonian_ME_Associate(pair_NO0,sizeof(int)*(size_t)pair_count);
+        resident_ok &= Set_Hamiltonian_ME_Associate(pair_NO1,sizeof(int)*(size_t)pair_count);
+        resident_ok &= Set_Hamiltonian_ME_Associate(pair_NOLG,sizeof(int)*(size_t)pair_count);
+        resident_ok &= Set_Hamiltonian_ME_Associate(nolg_MN,sizeof(int)*total_nolg_all);
+        resident_ok &= Set_Hamiltonian_ME_Associate(nolg_Nc,sizeof(int)*total_nolg_all);
+        resident_ok &= Set_Hamiltonian_ME_Associate(pair_h_offset,sizeof(size_t)*(size_t)pair_count);
+        resident_ok &= Set_Hamiltonian_ME_Associate(pair_nolg_offset,sizeof(size_t)*(size_t)pair_count);
+        resident_ok &= Set_Hamiltonian_ME_Associate(pair_orbs0_offset,sizeof(size_t)*(size_t)pair_count);
+        resident_ok &= Set_Hamiltonian_ME_Associate(pair_orbs1_offset,sizeof(size_t)*(size_t)pair_count);
+        resident_ok &= Set_Hamiltonian_ME_Associate(orbs0buf,sizeof(Type_Orbs_Grid)*packed_total_orbs0);
+        resident_ok &= Set_Hamiltonian_ME_Associate(orbs1buf,sizeof(Type_Orbs_Grid)*packed_total_orbs1);
+        c->t.meta_resident=resident_ok; c->t.nolg_resident=resident_ok;
+        c->t.orbs0_resident=resident_ok; c->t.orbs1_resident=resident_ok;
+        if (!resident_ok) {
+            c->t.meta_resident=c->t.nolg_resident=0;
+            c->t.orbs0_resident=c->t.orbs1_resident=0;
+        }
+    }
     free(vpotbuf);
     free(hbuf);
-    free(pair_orbs1_offset);
-    free(pair_orbs0_offset);
-    free(pair_nolg_offset);
-    free(pair_h_offset);
-    free(pair_NOLG);
-    free(pair_NO1);
-    free(pair_NO0);
-    free(pair_h_AN);
-    free(pair_Mc_AN);
 }
 
 #define SETH_ME_BLK 16

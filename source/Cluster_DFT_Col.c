@@ -119,6 +119,14 @@ static int ClusterCol_GpuVerbose(void)
     return (value != NULL && value[0] == '1');
 }
 
+static int ClusterCol_GpuThreshold(void)
+{
+    const char *env=getenv("OPENMX_CLUSTER_GPU_THRESHOLD");
+    int threshold=GPU_CPU_SWITCH_NUM;
+    if (env!=NULL && env[0]!='\0') { int v=atoi(env); if (0<v) threshold=v; }
+    return threshold;
+}
+
 static size_t ClusterCol_CheckedMulCount(size_t a, size_t b, const char *label)
 {
     if (a != 0 && b > ((size_t)-1) / a) {
@@ -444,6 +452,55 @@ static void ClusterCol_GpuSolver_Destroy(void)
 
     memset(ctx, 0, sizeof(*ctx));
     ctx->device_id = -1;
+}
+
+void Cluster_DFT_Col_Release_GPU_Solver(void)
+{
+    ClusterCol_GpuSolver_Destroy();
+}
+
+/* A MAGMA solve owns four dense panels here and may reserve additional
+   device work internally.  Decide collectively before entering the root
+   GPU path so a permanently crowded shared device falls back to ELPA
+   instead of leaving peer ranks waiting in collectives. */
+static int ClusterCol_GpuDiagFits(int n, int myworld1, int myid1)
+{
+    const char *env = getenv("OPENMX_CLUSTER_GPU_DIAG");
+    const char *reserve_env = getenv("OPENMX_CLUSTER_GPU_DIAG_RESERVE_MB");
+    size_t free_bytes = 0, total_bytes = 0;
+    size_t reserve = (size_t)1024 * 1024 * 1024;
+    size_t panels, required;
+    int local_fit = 1, fit = 1;
+    int owners = (SpinP_switch == 1) ? 2 : 1;
+
+    if (env != NULL && atoi(env) == 0) local_fit = 0;
+    if (reserve_env != NULL) {
+        long mib = atol(reserve_env);
+        if (0 <= mib) reserve = (size_t)mib * 1024U * 1024U;
+    }
+
+    if (local_fit && myid1 == 0) {
+        if ((size_t)n > SIZE_MAX / (size_t)n / sizeof(double) / 4U) {
+            local_fit = 0;
+        }
+        else {
+            panels = (size_t)4 * (size_t)n * (size_t)n * sizeof(double)
+                   + (size_t)n * sizeof(double);
+            if ((size_t)owners > (SIZE_MAX - reserve) / panels) local_fit = 0;
+            else {
+                required = panels * (size_t)owners + reserve;
+                if (hipMemGetInfo(&free_bytes, &total_bytes) != hipSuccess ||
+                    free_bytes < required) local_fit = 0;
+            }
+        }
+    }
+
+    MPI_Allreduce(&local_fit, &fit, 1, MPI_INT, MPI_MIN, mpi_comm_level1);
+    if (!fit && myid1 == 0 && myworld1 == 0) {
+        printf("<Cluster_DFT_Col> GPU dense buffers do not fit; using ELPA fallback.\n");
+        fflush(stdout);
+    }
+    return fit;
 }
 
 static void ClusterCol_GpuSolver_Init(void)
@@ -1457,7 +1514,7 @@ double Cluster_DFT_Col(
   n2 = n + 2;
 
   /* GPU dispatch (added by H.Kawai): assign HIP/OpenMP target device when GPUSOLVER is requested */
-  if (scf_eigen_lib_flag == GPUSOLVER && n >= GPU_CPU_SWITCH_NUM &&
+  if (scf_eigen_lib_flag == GPUSOLVER && n >= ClusterCol_GpuThreshold() &&
       Set_Hamiltonian_OpenMP_Rank_Is_Selected()) {
       set_hip_default_device_from_local_rank_noncollective();
   }
@@ -1535,7 +1592,8 @@ double Cluster_DFT_Col(
     }
   }
 
-  if (scf_eigen_lib_flag==GPUSOLVER && GPU_CPU_SWITCH_NUM<=n){
+  if (scf_eigen_lib_flag==GPUSOLVER && ClusterCol_GpuThreshold()<=n &&
+      ClusterCol_GpuDiagFits(n,myworld1,myid1)){
     ClusterCol_SetMaxNAndPartitions(SCF_iter,mode,TZ,n,numprocs1, &MaxN,is2,ie2);
     use_gpusolver_direct_cluster_dm = 1;
     firsttime = 0;
@@ -1761,7 +1819,7 @@ double Cluster_DFT_Col(
   }
   firsttime=0;
 
-  if (scf_eigen_lib_flag==GPUSOLVER && GPU_CPU_SWITCH_NUM<=n &&
+  if (scf_eigen_lib_flag==GPUSOLVER && ClusterCol_GpuThreshold()<=n &&
       !(SpinP_switch==1 && numprocs0!=1)){
     ClusterCol_GpuSolverDensePath(SCF_iter,SpinP_switch,ko,nh,CntOLP,
                                  numprocs0,myworld1,myid1,MP,is2,ie2,

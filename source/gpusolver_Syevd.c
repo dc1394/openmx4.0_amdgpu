@@ -48,6 +48,7 @@
  */
 
 #include "openmx_common.h"
+#include "set_hip_default_device_from_local_rank.h"
 #include "hip_runtime_compat.h"
 #include "hipsolver_compat.h"
 #include <stdint.h>
@@ -58,9 +59,11 @@ int32_t gpusolver_Syevd(double * A, double * W, int32_t m)
     int32_t deviceCount;
     wait_hipfunc(hipGetDeviceCount(&deviceCount));
 
-    int32_t rank;
-    MPI_Comm_rank(mpi_comm_level1, &rank);
-    wait_hipfunc(hipSetDevice(rank % deviceCount));
+    if (0 < SCF_Gpu_Num && SCF_Gpu_Num < deviceCount) deviceCount = SCF_Gpu_Num;
+
+    wait_hipfunc(hipSetDevice(openmx_gpu_map_rank_to_device(
+        openmx_gpu_local_rank_noncollective(),
+        openmx_gpu_local_size_noncollective(), deviceCount)));
 
     hipsolverDnHandle_t hipsolverH = NULL;
     hipStream_t       stream    = NULL;

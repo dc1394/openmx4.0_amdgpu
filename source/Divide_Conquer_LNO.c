@@ -34,6 +34,21 @@
 /* task-level threshold for proxy-to-GPU */
 #define DCLNO_GPU_PROXY_EIGEN_THRESHOLD_COL  (GPU_CPU_SWITCH_NUM2)
 
+/* runtime-tunable copy of the threshold (OPENMX_DCLNO_GPU_THRESHOLD) */
+static int DCLNO_GpuEigenThreshold(void)
+{
+    static int threshold = -1;
+    if (threshold < 0) {
+        const char *value = getenv("OPENMX_DCLNO_GPU_THRESHOLD");
+        threshold = DCLNO_GPU_PROXY_EIGEN_THRESHOLD_COL;
+        if (value != NULL && value[0] != '\0') {
+            int parsed = atoi(value);
+            if (0 < parsed) threshold = parsed;
+        }
+    }
+    return threshold;
+}
+
 /* MPI tags for node-local proxy traffic */
 #define DCLNO_PROXY_TAG_COL_S      41001
 #define DCLNO_PROXY_TAG_COL_H      41002
@@ -176,6 +191,9 @@ static void DCLNO_GPUProxy_Init(void)
         MPI_Abort(base_comm, 1);
     }
 
+    if (0 < SCF_Gpu_Num && SCF_Gpu_Num < DCLNO_ngpu) {
+        DCLNO_ngpu = SCF_Gpu_Num;
+    }
     DCLNO_gpu_id = DCLNO_node_rank % DCLNO_ngpu;
     color = DCLNO_gpu_id;
 
@@ -324,11 +342,14 @@ static void DCLNO_GpuSolver_Destroy(void)
     memset(ctx, 0, sizeof(*ctx));
 }
 
+static void DCLNO_GpuSolverZ_Destroy(void);
+
 static void DCLNO_GPUProxy_Finalize(void)
 {
     if (!DCLNO_gpu_proxy_initialized) return;
 
     DCLNO_GpuSolver_Destroy();
+    DCLNO_GpuSolverZ_Destroy();
 
     if (DCLNO_gpu_group_comm != MPI_COMM_NULL) {
         MPI_Comm_free(&DCLNO_gpu_group_comm);
@@ -565,6 +586,411 @@ static void DCLNO_Solve_Col_Local(int NUM,
     }
 
     if (owns_tmp) free(Tmp);
+}
+
+/* ------------------------------------------------------------------ */
+/* GPU dense solve kernel (noncollinear)                              */
+/* ------------------------------------------------------------------ */
+
+typedef struct {
+    int                initialized;
+    int                max_num;
+    size_t             d_work_bytes;
+    size_t             h_work_bytes;
+    hipStream_t       stream;
+    hipblasHandle_t     hipblas;
+    hipsolverDnHandle_t gpusolver;
+    dcomplex *         d_S;
+    dcomplex *         d_H;
+    dcomplex *         d_tmp;
+    dcomplex *         d_scale;
+    dcomplex *         h_scale;
+    double *           d_W;
+    int32_t *          d_info;
+    void *             d_work;
+    void *             h_work;
+} DCLNO_GpuSolverZCtx;
+
+static DCLNO_GpuSolverZCtx DCLNO_gpusolverz_ctx = {0};
+
+static void DCLNO_GpuSolverZ_Destroy(void)
+{
+    DCLNO_GpuSolverZCtx *ctx = &DCLNO_gpusolverz_ctx;
+
+    if (!ctx->initialized) return;
+
+    if (ctx->stream != NULL) wait_hipfunc(hipStreamSynchronize(ctx->stream));
+
+    if (ctx->d_S != NULL)     wait_hipfunc(hipFree(ctx->d_S));
+    if (ctx->d_H != NULL)     wait_hipfunc(hipFree(ctx->d_H));
+    if (ctx->d_tmp != NULL)   wait_hipfunc(hipFree(ctx->d_tmp));
+    if (ctx->d_scale != NULL) wait_hipfunc(hipFree(ctx->d_scale));
+    if (ctx->d_W != NULL)     wait_hipfunc(hipFree(ctx->d_W));
+    if (ctx->d_info != NULL)  wait_hipfunc(hipFree(ctx->d_info));
+    if (ctx->d_work != NULL)  wait_hipfunc(hipFree(ctx->d_work));
+    free(ctx->h_work);
+    free(ctx->h_scale);
+    if (ctx->gpusolver != NULL) wait_hipfunc(hipsolverDnDestroy(ctx->gpusolver));
+    if (ctx->hipblas != NULL)    wait_hipfunc(hipblasDestroy(ctx->hipblas));
+    if (ctx->stream != NULL)    wait_hipfunc(hipStreamDestroy(ctx->stream));
+
+    memset(ctx, 0, sizeof(*ctx));
+}
+
+static void DCLNO_GpuSolverZ_Init(void)
+{
+    DCLNO_GpuSolverZCtx *ctx = &DCLNO_gpusolverz_ctx;
+
+    if (ctx->initialized) return;
+
+    wait_hipfunc(hipStreamCreateWithFlags(&ctx->stream, hipStreamNonBlocking));
+    wait_hipfunc(hipblasCreate(&ctx->hipblas));
+    wait_hipfunc(hipsolverDnCreate(&ctx->gpusolver));
+    wait_hipfunc(hipblasSetStream(ctx->hipblas, ctx->stream));
+    wait_hipfunc(hipsolverDnSetStream(ctx->gpusolver, ctx->stream));
+
+    ctx->initialized = 1;
+}
+
+static void DCLNO_GpuSolverZ_EnsureMatrixCapacity(int num)
+{
+    DCLNO_GpuSolverZCtx *ctx = &DCLNO_gpusolverz_ctx;
+    size_t matrix_bytes;
+
+    if (num <= 0) {
+        DCLNO_AbortWithMessage("Invalid matrix size in DCLNO_GpuSolverZ_EnsureMatrixCapacity.");
+    }
+
+    DCLNO_GpuSolverZ_Init();
+
+    if (num <= ctx->max_num) return;
+
+    if (ctx->d_S != NULL)     wait_hipfunc(hipFree(ctx->d_S));
+    if (ctx->d_H != NULL)     wait_hipfunc(hipFree(ctx->d_H));
+    if (ctx->d_tmp != NULL)   wait_hipfunc(hipFree(ctx->d_tmp));
+    if (ctx->d_scale != NULL) wait_hipfunc(hipFree(ctx->d_scale));
+    if (ctx->d_W != NULL)     wait_hipfunc(hipFree(ctx->d_W));
+    if (ctx->d_info != NULL)  wait_hipfunc(hipFree(ctx->d_info));
+    free(ctx->h_scale);
+
+    matrix_bytes = DCLNO_CheckedArrayBytes(DCLNO_CheckedMulCount((size_t)num, (size_t)num,
+                                                                 "GPUSOLVER NC dense matrix dimensions"),
+                                           sizeof(dcomplex),
+                                           "GPUSOLVER NC dense matrix buffer");
+
+    wait_hipfunc(hipMalloc((void**)&ctx->d_S, matrix_bytes));
+    wait_hipfunc(hipMalloc((void**)&ctx->d_H, matrix_bytes));
+    wait_hipfunc(hipMalloc((void**)&ctx->d_tmp, matrix_bytes));
+    wait_hipfunc(hipMalloc((void**)&ctx->d_scale,
+                             DCLNO_CheckedArrayBytes((size_t)num, sizeof(dcomplex),
+                                                     "GPUSOLVER NC scale buffer")));
+    wait_hipfunc(hipMalloc((void**)&ctx->d_W,
+                             DCLNO_CheckedArrayBytes((size_t)num, sizeof(double),
+                                                     "GPUSOLVER NC eigenvalue buffer")));
+    wait_hipfunc(hipMalloc((void**)&ctx->d_info, sizeof(int32_t)));
+    ctx->h_scale = (dcomplex*)DCLNO_MallocArray((size_t)num, sizeof(dcomplex),
+                                                "GPUSOLVER NC host scale buffer");
+
+    ctx->max_num = num;
+}
+
+static void DCLNO_GpuSolverZ_EnsureWorkspace(int m, int maxn)
+{
+    DCLNO_GpuSolverZCtx *ctx = &DCLNO_gpusolverz_ctx;
+    hipsolverEigMode_t  jobz = HIPSOLVER_EIG_MODE_VECTOR;
+    hipblasFillMode_t   uplo = HIPBLAS_FILL_MODE_LOWER;
+    hipsolverEigRange_t range;
+    double vl = 0.0, vu = 0.0;
+    int64_t h_meig = 0;
+    size_t d_bytes = 0, h_bytes = 0;
+
+    if (m <= 0 || maxn <= 0 || maxn > m) {
+        DCLNO_AbortWithMessage("Invalid eigensolver dimensions in DCLNO_GpuSolverZ_EnsureWorkspace.");
+    }
+
+    range = (m == maxn) ? HIPSOLVER_EIG_RANGE_ALL : HIPSOLVER_EIG_RANGE_I;
+
+    wait_hipfunc(hipsolverDnXsyevdx_bufferSize(ctx->gpusolver, NULL, jobz, range, uplo, m,
+                                               HIP_C_64F, ctx->d_tmp, m, &vl, &vu, 1L, maxn, &h_meig,
+                                               HIP_R_64F, ctx->d_W, HIP_C_64F, &d_bytes, &h_bytes));
+
+    if (ctx->d_work_bytes < d_bytes) {
+        if (ctx->d_work != NULL) wait_hipfunc(hipFree(ctx->d_work));
+        ctx->d_work = NULL;
+        if (0 < d_bytes) {
+            wait_hipfunc(hipMalloc((void**)&ctx->d_work, d_bytes));
+        }
+        ctx->d_work_bytes = d_bytes;
+    }
+
+    if (h_bytes == 0) {
+        free(ctx->h_work);
+        ctx->h_work = NULL;
+        ctx->h_work_bytes = 0;
+    }
+    else if (ctx->h_work_bytes < h_bytes) {
+        free(ctx->h_work);
+        ctx->h_work = DCLNO_MallocArray(h_bytes, 1, "GPUSOLVER NC host workspace");
+        ctx->h_work_bytes = h_bytes;
+    }
+}
+
+static void DCLNO_GpuSolverZ_Eigen(dcomplex *d_A, int m, int maxn, double *W)
+{
+    DCLNO_GpuSolverZCtx *ctx = &DCLNO_gpusolverz_ctx;
+    hipsolverEigMode_t  jobz = HIPSOLVER_EIG_MODE_VECTOR;
+    hipblasFillMode_t   uplo = HIPBLAS_FILL_MODE_LOWER;
+    hipsolverEigRange_t range;
+    double vl = 0.0, vu = 0.0;
+    int64_t h_meig = 0;
+    int32_t info = 0;
+
+    DCLNO_GpuSolverZ_EnsureWorkspace(m, maxn);
+
+    range = (m == maxn) ? HIPSOLVER_EIG_RANGE_ALL : HIPSOLVER_EIG_RANGE_I;
+
+    wait_hipfunc(hipsolverDnXsyevdx(ctx->gpusolver, NULL, jobz, range, uplo, m, HIP_C_64F,
+                                    d_A, m, &vl, &vu, 1L, maxn, &h_meig, HIP_R_64F, ctx->d_W,
+                                    HIP_C_64F, ctx->d_work, ctx->d_work_bytes,
+                                    ctx->h_work, ctx->h_work_bytes, ctx->d_info));
+    wait_hipfunc(hipMemcpyAsync(&info, ctx->d_info, sizeof(int32_t), hipMemcpyDeviceToHost, ctx->stream));
+    wait_hipfunc(hipMemcpyAsync(W, ctx->d_W,
+                                  DCLNO_CheckedArrayBytes((size_t)maxn, sizeof(double),
+                                                          "GPUSOLVER NC eigenvalue copy"),
+                                  hipMemcpyDeviceToHost, ctx->stream));
+    wait_hipfunc(hipStreamSynchronize(ctx->stream));
+
+    if (info != 0) {
+        fprintf(stderr, "hipsolverDnXsyevdx failed in DC-LNO (NC): info=%d\n", (int)info);
+        DCLNO_AbortWithMessage("hipsolverDnXsyevdx (complex) failed in Divide_Conquer_LNO.c.");
+    }
+}
+
+/*
+   GPU counterpart of the noncollinear per-cluster solve for
+   Eigen_MPI_flag==0.  Reproduces the CPU flow, which diagonalizes the
+   TRANSPOSE (= conjugate for a Hermitian matrix) of the transformed
+   Hamiltonian and stores the back-transformed eigenvectors transposed
+   (state-major rows with leading dimension NUM) into Hmat.
+*/
+static void DCLNO_Solve_NonCol_GpuSolver(int NUM, int NUMH, int NUM2, int rebuild_s,
+                                         const dcomplex *Smat, dcomplex *Hmat, double *ko)
+{
+    DCLNO_GpuSolverZCtx *ctx = &DCLNO_gpusolverz_ctx;
+    hipDoubleComplex zone  = make_hipDoubleComplex(1.0, 0.0);
+    hipDoubleComplex zzero = make_hipDoubleComplex(0.0, 0.0);
+    size_t full_bytes;
+    int l;
+
+    if (NUM <= 0 || NUM2 <= 0 || NUM2 > NUM || 2*NUMH != NUM) {
+        DCLNO_AbortWithMessage("Invalid matrix dimensions in DCLNO_Solve_NonCol_GpuSolver.");
+    }
+    if (!rebuild_s) {
+        DCLNO_AbortWithMessage("DCLNO_Solve_NonCol_GpuSolver requires the overlap stage (LNO_recalc_flag==1).");
+    }
+
+    full_bytes = DCLNO_CheckedArrayBytes(DCLNO_CheckedMulCount((size_t)NUM, (size_t)NUM,
+                                                               "GPUSOLVER NC full matrix dimensions"),
+                                         sizeof(dcomplex),
+                                         "GPUSOLVER NC full matrix copy");
+
+    DCLNO_GpuSolverZ_EnsureMatrixCapacity(NUM);
+
+    wait_hipfunc(hipMemcpyAsync(ctx->d_H, Hmat, full_bytes, hipMemcpyHostToDevice, ctx->stream));
+
+    /* diagonalize the NUMH x NUMH overlap and build the spin-doubled
+       transform T = diag(U s^{-1/2}, U s^{-1/2}) in d_S */
+
+    wait_hipfunc(hipMemcpyAsync(ctx->d_tmp, Smat,
+                                  DCLNO_CheckedArrayBytes(DCLNO_CheckedMulCount((size_t)NUMH, (size_t)NUMH,
+                                                                                "GPUSOLVER NC overlap dimensions"),
+                                                          sizeof(dcomplex),
+                                                          "GPUSOLVER NC overlap copy"),
+                                  hipMemcpyHostToDevice, ctx->stream));
+
+    DCLNO_GpuSolverZ_Eigen(ctx->d_tmp, NUMH, NUMH, ko + 1);
+
+    for (l = 1; l <= NUMH; l++) {
+        ko[l] = 1.0 / sqrt(fabs(ko[l]));
+        ctx->h_scale[l-1].r = ko[l];
+        ctx->h_scale[l-1].i = 0.0;
+    }
+
+    wait_hipfunc(hipMemcpyAsync(ctx->d_scale, ctx->h_scale,
+                                  DCLNO_CheckedArrayBytes((size_t)NUMH, sizeof(dcomplex),
+                                                          "GPUSOLVER NC scale copy"),
+                                  hipMemcpyHostToDevice, ctx->stream));
+
+    wait_hipfunc(hipMemsetAsync(ctx->d_S, 0, full_bytes, ctx->stream));
+
+    /* top-left block: U * s^{-1/2}, written with leading dimension NUM */
+    wait_hipfunc(hipblasZdgmm(ctx->hipblas, HIPBLAS_SIDE_RIGHT, NUMH, NUMH,
+                              (hipDoubleComplex*)ctx->d_tmp, NUMH,
+                              (hipDoubleComplex*)ctx->d_scale, 1,
+                              (hipDoubleComplex*)ctx->d_S, NUM));
+
+    /* bottom-right block: copy of the top-left block */
+    wait_hipfunc(hipMemcpy2DAsync(ctx->d_S + (size_t)NUMH * (size_t)NUM + (size_t)NUMH,
+                                    (size_t)NUM * sizeof(dcomplex),
+                                    ctx->d_S,
+                                    (size_t)NUM * sizeof(dcomplex),
+                                    (size_t)NUMH * sizeof(dcomplex),
+                                    (size_t)NUMH,
+                                    hipMemcpyDeviceToDevice, ctx->stream));
+
+    /* H' = T^H * H * T */
+
+    wait_hipfunc(openmx_gemmul8Zgemm(ctx->hipblas, HIPBLAS_OP_N, HIPBLAS_OP_N, NUM, NUM, NUM, &zone,
+                                      (hipDoubleComplex*)ctx->d_H, NUM,
+                                      (hipDoubleComplex*)ctx->d_S, NUM, &zzero,
+                                      (hipDoubleComplex*)ctx->d_tmp, NUM));
+
+    wait_hipfunc(openmx_gemmul8Zgemm(ctx->hipblas, HIPBLAS_OP_C, HIPBLAS_OP_N, NUM, NUM, NUM, &zone,
+                                      (hipDoubleComplex*)ctx->d_S, NUM,
+                                      (hipDoubleComplex*)ctx->d_tmp, NUM, &zzero,
+                                      (hipDoubleComplex*)ctx->d_H, NUM));
+
+    /* d_tmp = (H')^T = conj(H'), matching the CPU packing into C */
+    wait_hipfunc(hipblasZgeam(ctx->hipblas, HIPBLAS_OP_T, HIPBLAS_OP_N, NUM, NUM,
+                              &zone, (hipDoubleComplex*)ctx->d_H, NUM,
+                              &zzero, (hipDoubleComplex*)ctx->d_H, NUM,
+                              (hipDoubleComplex*)ctx->d_tmp, NUM));
+
+    DCLNO_GpuSolverZ_Eigen(ctx->d_tmp, NUM, NUM2, ko + 1);
+
+    /* Hmat(state, basis) = (T * V)^T = V^T * T^T, stored with ld NUM */
+    wait_hipfunc(openmx_gemmul8Zgemm(ctx->hipblas, HIPBLAS_OP_T, HIPBLAS_OP_T, NUM2, NUM, NUM, &zone,
+                                      (hipDoubleComplex*)ctx->d_tmp, NUM,
+                                      (hipDoubleComplex*)ctx->d_S, NUM, &zzero,
+                                      (hipDoubleComplex*)ctx->d_H, NUM));
+
+    wait_hipfunc(hipMemcpyAsync(Hmat, ctx->d_H, full_bytes, hipMemcpyDeviceToHost, ctx->stream));
+    wait_hipfunc(hipStreamSynchronize(ctx->stream));
+}
+
+/* ------------------------------------------------------------------ */
+/* per-iteration GPU memory hygiene                                   */
+/* ------------------------------------------------------------------ */
+
+static int DCLNO_GpuTurnRelease(void)
+{
+    /* Releasing the GEMMul8 workspace and the solver buffers once the DC-LNO
+       phase is done keeps them from occupying the shared device through the
+       grid/force phases of the SCF step; opt out with
+       OPENMX_DCLNO_GPU_TURN_RELEASE=0 (falls back to the band-path knob). */
+    const char *value = getenv("OPENMX_DCLNO_GPU_TURN_RELEASE");
+
+    if (value == NULL) {
+        value = getenv("OPENMX_BAND_GEMMUL8_TURN_RELEASE");
+    }
+    if (value == NULL) {
+        return 1;
+    }
+    return (atoi(value) != 0);
+}
+
+static void DCLNO_GpuSolver_ReleaseDeviceMemory(void)
+{
+    DCLNO_GpuSolverCtx *ctx = &DCLNO_gpusolver_ctx;
+
+    if (!ctx->initialized) return;
+
+    if (ctx->stream != NULL) wait_hipfunc(hipStreamSynchronize(ctx->stream));
+
+    if (ctx->d_S != NULL)    wait_hipfunc(hipFree(ctx->d_S));
+    if (ctx->d_H != NULL)    wait_hipfunc(hipFree(ctx->d_H));
+    if (ctx->d_tmp != NULL)  wait_hipfunc(hipFree(ctx->d_tmp));
+    if (ctx->d_W != NULL)    wait_hipfunc(hipFree(ctx->d_W));
+
+    ctx->d_S = NULL;
+    ctx->d_H = NULL;
+    ctx->d_tmp = NULL;
+    ctx->d_W = NULL;
+    ctx->max_num = 0;
+}
+
+static void DCLNO_GpuSolverZ_ReleaseDeviceMemory(void)
+{
+    DCLNO_GpuSolverZCtx *ctx = &DCLNO_gpusolverz_ctx;
+
+    if (!ctx->initialized) return;
+
+    if (ctx->stream != NULL) wait_hipfunc(hipStreamSynchronize(ctx->stream));
+
+    if (ctx->d_S != NULL)     wait_hipfunc(hipFree(ctx->d_S));
+    if (ctx->d_H != NULL)     wait_hipfunc(hipFree(ctx->d_H));
+    if (ctx->d_tmp != NULL)   wait_hipfunc(hipFree(ctx->d_tmp));
+    if (ctx->d_scale != NULL) wait_hipfunc(hipFree(ctx->d_scale));
+    if (ctx->d_W != NULL)     wait_hipfunc(hipFree(ctx->d_W));
+    if (ctx->d_info != NULL)  wait_hipfunc(hipFree(ctx->d_info));
+    if (ctx->d_work != NULL)  wait_hipfunc(hipFree(ctx->d_work));
+    free(ctx->h_scale);
+
+    ctx->d_S = NULL;
+    ctx->d_H = NULL;
+    ctx->d_tmp = NULL;
+    ctx->d_scale = NULL;
+    ctx->h_scale = NULL;
+    ctx->d_W = NULL;
+    ctx->d_info = NULL;
+    ctx->d_work = NULL;
+    ctx->d_work_bytes = 0;
+    ctx->max_num = 0;
+}
+
+/*
+   All ranks sharing a device keep their solver buffers resident through the
+   whole atom loop, so the direct per-rank dispatch only pays off when the
+   combined footprint fits; otherwise ranks spin in allocation retries and
+   the GPU path ends up slower than the CPU eigensolver.  Collective over
+   DCLNO_gpu_group_comm.
+*/
+static int DCLNO_GpuGroupMemoryFits(int max_msize, int is_complex)
+{
+    const size_t elem = is_complex ? sizeof(dcomplex) : sizeof(double);
+    const size_t reserve = 1536ULL*1024ULL*1024ULL;
+    const size_t overhead = 256ULL*1024ULL*1024ULL;
+    size_t mm, need;
+    size_t free_bytes = 0, total_bytes = 0;
+    unsigned long long my_need, group_need = 0ULL;
+    unsigned long long my_free, group_free = 0ULL;
+    static int warned = 0;
+
+    if (max_msize <= 0) max_msize = 1;
+
+    mm = DCLNO_CheckedMulCount((size_t)max_msize, (size_t)max_msize, "GPU fit-check matrix count");
+    /* three dense matrices plus roughly four matrix-sized eigensolver work
+       areas, the GEMMul8 workspace, and per-rank HIP context overhead */
+    need = DCLNO_CheckedMulCount(mm, 7u*elem, "GPU fit-check per-rank bytes");
+    need += is_complex ? openmx_gemmul8ZWorkspaceSize(max_msize, max_msize, max_msize)
+                       : openmx_gemmul8DWorkspaceSize(max_msize, max_msize, max_msize);
+    need += overhead;
+
+    if (hipMemGetInfo(&free_bytes, &total_bytes) != hipSuccess) {
+        free_bytes = 0;
+    }
+
+    my_need = (unsigned long long)need;
+    my_free = (unsigned long long)free_bytes;
+    MPI_Allreduce(&my_need, &group_need, 1, MPI_UNSIGNED_LONG_LONG, MPI_SUM, DCLNO_gpu_group_comm);
+    MPI_Allreduce(&my_free, &group_free, 1, MPI_UNSIGNED_LONG_LONG, MPI_MIN, DCLNO_gpu_group_comm);
+
+    if (group_free < (unsigned long long)reserve ||
+        group_need > group_free - (unsigned long long)reserve) {
+        if (!warned && DCLNO_gpu_group_rank == 0) {
+            printf("<DC-LNO> GPU device %d: %d rank(s) would need %.3f GiB "
+                   "(free %.3f GiB, reserve %.3f GiB); using the CPU eigensolver instead.\n",
+                   DCLNO_gpu_id, DCLNO_gpu_group_size,
+                   (double)group_need/(1024.0*1024.0*1024.0),
+                   (double)group_free/(1024.0*1024.0*1024.0),
+                   (double)reserve/(1024.0*1024.0*1024.0));
+            fflush(stdout);
+            warned = 1;
+        }
+        return 0;
+    }
+
+    return 1;
 }
 
 /* ------------------------------------------------------------------ */
@@ -1009,12 +1435,20 @@ static double DC_Col(char * mode, int MD_iter, int SCF_iter, int SucceedReadingD
 
     MP = (int*)DCLNO_MallocArray((size_t)List_YOUSO[2], sizeof(int), "MP map");
 
+    if (use_gpu_accel && !use_gpu_proxy &&
+        !DCLNO_GpuGroupMemoryFits(Max_Msize >= DCLNO_GpuEigenThreshold() ? Max_Msize : 0, 0)) {
+        use_gpu_accel = 0;
+    }
+
     gpu_group_max_msize = Max_Msize;
-    if (use_gpu_accel) {
+    if (use_gpu_proxy) {
         MPI_Allreduce(MPI_IN_PLACE, &gpu_group_max_msize, 1, MPI_INT, MPI_MAX, DCLNO_gpu_group_comm);
-        if (DCLNO_is_gpu_owner && gpu_group_max_msize >= DCLNO_GPU_PROXY_EIGEN_THRESHOLD_COL) {
+        if (DCLNO_is_gpu_owner && gpu_group_max_msize >= DCLNO_GpuEigenThreshold()) {
             DCLNO_GpuSolver_EnsureMatrixCapacity(gpu_group_max_msize);
         }
+    }
+    else if (use_gpu_accel && Max_Msize >= DCLNO_GpuEigenThreshold()) {
+        DCLNO_GpuSolver_EnsureMatrixCapacity(Max_Msize);
     }
 
     /****************************************************
@@ -1603,7 +2037,7 @@ static double DC_Col(char * mode, int MD_iter, int SCF_iter, int SucceedReadingD
                 }
 
                 use_gpu_task = (use_gpu_accel && (DCLNO_is_gpu_owner || use_gpu_proxy) &&
-                                NUM >= DCLNO_GPU_PROXY_EIGEN_THRESHOLD_COL);
+                                NUM >= DCLNO_GpuEigenThreshold());
 
                 if (measure_time) dtime(&stime);
 
@@ -2063,6 +2497,13 @@ static double DC_Col(char * mode, int MD_iter, int SCF_iter, int SucceedReadingD
 
     if (SCF_iter == 2) firsttime = 0;
 
+    /* free the GEMMul8 workspace and solver buffers so the grid/force phases
+       of this SCF step see the memory; handles stay alive. */
+    if (use_gpu_accel && DCLNO_GpuTurnRelease()) {
+        DCLNO_GpuSolver_ReleaseDeviceMemory();
+        openmx_gemmul8ReleaseWorkspaces();
+    }
+
     dtime(&TEtime);
     return (TEtime - TStime);
 }
@@ -2132,6 +2573,7 @@ static double DC_NonCol(char *mode,
   double time0,time1,time2,time3,time4;
   double time5,time6,time7,time8;
   int Eigen_MPI_flag,bcast_flag;
+  int use_gpu_accel_nc,use_gpu_task_nc;
   double sum1,sum2,sum4;
   int i1s, j1s;
 
@@ -2220,7 +2662,18 @@ static double DC_NonCol(char *mode,
      get information of MPI for eigenvalue problems                                            
   ****************************************************/
 
-  if ( atomnum<=numprocs0 ){ 
+  use_gpu_accel_nc = (scf_eigen_lib_flag == GPUSOLVER);
+  if (use_gpu_accel_nc) {
+    DCLNO_GPUProxy_Init();
+  }
+
+  if (firsttime && myid0 == Host_ID && use_gpu_accel_nc && 0 < level_stdout) {
+    printf("<DC-LNO> GPUSOLVER direct per-rank dispatch (noncollinear) is enabled for local matrices with dimension >= %d on %d HIP device(s).\n",
+           DCLNO_GpuEigenThreshold(), DCLNO_ngpu);
+    fflush(stdout);
+  }
+
+  if ( atomnum<=numprocs0 ){
 
     MPI_Comm_size(MPI_CommWD1_DCLNO[myworld1_DCLNO],&numprocs1);
     MPI_Comm_rank(MPI_CommWD1_DCLNO[myworld1_DCLNO],&myid1);
@@ -2335,6 +2788,11 @@ static double DC_NonCol(char *mode,
 
   if (Eigen_MPI_flag==1){
     MPI_Bcast(&Max_Msize, 1, MPI_INT, 0, MPI_CommWD1_DCLNO[myworld1_DCLNO]);
+  }
+
+  if (use_gpu_accel_nc &&
+      !DCLNO_GpuGroupMemoryFits((Eigen_MPI_flag==0 && Max_Msize >= DCLNO_GpuEigenThreshold()) ? Max_Msize : 0, 1)) {
+    use_gpu_accel_nc = 0;
   }
 
   if (BLAS_allocate_flag==1 && LNO_recalc_flag==1){
@@ -3580,6 +4038,30 @@ static double DC_NonCol(char *mode,
 
     if (measure_time) dtime(&stime);
 
+    use_gpu_task_nc = (use_gpu_accel_nc && Eigen_MPI_flag==0 &&
+                       DCLNO_GpuEigenThreshold() <= NUM);
+
+    if (use_gpu_task_nc){
+
+      /* same rule as the CPU flow below */
+      if (SCF_iter<=2){
+        NUM2 = NUM;
+      }
+      else{
+        NUM2 = HO_TC[Mc_AN] + 100;
+        if (NUM<NUM2) NUM2 = NUM;
+      }
+
+      DCLNO_Solve_NonCol_GpuSolver(NUM, NUMH, NUM2, LNO_recalc_flag,
+                                   BLAS_OLP, BLAS_H, ko);
+
+      if (measure_time){
+        dtime(&etime);
+        time3 += etime - stime;
+      }
+    }
+    else{
+
     /* if (LNO_recalc_flag==1) */
 
     if (LNO_recalc_flag==1){
@@ -3894,6 +4376,8 @@ static double DC_NonCol(char *mode,
       dtime(&etime);
       time3 += etime - stime;
     }
+
+    } /* else: CPU eigensolver fallback */
 
     /***********************************************
         store eigenvalues and residues of poles
@@ -4597,6 +5081,13 @@ static double DC_NonCol(char *mode,
   if (SCF_iter==2) firsttime=0;
 
   /* for time */
+  /* free the GEMMul8 workspace and solver buffers so the grid/force phases
+     of this SCF step see the memory; handles stay alive. */
+  if (use_gpu_accel_nc && DCLNO_GpuTurnRelease()) {
+    DCLNO_GpuSolverZ_ReleaseDeviceMemory();
+    openmx_gemmul8ReleaseWorkspaces();
+  }
+
   dtime(&TEtime);
 
   return (TEtime - TStime);

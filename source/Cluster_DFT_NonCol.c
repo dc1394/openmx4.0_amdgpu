@@ -46,6 +46,14 @@ static int ClusterNonCol_GpuVerbose(void)
     return (value != NULL && value[0] == '1');
 }
 
+static int ClusterNonCol_GpuThreshold(void)
+{
+    const char *env=getenv("OPENMX_CLUSTER_GPU_THRESHOLD");
+    int threshold=GPU_CPU_SWITCH_NUM;
+    if (env!=NULL && env[0]!='\0') { int v=atoi(env); if (0<v) threshold=v; }
+    return threshold;
+}
+
 static size_t ClusterNonCol_CheckedMulCount(size_t a, size_t b, const char *label)
 {
     if (a != 0 && b > SIZE_MAX / a) {
@@ -856,6 +864,50 @@ static void ClusterNonCol_ReleaseGpuSolverCachedEVec(int myid)
     ClusterNonCol_CachedGpuSolverDenseOnDevice = 0;
 }
 
+void Cluster_DFT_NonCol_DemoteGpuSolverCachedEVec(void)
+{
+    int myid;
+    MPI_Comm_rank(mpi_comm_level1, &myid);
+    ClusterNonCol_ReleaseGpuSolverCachedEVec(myid);
+}
+
+void Cluster_DFT_NonCol_Release_GPU_Solver(void)
+{
+    Cluster_DFT_NonCol_DemoteGpuSolverCachedEVec();
+}
+
+static int ClusterNonCol_GpuDiagFits(int n2, int myid)
+{
+    const char *env = getenv("OPENMX_CLUSTER_GPU_DIAG");
+    const char *reserve_env = getenv("OPENMX_CLUSTER_GPU_DIAG_RESERVE_MB");
+    size_t free_bytes = 0, total_bytes = 0;
+    size_t reserve = (size_t)1024 * 1024 * 1024;
+    size_t required = 0;
+    int local_fit = 1, fit = 1;
+
+    if (env != NULL && atoi(env) == 0) local_fit = 0;
+    if (reserve_env != NULL) {
+        long mib = atol(reserve_env);
+        if (0 <= mib) reserve = (size_t)mib * 1024U * 1024U;
+    }
+    if (local_fit && myid == Host_ID) {
+        /* H, eigenvectors and two transformation work panels, all complex. */
+        if ((size_t)n2 > SIZE_MAX / (size_t)n2 / sizeof(dcomplex) / 4U) local_fit = 0;
+        else {
+            required = (size_t)4 * (size_t)n2 * (size_t)n2 * sizeof(dcomplex);
+            if (required > SIZE_MAX - reserve ||
+                hipMemGetInfo(&free_bytes, &total_bytes) != hipSuccess ||
+                free_bytes < required + reserve) local_fit = 0;
+        }
+    }
+    MPI_Allreduce(&local_fit, &fit, 1, MPI_INT, MPI_MIN, mpi_comm_level1);
+    if (!fit && myid == Host_ID) {
+        printf("<Cluster_DFT_NonCol> GPU dense buffers do not fit; using ELPA fallback.\n");
+        fflush(stdout);
+    }
+    return fit;
+}
+
 static void ClusterNonCol_StashGpuSolverDenseEVec(int myid, int n2, dcomplex **dense_evec, int *on_device)
 {
     ClusterNonCol_ReleaseGpuSolverCachedEVec(myid);
@@ -1265,7 +1317,7 @@ static void ClusterNonCol_BuildDenseIndexFromGathered(const int *order_GA, int *
         int Anum = MP[GA_AN];
 
         for (int i = 0; i < tnoA; i++) {
-            int col = Anum + i - 1;
+            int row = Anum + i - 1;
 
             for (int LB_AN = 0; LB_AN <= FNAN[GA_AN]; LB_AN++) {
                 int GB_AN = natn[GA_AN][LB_AN];
@@ -1274,7 +1326,7 @@ static void ClusterNonCol_BuildDenseIndexFromGathered(const int *order_GA, int *
                 int Bnum = MP[GB_AN];
 
                 for (int j = 0; j < tnoB; j++) {
-                    int row = Bnum + j - 1;
+                    int col = Bnum + j - 1;
 
                     if (row < 0 || n <= row || col < 0 || n <= col) {
                         ClusterNonCol_AbortWithMessage("Dense matrix index is out of range in Cluster_DFT_NonCol.c.");
@@ -1486,7 +1538,9 @@ static void ClusterNonCol_GpuSolverRootDensePath(int SCF_iter, double *ko, doubl
     const int owns_dense = (myid == Host_ID);
     const int cache_ready = Set_Hamiltonian_GpuSolver_Packed_CacheReady();
     const int cache_order = Set_Hamiltonian_GpuSolver_Packed_OrderMode();
-    const int use_setham_packed_cache = (cache_ready && cache_order == 1);
+    const char *setham_cache_env = getenv("OPENMX_CLUSTER_NC_SETHAM_CACHE");
+    const int use_setham_packed_cache = (cache_ready && cache_order == 1 &&
+                                         (setham_cache_env==NULL || atoi(setham_cache_env)!=0));
     int rebuild_s = (SCF_iter == 1 || !transformed_s_valid || cached_n != n || cached_n2 != n2);
     double *S = NULL;
     double *Cs = NULL;
@@ -1835,13 +1889,16 @@ double Cluster_DFT_NonCol(
   n2 = 2*n;
 
   /* GPU dispatch (added by H.Kawai): assign HIP/OpenMP target device when GPUSOLVER is requested */
-    if (scf_eigen_lib_flag == GPUSOLVER && n2 >= GPU_CPU_SWITCH_NUM &&
+    if (scf_eigen_lib_flag == GPUSOLVER && n2 >= ClusterNonCol_GpuThreshold() &&
         Set_Hamiltonian_OpenMP_Rank_Is_Selected()) {
       set_hip_default_device_from_local_rank_noncollective();
     }
 
   use_gpusolver_direct_cluster_dm =
-    (scf_eigen_lib_flag == GPUSOLVER && GPU_CPU_SWITCH_NUM <= n2 &&
+    (scf_eigen_lib_flag == GPUSOLVER && ClusterNonCol_GpuThreshold() <= n2 &&
+     ClusterNonCol_GpuDiagFits(n2,myid) &&
+     (getenv("OPENMX_CLUSTER_GPU_ROOT_DENSE")==NULL ||
+      atoi(getenv("OPENMX_CLUSTER_GPU_ROOT_DENSE"))!=0) &&
      strcasecmp(mode,"scf") == 0 &&
      MO_fileout != 1 && xanes_calc != 1 && xanes_gs_fileout != 1 &&
      !cal_partial_charge && !Dos_fileout && !DosGauss_fileout);
@@ -2033,7 +2090,8 @@ double Cluster_DFT_NonCol(
       F77_NAME(solve_evp_real,SOLVE_EVP_REAL)( &n, &n, Cs, &na_rows, &ko[1], Ss, &na_rows, &nblk,
                                                &mpi_comm_rows_int, &mpi_comm_cols_int );
     }
-    else if (scf_eigen_lib_flag==GPUSOLVER && GPU_CPU_SWITCH_NUM<=n2 && na_rows==n && na_cols==n){
+    else if (scf_eigen_lib_flag==GPUSOLVER && ClusterNonCol_GpuThreshold()<=n2 &&
+            ClusterNonCol_GpuDiagFits(n2,myid) && na_rows==n && na_cols==n){
       ClusterNonCol_GpuSolver_DenseDsyevx(Cs,Ss,ko,n,n,"Cluster_DFT_NonCol overlap");
     }
     else if (scf_eigen_lib_flag==2 || scf_eigen_lib_flag==GPUSOLVER){
@@ -2223,7 +2281,8 @@ double Cluster_DFT_NonCol(
     F77_NAME(solve_evp_complex,SOLVE_EVP_COMPLEX)( &n2, &MaxN, Hs2, &na_rows2, &ko[1], Cs2, &na_rows2,
                                                    &nblk2, &mpi_comm_rows_int, &mpi_comm_cols_int );
   }
-  else if (scf_eigen_lib_flag==GPUSOLVER && GPU_CPU_SWITCH_NUM<=n2 && na_rows2==n2 && na_cols2==n2){
+  else if (scf_eigen_lib_flag==GPUSOLVER && ClusterNonCol_GpuThreshold()<=n2 &&
+           ClusterNonCol_GpuDiagFits(n2,myid) && na_rows2==n2 && na_cols2==n2){
     ClusterNonCol_GpuSolver_DenseZheevx(Hs2,Cs2,ko,n2,MaxN,"Cluster_DFT_NonCol Hamiltonian");
   }
   else if (scf_eigen_lib_flag==2 || scf_eigen_lib_flag==GPUSOLVER){

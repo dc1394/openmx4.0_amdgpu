@@ -238,6 +238,100 @@ static int           DC_gpusolver_gemmul8_disabled = 1;
 static int           DC_gpusolver_gemmul8_disabled = 0;
 #endif
 static int           DC_gpusolver_eigen_disabled = 0;
+/* Once these monotonically growing workspaces have passed a memory
+   preflight, equal or smaller per-atom solves need no further query. */
+static int           DC_gpusolver_approved_gemm_n = 0;
+static int           DC_gpusolver_approved_gemm_num1 = 0;
+static int           DC_gpusolver_native_approved = 0;
+
+typedef struct {
+    int state;
+    int matomnum;
+    int *dim;
+    int *valid;
+    size_t *off;
+    double *d_arena;
+    size_t arena_elems;
+} DCColSCacheCtx;
+
+static DCColSCacheCtx DC_scache = {0};
+
+void Divide_Conquer_Release_GPU_SCache(void)
+{
+    if (DC_scache.d_arena != NULL) wait_hipfunc(hipFree(DC_scache.d_arena));
+    free(DC_scache.dim);
+    free(DC_scache.valid);
+    free(DC_scache.off);
+    memset(&DC_scache, 0, sizeof(DC_scache));
+}
+
+static void DCCol_SCache_Prepare(int matomnum, const int *Msize, int scf_iter)
+{
+    const char *enabled_env = getenv("OPENMX_DC_GPU_S_CACHE");
+    const char *reserve_env = getenv("OPENMX_DC_GPU_S_CACHE_RESERVE_MB");
+    size_t free_bytes = 0, total_bytes = 0, reserve = (size_t)4096 * 1024 * 1024;
+    size_t used = 0, budget;
+    int threshold = DC_GPU_Threshold();
+    int node_ranks = 1;
+    MPI_Comm node_comm = MPI_COMM_NULL;
+
+    if (enabled_env != NULL && atoi(enabled_env) == 0) return;
+    if (reserve_env != NULL) {
+        long mib = atol(reserve_env);
+        if (0 <= mib) reserve = (size_t)mib * 1024U * 1024U;
+    }
+    if (DC_scache.state == 1 && DC_scache.matomnum == matomnum) {
+        int same = 1;
+        for (int a=1; a<=matomnum; a++)
+            if (DC_scache.dim[a] != 0 && DC_scache.dim[a] != Msize[a]) same = 0;
+        if (same) {
+            if (scf_iter <= 2) memset(DC_scache.valid, 0, sizeof(int)*(size_t)(matomnum+1));
+            return;
+        }
+        Divide_Conquer_Release_GPU_SCache();
+    }
+    if (DC_scache.state == -1) return;
+
+    DC_scache.dim = (int*)calloc((size_t)matomnum+1, sizeof(int));
+    DC_scache.valid = (int*)calloc((size_t)matomnum+1, sizeof(int));
+    DC_scache.off = (size_t*)calloc((size_t)matomnum+1, sizeof(size_t));
+    if (DC_scache.dim == NULL || DC_scache.valid == NULL || DC_scache.off == NULL)
+        DC_AbortWithMessage("Could not allocate DC GPU S-cache tables.");
+
+    MPI_Comm_split_type(mpi_comm_level1, MPI_COMM_TYPE_SHARED, 0, MPI_INFO_NULL, &node_comm);
+    MPI_Comm_size(node_comm, &node_ranks);
+    MPI_Comm_free(&node_comm);
+    if (node_ranks < 1) node_ranks = 1;
+    if (hipMemGetInfo(&free_bytes, &total_bytes) != hipSuccess) {
+        Divide_Conquer_Release_GPU_SCache();
+        DC_scache.state = -1;
+        return;
+    }
+    budget = free_bytes > reserve ? (free_bytes-reserve)/(size_t)node_ranks : 0;
+    for (int a=1; a<=matomnum; a++) {
+        size_t elems = (size_t)Msize[a]*(size_t)Msize[a];
+        size_t bytes = elems*sizeof(double);
+        if (Msize[a] < threshold || bytes > budget || used*sizeof(double) > budget-bytes) continue;
+        DC_scache.dim[a] = Msize[a];
+        DC_scache.off[a] = used;
+        used += elems;
+    }
+    if (used != 0 && hipMalloc((void**)&DC_scache.d_arena, used*sizeof(double)) != hipSuccess) {
+        Divide_Conquer_Release_GPU_SCache();
+        DC_scache.state = -1;
+        return;
+    }
+    DC_scache.matomnum = matomnum;
+    DC_scache.arena_elems = used;
+    DC_scache.state = 1;
+}
+
+static double *DCCol_SCache_Ptr(int Mc_AN, int n)
+{
+    if (DC_scache.state != 1 || Mc_AN < 1 || DC_scache.matomnum < Mc_AN ||
+        DC_scache.dim[Mc_AN] != n) return NULL;
+    return DC_scache.d_arena + DC_scache.off[Mc_AN];
+}
 
 static unsigned DC_EnvU32(const char *name, unsigned fallback)
 {
@@ -494,6 +588,10 @@ static int DC_GpuSolver_HasHipblasMemoryForSolve(const char *where)
         return 0;
     }
 
+    if (DC_gpusolver_native_approved) {
+        return 1;
+    }
+
     reserve_bytes = DC_GpuSolver_HipblasReserveBytes();
     status        = hipMemGetInfo(&free_bytes, &total_bytes);
     if (status != hipSuccess) {
@@ -517,6 +615,7 @@ static int DC_GpuSolver_HasHipblasMemoryForSolve(const char *where)
         return 0;
     }
 
+    DC_gpusolver_native_approved = 1;
     return 1;
 }
 
@@ -533,6 +632,11 @@ static int DC_GpuSolver_PrepareGemmBackendForSolve(int n, int num1)
 
     if (DC_gpusolver_gemmul8_disabled) {
         return DC_GpuSolver_HasHipblasMemoryForSolve("DC Hamiltonian GEMM");
+    }
+
+    if (n <= DC_gpusolver_approved_gemm_n &&
+        num1 <= DC_gpusolver_approved_gemm_num1) {
+        return 1;
     }
 
     reserve_bytes  = DC_GpuSolver_Gemmul8ReserveBytes();
@@ -564,6 +668,10 @@ static int DC_GpuSolver_PrepareGemmBackendForSolve(int n, int num1)
         return DC_GpuSolver_HasHipblasMemoryForSolve("DC Hamiltonian GEMM");
     }
 
+    if (DC_gpusolver_approved_gemm_n < n)
+        DC_gpusolver_approved_gemm_n = n;
+    if (DC_gpusolver_approved_gemm_num1 < num1)
+        DC_gpusolver_approved_gemm_num1 = num1;
     return 1;
 }
 
@@ -865,6 +973,32 @@ static int DCCol_GpuSolver_LoadTransformedOverlap(int n, double **S_DC)
     }
 
     ctx->loaded_s_dim = n;
+    return 1;
+}
+
+static int DCCol_GpuSolver_LoadCachedOverlap(int Mc_AN, int n, double **S_DC)
+{
+    DCGpuSolverCtx *ctx = &DC_gpusolver_ctx;
+    double *cached = DCCol_SCache_Ptr(Mc_AN, n);
+    size_t bytes = (size_t)n*(size_t)n*sizeof(double);
+    hipError_t status;
+
+    if (cached != NULL && DC_scache.valid[Mc_AN]) {
+        if (!DC_GpuSolver_EnsureMatrixCapacity(n)) return 0;
+        status = hipMemcpyAsync(ctx->d_S, cached, bytes, hipMemcpyDeviceToDevice, ctx->stream);
+        if (status != hipSuccess) return 0;
+        status = hipStreamSynchronize(ctx->stream);
+        if (status != hipSuccess) return 0;
+        ctx->loaded_s_dim = n;
+        return 1;
+    }
+
+    if (!DCCol_GpuSolver_LoadTransformedOverlap(n, S_DC)) return 0;
+    if (cached != NULL) {
+        status = hipMemcpyAsync(cached, ctx->d_S, bytes, hipMemcpyDeviceToDevice, ctx->stream);
+        if (status == hipSuccess && hipStreamSynchronize(ctx->stream) == hipSuccess)
+            DC_scache.valid[Mc_AN] = 1;
+    }
     return 1;
 }
 
@@ -1254,6 +1388,7 @@ static double DC_Col(char * mode, int SCF_iter, double ***** Hks, double **** OL
 
         // OpenMP
         set_openmp_nvidia_device_from_local_rank();
+        DCCol_SCache_Prepare(Matomnum, Msize, SCF_iter);
     }
 
     dtime(&TStime);
@@ -1972,7 +2107,7 @@ static double DC_Col(char * mode, int SCF_iter, double ***** Hks, double **** OL
             NUM = Anum - 1;
 
             if (use_dc_gpu) {
-                if (!DCCol_GpuSolver_LoadTransformedOverlap(NUM, S_DC)) {
+                if (!DCCol_GpuSolver_LoadCachedOverlap(Mc_AN, NUM, S_DC)) {
                     use_dc_gpu = 0;
                 }
             }

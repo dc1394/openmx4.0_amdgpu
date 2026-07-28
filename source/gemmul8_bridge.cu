@@ -372,6 +372,22 @@ extern "C" hipblasStatus_t openmx_gemmul8Dgemm(hipblasHandle_t handle,
     return HIPBLAS_STATUS_SUCCESS;
 }
 
+extern "C" size_t openmx_gemmul8ZWorkspaceSize(int m, int n, int k)
+{
+    if (m<=0 || n<=0 || k<=0 ||
+        gemmul8_disabled("OPENMX_GEMMUL8_DISABLE_Z","GEMMUL8_DISABLE_Z")) return 0;
+    const unsigned num_moduli=gemmul8_num_moduli("OPENMX_GEMMUL8_NUM_MOD_Z","GEMMUL8_NUM_MOD_Z");
+    return gemmul8::workSize<true,gemmul8::Backend::INT8>((size_t)m,(size_t)n,(size_t)k,num_moduli);
+}
+
+extern "C" size_t openmx_gemmul8DWorkspaceSize(int m, int n, int k)
+{
+    if (m<=0 || n<=0 || k<=0 ||
+        gemmul8_disabled("OPENMX_GEMMUL8_DISABLE_D","GEMMUL8_DISABLE_D")) return 0;
+    const unsigned num_moduli=gemmul8_num_moduli("OPENMX_GEMMUL8_NUM_MOD_D","GEMMUL8_NUM_MOD_D");
+    return gemmul8::workSize<false,gemmul8::Backend::INT8>((size_t)m,(size_t)n,(size_t)k,num_moduli);
+}
+
 extern "C" void openmx_gemmul8ReleaseWorkspaces(void)
 {
     std::lock_guard<std::mutex> lock(g_workspace_mutex);

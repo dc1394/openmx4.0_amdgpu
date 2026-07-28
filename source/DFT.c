@@ -45,6 +45,14 @@ static int DFT_SetProExpnVNAUseGPU(void)
     return 0;
 }
 
+static int DFT_GPU_GlobalThreshold(void)
+{
+    const char *env=getenv("OPENMX_BAND_GPU_THRESHOLD");
+    int threshold=GPU_CPU_SWITCH_NUM;
+    if (env!=NULL && env[0]!='\0') { int v=atoi(env); if (0<v) threshold=v; }
+    return threshold;
+}
+
 /* GPU device initialization helper for SCF (added by H.Kawai, ported from 3.9.9 GPU)
  * Uses MPI_COMM_TYPE_SHARED to assign GPU per node-local rank. Global dense
  * solvers may fall back for small matrices; DC paths use their local cluster
@@ -58,37 +66,100 @@ static void DFT_GPU_DeviceInit(int basis_count)
     MPI_Comm_rank(mpi_comm_level1,&myid0);
     scf_eigen_lib_flag = GPUSOLVER;
 
-    if (Solver!=5 && Solver!=11 && basis_count < GPU_CPU_SWITCH_NUM && myid0==Host_ID && 0<level_stdout) {
+    if (Solver!=5 && Solver!=11 && basis_count < DFT_GPU_GlobalThreshold() && myid0==Host_ID && 0<level_stdout) {
         printf("<DFT> gpusolver requested; global matrix dimension %d is below %d, so global dense eigensolver paths use a CPU fallback while GPU kernels remain enabled.\n",
-               basis_count,GPU_CPU_SWITCH_NUM);
+               basis_count,DFT_GPU_GlobalThreshold());
         fflush(stdout);
     }
 
     MPI_Comm node_comm, device_comm = MPI_COMM_NULL;
-    int local_rank, hip_device_count = 0;
-    int hip_device = -1, hip_ok = 0;
-    hipError_t hip_err;
+    int local_rank, local_size, hip_device_count = 0, omp_device_count = 0, device_count;
+    int hip_device = -1, hip_ok = 0, hip_ok_all;
+    /* fail_reason: 0=ok, 1=hipGetDeviceCount error, 2=zero HIP devices,
+       3=OpenMP sees no target device, 4=hipSetDevice error,
+       5=device context/module initialization impossible */
+    int fail_reason = 0, fail_err = 0;
+    hipError_t hip_err, set_err;
 
     MPI_Comm_split_type(mpi_comm_level1, MPI_COMM_TYPE_SHARED, 0, MPI_INFO_NULL, &node_comm);
     MPI_Comm_rank(node_comm, &local_rank);
+    MPI_Comm_size(node_comm, &local_size);
 
     hip_err = hipGetDeviceCount(&hip_device_count);
-    if (hip_err == hipSuccess && hip_device_count > 0) {
-        hip_device = local_rank % hip_device_count;
-        if (hipSetDevice(hip_device) == hipSuccess) {
+    if (hip_err != hipSuccess) {
+        fail_reason = 1;
+        fail_err = (int)hip_err;
+    }
+    else if (hip_device_count <= 0) {
+        fail_reason = 2;
+    }
+    else if ((omp_device_count = omp_get_num_devices()) <= 0) {
+        fail_reason = 3;
+    }
+    else {
+        device_count = (hip_device_count < omp_device_count) ? hip_device_count : omp_device_count;
+        if (0 < SCF_Gpu_Num && SCF_Gpu_Num < device_count) {
+            if (myid0==Host_ID && 0<level_stdout) {
+                printf("<DFT> scf.Gpu.Num caps the GPUs used per node at %d of the %d detected.\n",
+                       SCF_Gpu_Num,device_count);
+                fflush(stdout);
+            }
+            device_count = SCF_Gpu_Num;
+        }
+        hip_device = openmx_gpu_map_rank_to_device(local_rank, local_size, device_count);
+        set_err = hipSetDevice(hip_device);
+        if (set_err != hipSuccess) {
+            fail_reason = 4;
+            fail_err = (int)set_err;
+        }
+        else {
             omp_set_default_device(hip_device);
-            hip_ok = 1;
+            if (!gpu_rank_device_usable()) fail_reason = 5;
+            else                           hip_ok = 1;
         }
     }
 
-    MPI_Comm_split(node_comm, hip_ok ? hip_device : MPI_UNDEFINED, 0, &device_comm);
+    /* All ranks must select the same eigensolver; mixing GPU and ELPA
+       collectives can otherwise deadlock. */
+    MPI_Allreduce(&hip_ok, &hip_ok_all, 1, MPI_INT, MPI_MIN, mpi_comm_level1);
+
+    MPI_Comm_split(node_comm, hip_ok_all ? hip_device : MPI_UNDEFINED, 0, &device_comm);
     MPI_Comm_free(&node_comm);
     if (device_comm != MPI_COMM_NULL) MPI_Comm_free(&device_comm);
 
-    if (!hip_ok) {
+    if (!hip_ok_all) {
+        int numprocs, my_fail, nfail, worst_err, inbuf[2], outbuf[2];
+
         scf_eigen_lib_flag = ELPA2;
+        MPI_Comm_size(mpi_comm_level1,&numprocs);
+        my_fail = hip_ok ? 0 : 1;
+        MPI_Allreduce(&my_fail, &nfail, 1, MPI_INT, MPI_SUM, mpi_comm_level1);
+        inbuf[0] = fail_reason;
+        inbuf[1] = myid0;
+        MPI_Allreduce(inbuf, outbuf, 1, MPI_2INT, MPI_MAXLOC, mpi_comm_level1);
+        worst_err = fail_err;
+        MPI_Bcast(&worst_err, 1, MPI_INT, outbuf[1], mpi_comm_level1);
+
         if (myid0==Host_ID && 0<level_stdout) {
-            printf("<DFT> gpusolver requested, but no HIP device is available; using ELPA2.\n");
+            printf("<DFT> GPUSOLVER requested, but GPU initialization failed on %d of %d MPI ranks; using ELPA2.\n",
+                   nfail,numprocs);
+            if (outbuf[0]==1) {
+                printf("<DFT>   hipGetDeviceCount failed: %s (error %d).\n",
+                       hipGetErrorString((hipError_t)worst_err),worst_err);
+            }
+            else if (outbuf[0]==2) {
+                printf("<DFT>   hipGetDeviceCount reported 0 devices; check ROCR_VISIBLE_DEVICES and HIP_VISIBLE_DEVICES.\n");
+            }
+            else if (outbuf[0]==3) {
+                printf("<DFT>   omp_get_num_devices reported 0 target devices; check the OpenMP offload runtime and GPU visibility settings.\n");
+            }
+            else if (outbuf[0]==4) {
+                printf("<DFT>   hipSetDevice failed: %s (error %d).\n",
+                       hipGetErrorString((hipError_t)worst_err),worst_err);
+            }
+            else if (outbuf[0]==5) {
+                printf("<DFT>   some ranks could not initialize their GPU (device memory exhausted by the node's HIP/OpenMP contexts, or OPENMX_GPU=0); reduce the MPI ranks per GPU or raise scf.Gpu.Num.\n");
+            }
             fflush(stdout);
         }
     }
@@ -98,7 +169,7 @@ static int DFT_GPU_EigensolverActive(void)
 {
     if (scf_eigen_lib_flag!=GPUSOLVER) return 0;
     if (Solver==5 || Solver==11) return 1;
-    return (GPU_CPU_SWITCH_NUM<=DFT_GPU_BasisCount());
+    return (DFT_GPU_GlobalThreshold()<=DFT_GPU_BasisCount());
 }
 
 static int DFT_GPU_BasisCount(void)
@@ -783,6 +854,14 @@ double DFT(int MD_iter, int Cnt_Now)
       printf("<%s>  Solving the eigenvalue problem%s...\n",
              s_vec[Solver-1],
              DFT_GPU_EigensolverActive() ? " (GPU-accelerated)" : "");
+      if (!DFT_GPU_EigensolverActive() && DFT_GPU_GlobalThreshold()<=DFT_GPU_BasisCount()){
+        static int cpu_diag_notice_done = 0;
+        if (!cpu_diag_notice_done){
+          cpu_diag_notice_done = 1;
+          printf("<%s>  Note: the CPU eigensolver prints nothing until every k point of an SCF iteration is done (matrix dimension %d); minutes of silence here are normal.\n",
+                 s_vec[Solver-1],DFT_GPU_BasisCount());
+        }
+      }
       fflush(stdout);
     }
 
@@ -2249,6 +2328,11 @@ double DFT(int MD_iter, int Cnt_Now)
                calculation of forces
   ****************************************************/
 
+  Mixing_H_Release_GPU();
+  Cluster_DFT_Col_Release_GPU_Solver();
+  Cluster_DFT_NonCol_Release_GPU_Solver();
+  Divide_Conquer_Release_GPU_SCache();
+  Krylov_Release_GPU_KUCache();
   if (!orbitalOpt_Force_Skip) time7 += Force(H0,DS_NL,OLP,DM[0],EDM);
   
   if (scf_stress_flag){

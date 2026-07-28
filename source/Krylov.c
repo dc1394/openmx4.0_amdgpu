@@ -28,6 +28,10 @@
 #define  KRYLOV_GPU_EIGEN_MIN  GPU_CPU_SWITCH_NUM
 #define  KRYLOV_GPU_DGEMM_MIN_FLOPS  50000000.0
 
+static double Krylov_gpu_dgemm_min_flops = KRYLOV_GPU_DGEMM_MIN_FLOPS;
+static int Krylov_gpu_eigen_min = KRYLOV_GPU_EIGEN_MIN;
+static int Krylov_gpu_fused = 1;
+
 #include "tran_prototypes.h"
 
 #ifdef nosse
@@ -158,6 +162,21 @@ static void Krylov_GPU_InitOnce(void)
   if (initialized) return;
   initialized = 1;
 
+  {
+    const char *env = getenv("OPENMX_KRYLOV_GPU_DGEMM_MIN_FLOPS");
+    if (env != NULL && env[0] != '\0') {
+      double value = atof(env);
+      if (0.0 <= value) Krylov_gpu_dgemm_min_flops = value;
+    }
+    env = getenv("OPENMX_KRYLOV_GPU_EIGEN_MIN");
+    if (env != NULL && env[0] != '\0') {
+      int value = atoi(env);
+      if (0 < value) Krylov_gpu_eigen_min = value;
+    }
+    env = getenv("OPENMX_KRYLOV_GPU_FUSED");
+    if (env != NULL && env[0] != '\0') Krylov_gpu_fused = (atoi(env) != 0);
+  }
+
   if (Krylov_GPU_Enabled()){
     wait_hipfunc(hipFree(0));
   }
@@ -263,7 +282,7 @@ static void Krylov_Dgemm(Krylov_GPU_Workspace *ws,
   const double alpha = 1.0;
   const double beta  = 0.0;
 
-  if (ws == NULL || !ws->active || ((double)m*(double)n*(double)k < KRYLOV_GPU_DGEMM_MIN_FLOPS)){
+  if (ws == NULL || !ws->active || ((double)m*(double)n*(double)k < Krylov_gpu_dgemm_min_flops)){
     char ta = (transa == HIPBLAS_OP_N) ? 'N' : 'T';
     char tb = (transb == HIPBLAS_OP_N) ? 'N' : 'T';
     F77_NAME(dgemm,DGEMM)(&ta, &tb, &m, &n, &k, (double*)&alpha,
@@ -301,7 +320,7 @@ static void Krylov_Eigen2(Krylov_GPU_Workspace *ws, double *a, int csize, double
   int i,j;
   int info, mout;
 
-  if (ws == NULL || !ws->active || n < KRYLOV_GPU_EIGEN_MIN){
+  if (ws == NULL || !ws->active || n < Krylov_gpu_eigen_min){
     Eigen_lapack2(a,csize,ko,n,EVmax);
     return;
   }
@@ -342,6 +361,181 @@ static void Krylov_Eigen2(Krylov_GPU_Workspace *ws, double *a, int csize, double
       a[i*n+j] = ws->h_A[i*n+j];
     }
   }
+}
+
+typedef struct {
+  int state;
+  int matomnum;
+  int nspin;
+  int *dim_n;
+  int *dim_m;
+  int *valid;
+  size_t *off;
+  double *d_arena;
+  size_t arena_elems;
+} Krylov_KUCache;
+
+static Krylov_KUCache Krylov_kucache = {0};
+
+void Krylov_Release_GPU_KUCache(void)
+{
+  if (Krylov_kucache.d_arena != NULL) wait_hipfunc(hipFree(Krylov_kucache.d_arena));
+  free(Krylov_kucache.dim_n);
+  free(Krylov_kucache.dim_m);
+  free(Krylov_kucache.valid);
+  free(Krylov_kucache.off);
+  memset(&Krylov_kucache,0,sizeof(Krylov_kucache));
+}
+
+static void Krylov_KUCache_Prepare(int matomnum, int nspin, const int *Msize,
+                                   const int *Msize3, int scf_iter)
+{
+  const char *enable = getenv("OPENMX_KRYLOV_GPU_KU_CACHE");
+  const char *reserve_env = getenv("OPENMX_KRYLOV_GPU_KU_RESERVE_MB");
+  size_t nslot = (size_t)nspin*(size_t)(matomnum+1);
+  size_t free_bytes=0,total_bytes=0,reserve=(size_t)4096*1024*1024;
+  size_t budget,used=0;
+  int node_ranks=1;
+  MPI_Comm node_comm=MPI_COMM_NULL;
+
+  if (enable!=NULL && atoi(enable)==0) return;
+  if (reserve_env!=NULL){
+    long mib=atol(reserve_env);
+    if (0<=mib) reserve=(size_t)mib*1024U*1024U;
+  }
+  if (Krylov_kucache.state==1 && Krylov_kucache.matomnum==matomnum &&
+      Krylov_kucache.nspin==nspin){
+    int same=1;
+    for (int spin=0;spin<nspin;spin++) for (int a=1;a<=matomnum;a++){
+      size_t s=(size_t)spin*(size_t)(matomnum+1)+(size_t)a;
+      if (Krylov_kucache.dim_n[s]!=0 &&
+          (Krylov_kucache.dim_n[s]!=Msize[a] || Krylov_kucache.dim_m[s]!=Msize3[a])) same=0;
+    }
+    if (same){
+      if (scf_iter<=1) memset(Krylov_kucache.valid,0,sizeof(int)*nslot);
+      return;
+    }
+    Krylov_Release_GPU_KUCache();
+  }
+  if (Krylov_kucache.state==-1) return;
+
+  Krylov_kucache.dim_n=(int*)calloc(nslot,sizeof(int));
+  Krylov_kucache.dim_m=(int*)calloc(nslot,sizeof(int));
+  Krylov_kucache.valid=(int*)calloc(nslot,sizeof(int));
+  Krylov_kucache.off=(size_t*)calloc(nslot,sizeof(size_t));
+  if (Krylov_kucache.dim_n==NULL || Krylov_kucache.dim_m==NULL ||
+      Krylov_kucache.valid==NULL || Krylov_kucache.off==NULL){
+    fprintf(stderr,"Krylov: could not allocate KU-cache tables.\n");
+    MPI_Abort(MPI_COMM_WORLD,1);
+  }
+
+  MPI_Comm_split_type(mpi_comm_level1,MPI_COMM_TYPE_SHARED,0,MPI_INFO_NULL,&node_comm);
+  MPI_Comm_size(node_comm,&node_ranks);
+  MPI_Comm_free(&node_comm);
+  if (node_ranks<1) node_ranks=1;
+  if (hipMemGetInfo(&free_bytes,&total_bytes)!=hipSuccess){
+    Krylov_Release_GPU_KUCache();
+    Krylov_kucache.state=-1;
+    return;
+  }
+  budget=free_bytes>reserve ? (free_bytes-reserve)/(size_t)node_ranks : 0;
+  for (int spin=0;spin<nspin;spin++) for (int a=1;a<=matomnum;a++){
+    size_t slot=(size_t)spin*(size_t)(matomnum+1)+(size_t)a;
+    size_t elems=(size_t)Msize[a]*(size_t)Msize3[a];
+    size_t bytes=elems*sizeof(double);
+    if (bytes>budget || used*sizeof(double)>budget-bytes) continue;
+    Krylov_kucache.dim_n[slot]=Msize[a];
+    Krylov_kucache.dim_m[slot]=Msize3[a];
+    Krylov_kucache.off[slot]=used;
+    used+=elems;
+  }
+  if (used!=0 && hipMalloc((void**)&Krylov_kucache.d_arena,used*sizeof(double))!=hipSuccess){
+    Krylov_Release_GPU_KUCache();
+    Krylov_kucache.state=-1;
+    return;
+  }
+  Krylov_kucache.state=1;
+  Krylov_kucache.matomnum=matomnum;
+  Krylov_kucache.nspin=nspin;
+  Krylov_kucache.arena_elems=used;
+}
+
+static const double *Krylov_KUCache_Get(Krylov_GPU_Workspace *ws,int spin,int Mc_AN,
+                                        int n,int m3,int msize2,double ***Krylov_U,double *KU)
+{
+  size_t slot;
+  double *dst;
+  if (Krylov_kucache.state!=1 || Mc_AN<1 || Krylov_kucache.matomnum<Mc_AN ||
+      spin<0 || Krylov_kucache.nspin<=spin) return NULL;
+  slot=(size_t)spin*(size_t)(Krylov_kucache.matomnum+1)+(size_t)Mc_AN;
+  if (Krylov_kucache.dim_n[slot]!=n || Krylov_kucache.dim_m[slot]!=m3) return NULL;
+  dst=Krylov_kucache.d_arena+Krylov_kucache.off[slot];
+  if (!Krylov_kucache.valid[slot]){
+    for (int i=0;i<n;i++) for (int j=0;j<m3;j++)
+      KU[(size_t)j*(size_t)n+(size_t)i]=Krylov_U[spin][Mc_AN][j*msize2+i+1];
+    wait_hipfunc(hipMemcpyAsync(dst,KU,sizeof(double)*(size_t)n*(size_t)m3,
+                                hipMemcpyHostToDevice,ws->stream));
+    wait_hipfunc(hipStreamSynchronize(ws->stream));
+    Krylov_kucache.valid[slot]=1;
+  }
+  return dst;
+}
+
+static int Krylov_ProjectedSolve_GPU(Krylov_GPU_Workspace *ws,int spin,int Mc_AN,
+                                     const int *Msize,const int *Msize2,const int *Msize3,
+                                     double ***Krylov_U,double ****EC_matrix,
+                                     double *H_DC,double *KU,double *C,double *ko)
+{
+  const double alpha=1.0,beta=0.0;
+  const double *d_KU;
+  int n=Msize[Mc_AN],m3=Msize3[Mc_AN],info,mout=0;
+  size_t nn=(size_t)n*(size_t)n;
+  size_t nm=(size_t)n*(size_t)m3;
+  size_t mm=(size_t)m3*(size_t)m3;
+
+  if (ws==NULL || !ws->active || !Krylov_gpu_fused) return 0;
+  if ((double)n*(double)m3*(double)n<Krylov_gpu_dgemm_min_flops ||
+      (double)m3*(double)m3*(double)n<Krylov_gpu_dgemm_min_flops ||
+      (double)m3*(double)n*(double)m3<Krylov_gpu_dgemm_min_flops) return 0;
+
+  Krylov_GPU_EnsureHipblas(ws);
+  Krylov_GPU_EnsureDouble(&ws->d_A,&ws->d_A_count,nn>mm?nn:mm);
+  Krylov_GPU_EnsureDouble(&ws->d_C,&ws->d_C_count,nm);
+  d_KU=Krylov_KUCache_Get(ws,spin,Mc_AN,n,m3,Msize2[Mc_AN],Krylov_U,KU);
+  if (d_KU==NULL){
+    for (int i=0;i<n;i++) for (int j=0;j<m3;j++)
+      KU[(size_t)j*(size_t)n+(size_t)i]=Krylov_U[spin][Mc_AN][j*Msize2[Mc_AN]+i+1];
+    Krylov_GPU_EnsureDouble(&ws->d_B,&ws->d_B_count,nm);
+    wait_hipfunc(hipMemcpyAsync(ws->d_B,KU,sizeof(double)*nm,hipMemcpyHostToDevice,ws->stream));
+    d_KU=ws->d_B;
+  }
+  wait_hipfunc(hipMemcpyAsync(ws->d_A,H_DC,sizeof(double)*nn,hipMemcpyHostToDevice,ws->stream));
+  wait_hipfunc(hipblasDgemm(ws->hipblas,HIPBLAS_OP_N,HIPBLAS_OP_N,n,m3,n,
+                            &alpha,ws->d_A,n,d_KU,n,&beta,ws->d_C,n));
+  wait_hipfunc(hipblasDgemm(ws->hipblas,HIPBLAS_OP_T,HIPBLAS_OP_N,m3,m3,n,
+                            &alpha,d_KU,n,ws->d_C,n,&beta,ws->d_A,m3));
+  wait_hipfunc(hipMemcpyAsync(H_DC,ws->d_A,sizeof(double)*mm,hipMemcpyDeviceToHost,ws->stream));
+  wait_hipfunc(hipStreamSynchronize(ws->stream));
+
+  for (int i=0;i<(int)Krylov_U[spin][Mc_AN][0];i++) H_DC[i*m3+i]=1.0e3;
+  for (int i=m3-1;0<=i;i--) for (int j=0;j<m3;j++)
+    H_DC[(i+1)*(m3+1)+(j+1)]=H_DC[i*m3+j]+EC_matrix[spin][Mc_AN][i+1][j+1];
+
+  /* MAGMA consumes a compact column-major panel. */
+  for (int i=0;i<m3;i++) for (int j=0;j<m3;j++) KU[(size_t)i*(size_t)m3+(size_t)j]=H_DC[(i+1)*(m3+1)+(j+1)];
+  wait_hipfunc(hipMemcpyAsync(ws->d_A,KU,sizeof(double)*mm,hipMemcpyHostToDevice,ws->stream));
+  wait_hipfunc(hipStreamSynchronize(ws->stream));
+  info=openmx_magma_dsyevdx_gpu(m3,m3,ws->d_A,ko+1,&mout);
+  if (info!=0 || mout!=m3){
+    Eigen_lapack2(H_DC,m3+1,ko,m3,m3);
+    for (int i=0;i<m3;i++) for (int j=0;j<m3;j++) KU[(size_t)i*(size_t)m3+(size_t)j]=H_DC[(size_t)i*(size_t)m3+(size_t)j];
+    wait_hipfunc(hipMemcpyAsync(ws->d_A,KU,sizeof(double)*mm,hipMemcpyHostToDevice,ws->stream));
+  }
+  wait_hipfunc(hipblasDgemm(ws->hipblas,HIPBLAS_OP_T,HIPBLAS_OP_T,m3,n,m3,
+                            &alpha,ws->d_A,m3,d_KU,n,&beta,ws->d_C,m3));
+  wait_hipfunc(hipMemcpyAsync(C,ws->d_C,sizeof(double)*nm,hipMemcpyDeviceToHost,ws->stream));
+  wait_hipfunc(hipStreamSynchronize(ws->stream));
+  return 1;
 }
 
 
@@ -563,6 +757,9 @@ static double Krylov_Col(char *mode,
     Msize3[Mc_AN] = rlmax_EC[Mc_AN]*EKC_core_size[Mc_AN];
     Msize4[Mc_AN] = rlmax_EC2[Mc_AN]*EKC_core_size[Mc_AN];
   }
+
+  if (Krylov_GPU_Enabled())
+    Krylov_KUCache_Prepare(Matomnum,SpinP_switch+1,Msize,Msize3,SCF_iter);
 
   m_size = 0;
 
@@ -1259,6 +1456,9 @@ static double Krylov_Col(char *mode,
 
 	/* BLAS3 version */
 
+	if (Krylov_ProjectedSolve_GPU(gpu_ws,spin,Mc_AN,Msize,Msize2,Msize3,
+	                              Krylov_U,EC_matrix,H_DC,KU,C,ko)==0){
+
 	for (i=0; i<Msize[Mc_AN]; i++){
 	  for (j=0; j<Msize3[Mc_AN]; j++){
 	    KU[j*Msize[Mc_AN]+i] = Krylov_U[spin][Mc_AN][j*Msize2[Mc_AN]+i+1];
@@ -1386,6 +1586,8 @@ static double Krylov_Col(char *mode,
 
 	Krylov_Dgemm(gpu_ws, HIPBLAS_OP_T, HIPBLAS_OP_T, M, N, K,
                      H_DC, lda, KU, ldb, C, ldc);
+
+	} /* fallback of fused GPU projected solve */
 
 	if (measure_time==1 && OMPID==0){ 
 	  dtime(&Etime1);
@@ -5759,6 +5961,9 @@ static double Krylov_Col_trd(char *mode,
     Msize4[Mc_AN] = rlmax_EC2[Mc_AN]*EKC_core_size[Mc_AN];
   }
 
+  if (Krylov_GPU_Enabled())
+    Krylov_KUCache_Prepare(Matomnum,SpinP_switch+1,Msize,Msize3,SCF_iter);
+
   m_size = 0;
 
   EVal = (double***)malloc(sizeof(double**)*(SpinP_switch+1));
@@ -6459,6 +6664,9 @@ static double Krylov_Col_trd(char *mode,
 
 	/* BLAS3 version */
 
+	if (Krylov_ProjectedSolve_GPU(gpu_ws,spin,Mc_AN,Msize,Msize2,Msize3,
+	                              Krylov_U,EC_matrix,H_DC,KU,C,ko)==0){
+
 	for (i=0; i<Msize[Mc_AN]; i++){
 	  for (j=0; j<Msize3[Mc_AN]; j++){
 	    KU[j*Msize[Mc_AN]+i] = Krylov_U[spin][Mc_AN][j*Msize2[Mc_AN]+i+1];
@@ -6586,6 +6794,8 @@ static double Krylov_Col_trd(char *mode,
 
 	Krylov_Dgemm(gpu_ws, HIPBLAS_OP_T, HIPBLAS_OP_T, M, N, K,
                      H_DC, lda, KU, ldb, C, ldc);
+
+	} /* fallback of fused GPU projected solve */
 
 	if (measure_time==1){ 
 	  dtime(&Etime1);
