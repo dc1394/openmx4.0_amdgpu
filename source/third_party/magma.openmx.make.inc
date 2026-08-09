@@ -2,7 +2,7 @@
 
 BACKEND      = hip
 ROCM_PATH   ?= /opt/rocm-7.2.0
-GPU_TARGET  ?= gfx1200
+GPU_TARGET  ?= gfx942
 
 CC           = $(ROCM_PATH)/bin/hipcc
 CXX          = $(ROCM_PATH)/bin/hipcc
@@ -25,7 +25,7 @@ LDFLAGS      = $(FPIC) $(FOPENMP)
 
 DEVCCFLAGS   = -O3 -DNDEBUG -DADD_ $(FPIC) $(FOPENMP) -std=c++14 -fno-gpu-rdc
 
-AOCL_LIB    ?= /opt/AMD/aocl/aocl-linux-aocc-5.2.0/aocc/lib
+AOCL_LIB    ?= /system/apps/rhel/aocl/5.1.0/aocc/lib
 
 LIB          =
 LIB         += -lflame -lblis -laoclutils

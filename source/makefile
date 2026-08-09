@@ -61,7 +61,15 @@ ROCM_LLVM ?= $(ROCM)/llvm
 ROCM_LIB  ?= $(ROCM)/lib
 ROCM_LLVM_LIB ?= $(ROCM_LLVM)/lib
 
-ARCH ?= $(shell $(ROCM_LLVM)/bin/offload-arch 2>/dev/null || $(ROCM)/bin/rocminfo | grep -o 'gfx[0-9a-f]+' | head -n 1)
+# offload-arch/rocminfo only answer on a node that owns a GPU, so keep a
+# fallback for builds driven from a GPU-less login node.  Both tools may append
+# target features (e.g. gfx942:sramecc+:xnack-); MAGMA's GPU_TARGET rejects
+# those, so keep the bare gfx name.
+GPU_ARCH_FALLBACK ?= gfx942
+ARCH ?= $(shell { $(ROCM_LLVM)/bin/offload-arch 2>/dev/null || $(ROCM)/bin/rocminfo 2>/dev/null | grep -oE 'gfx[0-9a-f]+'; } | head -n 1 | cut -d: -f1)
+ifeq ($(strip $(ARCH)),)
+ARCH := $(GPU_ARCH_FALLBACK)
+endif
 OMP_OFFLOAD := -fopenmp --offload-arch=$(ARCH)
 
 CLANG ?= $(ROCM_LLVM)/bin/clang
@@ -69,14 +77,20 @@ CPPLANG ?= $(ROCM_LLVM)/bin/clang++
 HIPCC ?= $(ROCM)/bin/hipcc
 FLANG ?= $(ROCM_LLVM)/bin/flang
 
-MPICC  ?= /home/kawai/opt/openmpi-rocmclang/bin/mpicc
-MPICXX ?= /home/kawai/opt/openmpi-rocmclang/bin/mpicxx
-MPIF90 ?= /home/kawai/opt/openmpi-rocmclang/bin/mpif90
+# OpenMPI built against the same ROCm as $(ROCM); override MPI_HOME elsewhere.
+# (module load openmpi/5.0.10/rocm7.2.0_amdflang)
+# The Fortran-90 "mpi" module is compiler-specific: the plain rocm7.2.0 build
+# ships a gfortran mpi.mod that $(FLANG) cannot read, so ELPA's "use mpi" needs
+# the amdflang-built variant of the very same OpenMPI.
+MPI_HOME ?= /system/apps/rhel/openmpi/5.0.10/rocm/7.2.0-rocm_amdflang/ompi
+MPICC  ?= $(MPI_HOME)/bin/mpicc
+MPICXX ?= $(MPI_HOME)/bin/mpicxx
+MPIF90 ?= $(MPI_HOME)/bin/mpif90
 
 MPI_CFLAGS  := $(shell $(MPICC) --showme:compile 2>/dev/null)
 MPI_FCFLAGS := $(shell $(MPIF90) --showme:compile 2>/dev/null)
 
-COMMON_INCLUDES = -I. -I$(ROCM)/include -I$(GEMMUL8_DIR)/include -I$(GEMMUL8_DIR)/src -I$(MAGMA_DIR)/include
+COMMON_INCLUDES = -I. -I$(ROCM)/include -I$(AOCL_INC) -I$(GEMMUL8_DIR)/include -I$(GEMMUL8_DIR)/src -I$(MAGMA_DIR)/include
 CFLAGS_COMMON = -w -fcommon -Wno-error=implicit-function-declaration -std=c11 -mtune=native -march=native -D__HIP_PLATFORM_AMD__ -DM_PI=3.14159265358979323846264338327950288 $(COMMON_INCLUDES)
 CPPFLAGS_COMMON = -w -fcommon -std=c++20 -mtune=native -march=native -D__HIP_PLATFORM_AMD__ $(COMMON_INCLUDES)
 
@@ -89,11 +103,23 @@ CC_DFTD3 = $(CLANG) -w -O0 $(MPI_CFLAGS) $(CFLAGS_COMMON) -fopenmp
 CXX = $(CPPLANG) -O3 $(MPI_CFLAGS) $(CPPFLAGS_COMMON) $(OMP_OFFLOAD)
 FC = $(FLANG) -O2 $(MPI_FCFLAGS) -mtune=native -march=native -fopenmp
 
-MPI_LIBDIR ?= /home/kawai/opt/openmpi-rocmclang/lib
-RPATHS = -Wl,--disable-new-dtags -Wl,-rpath,$(ROCM_LLVM_LIB) -Wl,-rpath,$(ROCM_LIB) -Wl,-rpath,$(MPI_LIBDIR)
+MPI_LIBDIR ?= $(MPI_HOME)/lib
+# AOCL's ScaLAPACK/libFLAME were built with AOCC's classic flang, so they pull
+# in libflang/libflangrti/libpgmath from the AOCC install.  Keep $(AOCC_LIB)
+# last: it also ships an older libomp.so that must not shadow ROCm's.
+AOCC_LIB ?= /system/apps/rhel/aocc/5.0.0/lib
+RPATHS = -Wl,--disable-new-dtags -Wl,-rpath,$(ROCM_LLVM_LIB) -Wl,-rpath,$(ROCM_LIB) -Wl,-rpath,$(MPI_LIBDIR) -Wl,-rpath,$(AOCL_LIB) -Wl,-rpath,$(AOCC_LIB)
 ROCM_GPU_LIBS := -L$(ROCM_LIB) -lamd_smi -lhipsolver -lrocsolver -lhipblas -lhipblaslt -lrocblas -lhipsparse -lamdhip64
-FLANG_RTL_LIBS := -L$(ROCM_LLVM_LIB) -lflang_rt.runtime -lflang_rt.quadmath -lquadmath
-AOCL_LIB ?= /opt/AMD/aocl/aocl-linux-aocc-5.2.0/aocc/lib
+# ROCm ships libflang_rt.* under the clang resource directory, not directly in
+# $(ROCM_LLVM_LIB); ask the compiler where that is instead of hardcoding the
+# LLVM major version.
+FLANG_RT_LIBDIR ?= $(shell $(FLANG) -print-resource-dir 2>/dev/null)/lib/$(shell $(FLANG) -print-target-triple 2>/dev/null)
+FLANG_RTL_LIBS := -L$(FLANG_RT_LIBDIR) -L$(ROCM_LLVM_LIB) -lflang_rt.runtime -lflang_rt.quadmath -lquadmath
+# AOCL (BLIS / libFLAME / ScaLAPACK / FFTW3); module load aocl/5.1.0/aocc5.0.0.
+# AOCL_INC also supplies fftw3.h, so it is part of COMMON_INCLUDES above.
+AOCL_HOME ?= /system/apps/rhel/aocl/5.1.0/aocc
+AOCL_INC ?= $(AOCL_HOME)/include
+AOCL_LIB ?= $(AOCL_HOME)/lib
 SCALAPACK_LIBS := -L$(AOCL_LIB) -lscalapack
 LAPACK_LIBS := -L$(AOCL_LIB) -lflame
 BLAS_LIBS := -L$(AOCL_LIB) -lblis

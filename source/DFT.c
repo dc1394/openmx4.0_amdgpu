@@ -165,6 +165,8 @@ static void DFT_GPU_DeviceInit(int basis_count)
     }
 }
 
+extern int openmx_gpu_eigensolver_use_hipsolver(void);
+
 static int DFT_GPU_EigensolverActive(void)
 {
     if (scf_eigen_lib_flag!=GPUSOLVER) return 0;
@@ -271,10 +273,14 @@ static void DFT_ConfigureSetHamiltonianOpenMP(int myid0)
     Set_Hamiltonian_Set_OpenMP_Rank_Selected(DFT_SetHamiltonianOpenMPSelectedRank(myid0));
 }
 
-static void DFT_PrepareGpuSolverHSPackedCache(void)
+static void DFT_PrepareGpuSolverHSPackedCache(int SCF_iter)
 {
     if (scf_eigen_lib_flag == GPUSOLVER && (Solver == 2 || Solver == 3)) {
-        Set_Hamiltonian_Build_GpuSolver_HS_Cache(Cnt_switch == 1);
+        /* Atom order and overlap are invariant during an uncontracted SCF
+           cycle.  Rebuild them at SCF 1 (and whenever contracted orbitals may
+           change), then refresh only the Hamiltonian on later iterations. */
+        const int refresh_static = (SCF_iter <= 1 || Cnt_switch == 1);
+        Set_Hamiltonian_Build_GpuSolver_HS_Cache(Cnt_switch == 1, refresh_static);
     }
     else {
         Set_Hamiltonian_Invalidate_GpuSolver_HS_Cache();
@@ -476,7 +482,14 @@ double DFT(int MD_iter, int Cnt_Now)
              DFT_SetProExpnVNAUseGPU() ? " (GPU-accelerated)" : "");
       fflush(stdout);
     }
-    time12 = Set_ProExpn_VNA(HVNA, HVNA2, DS_VNA);  
+    time12 = Set_ProExpn_VNA(HVNA, HVNA2, DS_VNA);
+    {
+      extern void openmx_gpu_zheevd_selftest(const char *label);
+      const char *selftest_env = getenv("OPENMX_ZHEEVD_SELFTEST");
+      if (selftest_env != NULL && atoi(selftest_env) != 0 && MYID_MPI_COMM_WORLD == 0 && MD_iter == 1) {
+        openmx_gpu_zheevd_selftest("post_HVNA");
+      }
+    }
   }
 
   /* SCF loop */
@@ -519,6 +532,15 @@ double DFT(int MD_iter, int Cnt_Now)
 
     SCF_iter++;
     LSCF_iter++;
+
+    {
+      extern void openmx_gpu_zheevd_selftest(const char *label);
+      const char *selftest_env = getenv("OPENMX_ZHEEVD_SELFTEST");
+      if (selftest_env != NULL && atoi(selftest_env) != 0 && MYID_MPI_COMM_WORLD == 0 && MD_iter == 1 &&
+          SCF_iter == 1) {
+        openmx_gpu_zheevd_selftest("scf1_top");
+      }
+    }
 
     /*****************************************************
                          print stdout
@@ -590,6 +612,14 @@ double DFT(int MD_iter, int Cnt_Now)
       } /* end of if (Solver==4) */
 
       time10 += Set_Orbitals_Grid(Cnt_kind);
+
+      {
+        extern void openmx_gpu_zheevd_selftest(const char *label);
+        const char *selftest_env = getenv("OPENMX_ZHEEVD_SELFTEST");
+        if (selftest_env != NULL && atoi(selftest_env) != 0 && MYID_MPI_COMM_WORLD == 0 && MD_iter == 1) {
+          openmx_gpu_zheevd_selftest("post_grids");
+        }
+      }
 
       /* YTL-start */
       if (CDDF_on == 1){
@@ -747,13 +777,31 @@ double DFT(int MD_iter, int Cnt_Now)
 	  time4 += TRAN_Poisson(ReVk,ImVk,SCF_iter,TRAN_SCF_Iter_Band,SucceedReadingDMfile);
 	}
 
+	{
+	  extern void openmx_gpu_zheevd_selftest(const char *label);
+	  const char *selftest_env = getenv("OPENMX_ZHEEVD_SELFTEST");
+	  if (selftest_env != NULL && atoi(selftest_env) != 0 && MYID_MPI_COMM_WORLD == 0 && MD_iter == 1 &&
+	      SCF_iter == 1) {
+	    openmx_gpu_zheevd_selftest("post_poisson1");
+	  }
+	}
+
 	time3 += Set_Hamiltonian("nostdout",
                                   MD_iter,
                                   LSCF_iter-SCF_iter_shift,
                                   SCF_iter-SCF_iter_shift,
                                   TRAN_Poisson_flag2,
                                   SucceedReadingDMfile,Cnt_kind,H0,HNL,DM[0],H);
-      }  
+
+	{
+	  extern void openmx_gpu_zheevd_selftest(const char *label);
+	  const char *selftest_env = getenv("OPENMX_ZHEEVD_SELFTEST");
+	  if (selftest_env != NULL && atoi(selftest_env) != 0 && MYID_MPI_COMM_WORLD == 0 && MD_iter == 1 &&
+	      SCF_iter == 1) {
+	    openmx_gpu_zheevd_selftest("post_setham1");
+	  }
+	}
+      }
 
       if (Cnt_switch==1 && Cnt_Now==1){
         if (MD_iter==1) Initial_CntCoes2(H,OLP);
@@ -853,7 +901,10 @@ double DFT(int MD_iter, int Cnt_Now)
     if (MYID_MPI_COMM_WORLD==Host_ID && 0<level_stdout){
       printf("<%s>  Solving the eigenvalue problem%s...\n",
              s_vec[Solver-1],
-             DFT_GPU_EigensolverActive() ? " (GPU-accelerated)" : "");
+             DFT_GPU_EigensolverActive()
+               ? (openmx_gpu_eigensolver_use_hipsolver() ? " (GPU-accelerated, hipSOLVER)"
+                                                         : " (GPU-accelerated, MAGMA)")
+               : "");
       if (!DFT_GPU_EigensolverActive() && DFT_GPU_GlobalThreshold()<=DFT_GPU_BasisCount()){
         static int cpu_diag_notice_done = 0;
         if (!cpu_diag_notice_done){
@@ -865,7 +916,16 @@ double DFT(int MD_iter, int Cnt_Now)
       fflush(stdout);
     }
 
-    DFT_PrepareGpuSolverHSPackedCache();
+    DFT_PrepareGpuSolverHSPackedCache(SCF_iter);
+
+    {
+      extern void openmx_gpu_zheevd_selftest(const char *label);
+      const char *selftest_env = getenv("OPENMX_ZHEEVD_SELFTEST");
+      if (selftest_env != NULL && atoi(selftest_env) != 0 && MYID_MPI_COMM_WORLD == 0 && MD_iter == 1 &&
+          SCF_iter == 1) {
+        openmx_gpu_zheevd_selftest("post_pack");
+      }
+    }
 
     if (Cnt_switch==0){
 

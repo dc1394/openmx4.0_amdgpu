@@ -131,6 +131,7 @@ enum {
 typedef struct {
     int ready;
     int owns;
+    int use_contracted;
     int order_mode;
     int size;
     int spin_count;
@@ -516,7 +517,7 @@ void Set_Hamiltonian_GpuSolver_SetMP(int *MP)
     }
 }
 
-void Set_Hamiltonian_Build_GpuSolver_HS_Cache(int use_contracted)
+void Set_Hamiltonian_Build_GpuSolver_HS_Cache(int use_contracted, int refresh_static)
 {
     SetHamiltonianGpuSolverPackedCache *cache = &Set_Hamiltonian_GpuSolver_Cache;
     int myid, numprocs;
@@ -533,6 +534,8 @@ void Set_Hamiltonian_Build_GpuSolver_HS_Cache(int use_contracted)
     int dummy_atom = 0;
     int order_mode;
     int spin_count;
+    int local_rebuild_static;
+    int rebuild_static;
     MPI_Comm selected_comm = MPI_COMM_NULL;
     double ****overlap_src;
     double *****h_src;
@@ -541,9 +544,8 @@ void Set_Hamiltonian_Build_GpuSolver_HS_Cache(int use_contracted)
     MPI_Comm_size(mpi_comm_level1, &numprocs);
     MPI_Comm_rank(mpi_comm_level1, &myid);
 
-    Set_Hamiltonian_GpuSolver_Free_Cache();
-
     if (scf_eigen_lib_flag != GPUSOLVER) {
+        Set_Hamiltonian_GpuSolver_Free_Cache();
         return;
     }
 
@@ -595,6 +597,7 @@ void Set_Hamiltonian_Build_GpuSolver_HS_Cache(int use_contracted)
     }
 
     if (selected_count == 0) {
+        Set_Hamiltonian_GpuSolver_Free_Cache();
         free(atom_displs);
         free(atom_counts);
         free(displs);
@@ -603,41 +606,70 @@ void Set_Hamiltonian_Build_GpuSolver_HS_Cache(int use_contracted)
         return;
     }
 
+    /* All ranks must make the same decision before the optional order/overlap
+       collectives.  A full refresh is mandatory at SCF 1 (new MD geometry),
+       while later uncontracted SCFs can retain the invariant part. */
+    local_rebuild_static =
+        refresh_static || !cache->ready || cache->use_contracted != (use_contracted ? 1 : 0) ||
+        cache->order_mode != order_mode || cache->spin_count != spin_count || cache->atom_count != atomnum ||
+        cache->size != total_size || cache->owns != local_selected ||
+        (local_selected && (cache->order_GA == NULL || cache->overlap == NULL));
+    MPI_Allreduce(&local_rebuild_static, &rebuild_static, 1, MPI_INT, MPI_MAX, mpi_comm_level1);
+
+    if (rebuild_static) {
+        Set_Hamiltonian_GpuSolver_Free_Cache();
+    }
+    else {
+        for (int spin = 0; spin < 4; spin++) {
+            free(cache->h[spin]);
+            cache->h[spin] = NULL;
+        }
+        for (int comp = 0; comp < 3; comp++) {
+            free(cache->imnl[comp]);
+            cache->imnl[comp] = NULL;
+        }
+        cache->ready = 0;
+    }
+
     MPI_Comm_split(mpi_comm_level1, local_selected ? 1 : MPI_UNDEFINED, myid, &selected_comm);
 
-    cache->ready = 1;
     cache->owns = local_selected;
+    cache->use_contracted = use_contracted ? 1 : 0;
     cache->order_mode = order_mode;
     cache->size = total_size;
     cache->spin_count = spin_count;
     cache->atom_count = atomnum;
 
-    if (myid == first_selected_root) {
-        cache->order_GA = (int *)Set_Hamiltonian_malloc(sizeof(int) * (size_t)(atomnum + 2),
-                                                        "GPU solver atom order cache", myid);
-    }
-
-    MPI_Gatherv((0 < Matomnum) ? &M2G[1] : &dummy_atom, Matomnum, MPI_INT,
-                (myid == first_selected_root) ? &cache->order_GA[1] : NULL,
-                atom_counts, atom_displs, MPI_INT, first_selected_root, mpi_comm_level1);
-
-    if (local_selected) {
-        if (myid != first_selected_root) {
+    if (rebuild_static) {
+        if (myid == first_selected_root) {
             cache->order_GA = (int *)Set_Hamiltonian_malloc(sizeof(int) * (size_t)(atomnum + 2),
                                                             "GPU solver atom order cache", myid);
         }
-        cache->order_GA[0] = 0;
-        cache->order_GA[atomnum + 1] = 0;
-        MPI_Bcast(&cache->order_GA[1], atomnum, MPI_INT, 0, selected_comm);
+
+        MPI_Gatherv((0 < Matomnum) ? &M2G[1] : &dummy_atom, Matomnum, MPI_INT,
+                    (myid == first_selected_root) ? &cache->order_GA[1] : NULL,
+                    atom_counts, atom_displs, MPI_INT, first_selected_root, mpi_comm_level1);
+
+        if (local_selected) {
+            if (myid != first_selected_root) {
+                cache->order_GA = (int *)Set_Hamiltonian_malloc(sizeof(int) * (size_t)(atomnum + 2),
+                                                                "GPU solver atom order cache", myid);
+            }
+            cache->order_GA[0] = 0;
+            cache->order_GA[atomnum + 1] = 0;
+            MPI_Bcast(&cache->order_GA[1], atomnum, MPI_INT, 0, selected_comm);
+        }
     }
 
     overlap_src = use_contracted ? CntOLP[0] : OLP[0];
     h_src = use_contracted ? CntH : H;
     imnl_src = use_contracted ? iCntHNL : iHNL;
 
-    Set_Hamiltonian_GpuSolver_GatherMatrixToSelected(overlap_src, &cache->overlap, order_mode, local_size, total_size,
-                                                    counts, displs, selected_roots, selected_comm,
-                                                    first_selected_root, myid);
+    if (rebuild_static) {
+        Set_Hamiltonian_GpuSolver_GatherMatrixToSelected(overlap_src, &cache->overlap, order_mode, local_size,
+                                                        total_size, counts, displs, selected_roots, selected_comm,
+                                                        first_selected_root, myid);
+    }
 
     for (int spin = 0; spin < spin_count; spin++) {
         Set_Hamiltonian_GpuSolver_GatherMatrixToSelected(h_src[spin], &cache->h[spin], order_mode, local_size,
@@ -650,6 +682,17 @@ void Set_Hamiltonian_Build_GpuSolver_HS_Cache(int use_contracted)
             Set_Hamiltonian_GpuSolver_GatherMatrixToSelected(imnl_src[comp], &cache->imnl[comp], order_mode,
                                                             local_size, total_size, counts, displs, selected_roots,
                                                             selected_comm, first_selected_root, myid);
+        }
+    }
+
+    cache->ready = 1;
+
+    {
+        const char *trace = getenv("OPENMX_BAND_CACHE_TRACE");
+        if (myid == Host_ID && trace != NULL && atoi(trace) != 0) {
+            printf("<DFT> packed HS cache: overlap/order %s, Hamiltonian refreshed\n",
+                   rebuild_static ? "rebuilt" : "reused");
+            fflush(stdout);
         }
     }
 

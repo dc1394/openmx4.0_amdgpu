@@ -3340,7 +3340,7 @@ double Set_Hamiltonian(char *mode,
 void Set_Hamiltonian_Set_OpenMP_Rank_Selected(int selected);
 int Set_Hamiltonian_OpenMP_Rank_Is_Selected(void);
 void Set_Hamiltonian_Invalidate_GpuSolver_HS_Cache(void);
-void Set_Hamiltonian_Build_GpuSolver_HS_Cache(int use_contracted);
+void Set_Hamiltonian_Build_GpuSolver_HS_Cache(int use_contracted, int refresh_static);
 void Set_Hamiltonian_GpuSolver_SetMP(int *MP);
 void Mixing_H_Release_GPU(void);
 void OpenMX_GpuPhaseNeed_Register(const char *phase, size_t group_bytes);

@@ -1,8 +1,14 @@
 #include <magma_v2.h>
 #include "hip_runtime_compat.h"
 
+#include <hipsolver/hipsolver.h>
+
+#include <chrono>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <mutex>
+#include <strings.h>
 
 namespace {
 
@@ -149,7 +155,243 @@ int ensure_z_work(magma_int_t lwork, magma_int_t lrwork, magma_int_t liwork)
     return MAGMA_SUCCESS;
 }
 
+hipsolverDnHandle_t g_hs_handle = nullptr;
+hipDoubleComplex   *g_hs_work = nullptr;
+int                 g_hs_lwork = 0;
+int                 g_hs_work_n = 0;
+double             *g_hs_dW = nullptr;
+double             *g_hs_hW = nullptr;
+int                 g_hs_W_n = 0;
+int                *g_hs_dinfo = nullptr;
+
+int ensure_hipsolver_ready(int n)
+{
+    if (g_hs_handle == nullptr) {
+        if (hipsolverDnCreate(&g_hs_handle) != HIPSOLVER_STATUS_SUCCESS) {
+            g_hs_handle = nullptr;
+            return -1;
+        }
+    }
+    if (g_hs_dinfo == nullptr) {
+        if (hipMalloc((void **)&g_hs_dinfo, sizeof(int)) != hipSuccess) {
+            g_hs_dinfo = nullptr;
+            return -1;
+        }
+    }
+    if (n > g_hs_W_n) {
+        if (g_hs_dW != nullptr) hipFree(g_hs_dW);
+        if (g_hs_hW != nullptr) std::free(g_hs_hW);
+        g_hs_dW = nullptr;
+        g_hs_hW = nullptr;
+        g_hs_W_n = 0;
+        if (hipMalloc((void **)&g_hs_dW, sizeof(double) * (size_t)n) != hipSuccess) {
+            g_hs_dW = nullptr;
+            return -1;
+        }
+        g_hs_hW = (double *)std::malloc(sizeof(double) * (size_t)n);
+        if (g_hs_hW == nullptr) {
+            return -1;
+        }
+        g_hs_W_n = n;
+    }
+    return 0;
+}
+
 } // namespace
+
+/* Backend selection for the dense GPU eigensolvers.  rocSOLVER's zheevd runs
+   entirely on the GPU and is far faster than hybrid MAGMA on CDNA server parts
+   (MI100/MI200/MI300 report gfx9xx), while on RDNA consumer parts
+   (gfx10xx/11xx/12xx, e.g. RX 9060XT = gfx1200) MAGMA is the faster of the
+   two.  Override with OPENMX_GPU_EIGENSOLVER=hipsolver|magma (anything else,
+   including "auto", keeps the detection). */
+extern "C" int openmx_gpu_eigensolver_use_hipsolver(void)
+{
+    static int cached = -1;
+
+    if (cached >= 0) {
+        return cached;
+    }
+
+    const char *env = std::getenv("OPENMX_GPU_EIGENSOLVER");
+    if (env != nullptr) {
+        if (strcasecmp(env, "hipsolver") == 0) {
+            cached = 1;
+            return cached;
+        }
+        if (strcasecmp(env, "magma") == 0) {
+            cached = 0;
+            return cached;
+        }
+    }
+
+    hipDeviceProp_t prop;
+    int dev = 0;
+    if (hipGetDevice(&dev) != hipSuccess || hipGetDeviceProperties(&prop, dev) != hipSuccess) {
+        cached = 0;
+        return cached;
+    }
+    cached = (std::strncmp(prop.gcnArchName, "gfx9", 4) == 0) ? 1 : 0;
+    return cached;
+}
+
+/* True when the GPU is an APU sharing physical memory with the CPU (MI300A):
+   host arrays are device-accessible and host<->device staging copies are pure
+   waste.  Discrete CDNA parts (MI300X, MI2xx) report integrated=0 and still
+   need real copies.  Override with OPENMX_GPU_ASSUME_APU=0/1. */
+extern "C" int openmx_gpu_is_apu(void)
+{
+    static int cached = -1;
+
+    if (cached >= 0) {
+        return cached;
+    }
+
+    const char *env = std::getenv("OPENMX_GPU_ASSUME_APU");
+    if (env != nullptr && *env != '\0') {
+        cached = (std::atoi(env) != 0) ? 1 : 0;
+        return cached;
+    }
+
+    hipDeviceProp_t prop;
+    int dev = 0;
+    if (hipGetDevice(&dev) != hipSuccess || hipGetDeviceProperties(&prop, dev) != hipSuccess) {
+        cached = 0;
+        return cached;
+    }
+    cached = (prop.integrated != 0) ? 1 : 0;
+
+    if (std::getenv("OPENMX_GPU_VERBOSE") != nullptr) {
+        std::fprintf(stderr, "openmx: GPU '%s' integrated(APU)=%d\n", prop.gcnArchName, cached);
+        std::fflush(stderr);
+    }
+    return cached;
+}
+
+/* Drop-in replacement for openmx_magma_zheevdx_gpu backed by
+   hipsolverDnZheevd.  rocSOLVER's full-spectrum divide&conquer is much faster
+   than its partial zheevdx, so all n eigenpairs are computed and only the
+   lowest maxn eigenvalues are stored into w; d_A is overwritten with all n
+   eigenvectors (ascending), of which callers consume the first maxn columns. */
+extern "C" int openmx_hipsolver_zheevd_gpu(int n, int maxn, void *d_A, double *w, int *mout_out)
+{
+    std::lock_guard<std::mutex> lock(g_magma_mutex);
+    hipsolverStatus_t status;
+    int lwork = 0;
+    int info = 0;
+
+    if (mout_out != nullptr) {
+        *mout_out = 0;
+    }
+    if (n <= 0 || maxn <= 0 || maxn > n || d_A == nullptr || w == nullptr) {
+        return MAGMA_ERR_ILLEGAL_VALUE;
+    }
+
+    if (ensure_hipsolver_ready(n) != 0) {
+        return MAGMA_ERR_HOST_ALLOC;
+    }
+
+    if (n > g_hs_work_n) {
+        status = hipsolverDnZheevd_bufferSize(g_hs_handle, HIPSOLVER_EIG_MODE_VECTOR,
+                                              HIPSOLVER_FILL_MODE_LOWER, n,
+                                              (hipDoubleComplex *)d_A, n, g_hs_dW, &lwork);
+        if (status != HIPSOLVER_STATUS_SUCCESS) {
+            return (int)status;
+        }
+        if (lwork < 1) {
+            lwork = 1;
+        }
+        if (lwork > g_hs_lwork) {
+            if (g_hs_work != nullptr) {
+                hipFree(g_hs_work);
+                g_hs_work = nullptr;
+                g_hs_lwork = 0;
+            }
+            if (hipMalloc((void **)&g_hs_work, sizeof(hipDoubleComplex) * (size_t)lwork) != hipSuccess) {
+                g_hs_work = nullptr;
+                return MAGMA_ERR_DEVICE_ALLOC;
+            }
+            g_hs_lwork = lwork;
+        }
+        g_hs_work_n = n;
+    }
+
+    status = hipsolverDnZheevd(g_hs_handle, HIPSOLVER_EIG_MODE_VECTOR, HIPSOLVER_FILL_MODE_LOWER, n,
+                               (hipDoubleComplex *)d_A, n, g_hs_dW, g_hs_work, g_hs_lwork, g_hs_dinfo);
+    if (status != HIPSOLVER_STATUS_SUCCESS) {
+        return (int)status;
+    }
+
+    if (hipMemcpy(&info, g_hs_dinfo, sizeof(int), hipMemcpyDeviceToHost) != hipSuccess) {
+        return MAGMA_ERR_UNKNOWN;
+    }
+    if (info != 0) {
+        return info;
+    }
+    if (hipMemcpy(g_hs_hW, g_hs_dW, sizeof(double) * (size_t)n, hipMemcpyDeviceToHost) != hipSuccess) {
+        return MAGMA_ERR_UNKNOWN;
+    }
+    std::memcpy(w, g_hs_hW, sizeof(double) * (size_t)maxn);
+    hipDeviceSynchronize();
+
+    if (mout_out != nullptr) {
+        *mout_out = maxn;
+    }
+    return 0;
+}
+
+/* Diagnostic: run a standalone zheevd on a fresh random Hermitian matrix and
+   print the wall time, to locate the point in the run where GPU performance
+   collapses.  Enabled via OPENMX_ZHEEVD_SELFTEST=1. */
+extern "C" void openmx_gpu_zheevd_selftest(const char *label)
+{
+    const int n = 2808;
+    size_t    nn = (size_t)n * (size_t)n;
+    hipDoubleComplex *h_A = (hipDoubleComplex *)std::malloc(sizeof(hipDoubleComplex) * nn);
+    hipDoubleComplex *d_A = nullptr;
+    double           *w = (double *)std::malloc(sizeof(double) * n);
+
+    if (h_A == nullptr || w == nullptr) {
+        std::free(h_A);
+        std::free(w);
+        return;
+    }
+
+    unsigned seed = 12345u;
+    for (int j = 0; j < n; j++) {
+        for (int i = j; i < n; i++) {
+            seed = seed * 1664525u + 1013904223u;
+            double re = (double)(seed >> 8) / (double)(1u << 24) - 0.5;
+            seed = seed * 1664525u + 1013904223u;
+            double im = (i == j) ? 0.0 : (double)(seed >> 8) / (double)(1u << 24) - 0.5;
+            h_A[(size_t)j * n + i] = {re, im};
+            h_A[(size_t)i * n + j] = {re, -im};
+        }
+    }
+
+    if (hipMalloc((void **)&d_A, sizeof(hipDoubleComplex) * nn) != hipSuccess) {
+        std::free(h_A);
+        std::free(w);
+        return;
+    }
+
+    for (int rep = 0; rep < 2; rep++) {
+        hipMemcpy(d_A, h_A, sizeof(hipDoubleComplex) * nn, hipMemcpyHostToDevice);
+        hipDeviceSynchronize();
+        double t0 = std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
+        int    mout = 0;
+        int    info = openmx_hipsolver_zheevd_gpu(n, n, d_A, w, &mout);
+        hipDeviceSynchronize();
+        double t1 = std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
+        std::printf("[ZHEEVD_SELFTEST] %-12s rep%d  %8.3f s (info=%d w0=%.4f)\n", label, rep, t1 - t0, info,
+                    w[0]);
+        std::fflush(stdout);
+    }
+
+    hipFree(d_A);
+    std::free(h_A);
+    std::free(w);
+}
 
 extern "C" int openmx_magma_dsyevdx_gpu(int n, int maxn, double *d_A, double *w, int *mout_out)
 {

@@ -27,6 +27,19 @@
 #define  measure_time  0
 
 extern int openmx_magma_zheevdx_gpu(int n, int maxn, void *d_A, double *w, int *mout);
+extern int openmx_hipsolver_zheevd_gpu(int n, int maxn, void *d_A, double *w, int *mout);
+extern int openmx_gpu_eigensolver_use_hipsolver(void);
+extern int openmx_gpu_is_apu(void);
+
+static int BandNonCol_SolveTimingEnabled(void)
+{
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char *value = getenv("OPENMX_SOLVE_TIMING");
+        enabled = (value != NULL && atoi(value) != 0);
+    }
+    return enabled;
+}
 
 /* GPU workspace for band non-collinear DM (added by H.Kawai, ported from 3.9.9 GPU) */
 typedef struct
@@ -607,30 +620,123 @@ static void BandNonCol_GpuSolver_DenseZheevx_Device(dcomplex *A, double *ko, int
         BandNonCol_AbortWithMessage("Invalid MAGMA eigensolver dimensions in Band_DFT_NonCol.c.");
     }
 
+    {
+        void *mapped = omp_get_mapped_ptr(A, omp_get_default_device());
+        const int real_copy = (mapped != NULL && mapped != (void *)A);
+        const int unified = (!real_copy && openmx_gpu_is_apu());
+        int solved_on_device_side = 0;
+
+        if (openmx_gpu_eigensolver_use_hipsolver() && real_copy){
+            /* The OpenMP mapping is a real device copy (MI300X and other
+               discrete GPUs): the device side is authoritative, so solve in
+               place on the mapped buffer and refresh the host array once. */
+            const int tdbg = BandNonCol_SolveTimingEnabled();
+            double tz0 = 0.0, tz1 = 0.0, tz2 = 0.0;
+
+            if (tdbg) dtime(&tz0);
+
+            info = openmx_hipsolver_zheevd_gpu(n,maxn,mapped,ko,&mout);
+
+            if (tdbg) { wait_hipfunc(hipDeviceSynchronize()); dtime(&tz1); }
+
 #pragma omp target update from(A[0 : nn])
 
-    wait_hipfunc(hipMalloc((void**)&d_A,bytes));
-    wait_hipfunc(hipMemcpy(d_A,A,bytes,hipMemcpyHostToDevice));
-    info = openmx_magma_zheevdx_gpu(n,maxn,d_A,ko,&mout);
-    wait_hipfunc(hipMemcpy(A,d_A,bytes,hipMemcpyDeviceToHost));
-    wait_hipfunc(hipFree(d_A));
+            solved_on_device_side = 1;
 
-    if (info!=0){
-        fprintf(stderr,"%s: magma_zheevdx_gpu failed, info=%d\n",where,info);
-        fflush(stderr);
-        MPI_Abort(mpi_comm_level1,1);
-    }
-    if (mout!=maxn){
-        fprintf(stderr,"%s: magma_zheevdx_gpu returned %d eigenpairs, expected %d\n",
-                where,mout,maxn);
-        fflush(stderr);
-        MPI_Abort(mpi_comm_level1,1);
-    }
+            if (tdbg) {
+                dtime(&tz2);
+                printf("NC_SOLVE_TIMING(dev-mapped) zheevd=%.3f updfrom=%.3f\n", tz1 - tz0, tz2 - tz1);
+                fflush(stdout);
+            }
+        }
+        else if (openmx_gpu_eigensolver_use_hipsolver() && unified){
+            /* APU (MI300A) zero-copy: the host array IS the device data; solve
+               on it directly with no staging and no transfers. */
+            const int tdbg = BandNonCol_SolveTimingEnabled();
+            double tz0 = 0.0, tz1 = 0.0;
 
-    for (l=maxn; 1<=l; l--) ko[l] = ko[l-1];
+            if (tdbg) dtime(&tz0);
 
+            info = openmx_hipsolver_zheevd_gpu(n,maxn,(mapped != NULL) ? mapped : (void *)A,ko,&mout);
+
+            solved_on_device_side = 1;
+
+            if (tdbg) {
+                wait_hipfunc(hipDeviceSynchronize());
+                dtime(&tz1);
+                printf("NC_SOLVE_TIMING(dev-unified) zheevd=%.3f\n", tz1 - tz0);
+                fflush(stdout);
+            }
+        }
+        else {
+            /* Staging path: discrete GPU without a live mapping, or MAGMA. */
+            const int tdbg = BandNonCol_SolveTimingEnabled();
+            double tt0 = 0.0, tt1 = 0.0, tt2 = 0.0, tt3 = 0.0, tt4 = 0.0;
+
+            if (tdbg) dtime(&tt0);
+
+#pragma omp target update from(A[0 : nn])
+
+            if (tdbg) dtime(&tt1);
+
+            wait_hipfunc(hipMalloc((void**)&d_A,bytes));
+            wait_hipfunc(hipMemcpy(d_A,A,bytes,hipMemcpyHostToDevice));
+
+            if (tdbg) { wait_hipfunc(hipDeviceSynchronize()); dtime(&tt2); }
+
+            if (openmx_gpu_eigensolver_use_hipsolver()){
+                info = openmx_hipsolver_zheevd_gpu(n,maxn,d_A,ko,&mout);
+            }
+            else {
+                info = openmx_magma_zheevdx_gpu(n,maxn,d_A,ko,&mout);
+            }
+
+            if (tdbg) { wait_hipfunc(hipDeviceSynchronize()); dtime(&tt3); }
+
+            wait_hipfunc(hipMemcpy(A,d_A,bytes,hipMemcpyDeviceToHost));
+            wait_hipfunc(hipFree(d_A));
+
+            if (tdbg) {
+                dtime(&tt4);
+                printf("NC_SOLVE_TIMING(dev-staged) updfrom=%.3f h2d=%.3f zheevd=%.3f d2h_free=%.3f\n",
+                       tt1 - tt0, tt2 - tt1, tt3 - tt2, tt4 - tt3);
+                fflush(stdout);
+            }
+        }
+
+        if (info!=0){
+            fprintf(stderr,"%s: GPU eigensolver (zheevd/zheevdx) failed, info=%d\n",where,info);
+            fflush(stderr);
+            MPI_Abort(mpi_comm_level1,1);
+        }
+        if (mout!=maxn){
+            fprintf(stderr,"%s: GPU eigensolver returned %d eigenpairs, expected %d\n",
+                    where,mout,maxn);
+            fflush(stderr);
+            MPI_Abort(mpi_comm_level1,1);
+        }
+
+        for (l=maxn; 1<=l; l--) ko[l] = ko[l-1];
+
+        {
+            const int tdbg = BandNonCol_SolveTimingEnabled();
+            double tu0 = 0.0, tu1 = 0.0;
+
+            if (tdbg) dtime(&tu0);
+
+            if (!solved_on_device_side){
+                /* Staging path left the authoritative data on the host. */
 #pragma omp target update to(A[0 : nn])
+            }
 #pragma omp target update to(ko[0 : n + 1])
+
+            if (tdbg) {
+                dtime(&tu1);
+                printf("NC_SOLVE_TIMING(dev) updto=%.3f\n", tu1 - tu0);
+                fflush(stdout);
+            }
+        }
+    }
 }
 
 static void BandNonCol_GEMMul8Zgemm_OpenMP(hipblasOperation_t transa, hipblasOperation_t transb, int m, int n, int k,
@@ -839,19 +945,61 @@ static void BandNonCol_GpuSolver_DenseZheevx(dcomplex *A, dcomplex *Z, double *k
     nn = (size_t)n*(size_t)n;
     bytes = sizeof(dcomplex)*nn;
 
-    wait_hipfunc(hipMalloc((void**)&d_A,bytes));
-    wait_hipfunc(hipMemcpy(d_A,A,bytes,hipMemcpyHostToDevice));
-    info = openmx_magma_zheevdx_gpu(n,maxn,d_A,ko,&mout);
-    wait_hipfunc(hipMemcpy(A,d_A,bytes,hipMemcpyDeviceToHost));
-    wait_hipfunc(hipFree(d_A));
+    if (openmx_gpu_eigensolver_use_hipsolver() && openmx_gpu_is_apu()){
+        /* APU (MI300A): the host array lives in the same physical memory the
+           GPU uses, so solve on it directly with no staging copies. */
+        const int tdbg = BandNonCol_SolveTimingEnabled();
+        double th0 = 0.0, th1 = 0.0;
+
+        if (tdbg) dtime(&th0);
+
+        info = openmx_hipsolver_zheevd_gpu(n,maxn,A,ko,&mout);
+
+        if (tdbg) {
+            wait_hipfunc(hipDeviceSynchronize());
+            dtime(&th1);
+            printf("NC_SOLVE_TIMING(host-unified) zheevd=%.3f\n", th1 - th0);
+            fflush(stdout);
+        }
+    }
+    else {
+        const int tdbg = BandNonCol_SolveTimingEnabled();
+        double th0 = 0.0, th1 = 0.0, th2 = 0.0, th3 = 0.0;
+
+        if (tdbg) dtime(&th0);
+
+        wait_hipfunc(hipMalloc((void**)&d_A,bytes));
+        wait_hipfunc(hipMemcpy(d_A,A,bytes,hipMemcpyHostToDevice));
+
+        if (tdbg) { wait_hipfunc(hipDeviceSynchronize()); dtime(&th1); }
+
+        if (openmx_gpu_eigensolver_use_hipsolver()){
+            info = openmx_hipsolver_zheevd_gpu(n,maxn,d_A,ko,&mout);
+        }
+        else {
+            info = openmx_magma_zheevdx_gpu(n,maxn,d_A,ko,&mout);
+        }
+
+        if (tdbg) { wait_hipfunc(hipDeviceSynchronize()); dtime(&th2); }
+
+        wait_hipfunc(hipMemcpy(A,d_A,bytes,hipMemcpyDeviceToHost));
+        wait_hipfunc(hipFree(d_A));
+
+        if (tdbg) {
+            dtime(&th3);
+            printf("NC_SOLVE_TIMING(host-staged) h2d=%.3f zheevd=%.3f d2h_free=%.3f\n",
+                   th1 - th0, th2 - th1, th3 - th2);
+            fflush(stdout);
+        }
+    }
 
     if (info!=0){
-        fprintf(stderr,"%s: magma_zheevdx_gpu failed, info=%d\n",where,info);
+        fprintf(stderr,"%s: GPU eigensolver (zheevd/zheevdx) failed, info=%d\n",where,info);
         fflush(stderr);
         MPI_Abort(mpi_comm_level1,1);
     }
     if (mout!=maxn){
-        fprintf(stderr,"%s: magma_zheevdx_gpu returned %d eigenpairs, expected %d\n",
+        fprintf(stderr,"%s: GPU eigensolver returned %d eigenpairs, expected %d\n",
                 where,mout,maxn);
         fflush(stderr);
         MPI_Abort(mpi_comm_level1,1);
@@ -1529,14 +1677,33 @@ static void BandNonCol_DenseGpuEigen(dcomplex *d_A, double *ko, int n, int maxn,
         BandNonCol_AbortWithMessage("Invalid MAGMA dense GPU eigensolver arguments in Band_DFT_NonCol.c.");
     }
 
-    info = openmx_magma_zheevdx_gpu(n,maxn,d_A,ko,&mout);
+    {
+        const int tdbg = BandNonCol_SolveTimingEnabled();
+        double td0 = 0.0, td1 = 0.0;
+
+        if (tdbg) dtime(&td0);
+
+        if (openmx_gpu_eigensolver_use_hipsolver()){
+            info = openmx_hipsolver_zheevd_gpu(n,maxn,d_A,ko,&mout);
+        }
+        else {
+            info = openmx_magma_zheevdx_gpu(n,maxn,d_A,ko,&mout);
+        }
+
+        if (tdbg) {
+            wait_hipfunc(hipDeviceSynchronize());
+            dtime(&td1);
+            printf("NC_SOLVE_TIMING(dense) zheevd=%.3f\n", td1 - td0);
+            fflush(stdout);
+        }
+    }
     if (info!=0){
-        fprintf(stderr,"%s: magma_zheevdx_gpu failed, info=%d\n",where,info);
+        fprintf(stderr,"%s: GPU eigensolver (zheevd/zheevdx) failed, info=%d\n",where,info);
         fflush(stderr);
         MPI_Abort(mpi_comm_level1,1);
     }
     if (mout!=maxn){
-        fprintf(stderr,"%s: magma_zheevdx_gpu returned %d eigenpairs, expected %d\n",
+        fprintf(stderr,"%s: GPU eigensolver returned %d eigenpairs, expected %d\n",
                 where,mout,maxn);
         fflush(stderr);
         MPI_Abort(mpi_comm_level1,1);
@@ -4536,6 +4703,16 @@ double Band_DFT_NonCol(
 
   if (myid0==Host_ID && 0<level_stdout){
     printf("<Band_DFT>  Eigen, time=%lf\n", EiloopTime-SiloopTime);fflush(stdout);
+  }
+
+  /* Debug hook: exit cleanly right after the first eigen phase so that
+     profilers (rocprofv3) flush their traces.  OPENMX_ABORT_AFTER_EIGEN=1. */
+  if (getenv("OPENMX_ABORT_AFTER_EIGEN") != NULL){
+    fflush(stdout);
+    fflush(stderr);
+    MPI_Barrier(mpi_comm_level1);
+    MPI_Finalize();
+    exit(0);
   }
 
   /****************************************************

@@ -38,6 +38,9 @@ void elpa_solve_evp_complex_2stage_double_impl_(int * n, int * MaxN, dcomplex * 
                                                 int * mpi_comm_rows_int, int * mpi_comm_cols_int, int * mpiworld);
 
 extern int openmx_magma_zheevdx_gpu(int n, int maxn, void *d_A, double *w, int *mout);
+extern int openmx_hipsolver_zheevd_gpu(int n, int maxn, void *d_A, double *w, int *mout);
+extern int openmx_gpu_eigensolver_use_hipsolver(void);
+extern int openmx_gpu_is_apu(void);
 
 static void Construct_Band_CsHs(int SCF_iter, int all_knum, int * order_GA, int * MP, double * S1, double * H1,
                                 double k1, double k2, double k3, dcomplex * Cs, dcomplex * Hs, int n,
@@ -208,7 +211,10 @@ static int BandCol_GpuPersistentEnabled(void)
     const char *value = getenv("OPENMX_BAND_GPU_PERSISTENT");
 
     if (value == NULL) {
-        return 0;
+        /* On an APU (MI300A) the save/load staging between SCF iterations is a
+           pure unified-memory round trip and memory is plentiful, so keep the
+           device buffers alive by default there. */
+        return openmx_gpu_is_apu();
     }
     return (atoi(value) != 0);
 }
@@ -252,9 +258,22 @@ static int BandCol_GemmWorkspaceTurnRelease(void)
     const char *value = getenv("OPENMX_BAND_GEMMUL8_TURN_RELEASE");
 
     if (value == NULL) {
-        return 1;
+        /* Keep the GEMMul8 workspace across turns on the memory-rich APU;
+           release per turn on smaller discrete GPUs as before. */
+        return openmx_gpu_is_apu() ? 0 : 1;
     }
     return (atoi(value) != 0);
+}
+
+/* Preserve the historical SCF-boundary behaviour unless retention was
+   explicitly requested.  The APU default above is useful between staggered
+   k-point turns, but carrying a roughly GiB-sized Z-GEMMul8 workspace per
+   rank into the next SCF is too broad a default for other inputs. */
+static int BandCol_GemmWorkspaceScfRelease(void)
+{
+    const char *value = getenv("OPENMX_BAND_GEMMUL8_TURN_RELEASE");
+
+    return (value == NULL) ? 1 : (atoi(value) != 0);
 }
 
 static int BandCol_GpuTurnGroup(void)
@@ -280,6 +299,62 @@ static int BandCol_GpuTurnGroup(void)
         return 1024;
     }
     return (int)group;
+}
+
+/* Cached overlap matrices remove a relatively long eigensolver call which
+   used to stagger the k-point ranks naturally.  On a single shared GPU that
+   can make every Hamiltonian solve arrive at once (a "thundering herd").
+   Allow the cached-SCF concurrency to be tuned independently without changing
+   the first-SCF setting.  Keeping the variable unset preserves the historical
+   behaviour. */
+static int BandCol_GpuTurnGroupForScf(int SCF_iter)
+{
+    const char *value;
+    long        group;
+
+    if (SCF_iter <= 1) {
+        return BandCol_GpuTurnGroup();
+    }
+
+    value = getenv("OPENMX_BAND_GPU_CACHED_TURN_GROUP");
+    if (value == NULL || *value == '\0') {
+        return BandCol_GpuTurnGroup();
+    }
+
+    group = strtol(value, NULL, 10);
+    if (group < 1L) {
+        return 1;
+    }
+    if (1024L < group) {
+        return 1024;
+    }
+    return (int)group;
+}
+
+static int BandCol_CacheTraceEnabled(void)
+{
+    static int enabled = -1;
+
+    if (enabled < 0) {
+        const char *value = getenv("OPENMX_BAND_CACHE_TRACE");
+        enabled = (value != NULL && atoi(value) != 0);
+    }
+    return enabled;
+}
+
+static int BandCol_AbortAfterEigenScf(void)
+{
+    const char *value = getenv("OPENMX_ABORT_AFTER_EIGEN_SCF");
+
+    if (value != NULL && *value != '\0') {
+        long scf = strtol(value, NULL, 10);
+        if (0 < scf && scf <= INT_MAX) {
+            return (int)scf;
+        }
+    }
+
+    value = getenv("OPENMX_ABORT_AFTER_EIGEN");
+    return (value != NULL && atoi(value) != 0) ? 1 : 0;
 }
 
 static int BandCol_MaxConcurrentKGpuTurns(void)
@@ -1131,11 +1206,11 @@ static void BandCol_GpuSolver_SaveTransformedS(int n)
         if (new_s == NULL) {
             BandCol_AbortWithMessage("Failed to allocate host transformed-overlap buffer in Band_DFT_Col.c.");
         }
-        ctx->h_transformed_s     = new_s;
-        ctx->h_transformed_s_dim = n;
+        ctx->h_transformed_s = new_s;
     }
 
     wait_hipfunc(hipMemcpy(ctx->h_transformed_s, ctx->d_S, sizeof(dcomplex) * matrix_count, hipMemcpyDeviceToHost));
+    ctx->h_transformed_s_dim = n;
 }
 
 static void BandCol_GpuSolver_LoadTransformedS(int n)
@@ -1243,14 +1318,18 @@ static void BandCol_GpuSolver_Eigen(dcomplex * d_A, int m, int maxn, double * W_
 
     BandCol_GpuSolver_EnsureMatrixCapacity(m);
 
-    info = openmx_magma_zheevdx_gpu(m, maxn, d_A, W_host, &mout);
+    if (openmx_gpu_eigensolver_use_hipsolver()) {
+        info = openmx_hipsolver_zheevd_gpu(m, maxn, d_A, W_host, &mout);
+    } else {
+        info = openmx_magma_zheevdx_gpu(m, maxn, d_A, W_host, &mout);
+    }
 
     if (info != 0) {
-        snprintf(msg, sizeof(msg), "magma_zheevdx_gpu failed in Band_DFT_Col.c: info=%d", info);
+        snprintf(msg, sizeof(msg), "GPU eigensolver (zheevd/zheevdx) failed in Band_DFT_Col.c: info=%d", info);
         BandCol_AbortWithMessage(msg);
     }
     if (mout != maxn) {
-        snprintf(msg, sizeof(msg), "magma_zheevdx_gpu returned %d eigenpairs, expected %d in Band_DFT_Col.c.",
+        snprintf(msg, sizeof(msg), "GPU eigensolver returned %d eigenpairs, expected %d in Band_DFT_Col.c.",
                  mout, maxn);
         BandCol_AbortWithMessage(msg);
     }
@@ -1480,6 +1559,16 @@ static dcomplex *BandCol_GpuSolver_EnsureEigenvectorCapacity(int n, int stride)
     return ctx->d_evec;
 }
 
+static int BandCol_SolveTimingEnabled(void)
+{
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char *value = getenv("OPENMX_SOLVE_TIMING");
+        enabled = (value != NULL && atoi(value) != 0);
+    }
+    return enabled;
+}
+
 static dcomplex *BandCol_GpuSolver_SolveHamiltonianImpl(int n, int maxn, const dcomplex *H_in, double *ko, dcomplex *C_out,
                                                        int build_eigenvectors)
 {
@@ -1488,6 +1577,8 @@ static dcomplex *BandCol_GpuSolver_SolveHamiltonianImpl(int n, int maxn, const d
     dcomplex            *evec_t;
     hipDoubleComplex      alpha = make_hipDoubleComplex(1.0, 0.0);
     hipDoubleComplex      beta = make_hipDoubleComplex(0.0, 0.0);
+    const int             tdbg = BandCol_SolveTimingEnabled();
+    double                tt0 = 0.0, tt1 = 0.0, tt2 = 0.0, tt3 = 0.0, tt4 = 0.0, tt5 = 0.0;
 
     if (!(ctx->transformed_s_valid && ctx->transformed_s_dim == n)) {
         BandCol_AbortWithMessage("Transformed overlap is not ready in BandCol_GpuSolver_SolveHamiltonian.");
@@ -1495,17 +1586,32 @@ static dcomplex *BandCol_GpuSolver_SolveHamiltonianImpl(int n, int maxn, const d
 
     matrix_bytes = sizeof(dcomplex) * (size_t)n * (size_t)n;
 
+    if (tdbg) dtime(&tt0);
+
     if (H_in != NULL) {
         wait_hipfunc(hipMemcpy(ctx->d_H, H_in, matrix_bytes, hipMemcpyHostToDevice));
     }
 
+    if (tdbg) { wait_hipfunc(hipDeviceSynchronize()); dtime(&tt1); }
+
     BandCol_GpuSolver_ZgemmDevice(HIPBLAS_OP_N, HIPBLAS_OP_N, n, n, n, ctx->d_H, ctx->d_S, ctx->d_tmp);
+
+    if (tdbg) { wait_hipfunc(hipDeviceSynchronize()); dtime(&tt2); }
 
     BandCol_GpuSolver_ZgemmDevice(HIPBLAS_OP_C, HIPBLAS_OP_N, n, n, n, ctx->d_S, ctx->d_tmp, ctx->d_H);
 
+    if (tdbg) { wait_hipfunc(hipDeviceSynchronize()); dtime(&tt3); }
+
     BandCol_GpuSolver_Eigen(ctx->d_H, n, maxn, ko + 1);
 
+    if (tdbg) { wait_hipfunc(hipDeviceSynchronize()); dtime(&tt4); }
+
     if (!build_eigenvectors) {
+        if (tdbg) {
+            printf("SOLVE_TIMING h2d=%.3f zgemm1=%.3f zgemm2=%.3f zheevd=%.3f (novec)\n",
+                   tt1 - tt0, tt2 - tt1, tt3 - tt2, tt4 - tt3);
+            fflush(stdout);
+        }
         return NULL;
     }
 
@@ -1518,6 +1624,14 @@ static dcomplex *BandCol_GpuSolver_SolveHamiltonianImpl(int n, int maxn, const d
     if (C_out != NULL) {
         wait_hipfunc(hipMemcpy(C_out, evec_t, sizeof(dcomplex) * (size_t)n * (size_t)maxn,
                                  hipMemcpyDeviceToHost));
+    }
+
+    if (tdbg) {
+        wait_hipfunc(hipDeviceSynchronize());
+        dtime(&tt5);
+        printf("SOLVE_TIMING h2d=%.3f zgemm1=%.3f zgemm2=%.3f zheevd=%.3f back=%.3f\n",
+               tt1 - tt0, tt2 - tt1, tt3 - tt2, tt4 - tt3, tt5 - tt4);
+        fflush(stdout);
     }
 
     return evec_t;
@@ -1735,6 +1849,14 @@ double Band_DFT_Col(int SCF_iter, int knum_i, int knum_j, int knum_k, int SpinP_
     /* MPI */
     MPI_Comm_size(mpi_comm_level1, &numprocs0);
     MPI_Comm_rank(mpi_comm_level1, &myid0);
+
+    if (SCF_iter == 1 && myid0 == 0) {
+        extern void openmx_gpu_zheevd_selftest(const char *label);
+        const char *selftest_env = getenv("OPENMX_ZHEEVD_SELFTEST");
+        if (selftest_env != NULL && atoi(selftest_env) != 0) {
+            openmx_gpu_zheevd_selftest("band_top");
+        }
+    }
 
     MPI_Barrier(mpi_comm_level1);
 
@@ -2476,6 +2598,14 @@ diagonalize1:
 
     dtime(&SiloopTime);
 
+    if (SCF_iter == 1 && myid0 == 0 && use_gpusolver_dense) {
+        extern void openmx_gpu_zheevd_selftest(const char *label);
+        const char *selftest_env = getenv("OPENMX_ZHEEVD_SELFTEST");
+        if (selftest_env != NULL && atoi(selftest_env) != 0) {
+            openmx_gpu_zheevd_selftest("band_entry");
+        }
+    }
+
     if (all_knum != 1 && use_gpusolver_dense) {
         const int max_concurrent_gpu_turns = BandCol_MaxConcurrentKGpuTurns();
         const int total_gpu_turns = Num_Comm_World1 * T_knum;
@@ -2590,7 +2720,7 @@ diagonalize1:
 
                 my_gpu_turn = spin * T_knum + kloop;
                 const int serialize_gpu_turns = BandCol_SerializeGpuSolverGpuTurns();
-                const int gpu_turn_group = serialize_gpu_turns ? BandCol_GpuTurnGroup() : 1;
+                const int gpu_turn_group = serialize_gpu_turns ? BandCol_GpuTurnGroupForScf(SCF_iter) : 1;
                 const int first_gpu_turn = serialize_gpu_turns ? 0 : my_gpu_turn;
                 const int last_gpu_turn = serialize_gpu_turns ? Num_Comm_World1 * T_knum : (my_gpu_turn + 1);
                 for (int gpu_turn = first_gpu_turn; gpu_turn < last_gpu_turn; gpu_turn++) {
@@ -2600,7 +2730,10 @@ diagonalize1:
 
                     if (owns_global_dense_rank && my_gpu_turn == gpu_turn) {
                         dcomplex *evec_device;
-                        const int build_s = (SCF_iter == 1) || !BandCol_GpuSolver_HasHostTransformedS(n);
+                        const int persistent_s = BandCol_GpuPersistentDecide();
+                        const int device_s_ready = persistent_s && BandCol_GpuSolver_HasDeviceTransformedS(n);
+                        const int host_s_ready = BandCol_GpuSolver_HasHostTransformedS(n);
+                        const int build_s = (SCF_iter == 1) || (!device_s_ready && !host_s_ready);
                         const int construct_scf_iter = build_s ? 1 : SCF_iter;
 
                         Construct_Band_CsHs(construct_scf_iter, all_knum, use_setham_packed_cache ? setham_order_GA : order_GA, MP,
@@ -2630,11 +2763,28 @@ diagonalize1:
 
                         if (build_s) {
                             BandCol_GpuSolver_PrepareTransformedS(1, n, construct_on_device ? NULL : Ss, ko, koS);
-                            BandCol_GpuSolver_SaveTransformedS(n);
-                        } else if (!(BandCol_GpuPersistentDecide() && BandCol_GpuSolver_HasDeviceTransformedS(n))) {
+                            /* A persistent device cache is already the object
+                               consumed by both ZGEMMs.  Copying another n*n
+                               matrix to pageable host memory wastes bandwidth
+                               and, on MI300A/XNACK, creates avoidable mapped
+                               pages.  Keep a host fallback only when device
+                               buffers will be released between SCFs. */
+                            if (!persistent_s) {
+                                BandCol_GpuSolver_SaveTransformedS(n);
+                            }
+                        } else if (!device_s_ready) {
                             BandCol_GpuSolver_LoadTransformedS(n);
                         }
                         transformed_s_ready = 1;
+
+                        if (BandCol_CacheTraceEnabled()) {
+                            printf("<Band_DFT> transformed-S cache rank=%d k=%d SCF=%d: %s%s\n",
+                                   myid0, kloop, SCF_iter,
+                                   build_s ? "build" : "hit",
+                                   build_s ? (persistent_s ? " (device-only)" : " (host fallback saved)")
+                                           : (device_s_ready ? " (device)" : " (host reload)"));
+                            fflush(stdout);
+                        }
 
                         if (SCF_iter == 1 && measure_time) {
                             dtime(&Etime);
@@ -3354,7 +3504,7 @@ diagonalize1:
             {
                 int my_gpu_turn = spin * T_knum + kloop;
                 const int serialize_gpu_turns = BandCol_SerializeGpuSolverGpuTurns();
-                const int gpu_turn_group = serialize_gpu_turns ? BandCol_GpuTurnGroup() : 1;
+                const int gpu_turn_group = serialize_gpu_turns ? BandCol_GpuTurnGroupForScf(SCF_iter) : 1;
                 const int first_gpu_turn = serialize_gpu_turns ? 0 : my_gpu_turn;
                 const int last_gpu_turn = serialize_gpu_turns ? Num_Comm_World1 * T_knum : (my_gpu_turn + 1);
 
@@ -3717,7 +3867,25 @@ diagonalize1:
 
     if (myid0 == Host_ID && 0 < level_stdout) {
         printf("<Band_DFT>  Eigen, time=%lf\n", EiloopTime - SiloopTime);
+        if (SCF_iter == 1 && BandCol_CacheTraceEnabled()) {
+            printf("<Band_DFT>  timing scope: Eigen includes occupation/ChemP%s.\n",
+                   (all_knum == 1) ? " and density-matrix collectives" : "");
+        }
         fflush(stdout);
+    }
+
+    /* Debug hook: exit cleanly after a requested SCF eigen phase so profilers
+       flush without running the (irrelevant here) force calculation.  The old
+       OPENMX_ABORT_AFTER_EIGEN=1 remains an alias for SCF 1. */
+    {
+        const int abort_after_scf = BandCol_AbortAfterEigenScf();
+        if (0 < abort_after_scf && abort_after_scf <= SCF_iter) {
+            fflush(stdout);
+            fflush(stderr);
+            MPI_Barrier(mpi_comm_level1);
+            MPI_Finalize();
+            exit(0);
+        }
     }
 
     dtime(&SiloopTime);
@@ -4584,9 +4752,13 @@ diagonalize1:
         MPI_Comm_free(&mpi_comm_cols);
     }
 
-    /* Many ranks share one GPU; cached GEMMul8 workspaces (~1 GiB per rank) would
-       otherwise accumulate across SCF iterations and starve later allocations. */
-    openmx_gemmul8ReleaseWorkspaces();
+    /* Honour the same retention policy at the SCF boundary as at each turn.
+       Unconditionally freeing here made OPENMX_BAND_GEMMUL8_TURN_RELEASE=0
+       ineffective and forced all cached-SCF k-point ranks to allocate their
+       ~1-GiB workspaces simultaneously on the next ZGEMM. */
+    if (BandCol_GemmWorkspaceScfRelease()) {
+        openmx_gemmul8ReleaseWorkspaces();
+    }
 
     MPI_Barrier(mpi_comm_level1);
     dtime(&TEtime);
