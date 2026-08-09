@@ -77,6 +77,16 @@ CPPLANG ?= $(ROCM_LLVM)/bin/clang++
 HIPCC ?= $(ROCM)/bin/hipcc
 FLANG ?= $(ROCM_LLVM)/bin/flang
 
+# Set_Density_Grid contains explicit AVX-512/AVX2 runtime dispatch.  Compile
+# its baseline code without -march=native so the dispatcher and scalar path
+# themselves never acquire AVX-512 instructions on an AVX-512 build host.
+CLANG_HOST_TRIPLE := $(shell $(CLANG) -dumpmachine 2>/dev/null)
+ifeq ($(findstring x86_64,$(CLANG_HOST_TRIPLE)),x86_64)
+SDG_CPU_BASELINE_FLAGS ?= -march=x86-64-v2 -mtune=native
+else
+SDG_CPU_BASELINE_FLAGS ?=
+endif
+
 # OpenMPI built against the same ROCm as $(ROCM); override MPI_HOME elsewhere.
 # (module load openmpi/5.0.10/rocm7.2.0_amdflang)
 # The Fortran-90 "mpi" module is compiler-specific: the plain rocm7.2.0 build
@@ -544,7 +554,7 @@ Nonlocal_RadialF.o: Nonlocal_RadialF.c openmx_common.h
 Set_Orbitals_Grid.o: Set_Orbitals_Grid.c openmx_common.h set_hip_default_device_from_local_rank.h
 	$(CC) -c Set_Orbitals_Grid.c
 Set_Density_Grid.o: Set_Density_Grid.c openmx_common.h
-	$(CC) -c Set_Density_Grid.c
+	$(CC_NOACC_O3) $(SDG_CPU_BASELINE_FLAGS) -c Set_Density_Grid.c
 Set_Density_Grid_GPU.o: Set_Density_Grid_GPU.c openmx_common.h set_hip_default_device_from_local_rank.h
 	$(CC) -c Set_Density_Grid_GPU.c
 Set_Aden_Grid.o: Set_Aden_Grid.c openmx_common.h

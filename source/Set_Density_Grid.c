@@ -14,13 +14,35 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
+#include <string.h>
 #include <time.h>
 #include <math.h>
 #include "openmx_common.h"
 #include "mpi.h"
 #include <omp.h>
 
-#define  measure_time   0
+#define  measure_time              0
+#define  SDG_NC_GRID_BATCH_AVX2    4
+#define  SDG_NC_GRID_BATCH_AVX512  8
+#define  SDG_NC_GRID_BATCH_MAX     SDG_NC_GRID_BATCH_AVX512
+
+enum {
+  SDG_NC_SIMD_SCALAR = 0,
+  SDG_NC_SIMD_AVX2 = 1,
+  SDG_NC_SIMD_AVX512 = 2
+};
+
+#if defined(__x86_64__) && (defined(__clang__) || defined(__GNUC__))
+#define SDG_X86_RUNTIME_DISPATCH 1
+#define SDG_TARGET_AVX2 \
+  __attribute__((target("avx2"),noinline))
+#define SDG_TARGET_AVX512 \
+  __attribute__((target("avx512f"),noinline))
+#else
+#define SDG_X86_RUNTIME_DISPATCH 0
+#define SDG_TARGET_AVX2
+#define SDG_TARGET_AVX512
+#endif
 
 static size_t SDG_checked_add(size_t a, size_t b, const char *name, int myid)
 {
@@ -60,6 +82,235 @@ static void *SDG_checked_alloc(size_t count, size_t element_size, int clear,
     abort();
   }
   return p;
+}
+
+static void *SDG_checked_aligned_alloc(size_t alignment, size_t count,
+                                       size_t element_size, const char *name,
+                                       int myid)
+{
+  const size_t bytes = SDG_checked_mul(count ? count : 1,element_size,name,myid);
+  const size_t padded = SDG_checked_add(bytes,alignment-1,name,myid) & ~(alignment-1);
+  void *p = aligned_alloc(alignment,padded);
+
+  if (p==NULL){
+    fprintf(stderr,"Set_Density_Grid: rank %d cannot allocate %s (%zu bytes)\n",
+            myid,name,padded);
+    fflush(stderr);
+    MPI_Abort(mpi_comm_level1,1);
+    abort();
+  }
+  return p;
+}
+
+static int SDG_env_disabled(const char *value)
+{
+  if (value==NULL || value[0]=='\0') return 0;
+  if (value[0]=='0' || value[0]=='n' || value[0]=='N' ||
+      value[0]=='f' || value[0]=='F' ||
+      strcmp(value,"scalar")==0 || strcmp(value,"SCALAR")==0) return 1;
+  return 0;
+}
+
+/* Select only instruction sets which both the processor and the operating
+   system can execute.  __builtin_cpu_supports includes the OSXSAVE/XCR0
+   checks, so an AVX-512 capable CPU whose vector state is disabled safely
+   falls back to AVX2.  OPENMX_DENSITY_GRID_NC_SIMD=avx2 caps the selection
+   for validation; 0/scalar selects the original scalar-compatible path. */
+static int SDG_nc_simd_mode(void)
+{
+  const char *value = getenv("OPENMX_DENSITY_GRID_NC_SIMD");
+  int allow_avx512 = 1;
+
+  if (SDG_env_disabled(value)) return SDG_NC_SIMD_SCALAR;
+  if (value!=NULL &&
+      (strcmp(value,"avx2")==0 || strcmp(value,"AVX2")==0)){
+    allow_avx512 = 0;
+  }
+
+#if SDG_X86_RUNTIME_DISPATCH
+  __builtin_cpu_init();
+  if (allow_avx512 && __builtin_cpu_supports("avx512f")){
+    return SDG_NC_SIMD_AVX512;
+  }
+  if (__builtin_cpu_supports("avx2")) return SDG_NC_SIMD_AVX2;
+#endif
+
+  return SDG_NC_SIMD_SCALAR;
+}
+
+static const char *SDG_nc_simd_mode_name(int mode)
+{
+  if (mode==SDG_NC_SIMD_AVX512) return "AVX-512";
+  if (mode==SDG_NC_SIMD_AVX2) return "AVX2";
+  return "scalar";
+}
+
+/* Evaluate eight independent non-collinear grid contractions together.  The
+   grid point is the SIMD dimension: the j and i accumulation order of every
+   individual density value is therefore identical to the scalar formula.
+   dm is packed as [i][j][spin], while the orbital batches are [orbital][grid]. */
+static SDG_TARGET_AVX512 void SDG_accumulate_nc8(
+                                      int no0, int no1,
+                                      const double *restrict dm,
+                                      const double *restrict orb0,
+                                      const double *restrict orb1,
+                                      const int *restrict nc,
+                                      double *restrict den0,
+                                      double *restrict den1,
+                                      double *restrict den2,
+                                      double *restrict den3)
+{
+  double sum0[SDG_NC_GRID_BATCH_AVX512] = {0.0};
+  double sum1[SDG_NC_GRID_BATCH_AVX512] = {0.0};
+  double sum2[SDG_NC_GRID_BATCH_AVX512] = {0.0};
+  double sum3[SDG_NC_GRID_BATCH_AVX512] = {0.0};
+  int i,j,g;
+
+  for (i=0; i<no0; i++){
+    double tmp0[SDG_NC_GRID_BATCH_AVX512] = {0.0};
+    double tmp1[SDG_NC_GRID_BATCH_AVX512] = {0.0};
+    double tmp2[SDG_NC_GRID_BATCH_AVX512] = {0.0};
+    double tmp3[SDG_NC_GRID_BATCH_AVX512] = {0.0};
+    const double *restrict dm_row = dm + (size_t)4*i*no1;
+    const double *restrict orb0_row = orb0 + (size_t)i*SDG_NC_GRID_BATCH_AVX512;
+
+    for (j=0; j<no1; j++){
+      const double *restrict orb1_row = orb1 + (size_t)j*SDG_NC_GRID_BATCH_AVX512;
+      const double cdm0 = dm_row[4*j+0];
+      const double cdm1 = dm_row[4*j+1];
+      const double cdm2 = dm_row[4*j+2];
+      const double cdm3 = dm_row[4*j+3];
+
+#pragma omp simd aligned(orb1_row:64) simdlen(8)
+      for (g=0; g<SDG_NC_GRID_BATCH_AVX512; g++){
+        const double orb = orb1_row[g];
+        tmp0[g] += orb*cdm0;
+        tmp1[g] += orb*cdm1;
+        tmp2[g] += orb*cdm2;
+        tmp3[g] += orb*cdm3;
+      }
+    }
+
+#pragma omp simd aligned(orb0_row:64) simdlen(8)
+    for (g=0; g<SDG_NC_GRID_BATCH_AVX512; g++){
+      const double orb = orb0_row[g];
+      sum0[g] += orb*tmp0[g];
+      sum1[g] += orb*tmp1[g];
+      sum2[g] += orb*tmp2[g];
+      sum3[g] += orb*tmp3[g];
+    }
+  }
+
+  /* Keep updates in ascending Nog order in case an unusual grid list contains
+     the same local grid index more than once. */
+  for (g=0; g<SDG_NC_GRID_BATCH_AVX512; g++){
+    const int n = nc[g];
+    den0[n] += sum0[g];
+    den1[n] += sum1[g];
+    den2[n] += sum2[g];
+    den3[n] += sum3[g];
+  }
+}
+
+/* Four grid points fill one AVX2 vector.  This function is compiled for AVX2
+   independently of the AVX-512 variant and is called only after the runtime
+   feature test above succeeds. */
+static SDG_TARGET_AVX2 void SDG_accumulate_nc4(
+                                      int no0, int no1,
+                                      const double *restrict dm,
+                                      const double *restrict orb0,
+                                      const double *restrict orb1,
+                                      const int *restrict nc,
+                                      double *restrict den0,
+                                      double *restrict den1,
+                                      double *restrict den2,
+                                      double *restrict den3)
+{
+  double sum0[SDG_NC_GRID_BATCH_AVX2] = {0.0};
+  double sum1[SDG_NC_GRID_BATCH_AVX2] = {0.0};
+  double sum2[SDG_NC_GRID_BATCH_AVX2] = {0.0};
+  double sum3[SDG_NC_GRID_BATCH_AVX2] = {0.0};
+  int i,j,g;
+
+  for (i=0; i<no0; i++){
+    double tmp0[SDG_NC_GRID_BATCH_AVX2] = {0.0};
+    double tmp1[SDG_NC_GRID_BATCH_AVX2] = {0.0};
+    double tmp2[SDG_NC_GRID_BATCH_AVX2] = {0.0};
+    double tmp3[SDG_NC_GRID_BATCH_AVX2] = {0.0};
+    const double *restrict dm_row = dm + (size_t)4*i*no1;
+    const double *restrict orb0_row = orb0 + (size_t)i*SDG_NC_GRID_BATCH_AVX2;
+
+    for (j=0; j<no1; j++){
+      const double *restrict orb1_row = orb1 + (size_t)j*SDG_NC_GRID_BATCH_AVX2;
+      const double cdm0 = dm_row[4*j+0];
+      const double cdm1 = dm_row[4*j+1];
+      const double cdm2 = dm_row[4*j+2];
+      const double cdm3 = dm_row[4*j+3];
+
+#pragma omp simd aligned(orb1_row:32) simdlen(4)
+      for (g=0; g<SDG_NC_GRID_BATCH_AVX2; g++){
+        const double orb = orb1_row[g];
+        tmp0[g] += orb*cdm0;
+        tmp1[g] += orb*cdm1;
+        tmp2[g] += orb*cdm2;
+        tmp3[g] += orb*cdm3;
+      }
+    }
+
+#pragma omp simd aligned(orb0_row:32) simdlen(4)
+    for (g=0; g<SDG_NC_GRID_BATCH_AVX2; g++){
+      const double orb = orb0_row[g];
+      sum0[g] += orb*tmp0[g];
+      sum1[g] += orb*tmp1[g];
+      sum2[g] += orb*tmp2[g];
+      sum3[g] += orb*tmp3[g];
+    }
+  }
+
+  for (g=0; g<SDG_NC_GRID_BATCH_AVX2; g++){
+    const int n = nc[g];
+    den0[n] += sum0[g];
+    den1[n] += sum1[g];
+    den2[n] += sum2[g];
+    den3[n] += sum3[g];
+  }
+}
+
+static inline void SDG_accumulate_nc1(int no0, int no1,
+                                      const double *restrict dm,
+                                      const double *restrict orb0,
+                                      const double *restrict orb1,
+                                      int nc,
+                                      double *restrict den0,
+                                      double *restrict den1,
+                                      double *restrict den2,
+                                      double *restrict den3)
+{
+  double sum0 = 0.0, sum1 = 0.0, sum2 = 0.0, sum3 = 0.0;
+  int i,j;
+
+  for (i=0; i<no0; i++){
+    const double *restrict dm_row = dm + (size_t)4*i*no1;
+    double tmp0 = 0.0, tmp1 = 0.0, tmp2 = 0.0, tmp3 = 0.0;
+
+    for (j=0; j<no1; j++){
+      const double orb = orb1[j];
+      tmp0 += orb*dm_row[4*j+0];
+      tmp1 += orb*dm_row[4*j+1];
+      tmp2 += orb*dm_row[4*j+2];
+      tmp3 += orb*dm_row[4*j+3];
+    }
+
+    sum0 += orb0[i]*tmp0;
+    sum1 += orb0[i]*tmp1;
+    sum2 += orb0[i]*tmp2;
+    sum3 += orb0[i]*tmp3;
+  }
+
+  den0[nc] += sum0;
+  den1[nc] += sum1;
+  den2[nc] += sum2;
+  den3[nc] += sum3;
 }
 
 
@@ -104,6 +355,9 @@ double Set_Density_Grid(int Cnt_kind, int Calc_CntOrbital_ON, double *****CDM, d
   double Stime_atom, Etime_atom;
   double time0,time1,time2;
   int use_local_gpu = 0;
+  int use_nc_simd;
+  int nc_simd_mode;
+  int nc_grid_batch;
 
   MPI_Status stat;
   MPI_Request request;
@@ -115,6 +369,20 @@ double Set_Density_Grid(int Cnt_kind, int Calc_CntOrbital_ON, double *****CDM, d
   /* MPI */
   MPI_Comm_size(mpi_comm_level1,&numprocs);
   MPI_Comm_rank(mpi_comm_level1,&myid);
+  nc_simd_mode = SpinP_switch==3 ? SDG_nc_simd_mode() : SDG_NC_SIMD_SCALAR;
+  use_nc_simd = (nc_simd_mode!=SDG_NC_SIMD_SCALAR);
+  nc_grid_batch = nc_simd_mode==SDG_NC_SIMD_AVX512 ?
+                    SDG_NC_GRID_BATCH_AVX512 : SDG_NC_GRID_BATCH_AVX2;
+  if (myid==0 && SDG_env_disabled(getenv("OPENMX_DENSITY_GRID_NC_SIMD_TRACE"))==0 &&
+      getenv("OPENMX_DENSITY_GRID_NC_SIMD_TRACE")!=NULL){
+    static int trace_printed = 0;
+    if (!trace_printed){
+      printf("Set_Density_Grid: NC SIMD backend = %s\n",
+             SDG_nc_simd_mode_name(nc_simd_mode));
+      fflush(stdout);
+      trace_printed = 1;
+    }
+  }
   
   dtime(&TStime);
 
@@ -397,27 +665,75 @@ double Set_Density_Grid(int Cnt_kind, int Calc_CntOrbital_ON, double *****CDM, d
   if (!use_local_gpu){
   
   
-#pragma omp parallel shared(myid,G2ID,Orbs_Grid_FNAN,List_YOUSO,time_per_atom,Tmp_Den_Grid,Orbs_Grid,COrbs_Grid,Cnt_switch,Cnt_kind,GListTAtoms2,GListTAtoms1,NumOLG,CDM,SpinP_switch,WhatSpecies,ncn,F_G2M,natn,Spe_Total_CNO,M2G) private(Mc_AN,h_AN,Stime_atom,Etime_atom,Gc_AN,Cwan,NO0,Gh_AN,Mh_AN,Rnh,Hwan,NO1,spin,i,j,tmp_CDM,Nog,Nc_0,Nc_1,Nc_2,Nc_3,Nh_0,Nh_1,Nh_2,Nh_3,orbs0_0,orbs0_1,orbs0_2,orbs0_3,orbs1_0,orbs1_1,orbs1_2,orbs1_3,sum_0,sum_1,sum_2,sum_3,tmp0_0,tmp0_1,tmp0_2,tmp0_3,Nc,Nh,orbs0,orbs1,sum,tmp0)
+#pragma omp parallel shared(myid,G2ID,Orbs_Grid_FNAN,List_YOUSO,time_per_atom,Tmp_Den_Grid,Orbs_Grid,COrbs_Grid,Cnt_switch,Cnt_kind,GListTAtoms2,GListTAtoms1,NumOLG,CDM,SpinP_switch,use_nc_simd,nc_simd_mode,nc_grid_batch,WhatSpecies,ncn,F_G2M,natn,Spe_Total_CNO,M2G) private(Mc_AN,h_AN,Stime_atom,Etime_atom,Gc_AN,Cwan,NO0,Gh_AN,Mh_AN,Rnh,Hwan,NO1,spin,i,j,tmp_CDM,Nog,Nc_0,Nc_1,Nc_2,Nc_3,Nh_0,Nh_1,Nh_2,Nh_3,orbs0_0,orbs0_1,orbs0_2,orbs0_3,orbs1_0,orbs1_1,orbs1_2,orbs1_3,sum_0,sum_1,sum_2,sum_3,tmp0_0,tmp0_1,tmp0_2,tmp0_3,Nc,Nh,orbs0,orbs1,sum,tmp0)
   {
 
     orbs0 = (double*)malloc(sizeof(double)*List_YOUSO[7]);
     orbs1 = (double*)malloc(sizeof(double)*List_YOUSO[7]);
 
-    orbs0_0 = (double*)malloc(sizeof(double)*List_YOUSO[7]);
-    orbs0_1 = (double*)malloc(sizeof(double)*List_YOUSO[7]);
-    orbs0_2 = (double*)malloc(sizeof(double)*List_YOUSO[7]);
-    orbs0_3 = (double*)malloc(sizeof(double)*List_YOUSO[7]);
-    orbs1_0 = (double*)malloc(sizeof(double)*List_YOUSO[7]);
-    orbs1_1 = (double*)malloc(sizeof(double)*List_YOUSO[7]);
-    orbs1_2 = (double*)malloc(sizeof(double)*List_YOUSO[7]);
-    orbs1_3 = (double*)malloc(sizeof(double)*List_YOUSO[7]);
+    orbs0_0 = NULL;
+    orbs0_1 = NULL;
+    orbs0_2 = NULL;
+    orbs0_3 = NULL;
+    orbs1_0 = NULL;
+    orbs1_1 = NULL;
+    orbs1_2 = NULL;
+    orbs1_3 = NULL;
+    tmp_CDM = NULL;
+    double **tmp_CDM_rows = NULL;
+    double *tmp_CDM_storage = NULL;
 
-    tmp_CDM = (double***)malloc(sizeof(double**)*(SpinP_switch+1)); 
-    for (i=0; i<(SpinP_switch+1); i++){
-      tmp_CDM[i] = (double**)malloc(sizeof(double*)*List_YOUSO[7]); 
-      for (j=0; j<List_YOUSO[7]; j++){
-	tmp_CDM[i][j] = (double*)malloc(sizeof(double)*List_YOUSO[7]); 
+    if (!use_nc_simd){
+      const size_t max_orb = (size_t)List_YOUSO[7];
+      const size_t nspin = (size_t)(SpinP_switch+1);
+      const size_t nrows = SDG_checked_mul(nspin,max_orb,"density matrix rows",myid);
+      const size_t nelem = SDG_checked_mul(nrows,max_orb,"density matrix scratch",myid);
+
+      orbs0_0 = (double*)SDG_checked_alloc(max_orb,sizeof(double),0,"orbital scratch",myid);
+      orbs0_1 = (double*)SDG_checked_alloc(max_orb,sizeof(double),0,"orbital scratch",myid);
+      orbs0_2 = (double*)SDG_checked_alloc(max_orb,sizeof(double),0,"orbital scratch",myid);
+      orbs0_3 = (double*)SDG_checked_alloc(max_orb,sizeof(double),0,"orbital scratch",myid);
+      orbs1_0 = (double*)SDG_checked_alloc(max_orb,sizeof(double),0,"orbital scratch",myid);
+      orbs1_1 = (double*)SDG_checked_alloc(max_orb,sizeof(double),0,"orbital scratch",myid);
+      orbs1_2 = (double*)SDG_checked_alloc(max_orb,sizeof(double),0,"orbital scratch",myid);
+      orbs1_3 = (double*)SDG_checked_alloc(max_orb,sizeof(double),0,"orbital scratch",myid);
+
+      tmp_CDM = (double***)SDG_checked_alloc(nspin,sizeof(double**),0,
+                                              "density matrix pointers",myid);
+      tmp_CDM_rows = (double**)SDG_checked_alloc(nrows,sizeof(double*),0,
+                                                  "density matrix row pointers",myid);
+      tmp_CDM_storage = (double*)SDG_checked_alloc(nelem,sizeof(double),0,
+                                                   "density matrix scratch",myid);
+      for (i=0; i<(SpinP_switch+1); i++){
+        tmp_CDM[i] = tmp_CDM_rows + (size_t)i*max_orb;
+        for (j=0; j<List_YOUSO[7]; j++){
+          tmp_CDM[i][j] = tmp_CDM_storage + ((size_t)i*max_orb+j)*max_orb;
+        }
       }
+    }
+
+    /* The non-collinear contraction uses a spin-interleaved density matrix
+       and orbital-major batches.  Runtime dispatch selects eight grid points
+       for AVX-512 or four grid points for AVX2. */
+    double *nc_dm = NULL;
+    double *nc_orb0 = NULL;
+    double *nc_orb1 = NULL;
+    if (use_nc_simd){
+      const size_t max_orb = (size_t)List_YOUSO[7];
+      const size_t max_orb2 = SDG_checked_mul(max_orb,max_orb,
+                                              "NC density matrix scratch",myid);
+      nc_dm = (double*)SDG_checked_aligned_alloc(64,
+                           SDG_checked_mul((size_t)4,max_orb2,
+                                           "NC density matrix scratch",myid),
+                           sizeof(double),"NC density matrix scratch",myid);
+      nc_orb0 = (double*)SDG_checked_aligned_alloc(64,
+                             SDG_checked_mul(max_orb,(size_t)nc_grid_batch,
+                                             "NC orbital scratch",myid),
+                             sizeof(double),"NC orbital scratch",myid);
+      nc_orb1 = (double*)SDG_checked_aligned_alloc(64,
+                             SDG_checked_mul(max_orb,(size_t)nc_grid_batch,
+                                             "NC orbital scratch",myid),
+                             sizeof(double),"NC orbital scratch",myid);
     }
 
     /* Each center atom owns a disjoint Tmp_Den_Grid slice.  Assign whole
@@ -445,18 +761,127 @@ double Set_Density_Grid(int Cnt_kind, int Calc_CntOrbital_ON, double *****CDM, d
 	Hwan = WhatSpecies[Gh_AN];
 	NO1 = Spe_Total_CNO[Hwan];
 
-	/* store CDM into tmp_CDM */
-
-	for (spin=0; spin<=SpinP_switch; spin++){
+	/* Pack once per atom pair.  Interleaving the four NC components makes
+	   their coefficients one compact load stream in the batched kernel. */
+	if (use_nc_simd){
 	  for (i=0; i<NO0; i++){
 	    for (j=0; j<NO1; j++){
-	      tmp_CDM[spin][i][j] = CDM[spin][Mc_AN][h_AN][i][j];
+              const size_t ij = (size_t)4*((size_t)i*NO1+j);
+              nc_dm[ij+0] = CDM[0][Mc_AN][h_AN][i][j];
+              nc_dm[ij+1] = CDM[1][Mc_AN][h_AN][i][j];
+              nc_dm[ij+2] = CDM[2][Mc_AN][h_AN][i][j];
+              nc_dm[ij+3] = CDM[3][Mc_AN][h_AN][i][j];
+	    }
+	  }
+	}
+	else{
+	  for (spin=0; spin<=SpinP_switch; spin++){
+	    for (i=0; i<NO0; i++){
+	      for (j=0; j<NO1; j++){
+	        tmp_CDM[spin][i][j] = CDM[spin][Mc_AN][h_AN][i][j];
+	      }
 	    }
 	  }
 	}
 
 	/* summation of non-zero elements */
 	/* for (Nog=0; Nog<NumOLG[Mc_AN][h_AN]; Nog++){ */
+	if (use_nc_simd){
+          int nc_batch[SDG_NC_GRID_BATCH_MAX];
+          int nh_batch[SDG_NC_GRID_BATCH_MAX];
+          int g;
+
+          for (Nog=0; Nog<=NumOLG[Mc_AN][h_AN]-nc_grid_batch;
+               Nog+=nc_grid_batch){
+            for (g=0; g<nc_grid_batch; g++){
+              nc_batch[g] = GListTAtoms1[Mc_AN][h_AN][Nog+g];
+              nh_batch[g] = GListTAtoms2[Mc_AN][h_AN][Nog+g];
+            }
+
+            if (Cnt_kind==0 && Cnt_switch==1){
+              for (i=0; i<NO0; i++){
+#pragma omp simd
+                for (g=0; g<nc_grid_batch; g++){
+                  nc_orb0[(size_t)i*nc_grid_batch+g] =
+                    COrbs_Grid[Mc_AN][i][nc_batch[g]];
+                }
+              }
+              for (j=0; j<NO1; j++){
+#pragma omp simd
+                for (g=0; g<nc_grid_batch; g++){
+                  nc_orb1[(size_t)j*nc_grid_batch+g] =
+                    COrbs_Grid[Mh_AN][j][nh_batch[g]];
+                }
+              }
+            }
+            else{
+              for (i=0; i<NO0; i++){
+#pragma omp simd
+                for (g=0; g<nc_grid_batch; g++){
+                  nc_orb0[(size_t)i*nc_grid_batch+g] =
+                    Orbs_Grid[Mc_AN][nc_batch[g]][i];
+                }
+              }
+
+              if (G2ID[Gh_AN]==myid){
+                for (j=0; j<NO1; j++){
+#pragma omp simd
+                  for (g=0; g<nc_grid_batch; g++){
+                    nc_orb1[(size_t)j*nc_grid_batch+g] =
+                      Orbs_Grid[Mh_AN][nh_batch[g]][j];
+                  }
+                }
+              }
+              else{
+                for (j=0; j<NO1; j++){
+#pragma omp simd
+                  for (g=0; g<nc_grid_batch; g++){
+                    nc_orb1[(size_t)j*nc_grid_batch+g] =
+                      Orbs_Grid_FNAN[Mc_AN][h_AN][Nog+g][j];
+                  }
+                }
+              }
+            }
+
+            if (nc_simd_mode==SDG_NC_SIMD_AVX512){
+              SDG_accumulate_nc8(NO0,NO1,nc_dm,nc_orb0,nc_orb1,nc_batch,
+                                 Tmp_Den_Grid[0][Mc_AN],Tmp_Den_Grid[1][Mc_AN],
+                                 Tmp_Den_Grid[2][Mc_AN],Tmp_Den_Grid[3][Mc_AN]);
+            }
+            else{
+              SDG_accumulate_nc4(NO0,NO1,nc_dm,nc_orb0,nc_orb1,nc_batch,
+                                 Tmp_Den_Grid[0][Mc_AN],Tmp_Den_Grid[1][Mc_AN],
+                                 Tmp_Den_Grid[2][Mc_AN],Tmp_Den_Grid[3][Mc_AN]);
+            }
+          }
+
+          /* At most seven (AVX-512) or three (AVX2) points remain.  This tail retains the
+             same spin fusion and exact per-component accumulation order. */
+          for (; Nog<NumOLG[Mc_AN][h_AN]; Nog++){
+            Nc = GListTAtoms1[Mc_AN][h_AN][Nog];
+            Nh = GListTAtoms2[Mc_AN][h_AN][Nog];
+
+            if (Cnt_kind==0 && Cnt_switch==1){
+              for (i=0; i<NO0; i++) orbs0[i] = COrbs_Grid[Mc_AN][i][Nc];
+              for (j=0; j<NO1; j++) orbs1[j] = COrbs_Grid[Mh_AN][j][Nh];
+            }
+            else{
+              for (i=0; i<NO0; i++) orbs0[i] = Orbs_Grid[Mc_AN][Nc][i];
+              if (G2ID[Gh_AN]==myid){
+                for (j=0; j<NO1; j++) orbs1[j] = Orbs_Grid[Mh_AN][Nh][j];
+              }
+              else{
+                for (j=0; j<NO1; j++)
+                  orbs1[j] = Orbs_Grid_FNAN[Mc_AN][h_AN][Nog][j];
+              }
+            }
+
+            SDG_accumulate_nc1(NO0,NO1,nc_dm,orbs0,orbs1,Nc,
+                               Tmp_Den_Grid[0][Mc_AN],Tmp_Den_Grid[1][Mc_AN],
+                               Tmp_Den_Grid[2][Mc_AN],Tmp_Den_Grid[3][Mc_AN]);
+          }
+        }
+        else{
 	for (Nog=0; Nog<NumOLG[Mc_AN][h_AN]-3; Nog+=4){
 
 	  Nc_0 = GListTAtoms1[Mc_AN][h_AN][Nog];
@@ -713,6 +1138,7 @@ double Set_Density_Grid(int Cnt_kind, int Calc_CntOrbital_ON, double *****CDM, d
           }
 
 	} /* Nog */
+	} /* collinear four-grid path */
 	
       } /* h_AN */
 
@@ -735,13 +1161,12 @@ double Set_Density_Grid(int Cnt_kind, int Calc_CntOrbital_ON, double *****CDM, d
     free(orbs1_2);
     free(orbs1_3);
 
-    for (i=0; i<(SpinP_switch+1); i++){
-      for (j=0; j<List_YOUSO[7]; j++){
-	free(tmp_CDM[i][j]);
-      }
-      free(tmp_CDM[i]);
-    }
+    free(tmp_CDM_storage);
+    free(tmp_CDM_rows);
     free(tmp_CDM);
+    free(nc_dm);
+    free(nc_orb0);
+    free(nc_orb1);
 
 #pragma omp flush(Tmp_Den_Grid)
 
