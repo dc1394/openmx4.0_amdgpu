@@ -34,6 +34,7 @@ static int DFT_GPU_BasisCount(void);
 static int DFT_SetOLPKinUseGPU(void);
 static int DFT_SetProExpnVNAUseGPU(void);
 double Cluster_DFT_NonCol_ScatterGpuSolverCachedEVec(int n2, int *is2, int *ie2, dcomplex *EVec1);
+extern int BandNonCol_HamiltonianUseHipSolver(void);
 
 static int DFT_SetOLPKinUseGPU(void)
 {
@@ -899,12 +900,21 @@ double DFT(int MD_iter, int Cnt_Now)
     s_vec[9]="EGAC";          s_vec[10]="DC-LNO";  s_vec[11]="Cluster-LNO";
 
     if (MYID_MPI_COMM_WORLD==Host_ID && 0<level_stdout){
+      const char *gpu_solver_label = "";
+      if (DFT_GPU_EigensolverActive()) {
+        if (Solver == 3 && SpinP_switch == 3 &&
+            openmx_gpu_eigensolver_use_hipsolver() &&
+            !BandNonCol_HamiltonianUseHipSolver()) {
+          gpu_solver_label = " (GPU-accelerated, hipSOLVER(S)+MAGMA(H))";
+        }
+        else {
+          gpu_solver_label = openmx_gpu_eigensolver_use_hipsolver()
+                           ? " (GPU-accelerated, hipSOLVER)"
+                           : " (GPU-accelerated, MAGMA)";
+        }
+      }
       printf("<%s>  Solving the eigenvalue problem%s...\n",
-             s_vec[Solver-1],
-             DFT_GPU_EigensolverActive()
-               ? (openmx_gpu_eigensolver_use_hipsolver() ? " (GPU-accelerated, hipSOLVER)"
-                                                         : " (GPU-accelerated, MAGMA)")
-               : "");
+             s_vec[Solver-1],gpu_solver_label);
       if (!DFT_GPU_EigensolverActive() && DFT_GPU_GlobalThreshold()<=DFT_GPU_BasisCount()){
         static int cpu_diag_notice_done = 0;
         if (!cpu_diag_notice_done){
@@ -917,6 +927,19 @@ double DFT(int MD_iter, int Cnt_Now)
     }
 
     DFT_PrepareGpuSolverHSPackedCache(SCF_iter);
+
+    /* The non-collinear spinor diagonalization is extremely sensitive to
+       the multi-GiB flattened orbital tables built by Set_Hamiltonian.  On
+       MI300A even their host copies compete with the dense GPU eigensolvers
+       for the same physical memory.  The packed H/S cache is complete here and
+       the density-grid code has an independent service/fallback path, so
+       release both the host tables and any device associations. */
+    if (DFT_GPU_EigensolverActive() && Solver == 3 && SpinP_switch == 3) {
+      const char *demote_env = getenv("OPENMX_NC_EIGEN_DEMOTE_SETHAM");
+      if (demote_env == NULL || atoi(demote_env) != 0) {
+        Set_Hamiltonian_Invalidate_OpenMP_MatrixElements_Cache();
+      }
+    }
 
     {
       extern void openmx_gpu_zheevd_selftest(const char *label);

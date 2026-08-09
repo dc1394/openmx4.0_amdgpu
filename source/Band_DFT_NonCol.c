@@ -22,12 +22,15 @@
 #include <stdlib.h>
 #include <stdint.h>
 #include <string.h>
+#include <strings.h>
 #include <time.h>
 
 #define  measure_time  0
 
 extern int openmx_magma_zheevdx_gpu(int n, int maxn, void *d_A, double *w, int *mout);
+extern int openmx_magma_release_z_workspace(void);
 extern int openmx_hipsolver_zheevd_gpu(int n, int maxn, void *d_A, double *w, int *mout);
+extern int openmx_hipsolver_release_workspace(void);
 extern int openmx_gpu_eigensolver_use_hipsolver(void);
 extern int openmx_gpu_is_apu(void);
 
@@ -449,6 +452,41 @@ static int BandNonCol_GemmWorkspaceTurnRelease(void)
     return (atoi(value)!=0);
 }
 
+static int BandNonCol_HipSolverWorkspaceTurnRelease(void)
+{
+    const char *value = getenv("OPENMX_NC_HIPSOLVER_TURN_RELEASE");
+
+    if (value==NULL){
+        /* On a unified-memory APU, retaining one large workspace in every
+           MPI owner leaves less physical memory for the following owners and
+           for the eigenvector back-transform. */
+        return openmx_gpu_is_apu();
+    }
+    return (atoi(value)!=0);
+}
+
+static int BandNonCol_MagmaWorkspaceTurnRelease(void)
+{
+    const char *value = getenv("OPENMX_NC_MAGMA_TURN_RELEASE");
+
+    if (value==NULL) return openmx_gpu_is_apu();
+    return (atoi(value)!=0);
+}
+
+/* rocSOLVER's full-spectrum Zheevd is very fast for the overlap matrix, but
+   on MI300A it can return non-finite eigenvectors for the highly degenerate
+   non-collinear spinor Hamiltonian even though its eigenvalues are finite.
+   Keep MAGMA's range-I solver as the safe default for H.  The opt-in exists
+   for diagnosing future ROCm releases without weakening the default. */
+int BandNonCol_HamiltonianUseHipSolver(void)
+{
+    const char *value;
+
+    if (!openmx_gpu_eigensolver_use_hipsolver()) return 0;
+    value = getenv("OPENMX_NC_HAMILTONIAN_EIGENSOLVER");
+    return (value!=NULL && strcasecmp(value,"hipsolver")==0);
+}
+
 static int BandNonCol_SerializeGpuSolverGpuTurns(void)
 {
     const char *value = getenv("OPENMX_GPUSOLVER_SERIAL_GPU_TURNS");
@@ -607,7 +645,7 @@ static int BandNonCol_OmpTargetIsPresent(const void *ptr, size_t bytes)
 }
 
 static void BandNonCol_GpuSolver_DenseZheevx_Device(dcomplex *A, double *ko, int n, int maxn,
-                                                   const char *where)
+                                                   int use_hipsolver, const char *where)
 {
     dcomplex *d_A = NULL;
     int info = 0;
@@ -626,7 +664,7 @@ static void BandNonCol_GpuSolver_DenseZheevx_Device(dcomplex *A, double *ko, int
         const int unified = (!real_copy && openmx_gpu_is_apu());
         int solved_on_device_side = 0;
 
-        if (openmx_gpu_eigensolver_use_hipsolver() && real_copy){
+        if (use_hipsolver && real_copy){
             /* The OpenMP mapping is a real device copy (MI300X and other
                discrete GPUs): the device side is authoritative, so solve in
                place on the mapped buffer and refresh the host array once. */
@@ -649,7 +687,7 @@ static void BandNonCol_GpuSolver_DenseZheevx_Device(dcomplex *A, double *ko, int
                 fflush(stdout);
             }
         }
-        else if (openmx_gpu_eigensolver_use_hipsolver() && unified){
+        else if (use_hipsolver && unified){
             /* APU (MI300A) zero-copy: the host array IS the device data; solve
                on it directly with no staging and no transfers. */
             const int tdbg = BandNonCol_SolveTimingEnabled();
@@ -684,7 +722,7 @@ static void BandNonCol_GpuSolver_DenseZheevx_Device(dcomplex *A, double *ko, int
 
             if (tdbg) { wait_hipfunc(hipDeviceSynchronize()); dtime(&tt2); }
 
-            if (openmx_gpu_eigensolver_use_hipsolver()){
+            if (use_hipsolver){
                 info = openmx_hipsolver_zheevd_gpu(n,maxn,d_A,ko,&mout);
             }
             else {
@@ -714,6 +752,13 @@ static void BandNonCol_GpuSolver_DenseZheevx_Device(dcomplex *A, double *ko, int
                     where,mout,maxn);
             fflush(stderr);
             MPI_Abort(mpi_comm_level1,1);
+        }
+
+        if (use_hipsolver && BandNonCol_HipSolverWorkspaceTurnRelease()){
+            (void)openmx_hipsolver_release_workspace();
+        }
+        else if (!use_hipsolver && BandNonCol_MagmaWorkspaceTurnRelease()){
+            (void)openmx_magma_release_z_workspace();
         }
 
         for (l=maxn; 1<=l; l--) ko[l] = ko[l-1];
@@ -928,7 +973,7 @@ static void BandNonCol_AddDense_OpenMP(int n, dcomplex *dst, const dcomplex *src
 }
 
 static void BandNonCol_GpuSolver_DenseZheevx(dcomplex *A, dcomplex *Z, double *ko, int n, int maxn,
-                                            const char *where)
+                                            int use_hipsolver, const char *where)
 {
     dcomplex *d_A = NULL;
     int info = 0;
@@ -945,7 +990,7 @@ static void BandNonCol_GpuSolver_DenseZheevx(dcomplex *A, dcomplex *Z, double *k
     nn = (size_t)n*(size_t)n;
     bytes = sizeof(dcomplex)*nn;
 
-    if (openmx_gpu_eigensolver_use_hipsolver() && openmx_gpu_is_apu()){
+    if (use_hipsolver && openmx_gpu_is_apu()){
         /* APU (MI300A): the host array lives in the same physical memory the
            GPU uses, so solve on it directly with no staging copies. */
         const int tdbg = BandNonCol_SolveTimingEnabled();
@@ -973,7 +1018,7 @@ static void BandNonCol_GpuSolver_DenseZheevx(dcomplex *A, dcomplex *Z, double *k
 
         if (tdbg) { wait_hipfunc(hipDeviceSynchronize()); dtime(&th1); }
 
-        if (openmx_gpu_eigensolver_use_hipsolver()){
+        if (use_hipsolver){
             info = openmx_hipsolver_zheevd_gpu(n,maxn,d_A,ko,&mout);
         }
         else {
@@ -1003,6 +1048,13 @@ static void BandNonCol_GpuSolver_DenseZheevx(dcomplex *A, dcomplex *Z, double *k
                 where,mout,maxn);
         fflush(stderr);
         MPI_Abort(mpi_comm_level1,1);
+    }
+
+    if (use_hipsolver && BandNonCol_HipSolverWorkspaceTurnRelease()){
+        (void)openmx_hipsolver_release_workspace();
+    }
+    else if (!use_hipsolver && BandNonCol_MagmaWorkspaceTurnRelease()){
+        (void)openmx_magma_release_z_workspace();
     }
 
     for (l=maxn; 1<=l; l--) ko[l] = ko[l-1];
@@ -1667,7 +1719,8 @@ static void BandNonCol_ConstructDenseMs_OpenMP(int cpx_flag, int n, double k1, d
     }
 }
 
-static void BandNonCol_DenseGpuEigen(dcomplex *d_A, double *ko, int n, int maxn, const char *where)
+static void BandNonCol_DenseGpuEigen(dcomplex *d_A, double *ko, int n, int maxn,
+                                     int use_hipsolver, const char *where)
 {
     int info;
     int mout = 0;
@@ -1683,7 +1736,7 @@ static void BandNonCol_DenseGpuEigen(dcomplex *d_A, double *ko, int n, int maxn,
 
         if (tdbg) dtime(&td0);
 
-        if (openmx_gpu_eigensolver_use_hipsolver()){
+        if (use_hipsolver){
             info = openmx_hipsolver_zheevd_gpu(n,maxn,d_A,ko,&mout);
         }
         else {
@@ -1754,7 +1807,8 @@ static void BandNonCol_DenseGpuPrepareOverlap(int rebuild_overlap, int n, int n2
         }
 
         BandNonCol_DenseGpu_ReleaseOverlapMagmaScratch();
-        BandNonCol_DenseGpuEigen(w->d_S,ko,n,n,"Band_DFT_NonCol root dense overlap");
+        BandNonCol_DenseGpuEigen(w->d_S,ko,n,n,openmx_gpu_eigensolver_use_hipsolver(),
+                                 "Band_DFT_NonCol root dense overlap");
 
         for (int l=1; l<=n; l++){
             if (ko[l]<1.0e-10) ko[l] = 1.0e-10;
@@ -2555,6 +2609,7 @@ static void BandNonCol_RootDenseSolveOneK_HIP(int rebuild_overlap,
     BandNonColDenseGpuWorkspace *w = &BandNonCol_dense_gpu_workspace;
     const hipDoubleComplex alpha = make_hipDoubleComplex(1.0,0.0);
     const hipDoubleComplex beta  = make_hipDoubleComplex(0.0,0.0);
+    int h_use_hipsolver;
 
     BandNonCol_DenseGpu_Ensure(n,n2);
 
@@ -2562,6 +2617,14 @@ static void BandNonCol_RootDenseSolveOneK_HIP(int rebuild_overlap,
         BandNonCol_ConstructDenseMsFromPacked_HIP(0,m_olp,w->d_S,packed_order_GA,MP,k1,k2,k3,n);
     }
     BandNonCol_DenseGpuPrepareOverlap(rebuild_overlap,n,n2,ko,rdw->s_all);
+
+    /* In the default hybrid path the overlap uses hipSOLVER and H uses
+       MAGMA.  Return the overlap scratch before MAGMA allocates its range-I
+       work arrays. */
+    if (rebuild_overlap && openmx_gpu_eigensolver_use_hipsolver() &&
+        BandNonCol_HipSolverWorkspaceTurnRelease()){
+        (void)openmx_hipsolver_release_workspace();
+    }
     BandNonCol_DenseGpu_Ensure(n,n2);
 
     BandNonCol_ConstructDenseMsFromPacked_HIP(0,m_h11,w->d_H11,packed_order_GA,MP,k1,k2,k3,n);
@@ -2601,9 +2664,21 @@ static void BandNonCol_RootDenseSolveOneK_HIP(int rebuild_overlap,
     if (BandNonCol_GemmWorkspaceTurnRelease()){
         openmx_gemmul8ReleaseWorkspaces();
     }
-    BandNonCol_DenseGpuEigen(w->d_H2,ko,n2,MaxN,"Band_DFT_NonCol root dense Hamiltonian");
+    h_use_hipsolver = BandNonCol_HamiltonianUseHipSolver();
+    BandNonCol_DenseGpuEigen(w->d_H2,ko,n2,MaxN,h_use_hipsolver,
+                             "Band_DFT_NonCol root dense Hamiltonian");
     for (int l=1; l<=MaxN; l++){
         EIGEN[0][kloop][l] = ko[l];
+    }
+
+    /* The solve above is synchronous.  Return rocSOLVER's large process-wide
+       scratch before this rank enters the n2-by-n2 back-transform; otherwise
+       completed turns accumulate scratch and squeeze later turns on MI300A. */
+    if (h_use_hipsolver && BandNonCol_HipSolverWorkspaceTurnRelease()){
+        (void)openmx_hipsolver_release_workspace();
+    }
+    else if (!h_use_hipsolver && BandNonCol_MagmaWorkspaceTurnRelease()){
+        (void)openmx_magma_release_z_workspace();
     }
 
     if (!need_evec){
@@ -3985,7 +4060,8 @@ double Band_DFT_NonCol(
 	mpi_comm_cols_int = MPI_Comm_c2f(mpi_comm_cols);
 
 	if (scf_eigen_lib_flag==GPUSOLVER && BandNonCol_GpuThreshold()<=n2 && na_rows==n && na_cols==n){
-	  BandNonCol_GpuSolver_DenseZheevx(Cs,Ss,ko,n,n,"Band_DFT_NonCol overlap");
+	  BandNonCol_GpuSolver_DenseZheevx(Cs,Ss,ko,n,n,openmx_gpu_eigensolver_use_hipsolver(),
+                                            "Band_DFT_NonCol overlap");
 	}
 	else if (scf_eigen_lib_flag==1 || (numprocs2<5 && scf_eigen_lib_flag!=GPUSOLVER)){
 	  F77_NAME(solve_evp_complex,SOLVE_EVP_COMPLEX)
@@ -4178,7 +4254,9 @@ double Band_DFT_NonCol(
       mpi_comm_cols_int = MPI_Comm_c2f(mpi_comm_cols);
 
         if (scf_eigen_lib_flag==GPUSOLVER && BandNonCol_GpuThreshold()<=n2 && na_rows2==n2 && na_cols2==n2){
-          BandNonCol_GpuSolver_DenseZheevx(Hs2,Cs2,ko,n2,MaxN,"Band_DFT_NonCol Hamiltonian");
+          BandNonCol_GpuSolver_DenseZheevx(Hs2,Cs2,ko,n2,MaxN,
+                                           BandNonCol_HamiltonianUseHipSolver(),
+                                           "Band_DFT_NonCol Hamiltonian");
         }
         else if (scf_eigen_lib_flag==1 || (numprocs2<5 && scf_eigen_lib_flag!=GPUSOLVER)){
 	  F77_NAME(solve_evp_complex,SOLVE_EVP_COMPLEX)
@@ -4707,12 +4785,15 @@ double Band_DFT_NonCol(
 
   /* Debug hook: exit cleanly right after the first eigen phase so that
      profilers (rocprofv3) flush their traces.  OPENMX_ABORT_AFTER_EIGEN=1. */
-  if (getenv("OPENMX_ABORT_AFTER_EIGEN") != NULL){
-    fflush(stdout);
-    fflush(stderr);
-    MPI_Barrier(mpi_comm_level1);
-    MPI_Finalize();
-    exit(0);
+  {
+    const char *abort_after_eigen = getenv("OPENMX_ABORT_AFTER_EIGEN");
+    if (abort_after_eigen != NULL && atoi(abort_after_eigen) != 0){
+      fflush(stdout);
+      fflush(stderr);
+      MPI_Barrier(mpi_comm_level1);
+      MPI_Finalize();
+      exit(0);
+    }
   }
 
   /****************************************************
@@ -4924,7 +5005,8 @@ double Band_DFT_NonCol(
 	mpi_comm_cols_int = MPI_Comm_c2f(mpi_comm_cols);
 
         if (scf_eigen_lib_flag==GPUSOLVER && BandNonCol_GpuThreshold()<=n2 && na_rows==n && na_cols==n){
-          BandNonCol_GpuSolver_DenseZheevx(Cs,Ss,ko,n,n,"Band_DFT_NonCol overlap");
+          BandNonCol_GpuSolver_DenseZheevx(Cs,Ss,ko,n,n,openmx_gpu_eigensolver_use_hipsolver(),
+                                           "Band_DFT_NonCol overlap");
         }
         else if (scf_eigen_lib_flag==1 || (numprocs2<5 && scf_eigen_lib_flag!=GPUSOLVER)){
   	  F77_NAME(solve_evp_complex,SOLVE_EVP_COMPLEX)
@@ -5102,7 +5184,9 @@ double Band_DFT_NonCol(
 	mpi_comm_cols_int = MPI_Comm_c2f(mpi_comm_cols);
   
         if (scf_eigen_lib_flag==GPUSOLVER && BandNonCol_GpuThreshold()<=n2 && na_rows2==n2 && na_cols2==n2){
-          BandNonCol_GpuSolver_DenseZheevx(Hs2,Cs2,ko,n2,MaxN,"Band_DFT_NonCol Hamiltonian");
+          BandNonCol_GpuSolver_DenseZheevx(Hs2,Cs2,ko,n2,MaxN,
+                                           BandNonCol_HamiltonianUseHipSolver(),
+                                           "Band_DFT_NonCol Hamiltonian");
         }
         else if (scf_eigen_lib_flag==1 || (numprocs2<5 && scf_eigen_lib_flag!=GPUSOLVER)){
 	  F77_NAME(solve_evp_complex,SOLVE_EVP_COMPLEX)

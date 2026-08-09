@@ -340,6 +340,25 @@ extern "C" int openmx_hipsolver_zheevd_gpu(int n, int maxn, void *d_A, double *w
     return 0;
 }
 
+/* Release only the large Zheevd scratch allocation.  Handles, eigenvalue
+   storage, and host buffers are small and remain cached.  The caller invokes
+   this after the synchronous solve when another MPI owner or a large
+   back-transform needs the shared MI300A memory. */
+extern "C" int openmx_hipsolver_release_workspace(void)
+{
+    std::lock_guard<std::mutex> lock(g_magma_mutex);
+
+    if (g_hs_work != nullptr) {
+        if (hipFree(g_hs_work) != hipSuccess) {
+            return -1;
+        }
+        g_hs_work = nullptr;
+    }
+    g_hs_lwork = 0;
+    g_hs_work_n = 0;
+    return 0;
+}
+
 /* Diagnostic: run a standalone zheevd on a fresh random Hermitian matrix and
    print the wall time, to locate the point in the run where GPU performance
    collapses.  Enabled via OPENMX_ZHEEVD_SELFTEST=1. */
@@ -550,4 +569,27 @@ extern "C" int openmx_magma_zheevdx_gpu(int n, int maxn, void *d_A, double *w, i
         return static_cast<int>(ret);
     }
     return static_cast<int>(info);
+}
+
+/* MAGMA's range-I path caches a dense host copy and several large pinned host
+   work arrays.  On a unified-memory APU those allocations consume the same
+   physical pool as the following GPU turns, so NC band calculations release
+   them at a safe, synchronous turn boundary. */
+extern "C" int openmx_magma_release_z_workspace(void)
+{
+    std::lock_guard<std::mutex> lock(g_magma_mutex);
+
+    if (g_z_host_matrix != nullptr) magma_free_cpu(g_z_host_matrix);
+    if (g_z_work != nullptr)        magma_free_cpu(g_z_work);
+    if (g_z_rwork != nullptr)       magma_free_cpu(g_z_rwork);
+    if (g_z_iwork != nullptr)       magma_free_cpu(g_z_iwork);
+    g_z_host_matrix = nullptr;
+    g_z_work = nullptr;
+    g_z_rwork = nullptr;
+    g_z_iwork = nullptr;
+    g_z_host_matrix_elems = 0;
+    g_z_lwork = 0;
+    g_z_lrwork = 0;
+    g_z_liwork = 0;
+    return 0;
 }

@@ -79,6 +79,36 @@ static void Set_Hamiltonian_ME_Disassociate(void *host)
     }
 }
 
+static int Set_Hamiltonian_NonColGpuEigensolverActive(void)
+{
+    const char *threshold_env;
+    int threshold = GPU_CPU_SWITCH_NUM;
+    int basis_count = 0;
+
+    if (scf_eigen_lib_flag != GPUSOLVER || Solver != 3 || SpinP_switch != 3) {
+        return 0;
+    }
+
+    threshold_env = getenv("OPENMX_BAND_GPU_THRESHOLD");
+    if (threshold_env != NULL && threshold_env[0] != '\0') {
+        int requested = atoi(threshold_env);
+        if (0 < requested) threshold = requested;
+    }
+    for (int GA_AN = 1; GA_AN <= atomnum; GA_AN++) {
+        basis_count += Spe_Total_CNO[WhatSpecies[GA_AN]];
+    }
+    return threshold <= 2*basis_count;
+}
+
+static int Set_Hamiltonian_ME_KeepDeviceResident(void)
+{
+    if (Set_Hamiltonian_NonColGpuEigensolverActive()) {
+        const char *demote = getenv("OPENMX_NC_EIGEN_DEMOTE_SETHAM");
+        if (demote == NULL || atoi(demote) != 0) return 0;
+    }
+    return 1;
+}
+
 void Set_Hamiltonian_Invalidate_OpenMP_MatrixElements_Cache(void)
 {
     SetHamiltonianMETableCache *c = &Set_Hamiltonian_ME_Tables;
@@ -1509,7 +1539,8 @@ static void Calc_MatrixElements_dVH_Vxc_VNA_OpenMP(int Cnt_kind)
 
     {
         SetHamiltonianMETableCache *c = &Set_Hamiltonian_ME_Tables;
-        int resident_ok = 1;
+        const int keep_device_resident = Set_Hamiltonian_ME_KeepDeviceResident();
+        int resident_ok = 0;
 
         c->ready = 1; c->cnt_kind = Cnt_kind;
         c->pair_Mc_AN=pair_Mc_AN; c->pair_h_AN=pair_h_AN;
@@ -1529,22 +1560,46 @@ static void Calc_MatrixElements_dVH_Vxc_VNA_OpenMP(int Cnt_kind)
         c->t.pair_orbs0_offset=pair_orbs0_offset; c->t.pair_orbs1_offset=pair_orbs1_offset;
         c->t.orbs0buf=orbs0buf; c->t.orbs1buf=orbs1buf;
 
-        resident_ok &= Set_Hamiltonian_ME_Associate(pair_NO0,sizeof(int)*(size_t)pair_count);
-        resident_ok &= Set_Hamiltonian_ME_Associate(pair_NO1,sizeof(int)*(size_t)pair_count);
-        resident_ok &= Set_Hamiltonian_ME_Associate(pair_NOLG,sizeof(int)*(size_t)pair_count);
-        resident_ok &= Set_Hamiltonian_ME_Associate(nolg_MN,sizeof(int)*total_nolg_all);
-        resident_ok &= Set_Hamiltonian_ME_Associate(nolg_Nc,sizeof(int)*total_nolg_all);
-        resident_ok &= Set_Hamiltonian_ME_Associate(pair_h_offset,sizeof(size_t)*(size_t)pair_count);
-        resident_ok &= Set_Hamiltonian_ME_Associate(pair_nolg_offset,sizeof(size_t)*(size_t)pair_count);
-        resident_ok &= Set_Hamiltonian_ME_Associate(pair_orbs0_offset,sizeof(size_t)*(size_t)pair_count);
-        resident_ok &= Set_Hamiltonian_ME_Associate(pair_orbs1_offset,sizeof(size_t)*(size_t)pair_count);
-        resident_ok &= Set_Hamiltonian_ME_Associate(orbs0buf,sizeof(Type_Orbs_Grid)*packed_total_orbs0);
-        resident_ok &= Set_Hamiltonian_ME_Associate(orbs1buf,sizeof(Type_Orbs_Grid)*packed_total_orbs1);
+        if (keep_device_resident) {
+            resident_ok = 1;
+            resident_ok &= Set_Hamiltonian_ME_Associate(pair_NO0,sizeof(int)*(size_t)pair_count);
+            resident_ok &= Set_Hamiltonian_ME_Associate(pair_NO1,sizeof(int)*(size_t)pair_count);
+            resident_ok &= Set_Hamiltonian_ME_Associate(pair_NOLG,sizeof(int)*(size_t)pair_count);
+            resident_ok &= Set_Hamiltonian_ME_Associate(nolg_MN,sizeof(int)*total_nolg_all);
+            resident_ok &= Set_Hamiltonian_ME_Associate(nolg_Nc,sizeof(int)*total_nolg_all);
+            resident_ok &= Set_Hamiltonian_ME_Associate(pair_h_offset,sizeof(size_t)*(size_t)pair_count);
+            resident_ok &= Set_Hamiltonian_ME_Associate(pair_nolg_offset,sizeof(size_t)*(size_t)pair_count);
+            resident_ok &= Set_Hamiltonian_ME_Associate(pair_orbs0_offset,sizeof(size_t)*(size_t)pair_count);
+            resident_ok &= Set_Hamiltonian_ME_Associate(pair_orbs1_offset,sizeof(size_t)*(size_t)pair_count);
+            resident_ok &= Set_Hamiltonian_ME_Associate(orbs0buf,sizeof(Type_Orbs_Grid)*packed_total_orbs0);
+            resident_ok &= Set_Hamiltonian_ME_Associate(orbs1buf,sizeof(Type_Orbs_Grid)*packed_total_orbs1);
+        }
         c->t.meta_resident=resident_ok; c->t.nolg_resident=resident_ok;
         c->t.orbs0_resident=resident_ok; c->t.orbs1_resident=resident_ok;
         if (!resident_ok) {
+            /* An allocation or association may fail after earlier entries
+               succeeded.  Do not leave those partial mappings live merely
+               because the aggregate resident flags are false. */
+            Set_Hamiltonian_ME_Disassociate(pair_NO0);
+            Set_Hamiltonian_ME_Disassociate(pair_NO1);
+            Set_Hamiltonian_ME_Disassociate(pair_NOLG);
+            Set_Hamiltonian_ME_Disassociate(nolg_MN);
+            Set_Hamiltonian_ME_Disassociate(nolg_Nc);
+            Set_Hamiltonian_ME_Disassociate(pair_h_offset);
+            Set_Hamiltonian_ME_Disassociate(pair_nolg_offset);
+            Set_Hamiltonian_ME_Disassociate(pair_orbs0_offset);
+            Set_Hamiltonian_ME_Disassociate(pair_orbs1_offset);
+            Set_Hamiltonian_ME_Disassociate(orbs0buf);
+            Set_Hamiltonian_ME_Disassociate(orbs1buf);
             c->t.meta_resident=c->t.nolg_resident=0;
             c->t.orbs0_resident=c->t.orbs1_resident=0;
+        }
+        if (!keep_device_resident && myid == Host_ID) {
+            const char *trace = getenv("OPENMX_BAND_CACHE_TRACE");
+            if (trace != NULL && atoi(trace) != 0) {
+                printf("<DFT> Set_Hamiltonian orbital-table residency skipped for NC eigensolver\n");
+                fflush(stdout);
+            }
         }
     }
     free(vpotbuf);
