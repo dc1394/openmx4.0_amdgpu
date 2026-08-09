@@ -154,6 +154,16 @@ static int SetPro_gpu_default_enabled(void)
   return openmx_gpu_is_apu() ? 0 : 1;
 }
 
+/* OPENMX_SETPRO_GPU remains the umbrella for compatibility.  The three
+   stages can be selected independently so force derivatives do not have to
+   share the policy of the energy-only HVNA contraction. */
+static int SetPro_gpu_stage_enabled(const char *stage_name)
+{
+  int enabled = SetPro_collective_env_flag("OPENMX_SETPRO_GPU",
+                                            SetPro_gpu_default_enabled());
+  return SetPro_collective_env_flag(stage_name,enabled);
+}
+
 static int SetPro_HVNA_GpuBegin(Type_DS_VNA *****DS_VNA, int *VNA_List,
                                 int *VNA_List2, int Num_RVNA)
 {
@@ -168,7 +178,7 @@ static int SetPro_HVNA_GpuBegin(Type_DS_VNA *****DS_VNA, int *VNA_List,
   g->num_rvna = Num_RVNA;
 
   if (scf_eigen_lib_flag!=GPUSOLVER) return 0;
-  if (!SetPro_collective_env_flag("OPENMX_SETPRO_GPU",SetPro_gpu_default_enabled())) return 0;
+  if (!SetPro_gpu_stage_enabled("OPENMX_SETPRO_HVNA_GPU")) return 0;
 
   MPI_Comm_split_type(mpi_comm_level1,MPI_COMM_TYPE_SHARED,0,MPI_INFO_NULL,&node_comm);
   MPI_Comm_size(node_comm,&node_ranks);
@@ -698,7 +708,7 @@ static int SetPro_DSVNA_GpuBegin(int *VNA_List, int *VNA_List2, int Num_RVNA,
   memset(g,0,sizeof(*g));
 
   if (scf_eigen_lib_flag!=GPUSOLVER) return 0;
-  if (!SetPro_collective_env_flag("OPENMX_SETPRO_GPU",SetPro_gpu_default_enabled())) return 0;
+  if (!SetPro_gpu_stage_enabled("OPENMX_SETPRO_DSVNA_GPU")) return 0;
 
   MPI_Comm_split_type(mpi_comm_level1,MPI_COMM_TYPE_SHARED,0,MPI_INFO_NULL,&node_comm);
   MPI_Comm_size(node_comm,&node_ranks);
@@ -1367,7 +1377,7 @@ static int SetPro_VNA23_GpuBegin(void)
   memset(g,0,sizeof(*g));
 
   if (scf_eigen_lib_flag!=GPUSOLVER) return 0;
-  if (!SetPro_collective_env_flag("OPENMX_SETPRO_GPU",SetPro_gpu_default_enabled())) return 0;
+  if (!SetPro_gpu_stage_enabled("OPENMX_SETPRO_VNA23_GPU")) return 0;
 
   MPI_Comm_split_type(mpi_comm_level1,MPI_COMM_TYPE_SHARED,0,MPI_INFO_NULL,&node_comm);
   MPI_Comm_size(node_comm,&node_ranks);

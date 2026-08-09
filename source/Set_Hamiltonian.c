@@ -1685,6 +1685,162 @@ static void Set_Hamiltonian_ME_Pair_Blocked_Spin0(int Mc_AN, int h_AN, int Mh_AN
     }
 }
 
+/* Accumulate four overlap-grid points at a time for the non-collinear CPU
+   path.  Each matrix element stays in a scalar/vector register across the
+   four updates, reducing accumulator traffic without regrouping the floating
+   point sum: for every spin and (i,j), contributions are still added in
+   increasing Nog order. */
+static void Set_Hamiltonian_ME_Pair_NC4(int Mc_AN, int h_AN, int Mh_AN,
+                                       int Gh_AN_is_local, int NO0, int NO1,
+                                       int NOLG, double **restrict tmpH0,
+                                       double **restrict tmpH1,
+                                       double **restrict tmpH2,
+                                       double **restrict tmpH3)
+{
+    const int *restrict nc_list = GListTAtoms1[Mc_AN][h_AN];
+    const int *restrict nh_list = GListTAtoms2[Mc_AN][h_AN];
+    const int *restrict mgrid = MGridListAtom[Mc_AN];
+    const double *restrict vpot0 = Vpot_Grid[0];
+    const double *restrict vpot1 = Vpot_Grid[1];
+    const double *restrict vpot2 = Vpot_Grid[2];
+    const double *restrict vpot3 = Vpot_Grid[3];
+    Type_Orbs_Grid **restrict og_c = Orbs_Grid[Mc_AN];
+    Type_Orbs_Grid **restrict og_h = Gh_AN_is_local ? Orbs_Grid[Mh_AN] : NULL;
+    Type_Orbs_Grid **restrict og_f = Gh_AN_is_local ? NULL : Orbs_Grid_FNAN[Mc_AN][h_AN];
+    int Nog, i, j;
+
+    for (Nog = 0; Nog <= NOLG - 4; Nog += 4) {
+        const int Nc0 = nc_list[Nog];
+        const int Nc1 = nc_list[Nog + 1];
+        const int Nc2 = nc_list[Nog + 2];
+        const int Nc3 = nc_list[Nog + 3];
+        const int MN0 = mgrid[Nc0];
+        const int MN1 = mgrid[Nc1];
+        const int MN2 = mgrid[Nc2];
+        const int MN3 = mgrid[Nc3];
+        const Type_Orbs_Grid *restrict orbs0_0 = og_c[Nc0];
+        const Type_Orbs_Grid *restrict orbs0_1 = og_c[Nc1];
+        const Type_Orbs_Grid *restrict orbs0_2 = og_c[Nc2];
+        const Type_Orbs_Grid *restrict orbs0_3 = og_c[Nc3];
+        const Type_Orbs_Grid *restrict orbs1_0 = og_h ? og_h[nh_list[Nog]] : og_f[Nog];
+        const Type_Orbs_Grid *restrict orbs1_1 = og_h ? og_h[nh_list[Nog + 1]] : og_f[Nog + 1];
+        const Type_Orbs_Grid *restrict orbs1_2 = og_h ? og_h[nh_list[Nog + 2]] : og_f[Nog + 2];
+        const Type_Orbs_Grid *restrict orbs1_3 = og_h ? og_h[nh_list[Nog + 3]] : og_f[Nog + 3];
+        const double v0_0 = GridVol * vpot0[MN0];
+        const double v1_0 = GridVol * vpot1[MN0];
+        const double v2_0 = GridVol * vpot2[MN0];
+        const double v3_0 = GridVol * vpot3[MN0];
+        const double v0_1 = GridVol * vpot0[MN1];
+        const double v1_1 = GridVol * vpot1[MN1];
+        const double v2_1 = GridVol * vpot2[MN1];
+        const double v3_1 = GridVol * vpot3[MN1];
+        const double v0_2 = GridVol * vpot0[MN2];
+        const double v1_2 = GridVol * vpot1[MN2];
+        const double v2_2 = GridVol * vpot2[MN2];
+        const double v3_2 = GridVol * vpot3[MN2];
+        const double v0_3 = GridVol * vpot0[MN3];
+        const double v1_3 = GridVol * vpot1[MN3];
+        const double v2_3 = GridVol * vpot2[MN3];
+        const double v3_3 = GridVol * vpot3[MN3];
+
+        for (i = 0; i < NO0; i++) {
+            const double orb0_0 = (double)orbs0_0[i];
+            const double orb0_1 = (double)orbs0_1[i];
+            const double orb0_2 = (double)orbs0_2[i];
+            const double orb0_3 = (double)orbs0_3[i];
+            const double a0_0 = v0_0 * orb0_0;
+            const double a1_0 = v1_0 * orb0_0;
+            const double a2_0 = v2_0 * orb0_0;
+            const double a3_0 = v3_0 * orb0_0;
+            const double a0_1 = v0_1 * orb0_1;
+            const double a1_1 = v1_1 * orb0_1;
+            const double a2_1 = v2_1 * orb0_1;
+            const double a3_1 = v3_1 * orb0_1;
+            const double a0_2 = v0_2 * orb0_2;
+            const double a1_2 = v1_2 * orb0_2;
+            const double a2_2 = v2_2 * orb0_2;
+            const double a3_2 = v3_2 * orb0_2;
+            const double a0_3 = v0_3 * orb0_3;
+            const double a1_3 = v1_3 * orb0_3;
+            const double a2_3 = v2_3 * orb0_3;
+            const double a3_3 = v3_3 * orb0_3;
+            double *restrict row0 = tmpH0[i];
+            double *restrict row1 = tmpH1[i];
+            double *restrict row2 = tmpH2[i];
+            double *restrict row3 = tmpH3[i];
+
+            for (j = 0; j < NO1; j++) {
+                double h0 = row0[j];
+                double h1 = row1[j];
+                double h2 = row2[j];
+                double h3 = row3[j];
+                double orb1 = (double)orbs1_0[j];
+
+                h0 += a0_0 * orb1;
+                h1 += a1_0 * orb1;
+                h2 += a2_0 * orb1;
+                h3 += a3_0 * orb1;
+
+                orb1 = (double)orbs1_1[j];
+                h0 += a0_1 * orb1;
+                h1 += a1_1 * orb1;
+                h2 += a2_1 * orb1;
+                h3 += a3_1 * orb1;
+
+                orb1 = (double)orbs1_2[j];
+                h0 += a0_2 * orb1;
+                h1 += a1_2 * orb1;
+                h2 += a2_2 * orb1;
+                h3 += a3_2 * orb1;
+
+                orb1 = (double)orbs1_3[j];
+                h0 += a0_3 * orb1;
+                h1 += a1_3 * orb1;
+                h2 += a2_3 * orb1;
+                h3 += a3_3 * orb1;
+
+                row0[j] = h0;
+                row1[j] = h1;
+                row2[j] = h2;
+                row3[j] = h3;
+            }
+        }
+    }
+
+    /* One to three points may remain.  Keep the original single-Nog kernel
+       for this tail, including its arithmetic order. */
+    for (; Nog < NOLG; Nog++) {
+        const int Nc = nc_list[Nog];
+        const int MN = mgrid[Nc];
+        const Type_Orbs_Grid *restrict orbs0 = og_c[Nc];
+        const Type_Orbs_Grid *restrict orbs1 = og_h ? og_h[nh_list[Nog]] : og_f[Nog];
+        const double v0 = GridVol * vpot0[MN];
+        const double v1 = GridVol * vpot1[MN];
+        const double v2 = GridVol * vpot2[MN];
+        const double v3 = GridVol * vpot3[MN];
+
+        for (i = 0; i < NO0; i++) {
+            const double orb0 = (double)orbs0[i];
+            const double a0 = v0 * orb0;
+            const double a1 = v1 * orb0;
+            const double a2 = v2 * orb0;
+            const double a3 = v3 * orb0;
+            double *restrict row0 = tmpH0[i];
+            double *restrict row1 = tmpH1[i];
+            double *restrict row2 = tmpH2[i];
+            double *restrict row3 = tmpH3[i];
+
+            for (j = 0; j < NO1; j++) {
+                const double orb1 = (double)orbs1[j];
+                row0[j] += a0 * orb1;
+                row1[j] += a1 * orb1;
+                row2[j] += a2 * orb1;
+                row3[j] += a3 * orb1;
+            }
+        }
+    }
+}
+
 static void Calc_MatrixElements_dVH_Vxc_VNA_CPU(int Cnt_kind)
 {
     int    Mc_AN, Gc_AN, Mh_AN, h_AN, Gh_AN;
@@ -2056,46 +2212,10 @@ static void Calc_MatrixElements_dVH_Vxc_VNA_CPU(int Cnt_kind)
                     }
                 }
 
-                int Nog;
-
-                for (Nog = 0; Nog < NOLG; Nog++) {
-
-                    int Nc = GListTAtoms1[Mc_AN][h_AN][Nog];
-                    int MN = MGridListAtom[Mc_AN][Nc];
-                    int Nh = GListTAtoms2[Mc_AN][h_AN][Nog];
-                    Type_Orbs_Grid *orbs1 =
-                        Gh_AN_is_local ? Orbs_Grid[Mh_AN][Nh] : Orbs_Grid_FNAN[Mc_AN][h_AN][Nog];
-                    Type_Orbs_Grid *orbs0 = Orbs_Grid[Mc_AN][Nc];
-
-                    double AI_tmp_GVVG  = GridVol * Vpot_Grid[0][MN];
-                    double AI_tmp_GVVG1 = GridVol * Vpot_Grid[1][MN];
-                    double AI_tmp_GVVG2 = GridVol * Vpot_Grid[2][MN];
-                    double AI_tmp_GVVG3 = GridVol * Vpot_Grid[3][MN];
-
-                    int i;
-                    for (i = 0; i < NO0; i++) {
-
-                        double orb0 = (double)orbs0[i];
-                        double AI_tmp_i0 = AI_tmp_GVVG  * orb0;
-                        double AI_tmp_i1 = AI_tmp_GVVG1 * orb0;
-                        double AI_tmp_i2 = AI_tmp_GVVG2 * orb0;
-                        double AI_tmp_i3 = AI_tmp_GVVG3 * orb0;
-                        double *tmp0 = AI_tmpH[0][i];
-                        double *tmp1 = AI_tmpH[1][i];
-                        double *tmp2 = AI_tmpH[2][i];
-                        double *tmp3 = AI_tmpH[3][i];
-                        int    j;
-
-                        for (j = 0; j < NO1; j++) {
-                            double orb1 = (double)orbs1[j];
-                            tmp0[j] += AI_tmp_i0 * orb1;
-                            tmp1[j] += AI_tmp_i1 * orb1;
-                            tmp2[j] += AI_tmp_i2 * orb1;
-                            tmp3[j] += AI_tmp_i3 * orb1;
-                        }
-                    }
-
-                } /* Nog */
+                Set_Hamiltonian_ME_Pair_NC4(Mc_AN, h_AN, Mh_AN,
+                                            Gh_AN_is_local, NO0, NO1, NOLG,
+                                            AI_tmpH[0], AI_tmpH[1],
+                                            AI_tmpH[2], AI_tmpH[3]);
 
                 /* AITUNE copy from temporary buffer */
 

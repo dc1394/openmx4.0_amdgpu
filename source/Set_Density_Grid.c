@@ -112,9 +112,6 @@ double Set_Density_Grid(int Cnt_kind, int Calc_CntOrbital_ON, double *****CDM, d
   MPI_Request *request_send;
   MPI_Request *request_recv;
 
-  /* for OpenMP */
-  int OMPID,Nthrds;
-
   /* MPI */
   MPI_Comm_size(mpi_comm_level1,&numprocs);
   MPI_Comm_rank(mpi_comm_level1,&myid);
@@ -400,29 +397,7 @@ double Set_Density_Grid(int Cnt_kind, int Calc_CntOrbital_ON, double *****CDM, d
   if (!use_local_gpu){
   
   
-  /* AITUNE ========================== */ 
-  int OneD_Nloop = 0;
-  int ai_MaxNc = 0;
-  for (Mc_AN=1; Mc_AN<=Matomnum; Mc_AN++){
-    int Gc_AN = M2G[Mc_AN];    
-    for (h_AN=0; h_AN<=FNAN[Gc_AN]; h_AN++){
-      OneD_Nloop++;
-      if(ai_MaxNc < GridN_Atom[Gc_AN]) {ai_MaxNc = GridN_Atom[Gc_AN];}
-    }
-  }  
-  /* ai_MaxNc is maximum of GridN_Atom[] */
-
-  int gNthrds;
-#pragma omp parallel
-  {
-    gNthrds = omp_get_num_threads();
-  }
-
-  double*** ai_tmpDG_all = (double***)malloc(sizeof(double**)*gNthrds);
-	
-  /* ========================== AITUNE */ 
-
-#pragma omp parallel shared(myid,G2ID,Orbs_Grid_FNAN,List_YOUSO,time_per_atom,Tmp_Den_Grid,Orbs_Grid,COrbs_Grid,Cnt_switch,Cnt_kind,GListTAtoms2,GListTAtoms1,NumOLG,CDM,SpinP_switch,WhatSpecies,ncn,F_G2M,natn,Spe_Total_CNO,M2G) private(OMPID,Nthrds,Mc_AN,h_AN,Stime_atom,Etime_atom,Gc_AN,Cwan,NO0,Gh_AN,Mh_AN,Rnh,Hwan,NO1,spin,i,j,tmp_CDM,Nog,Nc_0,Nc_1,Nc_2,Nc_3,Nh_0,Nh_1,Nh_2,Nh_3,orbs0_0,orbs0_1,orbs0_2,orbs0_3,orbs1_0,orbs1_1,orbs1_2,orbs1_3,sum_0,sum_1,sum_2,sum_3,tmp0_0,tmp0_1,tmp0_2,tmp0_3,Nc,Nh,orbs0,orbs1,sum,tmp0)
+#pragma omp parallel shared(myid,G2ID,Orbs_Grid_FNAN,List_YOUSO,time_per_atom,Tmp_Den_Grid,Orbs_Grid,COrbs_Grid,Cnt_switch,Cnt_kind,GListTAtoms2,GListTAtoms1,NumOLG,CDM,SpinP_switch,WhatSpecies,ncn,F_G2M,natn,Spe_Total_CNO,M2G) private(Mc_AN,h_AN,Stime_atom,Etime_atom,Gc_AN,Cwan,NO0,Gh_AN,Mh_AN,Rnh,Hwan,NO1,spin,i,j,tmp_CDM,Nog,Nc_0,Nc_1,Nc_2,Nc_3,Nh_0,Nh_1,Nh_2,Nh_3,orbs0_0,orbs0_1,orbs0_2,orbs0_3,orbs1_0,orbs1_1,orbs1_2,orbs1_3,sum_0,sum_1,sum_2,sum_3,tmp0_0,tmp0_1,tmp0_2,tmp0_3,Nc,Nh,orbs0,orbs1,sum,tmp0)
   {
 
     orbs0 = (double*)malloc(sizeof(double)*List_YOUSO[7]);
@@ -445,27 +420,10 @@ double Set_Density_Grid(int Cnt_kind, int Calc_CntOrbital_ON, double *****CDM, d
       }
     }
 
-    /* get info. on OpenMP */ 
-
-    OMPID = omp_get_thread_num();
-    Nthrds = omp_get_num_threads();
-
-	
-    /* AITUNE ========================== */  
-
-
-    double *ai_tmpDGs[4];
-    {
-      int spin;
-      for (spin=0; spin<=SpinP_switch; spin++){
-	ai_tmpDGs[spin] = (double*)malloc(sizeof(double)* ai_MaxNc);
-      }
-    }
-    ai_tmpDG_all[OMPID] = ai_tmpDGs;
-    /* ==================================== AITUNE */
-
-
-    /* for (Mc_AN=(OMPID+1); Mc_AN<=Matomnum; Mc_AN+=Nthrds){ AITUNE */
+    /* Each center atom owns a disjoint Tmp_Den_Grid slice.  Assign whole
+       atoms to threads, avoiding two workshare barriers for every neighbor
+       pair and the large per-thread grid reduction used by the old loop. */
+#pragma omp for schedule(static)
     for (Mc_AN=1; Mc_AN<=Matomnum; Mc_AN++){
 
       dtime(&Stime_atom);
@@ -475,14 +433,7 @@ double Set_Density_Grid(int Cnt_kind, int Calc_CntOrbital_ON, double *****CDM, d
       Gc_AN = M2G[Mc_AN];
       Cwan = WhatSpecies[Gc_AN];
       NO0 = Spe_Total_CNO[Cwan]; 
-	  
       int spin;
-      for (spin=0; spin<=SpinP_switch; spin++){
-	int Nc;
-	for (Nc=0; Nc<GridN_Atom[Gc_AN]; Nc++){
-	  ai_tmpDGs[spin][Nc] = 0.0;
-	}
-      }
 
       for (h_AN=0; h_AN<=FNAN[Gc_AN]; h_AN++){
 
@@ -506,7 +457,6 @@ double Set_Density_Grid(int Cnt_kind, int Calc_CntOrbital_ON, double *****CDM, d
 
 	/* summation of non-zero elements */
 	/* for (Nog=0; Nog<NumOLG[Mc_AN][h_AN]; Nog++){ */
-#pragma omp for
 	for (Nog=0; Nog<NumOLG[Mc_AN][h_AN]-3; Nog+=4){
 
 	  Nc_0 = GListTAtoms1[Mc_AN][h_AN][Nog];
@@ -561,51 +511,128 @@ double Set_Density_Grid(int Cnt_kind, int Calc_CntOrbital_ON, double *****CDM, d
 	    }
 	  }
 	  
-	  for (spin=0; spin<=SpinP_switch; spin++){
+	  if (SpinP_switch==3){
+            /* The first suffix is spin and the second is the grid point.
+               Interleave the four independent spin contractions so that the
+               orbital values are loaded only once.  The j and i accumulation
+               order of every individual density component is unchanged. */
+            double sum_00 = 0.0, sum_01 = 0.0, sum_02 = 0.0, sum_03 = 0.0;
+            double sum_10 = 0.0, sum_11 = 0.0, sum_12 = 0.0, sum_13 = 0.0;
+            double sum_20 = 0.0, sum_21 = 0.0, sum_22 = 0.0, sum_23 = 0.0;
+            double sum_30 = 0.0, sum_31 = 0.0, sum_32 = 0.0, sum_33 = 0.0;
 
-	    /* Tmp_Den_Grid */
+            for (i=0; i<NO0; i++){
+              const double *dm0 = tmp_CDM[0][i];
+              const double *dm1 = tmp_CDM[1][i];
+              const double *dm2 = tmp_CDM[2][i];
+              const double *dm3 = tmp_CDM[3][i];
+              double tmp_00 = 0.0, tmp_01 = 0.0, tmp_02 = 0.0, tmp_03 = 0.0;
+              double tmp_10 = 0.0, tmp_11 = 0.0, tmp_12 = 0.0, tmp_13 = 0.0;
+              double tmp_20 = 0.0, tmp_21 = 0.0, tmp_22 = 0.0, tmp_23 = 0.0;
+              double tmp_30 = 0.0, tmp_31 = 0.0, tmp_32 = 0.0, tmp_33 = 0.0;
 
-	    sum_0 = 0.0;
-	    sum_1 = 0.0;
-	    sum_2 = 0.0;
-	    sum_3 = 0.0;
+              for (j=0; j<NO1; j++){
+                const double orb_0 = orbs1_0[j];
+                const double orb_1 = orbs1_1[j];
+                const double orb_2 = orbs1_2[j];
+                const double orb_3 = orbs1_3[j];
+                const double cdm_0 = dm0[j];
+                const double cdm_1 = dm1[j];
+                const double cdm_2 = dm2[j];
+                const double cdm_3 = dm3[j];
 
-	    for (i=0; i<NO0; i++){
+                tmp_00 += orb_0*cdm_0;
+                tmp_01 += orb_1*cdm_0;
+                tmp_02 += orb_2*cdm_0;
+                tmp_03 += orb_3*cdm_0;
+                tmp_10 += orb_0*cdm_1;
+                tmp_11 += orb_1*cdm_1;
+                tmp_12 += orb_2*cdm_1;
+                tmp_13 += orb_3*cdm_1;
+                tmp_20 += orb_0*cdm_2;
+                tmp_21 += orb_1*cdm_2;
+                tmp_22 += orb_2*cdm_2;
+                tmp_23 += orb_3*cdm_2;
+                tmp_30 += orb_0*cdm_3;
+                tmp_31 += orb_1*cdm_3;
+                tmp_32 += orb_2*cdm_3;
+                tmp_33 += orb_3*cdm_3;
+              }
 
-	      tmp0_0 = 0.0;
-	      tmp0_1 = 0.0;
-	      tmp0_2 = 0.0;
-	      tmp0_3 = 0.0;
+              sum_00 += orbs0_0[i]*tmp_00;
+              sum_01 += orbs0_1[i]*tmp_01;
+              sum_02 += orbs0_2[i]*tmp_02;
+              sum_03 += orbs0_3[i]*tmp_03;
+              sum_10 += orbs0_0[i]*tmp_10;
+              sum_11 += orbs0_1[i]*tmp_11;
+              sum_12 += orbs0_2[i]*tmp_12;
+              sum_13 += orbs0_3[i]*tmp_13;
+              sum_20 += orbs0_0[i]*tmp_20;
+              sum_21 += orbs0_1[i]*tmp_21;
+              sum_22 += orbs0_2[i]*tmp_22;
+              sum_23 += orbs0_3[i]*tmp_23;
+              sum_30 += orbs0_0[i]*tmp_30;
+              sum_31 += orbs0_1[i]*tmp_31;
+              sum_32 += orbs0_2[i]*tmp_32;
+              sum_33 += orbs0_3[i]*tmp_33;
+            }
 
-	      for (j=0; j<NO1; j++){
-		tmp0_0 += orbs1_0[j]*tmp_CDM[spin][i][j];
-		tmp0_1 += orbs1_1[j]*tmp_CDM[spin][i][j];
-		tmp0_2 += orbs1_2[j]*tmp_CDM[spin][i][j];
-		tmp0_3 += orbs1_3[j]*tmp_CDM[spin][i][j];
+            Tmp_Den_Grid[0][Mc_AN][Nc_0] += sum_00;
+            Tmp_Den_Grid[0][Mc_AN][Nc_1] += sum_01;
+            Tmp_Den_Grid[0][Mc_AN][Nc_2] += sum_02;
+            Tmp_Den_Grid[0][Mc_AN][Nc_3] += sum_03;
+            Tmp_Den_Grid[1][Mc_AN][Nc_0] += sum_10;
+            Tmp_Den_Grid[1][Mc_AN][Nc_1] += sum_11;
+            Tmp_Den_Grid[1][Mc_AN][Nc_2] += sum_12;
+            Tmp_Den_Grid[1][Mc_AN][Nc_3] += sum_13;
+            Tmp_Den_Grid[2][Mc_AN][Nc_0] += sum_20;
+            Tmp_Den_Grid[2][Mc_AN][Nc_1] += sum_21;
+            Tmp_Den_Grid[2][Mc_AN][Nc_2] += sum_22;
+            Tmp_Den_Grid[2][Mc_AN][Nc_3] += sum_23;
+            Tmp_Den_Grid[3][Mc_AN][Nc_0] += sum_30;
+            Tmp_Den_Grid[3][Mc_AN][Nc_1] += sum_31;
+            Tmp_Den_Grid[3][Mc_AN][Nc_2] += sum_32;
+            Tmp_Den_Grid[3][Mc_AN][Nc_3] += sum_33;
+          }
+          else{
+            for (spin=0; spin<=SpinP_switch; spin++){
+
+	      /* Tmp_Den_Grid */
+
+	      sum_0 = 0.0;
+	      sum_1 = 0.0;
+	      sum_2 = 0.0;
+	      sum_3 = 0.0;
+
+	      for (i=0; i<NO0; i++){
+
+	        tmp0_0 = 0.0;
+	        tmp0_1 = 0.0;
+	        tmp0_2 = 0.0;
+	        tmp0_3 = 0.0;
+
+	        for (j=0; j<NO1; j++){
+		  tmp0_0 += orbs1_0[j]*tmp_CDM[spin][i][j];
+		  tmp0_1 += orbs1_1[j]*tmp_CDM[spin][i][j];
+		  tmp0_2 += orbs1_2[j]*tmp_CDM[spin][i][j];
+		  tmp0_3 += orbs1_3[j]*tmp_CDM[spin][i][j];
+	        }
+
+	        sum_0 += orbs0_0[i]*tmp0_0;
+	        sum_1 += orbs0_1[i]*tmp0_1;
+	        sum_2 += orbs0_2[i]*tmp0_2;
+	        sum_3 += orbs0_3[i]*tmp0_3;
 	      }
-
-	      sum_0 += orbs0_0[i]*tmp0_0;
-	      sum_1 += orbs0_1[i]*tmp0_1;
-	      sum_2 += orbs0_2[i]*tmp0_2;
-	      sum_3 += orbs0_3[i]*tmp0_3;
-	    }
 		
-	    ai_tmpDGs[spin][Nc_0] += sum_0;
-	    ai_tmpDGs[spin][Nc_1] += sum_1;
-	    ai_tmpDGs[spin][Nc_2] += sum_2;
-	    ai_tmpDGs[spin][Nc_3] += sum_3;
+	      Tmp_Den_Grid[spin][Mc_AN][Nc_0] += sum_0;
+	      Tmp_Den_Grid[spin][Mc_AN][Nc_1] += sum_1;
+	      Tmp_Den_Grid[spin][Mc_AN][Nc_2] += sum_2;
+	      Tmp_Den_Grid[spin][Mc_AN][Nc_3] += sum_3;
 
-	    /*
-	    Tmp_Den_Grid[spin][Mc_AN][Nc_0] += sum_0;
-	    Tmp_Den_Grid[spin][Mc_AN][Nc_1] += sum_1;
-	    Tmp_Den_Grid[spin][Mc_AN][Nc_2] += sum_2;
-	    Tmp_Den_Grid[spin][Mc_AN][Nc_3] += sum_3;
-	    */
-
-	  } /* spin */
+	    } /* spin */
+          }
 	} /* Nog */
 
-#pragma omp for
 	for (Nog = NumOLG[Mc_AN][h_AN] - (NumOLG[Mc_AN][h_AN] % 4); Nog<NumOLG[Mc_AN][h_AN]; Nog++){
 	  /*for (; Nog<NumOLG[Mc_AN][h_AN]; Nog++){*/
 	
@@ -638,39 +665,56 @@ double Set_Density_Grid(int Cnt_kind, int Calc_CntOrbital_ON, double *****CDM, d
 	    }
 	  }
 
-	  for (spin=0; spin<=SpinP_switch; spin++){
+	  if (SpinP_switch==3){
+            double sum0 = 0.0, sum1 = 0.0, sum2 = 0.0, sum3 = 0.0;
+
+            for (i=0; i<NO0; i++){
+              const double *dm0 = tmp_CDM[0][i];
+              const double *dm1 = tmp_CDM[1][i];
+              const double *dm2 = tmp_CDM[2][i];
+              const double *dm3 = tmp_CDM[3][i];
+              double tmp_spin0 = 0.0, tmp_spin1 = 0.0;
+              double tmp_spin2 = 0.0, tmp_spin3 = 0.0;
+
+              for (j=0; j<NO1; j++){
+                const double orb = orbs1[j];
+                tmp_spin0 += orb*dm0[j];
+                tmp_spin1 += orb*dm1[j];
+                tmp_spin2 += orb*dm2[j];
+                tmp_spin3 += orb*dm3[j];
+              }
+
+              sum0 += orbs0[i]*tmp_spin0;
+              sum1 += orbs0[i]*tmp_spin1;
+              sum2 += orbs0[i]*tmp_spin2;
+              sum3 += orbs0[i]*tmp_spin3;
+            }
+
+            Tmp_Den_Grid[0][Mc_AN][Nc] += sum0;
+            Tmp_Den_Grid[1][Mc_AN][Nc] += sum1;
+            Tmp_Den_Grid[2][Mc_AN][Nc] += sum2;
+            Tmp_Den_Grid[3][Mc_AN][Nc] += sum3;
+          }
+          else{
+            for (spin=0; spin<=SpinP_switch; spin++){
  
  
-	    sum = 0.0;
-	    for (i=0; i<NO0; i++){
-	      tmp0 = 0.0;
-	      for (j=0; j<NO1; j++){
-		tmp0 += orbs1[j]*tmp_CDM[spin][i][j];
+	      sum = 0.0;
+	      for (i=0; i<NO0; i++){
+	        tmp0 = 0.0;
+	        for (j=0; j<NO1; j++){
+		  tmp0 += orbs1[j]*tmp_CDM[spin][i][j];
+	        }
+	        sum += orbs0[i]*tmp0;
 	      }
-	      sum += orbs0[i]*tmp0;
-	    }
  
-	    ai_tmpDGs[spin][Nc] += sum;
-	    /*Tmp_Den_Grid[spin][Mc_AN][Nc] += sum;*/
-	  }
+	      Tmp_Den_Grid[spin][Mc_AN][Nc] += sum;
+	    }
+          }
 
 	} /* Nog */
 	
       } /* h_AN */
-
-      /* AITUNE   merge temporary buffer for all omp threads */	
-      for (spin=0; spin<=SpinP_switch; spin++){
-	int Nc;
-#pragma omp for
-	for (Nc=0; Nc<GridN_Atom[Gc_AN]; Nc++){
-	  double sum = 0.0;
-	  int th;
-	  for(th = 0; th < Nthrds; th++){
-	    sum += ai_tmpDG_all[th][spin][Nc];
-	  }
-	  Tmp_Den_Grid[spin][Mc_AN][Nc] += sum;
-	}
-      }
 
       dtime(&Etime_atom);
       time_per_atom[Gc_AN] += Etime_atom - Stime_atom;
@@ -696,9 +740,6 @@ double Set_Density_Grid(int Cnt_kind, int Calc_CntOrbital_ON, double *****CDM, d
 	free(tmp_CDM[i][j]);
       }
       free(tmp_CDM[i]);
-	
-      free(ai_tmpDGs[i]); /* AITUNE */
-	
     }
     free(tmp_CDM);
 
@@ -706,8 +747,6 @@ double Set_Density_Grid(int Cnt_kind, int Calc_CntOrbital_ON, double *****CDM, d
 
   } /* #pragma omp parallel */
   
-  free(ai_tmpDG_all);
-
   } /* !use_local_gpu */
 
   dtime(&time2);

@@ -479,7 +479,11 @@ void TotalEnergy_EH0_TwoCenter_Batch_OpenMP(int pair_count, int *pair_ban, int *
       sum = 0.0;
       sumr = 0.0;
 
-#pragma omp parallel for reduction(+:sum,sumr)
+      /* The pair loop already runs inside a target parallel region.  A nested
+         parallel region here is not supported consistently by AMD's device
+         runtime and can corrupt the EH0 force reduction.  Keep one pair per
+         GPU lane and use a lane-local SIMD reduction over its radial grid. */
+#pragma omp simd reduction(+:sum,sumr)
       for (n1=0; n1<tgn; n1++){
         int idx;
         double x,y,z,z2,r2,r,xx,rho0,wt,va0,dr_va0;

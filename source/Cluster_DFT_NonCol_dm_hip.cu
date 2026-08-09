@@ -1,6 +1,9 @@
 #include <hip/hip_runtime.h>
 #include <stddef.h>
+#include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 
 typedef struct {
     double r;
@@ -522,6 +525,7 @@ extern "C" int BandNonCol_BuildDenseSs2_HIP(int n, int n2, const dcomplex *d_S, 
 }
 
 __global__ static void BandNonColDMRootDenseKernel(int entry_count, int n, int n2, int nk_occ,
+                                                   int dense_evec_ld,
                                                    const int *basis0, const int *basis1,
                                                    const int *phase_index,
                                                    const double *phase_r, const double *phase_i,
@@ -557,10 +561,10 @@ __global__ static void BandNonColDMRootDenseKernel(int entry_count, int n, int n
     for (int k = lane; k < nk_occ; k += warpSize) {
         const double w = occ[k];
         const double ew = eig_occ[k];
-        const dcomplex va_up = dense_evec[(size_t)ia * (size_t)nk_occ + (size_t)k];
-        const dcomplex vb_up = dense_evec[(size_t)ib * (size_t)nk_occ + (size_t)k];
-        const dcomplex va_dn = dense_evec[(size_t)(ia + n) * (size_t)nk_occ + (size_t)k];
-        const dcomplex vb_dn = dense_evec[(size_t)(ib + n) * (size_t)nk_occ + (size_t)k];
+        const dcomplex va_up = dense_evec[(size_t)ia * (size_t)dense_evec_ld + (size_t)k];
+        const dcomplex vb_up = dense_evec[(size_t)ib * (size_t)dense_evec_ld + (size_t)k];
+        const dcomplex va_dn = dense_evec[(size_t)(ia + n) * (size_t)dense_evec_ld + (size_t)k];
+        const dcomplex vb_dn = dense_evec[(size_t)(ib + n) * (size_t)dense_evec_ld + (size_t)k];
         const double re11 = va_up.r * vb_up.r + va_up.i * vb_up.i;
         const double im11 = va_up.r * vb_up.i - va_up.i * vb_up.r;
         const double re22 = va_dn.r * vb_dn.r + va_dn.i * vb_dn.i;
@@ -603,13 +607,188 @@ __global__ static void BandNonColDMRootDenseKernel(int entry_count, int n, int n
     }
 }
 
-extern "C" int BandNonCol_CalcDMRootDense_HIP(int entry_count, int pair_count, int size_H1,
-                                              int n, int n2, int nk_occ,
-                                              const int *basis0, const int *basis1,
-                                              const int *phase_index, const double *phase_r,
-                                              const double *phase_i, const double *occ,
-                                              const double *eig_occ, const dcomplex *dense_evec,
-                                              double *dm_buffer)
+typedef struct {
+    int initialized;
+    int device_id;
+    size_t entry_capacity;
+    size_t pair_capacity;
+    size_t occ_capacity;
+    size_t dm_capacity;
+    int *d_basis0;
+    int *d_basis1;
+    int *d_phase_index;
+    double *d_phase_r;
+    double *d_phase_i;
+    double *d_occ;
+    double *d_eig_occ;
+    double *d_dm_buffer;
+} BandNonColDMDeviceWorkspace;
+
+static BandNonColDMDeviceWorkspace BandNonCol_dm_device_workspace = {0};
+static int BandNonCol_dm_device_atexit_registered = 0;
+
+/* This routine frees only storage owned by the DM helper.  In particular,
+   the d_C2 eigenvector pointer supplied by Band_DFT_NonCol is borrowed and
+   is deliberately neither stored in this workspace nor freed here. */
+static void BandNonCol_DMDeviceWorkspaceFreeOwned(BandNonColDMDeviceWorkspace *w)
+{
+    if (w->d_dm_buffer  != NULL) (void)hipFree(w->d_dm_buffer);
+    if (w->d_eig_occ    != NULL) (void)hipFree(w->d_eig_occ);
+    if (w->d_occ        != NULL) (void)hipFree(w->d_occ);
+    if (w->d_phase_i    != NULL) (void)hipFree(w->d_phase_i);
+    if (w->d_phase_r    != NULL) (void)hipFree(w->d_phase_r);
+    if (w->d_phase_index!= NULL) (void)hipFree(w->d_phase_index);
+    if (w->d_basis1     != NULL) (void)hipFree(w->d_basis1);
+    if (w->d_basis0     != NULL) (void)hipFree(w->d_basis0);
+
+    memset(w,0,sizeof(*w));
+    w->device_id = -1;
+}
+
+static int BandNonCol_DMDeviceWorkspaceRelease(int report_errors)
+{
+    BandNonColDMDeviceWorkspace *w = &BandNonCol_dm_device_workspace;
+    int saved_device = -1;
+    int switched_device = 0;
+    int release_failed = 0;
+    hipError_t err;
+
+    if (!w->initialized) return 0;
+
+    err = hipGetDevice(&saved_device);
+    if (err!=hipSuccess){
+        if (report_errors) BandNonColReportHipError("hipGetDevice(DM workspace release)",err);
+        return 1;
+    }
+    if (saved_device!=w->device_id){
+        err = hipSetDevice(w->device_id);
+        if (err!=hipSuccess){
+            if (report_errors) BandNonColReportHipError("hipSetDevice(DM workspace owner)",err);
+            return 1;
+        }
+        switched_device = 1;
+    }
+
+    /* The normal path has already synchronized, while the failure path may
+       still have outstanding work referring to these allocations. */
+    err = hipDeviceSynchronize();
+    if (err!=hipSuccess){
+        if (report_errors){
+            BandNonColReportHipError("hipDeviceSynchronize(DM workspace release)",err);
+        }
+        release_failed = 1;
+    }
+    BandNonCol_DMDeviceWorkspaceFreeOwned(w);
+
+    if (switched_device){
+        err = hipSetDevice(saved_device);
+        if (err!=hipSuccess){
+            if (report_errors) BandNonColReportHipError("hipSetDevice(DM workspace restore)",err);
+            return 1;
+        }
+    }
+    return release_failed;
+}
+
+static void BandNonCol_DMDeviceWorkspaceProcessCleanup(void)
+{
+    BandNonColDMDeviceWorkspace *w = &BandNonCol_dm_device_workspace;
+    int saved_device = -1;
+
+    /* MPI may already be finalized here, so cleanup is intentionally silent. */
+    if (!w->initialized) return;
+    (void)hipGetDevice(&saved_device);
+    if (hipSetDevice(w->device_id)==hipSuccess){
+        (void)hipDeviceSynchronize();
+        BandNonCol_DMDeviceWorkspaceFreeOwned(w);
+    }
+    if (0<=saved_device) (void)hipSetDevice(saved_device);
+}
+
+static int BandNonCol_DMDeviceWorkspaceRegisterCleanup(void)
+{
+    if (!BandNonCol_dm_device_atexit_registered){
+        if (atexit(BandNonCol_DMDeviceWorkspaceProcessCleanup)!=0){
+            fprintf(stderr,"<Band> Failed to register HIP DM workspace cleanup.\n");
+            fflush(stderr);
+            return 1;
+        }
+        BandNonCol_dm_device_atexit_registered = 1;
+    }
+    return 0;
+}
+
+static int BandNonCol_DMDeviceWorkspaceEnsure(int device_id, size_t entry_count,
+                                              size_t pair_count, size_t occ_count,
+                                              size_t dm_count)
+{
+    BandNonColDMDeviceWorkspace *w = &BandNonCol_dm_device_workspace;
+    BandNonColDMDeviceWorkspace replacement;
+    hipError_t err;
+
+    if (BandNonCol_DMDeviceWorkspaceRegisterCleanup()!=0) return 1;
+
+    if (w->initialized && w->device_id!=device_id){
+        if (BandNonCol_DMDeviceWorkspaceRelease(1)!=0) return 1;
+    }
+    if (w->initialized && entry_count<=w->entry_capacity && pair_count<=w->pair_capacity &&
+        occ_count<=w->occ_capacity && dm_count<=w->dm_capacity){
+        return 0;
+    }
+
+    memset(&replacement,0,sizeof(replacement));
+    replacement.device_id = device_id;
+    replacement.entry_capacity = (w->entry_capacity<entry_count) ? entry_count : w->entry_capacity;
+    replacement.pair_capacity = (w->pair_capacity<pair_count) ? pair_count : w->pair_capacity;
+    replacement.occ_capacity = (w->occ_capacity<occ_count) ? occ_count : w->occ_capacity;
+    replacement.dm_capacity = (w->dm_capacity<dm_count) ? dm_count : w->dm_capacity;
+
+    err = hipMalloc((void **)&replacement.d_basis0,
+                    sizeof(int)*replacement.entry_capacity);
+    if (BandNonColReportHipError("hipMalloc(cached DM basis0)",err)) goto allocation_failed;
+    err = hipMalloc((void **)&replacement.d_basis1,
+                    sizeof(int)*replacement.entry_capacity);
+    if (BandNonColReportHipError("hipMalloc(cached DM basis1)",err)) goto allocation_failed;
+    err = hipMalloc((void **)&replacement.d_phase_index,
+                    sizeof(int)*replacement.entry_capacity);
+    if (BandNonColReportHipError("hipMalloc(cached DM phase_index)",err)) goto allocation_failed;
+    err = hipMalloc((void **)&replacement.d_phase_r,
+                    sizeof(double)*replacement.pair_capacity);
+    if (BandNonColReportHipError("hipMalloc(cached DM phase_r)",err)) goto allocation_failed;
+    err = hipMalloc((void **)&replacement.d_phase_i,
+                    sizeof(double)*replacement.pair_capacity);
+    if (BandNonColReportHipError("hipMalloc(cached DM phase_i)",err)) goto allocation_failed;
+    err = hipMalloc((void **)&replacement.d_occ,
+                    sizeof(double)*replacement.occ_capacity);
+    if (BandNonColReportHipError("hipMalloc(cached DM occ)",err)) goto allocation_failed;
+    err = hipMalloc((void **)&replacement.d_eig_occ,
+                    sizeof(double)*replacement.occ_capacity);
+    if (BandNonColReportHipError("hipMalloc(cached DM eig_occ)",err)) goto allocation_failed;
+    err = hipMalloc((void **)&replacement.d_dm_buffer,
+                    sizeof(double)*replacement.dm_capacity);
+    if (BandNonColReportHipError("hipMalloc(cached DM buffer)",err)) goto allocation_failed;
+    replacement.initialized = 1;
+
+    if (w->initialized){
+        /* Both workspaces belong to the current device at this point. */
+        BandNonCol_DMDeviceWorkspaceFreeOwned(w);
+    }
+    *w = replacement;
+    return 0;
+
+allocation_failed:
+    BandNonCol_DMDeviceWorkspaceFreeOwned(&replacement);
+    return 1;
+}
+
+static int BandNonCol_CalcDMRootDenseImpl_HIP(int entry_count, int pair_count, int size_H1,
+                                             int n, int n2, int nk_occ,
+                                             const int *basis0, const int *basis1,
+                                             const int *phase_index, const double *phase_r,
+                                             const double *phase_i, const double *occ,
+                                             const double *eig_occ, const dcomplex *dense_evec,
+                                             int dense_evec_ld, int dense_evec_on_device,
+                                             double *dm_buffer)
 {
     const int block_size = 256;
     int device_id = 0;
@@ -618,6 +797,7 @@ extern "C" int BandNonCol_CalcDMRootDense_HIP(int entry_count, int pair_count, i
     int entries_per_block;
     dim3 block(block_size);
     dim3 grid;
+    BandNonColDMDeviceWorkspace *device_ws = NULL;
     int *d_basis0 = NULL;
     int *d_basis1 = NULL;
     int *d_phase_index = NULL;
@@ -625,22 +805,25 @@ extern "C" int BandNonCol_CalcDMRootDense_HIP(int entry_count, int pair_count, i
     double *d_phase_i = NULL;
     double *d_occ = NULL;
     double *d_eig_occ = NULL;
-    dcomplex *d_dense_evec = NULL;
+    dcomplex *d_dense_evec_copy = NULL;
+    const dcomplex *d_dense_evec = NULL;
     double *d_dm_buffer = NULL;
     hipError_t err;
-    size_t entry_int_bytes = sizeof(int) * (size_t)entry_count;
-    size_t pair_bytes = sizeof(double) * (size_t)pair_count;
-    size_t occ_bytes = sizeof(double) * (size_t)nk_occ;
-    size_t evec_bytes = sizeof(dcomplex) * (size_t)n2 * (size_t)nk_occ;
-    size_t evec_dst_pitch = sizeof(dcomplex) * (size_t)nk_occ;
-    size_t evec_src_pitch = sizeof(dcomplex) * (size_t)n2;
-    size_t evec_width = sizeof(dcomplex) * (size_t)nk_occ;
-    size_t evec_height = (size_t)n2;
-    size_t dm_bytes = sizeof(double) * (size_t)size_H1 * 8U;
+    size_t entry_int_bytes;
+    size_t pair_bytes;
+    size_t occ_bytes;
+    size_t evec_bytes;
+    size_t evec_dst_pitch;
+    size_t evec_src_pitch;
+    size_t evec_width;
+    size_t evec_height;
+    size_t dm_count;
+    size_t dm_bytes;
     int failed = 0;
 
     if (entry_count <= 0 || pair_count <= 0 || size_H1 <= 0 ||
-        n <= 0 || n2 <= 0 || nk_occ <= 0 ||
+        n <= 0 || n2 <= 0 || (size_t)n2 != 2U*(size_t)n ||
+        nk_occ <= 0 || dense_evec_ld < nk_occ ||
         basis0 == NULL || basis1 == NULL || phase_index == NULL ||
         phase_r == NULL || phase_i == NULL || occ == NULL || eig_occ == NULL ||
         dense_evec == NULL || dm_buffer == NULL) {
@@ -648,6 +831,23 @@ extern "C" int BandNonCol_CalcDMRootDense_HIP(int entry_count, int pair_count, i
         fflush(stderr);
         return 1;
     }
+
+    entry_int_bytes = sizeof(int)*(size_t)entry_count;
+    pair_bytes = sizeof(double)*(size_t)pair_count;
+    occ_bytes = sizeof(double)*(size_t)nk_occ;
+    evec_dst_pitch = sizeof(dcomplex)*(size_t)nk_occ;
+    evec_src_pitch = sizeof(dcomplex)*(size_t)dense_evec_ld;
+    evec_width = sizeof(dcomplex)*(size_t)nk_occ;
+    evec_height = (size_t)n2;
+    dm_count = (size_t)size_H1*8U;
+    dm_bytes = sizeof(double)*dm_count;
+    if ((size_t)n2>SIZE_MAX/(size_t)nk_occ ||
+        (size_t)n2*(size_t)nk_occ>SIZE_MAX/sizeof(dcomplex)){
+        fprintf(stderr,"<Band> HIP non-collinear density-matrix eigenvector size overflow.\n");
+        fflush(stderr);
+        return 1;
+    }
+    evec_bytes = sizeof(dcomplex)*(size_t)n2*(size_t)nk_occ;
 
     err = hipGetDevice(&device_id);
     if (BandNonColReportHipError("hipGetDevice(BandNonCol DM)", err)) goto cleanup_failed;
@@ -662,24 +862,44 @@ extern "C" int BandNonCol_CalcDMRootDense_HIP(int entry_count, int pair_count, i
     }
     grid = dim3((unsigned int)((entry_count + entries_per_block - 1) / entries_per_block));
 
-    err = hipMalloc((void **)&d_basis0, entry_int_bytes);
-    if (BandNonColReportHipError("hipMalloc(DM basis0)", err)) goto cleanup_failed;
-    err = hipMalloc((void **)&d_basis1, entry_int_bytes);
-    if (BandNonColReportHipError("hipMalloc(DM basis1)", err)) goto cleanup_failed;
-    err = hipMalloc((void **)&d_phase_index, entry_int_bytes);
-    if (BandNonColReportHipError("hipMalloc(DM phase_index)", err)) goto cleanup_failed;
-    err = hipMalloc((void **)&d_phase_r, pair_bytes);
-    if (BandNonColReportHipError("hipMalloc(DM phase_r)", err)) goto cleanup_failed;
-    err = hipMalloc((void **)&d_phase_i, pair_bytes);
-    if (BandNonColReportHipError("hipMalloc(DM phase_i)", err)) goto cleanup_failed;
-    err = hipMalloc((void **)&d_occ, occ_bytes);
-    if (BandNonColReportHipError("hipMalloc(DM occ)", err)) goto cleanup_failed;
-    err = hipMalloc((void **)&d_eig_occ, occ_bytes);
-    if (BandNonColReportHipError("hipMalloc(DM eig_occ)", err)) goto cleanup_failed;
-    err = hipMalloc((void **)&d_dense_evec, evec_bytes);
-    if (BandNonColReportHipError("hipMalloc(DM dense_evec)", err)) goto cleanup_failed;
-    err = hipMalloc((void **)&d_dm_buffer, dm_bytes);
-    if (BandNonColReportHipError("hipMalloc(DM buffer)", err)) goto cleanup_failed;
+    if (dense_evec_on_device) {
+        if (BandNonCol_DMDeviceWorkspaceEnsure(device_id,(size_t)entry_count,
+                                               (size_t)pair_count,(size_t)nk_occ,
+                                               dm_count)!=0){
+            goto cleanup_failed;
+        }
+        device_ws = &BandNonCol_dm_device_workspace;
+        d_basis0 = device_ws->d_basis0;
+        d_basis1 = device_ws->d_basis1;
+        d_phase_index = device_ws->d_phase_index;
+        d_phase_r = device_ws->d_phase_r;
+        d_phase_i = device_ws->d_phase_i;
+        d_occ = device_ws->d_occ;
+        d_eig_occ = device_ws->d_eig_occ;
+        d_dm_buffer = device_ws->d_dm_buffer;
+        d_dense_evec = dense_evec;
+    }
+    else {
+        err = hipMalloc((void **)&d_basis0, entry_int_bytes);
+        if (BandNonColReportHipError("hipMalloc(DM basis0)", err)) goto cleanup_failed;
+        err = hipMalloc((void **)&d_basis1, entry_int_bytes);
+        if (BandNonColReportHipError("hipMalloc(DM basis1)", err)) goto cleanup_failed;
+        err = hipMalloc((void **)&d_phase_index, entry_int_bytes);
+        if (BandNonColReportHipError("hipMalloc(DM phase_index)", err)) goto cleanup_failed;
+        err = hipMalloc((void **)&d_phase_r, pair_bytes);
+        if (BandNonColReportHipError("hipMalloc(DM phase_r)", err)) goto cleanup_failed;
+        err = hipMalloc((void **)&d_phase_i, pair_bytes);
+        if (BandNonColReportHipError("hipMalloc(DM phase_i)", err)) goto cleanup_failed;
+        err = hipMalloc((void **)&d_occ, occ_bytes);
+        if (BandNonColReportHipError("hipMalloc(DM occ)", err)) goto cleanup_failed;
+        err = hipMalloc((void **)&d_eig_occ, occ_bytes);
+        if (BandNonColReportHipError("hipMalloc(DM eig_occ)", err)) goto cleanup_failed;
+        err = hipMalloc((void **)&d_dense_evec_copy, evec_bytes);
+        if (BandNonColReportHipError("hipMalloc(DM dense_evec)", err)) goto cleanup_failed;
+        d_dense_evec = d_dense_evec_copy;
+        err = hipMalloc((void **)&d_dm_buffer, dm_bytes);
+        if (BandNonColReportHipError("hipMalloc(DM buffer)", err)) goto cleanup_failed;
+    }
 
     err = hipMemcpy(d_basis0, basis0, entry_int_bytes, hipMemcpyHostToDevice);
     if (BandNonColReportHipError("hipMemcpy(DM basis0)", err)) goto cleanup_failed;
@@ -695,14 +915,18 @@ extern "C" int BandNonCol_CalcDMRootDense_HIP(int entry_count, int pair_count, i
     if (BandNonColReportHipError("hipMemcpy(DM occ)", err)) goto cleanup_failed;
     err = hipMemcpy(d_eig_occ, eig_occ, occ_bytes, hipMemcpyHostToDevice);
     if (BandNonColReportHipError("hipMemcpy(DM eig_occ)", err)) goto cleanup_failed;
-    err = hipMemcpy2D(d_dense_evec, evec_dst_pitch, dense_evec, evec_src_pitch,
-                      evec_width, evec_height, hipMemcpyHostToDevice);
-    if (BandNonColReportHipError("hipMemcpy2D(DM dense_evec)", err)) goto cleanup_failed;
+    if (!dense_evec_on_device) {
+        err = hipMemcpy2D(d_dense_evec_copy, evec_dst_pitch, dense_evec, evec_src_pitch,
+                          evec_width, evec_height, hipMemcpyHostToDevice);
+        if (BandNonColReportHipError("hipMemcpy2D(DM dense_evec)", err)) goto cleanup_failed;
+    }
     err = hipMemset(d_dm_buffer, 0, dm_bytes);
     if (BandNonColReportHipError("hipMemset(DM buffer)", err)) goto cleanup_failed;
 
     hipLaunchKernelGGL(BandNonColDMRootDenseKernel, grid, block, 0, 0,
-                       entry_count, n, n2, nk_occ, d_basis0, d_basis1, d_phase_index,
+                       entry_count, n, n2, nk_occ,
+                       dense_evec_on_device ? dense_evec_ld : nk_occ,
+                       d_basis0, d_basis1, d_phase_index,
                        d_phase_r, d_phase_i, d_occ, d_eig_occ, d_dense_evec,
                        d_dm_buffer, size_H1);
     err = hipGetLastError();
@@ -718,8 +942,12 @@ cleanup_failed:
     failed = 1;
 
 cleanup:
+    if (dense_evec_on_device){
+        if (failed) (void)BandNonCol_DMDeviceWorkspaceRelease(1);
+        return failed;
+    }
     if (d_dm_buffer != NULL) hipFree(d_dm_buffer);
-    if (d_dense_evec != NULL) hipFree(d_dense_evec);
+    if (d_dense_evec_copy != NULL) hipFree(d_dense_evec_copy);
     if (d_eig_occ != NULL) hipFree(d_eig_occ);
     if (d_occ != NULL) hipFree(d_occ);
     if (d_phase_i != NULL) hipFree(d_phase_i);
@@ -728,4 +956,31 @@ cleanup:
     if (d_basis1 != NULL) hipFree(d_basis1);
     if (d_basis0 != NULL) hipFree(d_basis0);
     return failed;
+}
+
+extern "C" int BandNonCol_CalcDMRootDense_HIP(int entry_count, int pair_count, int size_H1,
+                                              int n, int n2, int nk_occ,
+                                              const int *basis0, const int *basis1,
+                                              const int *phase_index, const double *phase_r,
+                                              const double *phase_i, const double *occ,
+                                              const double *eig_occ, const dcomplex *dense_evec,
+                                              double *dm_buffer)
+{
+    return BandNonCol_CalcDMRootDenseImpl_HIP(entry_count,pair_count,size_H1,n,n2,nk_occ,
+                                              basis0,basis1,phase_index,phase_r,phase_i,
+                                              occ,eig_occ,dense_evec,n2,0,dm_buffer);
+}
+
+extern "C" int BandNonCol_CalcDMRootDenseDevice_HIP(int entry_count, int pair_count, int size_H1,
+                                                    int n, int n2, int nk_occ,
+                                                    const int *basis0, const int *basis1,
+                                                    const int *phase_index, const double *phase_r,
+                                                    const double *phase_i, const double *occ,
+                                                    const double *eig_occ,
+                                                    const dcomplex *d_dense_evec,
+                                                    int dense_evec_ld, double *dm_buffer)
+{
+    return BandNonCol_CalcDMRootDenseImpl_HIP(entry_count,pair_count,size_H1,n,n2,nk_occ,
+                                              basis0,basis1,phase_index,phase_r,phase_i,
+                                              occ,eig_occ,d_dense_evec,dense_evec_ld,1,dm_buffer);
 }

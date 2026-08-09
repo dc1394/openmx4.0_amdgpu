@@ -92,6 +92,14 @@ extern int BandNonCol_CalcDMRootDense_HIP(int entry_count, int pair_count, int s
                                           const double *phase_i, const double *occ,
                                           const double *eig_occ, const dcomplex *dense_evec,
                                           double *dm_buffer);
+extern int BandNonCol_CalcDMRootDenseDevice_HIP(int entry_count, int pair_count, int size_H1,
+                                                int n, int n2, int nk_occ,
+                                                const int *basis0, const int *basis1,
+                                                const int *phase_index, const double *phase_r,
+                                                const double *phase_i, const double *occ,
+                                                const double *eig_occ,
+                                                const dcomplex *d_dense_evec,
+                                                int dense_evec_ld, double *dm_buffer);
 
 typedef struct
 {
@@ -145,13 +153,17 @@ typedef struct
     dcomplex *     d_H12;
     dcomplex *     d_tmp;
     dcomplex *     d_H2;
-    dcomplex *     d_S2;
     dcomplex *     d_C2;
+    size_t         d_C2_elems;
+    int            d_C2_valid;
+    int            d_C2_n2;
+    int            d_C2_ld;
     dcomplex *     d_scale;
     dcomplex *     h_scale;
 } BandNonColDenseGpuWorkspace;
 
 static BandNonColDenseGpuWorkspace BandNonCol_dense_gpu_workspace = {0};
+static int BandNonCol_dense_gpu_atexit_registered = 0;
 
 static void BandNonCol_DenseGpu_EnsureHipblas(void)
 {
@@ -183,7 +195,6 @@ static void BandNonCol_DenseGpu_Destroy(void)
     if (w->d_H12   != NULL) wait_hipfunc(hipFree(w->d_H12));
     if (w->d_tmp   != NULL) wait_hipfunc(hipFree(w->d_tmp));
     if (w->d_H2    != NULL) wait_hipfunc(hipFree(w->d_H2));
-    if (w->d_S2    != NULL) wait_hipfunc(hipFree(w->d_S2));
     if (w->d_C2    != NULL) wait_hipfunc(hipFree(w->d_C2));
     if (w->d_scale != NULL) wait_hipfunc(hipFree(w->d_scale));
     if (w->hipblas  != NULL) wait_hipfunc(hipblasDestroy(w->hipblas));
@@ -191,6 +202,67 @@ static void BandNonCol_DenseGpu_Destroy(void)
 
     memset(w,0,sizeof(*w));
     w->device_id = -1;
+}
+
+static int BandNonCol_DeviceEigenvectorDMRequested(void)
+{
+    const char *value = getenv("OPENMX_NC_DEVICE_EIGENVECTOR_DM");
+
+    return (value!=NULL && atoi(value)!=0);
+}
+
+static int BandNonCol_BacktransformBarrierRequested(void)
+{
+    const char *value = getenv("OPENMX_NC_BACKTRANSFORM_BARRIER");
+
+    return (value!=NULL && atoi(value)!=0);
+}
+
+static int BandNonCol_DenseBufferCacheEnabled(void)
+{
+    const char *value = getenv("OPENMX_NC_DENSE_BUFFER_CACHE");
+
+    /* The direct DM path consumes d_C2 after the global chemical-potential
+       phase, so its opt-in necessarily extends the dense workspace lifetime. */
+    return BandNonCol_DeviceEigenvectorDMRequested() ||
+           (value!=NULL && atoi(value)!=0);
+}
+
+static void BandNonCol_DenseGpu_ProcessCleanup(void)
+{
+    BandNonColDenseGpuWorkspace *w = &BandNonCol_dense_gpu_workspace;
+
+    /* atexit handlers run after OpenMX has finalized MPI.  Do not use
+       wait_hipfunc here, since its retry/error path calls MPI routines. */
+    if (w->device_id>=0) (void)hipSetDevice(w->device_id);
+    (void)hipDeviceSynchronize();
+    if (w->d_S     != NULL) (void)hipFree(w->d_S);
+    if (w->d_H11   != NULL) (void)hipFree(w->d_H11);
+    if (w->d_H22   != NULL) (void)hipFree(w->d_H22);
+    if (w->d_H12   != NULL) (void)hipFree(w->d_H12);
+    if (w->d_tmp   != NULL) (void)hipFree(w->d_tmp);
+    if (w->d_H2    != NULL) (void)hipFree(w->d_H2);
+    if (w->d_C2    != NULL) (void)hipFree(w->d_C2);
+    if (w->d_scale != NULL) (void)hipFree(w->d_scale);
+    if (w->hipblas != NULL) (void)hipblasDestroy(w->hipblas);
+    free(w->h_scale);
+
+    memset(w,0,sizeof(*w));
+    w->device_id = -1;
+}
+
+static void BandNonCol_DenseGpu_RegisterProcessCleanup(void)
+{
+    if (!BandNonCol_dense_gpu_atexit_registered){
+        if (atexit(BandNonCol_DenseGpu_ProcessCleanup)==0){
+            BandNonCol_dense_gpu_atexit_registered = 1;
+        }
+        else {
+            fprintf(stderr,
+                    "<Band>  Warning: failed to register non-collinear dense GPU cache cleanup.\n");
+            fflush(stderr);
+        }
+    }
 }
 
 static void BandNonCol_DenseGpu_Ensure(int n, int n2)
@@ -205,6 +277,16 @@ static void BandNonCol_DenseGpu_Ensure(int n, int n2)
     }
 
     wait_hipfunc(hipGetDevice(&current_device));
+    if (w->initialized && w->device_id!=current_device){
+      int workspace_device = w->device_id;
+
+      /* HIP allocations and the hipBLAS handle belong to the device on
+         which this workspace was created.  Tear them down in that context
+         before following a rank/device remap. */
+      wait_hipfunc(hipSetDevice(workspace_device));
+      BandNonCol_DenseGpu_Destroy();
+      wait_hipfunc(hipSetDevice(current_device));
+    }
     if (!(w->initialized && w->device_id==current_device && n<=w->n_dim && n2<=w->n2_dim)){
       if (w->initialized){
         BandNonCol_DenseGpu_Destroy();
@@ -243,14 +325,14 @@ static void BandNonCol_DenseGpu_ReleaseWaveBuffers(void)
 {
     BandNonColDenseGpuWorkspace *w = &BandNonCol_dense_gpu_workspace;
 
-    if (w->d_S2 != NULL){
-        wait_hipfunc(hipFree(w->d_S2));
-        w->d_S2 = NULL;
-    }
     if (w->d_C2 != NULL){
         wait_hipfunc(hipFree(w->d_C2));
         w->d_C2 = NULL;
     }
+    w->d_C2_elems = 0U;
+    w->d_C2_valid = 0;
+    w->d_C2_n2 = 0;
+    w->d_C2_ld = 0;
 }
 
 static void BandNonCol_DenseGpu_ReleaseOverlapMagmaScratch(void)
@@ -284,17 +366,50 @@ static void BandNonCol_DenseGpu_ReleaseOverlapMagmaScratch(void)
     BandNonCol_DenseGpu_ReleaseHipblas();
 }
 
-static void BandNonCol_DenseGpu_EnsureWaveBuffers(int n2)
+static void BandNonCol_DenseGpu_EnsureWaveBuffers(int n2, int MaxN)
 {
     BandNonColDenseGpuWorkspace *w = &BandNonCol_dense_gpu_workspace;
-    size_t n2n2 = (size_t)n2*(size_t)n2;
+    size_t compact_count;
 
-    if (w->d_S2==NULL){
-        wait_hipfunc(hipMalloc((void**)&w->d_S2,sizeof(dcomplex)*n2n2));
+    if (n2<=0 || MaxN<=0 || n2<MaxN){
+        BandNonCol_AbortWithMessage("Invalid compact wavefunction dimensions in Band_DFT_NonCol.c.");
+    }
+
+    if ((size_t)MaxN>SIZE_MAX/(size_t)n2){
+        BandNonCol_AbortWithMessage("Compact wavefunction size overflow in Band_DFT_NonCol.c.");
+    }
+    compact_count = (size_t)n2*(size_t)MaxN;
+    if (compact_count>SIZE_MAX/sizeof(dcomplex)){
+        BandNonCol_AbortWithMessage("Compact wavefunction byte-size overflow in Band_DFT_NonCol.c.");
+    }
+
+    if (w->d_C2!=NULL && w->d_C2_elems<compact_count){
+        wait_hipfunc(hipFree(w->d_C2));
+        w->d_C2 = NULL;
+        w->d_C2_elems = 0U;
     }
     if (w->d_C2==NULL){
-        wait_hipfunc(hipMalloc((void**)&w->d_C2,sizeof(dcomplex)*n2n2));
+        wait_hipfunc(hipMalloc((void**)&w->d_C2,sizeof(dcomplex)*compact_count));
+        w->d_C2_elems = compact_count;
     }
+    w->d_C2_valid = 0;
+}
+
+static const dcomplex *BandNonCol_DenseGpu_DeviceEigenvectors(int n2, int leading_dim)
+{
+    BandNonColDenseGpuWorkspace *w = &BandNonCol_dense_gpu_workspace;
+    int current_device;
+    size_t required;
+
+    if (n2<=0 || leading_dim<=0 || (size_t)leading_dim>SIZE_MAX/(size_t)n2) return NULL;
+    required = (size_t)n2*(size_t)leading_dim;
+
+    if (hipGetDevice(&current_device)!=hipSuccess || !w->initialized ||
+        w->device_id!=current_device || !w->d_C2_valid || w->d_C2==NULL || w->d_C2_n2!=n2 ||
+        w->d_C2_ld!=leading_dim || w->d_C2_elems<required){
+        return NULL;
+    }
+    return w->d_C2;
 }
 
 static void BandNonCol_DenseGpu_ReleasePreMagmaBuffers(int release_s)
@@ -1194,8 +1309,13 @@ static size_t BandNonCol_RootDenseDeviceBytes(int n, int n2, int MaxN, int size_
 {
     size_t nn = BandNonCol_CheckedMul((size_t)n,(size_t)n,"root dense n*n");
     size_t n2n2 = BandNonCol_CheckedMul((size_t)n2,(size_t)n2,"root dense n2*n2");
+    size_t n2maxn = BandNonCol_CheckedMul((size_t)n2,(size_t)MaxN,"root dense n2*MaxN");
     size_t matrix_bytes = BandNonCol_ArrayBytes(nn,sizeof(dcomplex),"root dense n*n matrix");
     size_t matrix2_bytes = BandNonCol_ArrayBytes(n2n2,sizeof(dcomplex),"root dense n2*n2 matrix");
+    size_t compact_evec_bytes = BandNonCol_ArrayBytes(n2maxn,sizeof(dcomplex),
+                                                       "root dense compact eigenvectors");
+    size_t scale_bytes = BandNonCol_ArrayBytes((size_t)n2,sizeof(dcomplex),
+                                                "root dense scale vector");
     size_t packed_count = (0<size_H1) ? (size_t)size_H1 : 0U;
     size_t construct_bytes = 0;
     size_t overlap_peak = 0;
@@ -1235,9 +1355,37 @@ static size_t BandNonCol_RootDenseDeviceBytes(int n, int n2, int MaxN, int size_
     BandNonCol_AddBytes(&wavefunction_peak,construct_bytes,"root dense wavefunction peak construct cache");
     BandNonCol_AddBytes(&wavefunction_peak,ko_bytes,"root dense wavefunction peak eigenvalues");
     BandNonCol_AddBytes(&wavefunction_peak,matrix_bytes,"root dense wavefunction overlap matrix");
-    BandNonCol_AddBytes(&wavefunction_peak,
-                        BandNonCol_CheckedMul(matrix2_bytes,3U,"root dense wavefunction n2*n2 matrices"),
-                        "root dense wavefunction n2*n2 matrices");
+    BandNonCol_AddBytes(&wavefunction_peak,matrix2_bytes,"root dense wavefunction Hamiltonian matrix");
+    BandNonCol_AddBytes(&wavefunction_peak,compact_evec_bytes,
+                        "root dense wavefunction compact eigenvectors");
+
+    if (BandNonCol_DenseBufferCacheEnabled()){
+        /* Cached mode intentionally carries every dense buffer across phase
+           and SCF boundaries.  Include that retained memory in the automatic
+           per-device concurrency guard, not just the normal phase peak. */
+        BandNonCol_AddBytes(&overlap_peak,
+                            BandNonCol_CheckedMul(matrix_bytes,4U,
+                                                  "root dense cached overlap n*n matrices"),
+                            "root dense cached overlap n*n matrices");
+        BandNonCol_AddBytes(&overlap_peak,matrix2_bytes,
+                            "root dense cached overlap Hamiltonian matrix");
+        BandNonCol_AddBytes(&overlap_peak,compact_evec_bytes,
+                            "root dense cached overlap eigenvectors");
+        BandNonCol_AddBytes(&overlap_peak,scale_bytes,
+                            "root dense cached overlap scale vector");
+
+        BandNonCol_AddBytes(&hamiltonian_peak,compact_evec_bytes,
+                            "root dense cached Hamiltonian eigenvectors");
+        BandNonCol_AddBytes(&hamiltonian_peak,scale_bytes,
+                            "root dense cached Hamiltonian scale vector");
+
+        BandNonCol_AddBytes(&wavefunction_peak,
+                            BandNonCol_CheckedMul(matrix_bytes,4U,
+                                                  "root dense cached wavefunction n*n matrices"),
+                            "root dense cached wavefunction n*n matrices");
+        BandNonCol_AddBytes(&wavefunction_peak,scale_bytes,
+                            "root dense cached wavefunction scale vector");
+    }
 
     return BandNonCol_MaxBytes(overlap_peak,BandNonCol_MaxBytes(hamiltonian_peak,wavefunction_peak));
 }
@@ -1794,7 +1942,7 @@ static void BandNonCol_ConstructDenseMsFromPacked_HIP(int cpx_flag, const double
 }
 
 static void BandNonCol_DenseGpuPrepareOverlap(int rebuild_overlap, int n, int n2, double *ko,
-                                              dcomplex *h_S)
+                                              dcomplex *h_S, int cache_buffers)
 {
     BandNonColDenseGpuWorkspace *w = &BandNonCol_dense_gpu_workspace;
     const size_t nn = (size_t)n*(size_t)n;
@@ -1806,7 +1954,15 @@ static void BandNonCol_DenseGpuPrepareOverlap(int rebuild_overlap, int n, int n2
             BandNonCol_AbortWithMessage("Band_DFT_NonCol HIP overlap symmetrization failed.");
         }
 
-        BandNonCol_DenseGpu_ReleaseOverlapMagmaScratch();
+        if (cache_buffers){
+            /* The eigensolver uses a separate synchronous workspace.  With
+               ample device memory, retaining these matrices avoids freeing
+               and recreating about a GiB per k-point owner. */
+            wait_hipfunc(hipDeviceSynchronize());
+        }
+        else {
+            BandNonCol_DenseGpu_ReleaseOverlapMagmaScratch();
+        }
         BandNonCol_DenseGpuEigen(w->d_S,ko,n,n,openmx_gpu_eigensolver_use_hipsolver(),
                                  "Band_DFT_NonCol root dense overlap");
 
@@ -2398,7 +2554,8 @@ static void BandNonCol_CalcDMRootDenseAllK1_HIP(int myid0, int owns_root_dense, 
 
 static void BandNonCol_AccumulateDMRootDenseK_HIP(int size_H1, int *MP, int n, int n2, int MaxN,
                                                   double k1, double k2, double k3,
-                                                  double *ko, dcomplex *dense_evec,
+                                                  double *ko, const dcomplex *dense_evec,
+                                                  const dcomplex *d_dense_evec, int dense_evec_ld,
                                                   double *rDM11, double *rDM22, double *rDM12,
                                                   double *iDM12, double *iDM11, double *iDM22,
                                                   double *rEDM11, double *rEDM22)
@@ -2408,7 +2565,10 @@ static void BandNonCol_AccumulateDMRootDenseK_HIP(int size_H1, int *MP, int n, i
     double *dm_buffer;
     int nk;
 
-    if (dense_evec==NULL) return;
+    if (dense_evec==NULL && d_dense_evec==NULL) return;
+    if (d_dense_evec!=NULL && dense_evec_ld<=0){
+        BandNonCol_AbortWithMessage("Invalid device eigenvector leading dimension for BandNonCol DM.");
+    }
 
     BandNonCol_DMOccWorkspace_Ensure(MaxN);
     nk = BandNonCol_BuildOccupationWeightsDense(1,MaxN,ko,ws->occ,ws->eig_occ);
@@ -2428,10 +2588,15 @@ static void BandNonCol_AccumulateDMRootDenseK_HIP(int size_H1, int *MP, int n, i
     }
     memset(dm_buffer,0,sizeof(double)*(size_t)size_H1*8U);
 
-    if (BandNonCol_CalcDMRootDense_HIP(cache->entry_count,cache->pair_count,size_H1,
-                                       n,n2,nk,cache->basis0,cache->basis1,
-                                       cache->phase_index,cache->phase_r,cache->phase_i,
-                                       ws->occ,ws->eig_occ,dense_evec,dm_buffer) != 0){
+    if ((d_dense_evec!=NULL ?
+         BandNonCol_CalcDMRootDenseDevice_HIP(cache->entry_count,cache->pair_count,size_H1,
+                                              n,n2,nk,cache->basis0,cache->basis1,
+                                              cache->phase_index,cache->phase_r,cache->phase_i,
+                                              ws->occ,ws->eig_occ,d_dense_evec,dense_evec_ld,dm_buffer) :
+         BandNonCol_CalcDMRootDense_HIP(cache->entry_count,cache->pair_count,size_H1,
+                                        n,n2,nk,cache->basis0,cache->basis1,
+                                        cache->phase_index,cache->phase_r,cache->phase_i,
+                                        ws->occ,ws->eig_occ,dense_evec,dm_buffer)) != 0){
         free(dm_buffer);
         BandNonCol_AbortWithMessage("Band_DFT_NonCol HIP density-matrix generation failed.");
     }
@@ -2518,6 +2683,7 @@ typedef struct
 {
     int       valid;
     int       s_valid;
+    int       cs2_valid;
     int       n;
     int       n2;
     int       maxn;
@@ -2593,6 +2759,58 @@ static BandNonColRootDenseWorkspace *BandNonCol_RootDenseWorkspace_Ensure(int ow
     return ws;
 }
 
+static void BandNonCol_RootDenseBacktransform_HIP(int n, int n2, int MaxN,
+                                                   int copy_evec_to_host,
+                                                   BandNonColRootDenseWorkspace *rdw)
+{
+    BandNonColDenseGpuWorkspace *w = &BandNonCol_dense_gpu_workspace;
+    const hipDoubleComplex alpha = make_hipDoubleComplex(1.0,0.0);
+    const hipDoubleComplex beta  = make_hipDoubleComplex(0.0,0.0);
+    const int cache_buffers = BandNonCol_DenseBufferCacheEnabled();
+
+    if (rdw==NULL || !rdw->valid || rdw->s_all==NULL ||
+        !w->initialized || w->d_H2==NULL){
+        BandNonCol_AbortWithMessage("Deferred root dense eigenvectors are not available for backtransform.");
+    }
+
+    BandNonCol_DenseGpu_RestoreS(n,rdw->s_all);
+    BandNonCol_DenseGpu_EnsureWaveBuffers(n2,MaxN);
+
+    /* S2 is block diagonal, diag(S,S).  Multiplying the two spin blocks
+       independently halves the back-transform work and avoids materializing
+       the n2-by-n2 S2 matrix.  d_C2 uses a compact MaxN leading dimension;
+       an optional host copy preserves the legacy padded layout consumed by
+       the density-matrix and fallback distribution paths. */
+    BandNonCol_DenseGpu_EnsureHipblas();
+    wait_hipfunc(openmx_gemmul8Zgemm(w->hipblas,HIPBLAS_OP_T,HIPBLAS_OP_T,MaxN,n,n,&alpha,
+                                      (const hipDoubleComplex*)w->d_H2,n2,
+                                      (const hipDoubleComplex*)w->d_S,n,&beta,
+                                      (hipDoubleComplex*)w->d_C2,MaxN));
+    wait_hipfunc(openmx_gemmul8Zgemm(w->hipblas,HIPBLAS_OP_T,HIPBLAS_OP_T,MaxN,n,n,&alpha,
+                                      (const hipDoubleComplex*)(w->d_H2 + n),n2,
+                                      (const hipDoubleComplex*)w->d_S,n,&beta,
+                                      (hipDoubleComplex*)(w->d_C2 + (size_t)n*(size_t)MaxN),MaxN));
+    if (copy_evec_to_host){
+        wait_hipfunc(hipMemcpy2D(rdw->cs2,sizeof(dcomplex)*(size_t)n2,
+                                  w->d_C2,sizeof(dcomplex)*(size_t)MaxN,
+                                  sizeof(dcomplex)*(size_t)MaxN,(size_t)n2,
+                                  hipMemcpyDeviceToHost));
+        rdw->cs2_valid = 1;
+    }
+    else {
+        /* Match the synchronization formerly supplied by the blocking D2H
+           copy before exposing d_C2 to the later density-matrix phase. */
+        wait_hipfunc(hipDeviceSynchronize());
+    }
+    w->d_C2_valid = 1;
+    w->d_C2_n2 = n2;
+    w->d_C2_ld = MaxN;
+    if (!cache_buffers){
+        BandNonCol_DenseGpu_ReleaseWaveBuffers();
+        BandNonCol_DenseGpu_Destroy();
+    }
+}
+
 static void BandNonCol_RootDenseSolveOneK_HIP(int rebuild_overlap,
                                               int n, int n2, int MaxN, int kloop,
                                               double k1, double k2, double k3,
@@ -2603,20 +2821,30 @@ static void BandNonCol_RootDenseSolveOneK_HIP(int rebuild_overlap,
                                               const double *m_i12,
                                               int *packed_order_GA, int *MP,
                                               double *ko, double ***EIGEN,
-                                              int need_evec,
+                                              int need_evec, int copy_evec_to_host,
+                                              int defer_backtransform,
                                               BandNonColRootDenseWorkspace *rdw)
 {
     BandNonColDenseGpuWorkspace *w = &BandNonCol_dense_gpu_workspace;
-    const hipDoubleComplex alpha = make_hipDoubleComplex(1.0,0.0);
-    const hipDoubleComplex beta  = make_hipDoubleComplex(0.0,0.0);
+    const int cache_buffers = BandNonCol_DenseBufferCacheEnabled();
     int h_use_hipsolver;
 
+    rdw->cs2_valid = 0;
+    w->d_C2_valid = 0;
+
+    if (n<=0 || (size_t)n2!=2U*(size_t)n || MaxN<=0 || n2<MaxN){
+        BandNonCol_AbortWithMessage("Invalid spin-block dimensions in Band_DFT_NonCol root dense solver.");
+    }
+
+    if (cache_buffers){
+        BandNonCol_DenseGpu_RegisterProcessCleanup();
+    }
     BandNonCol_DenseGpu_Ensure(n,n2);
 
     if (rebuild_overlap){
         BandNonCol_ConstructDenseMsFromPacked_HIP(0,m_olp,w->d_S,packed_order_GA,MP,k1,k2,k3,n);
     }
-    BandNonCol_DenseGpuPrepareOverlap(rebuild_overlap,n,n2,ko,rdw->s_all);
+    BandNonCol_DenseGpuPrepareOverlap(rebuild_overlap,n,n2,ko,rdw->s_all,cache_buffers);
 
     /* In the default hybrid path the overlap uses hipSOLVER and H uses
        MAGMA.  Return the overlap scratch before MAGMA allocates its range-I
@@ -2660,7 +2888,12 @@ static void BandNonCol_RootDenseSolveOneK_HIP(int rebuild_overlap,
         BandNonCol_AbortWithMessage("Band_DFT_NonCol HIP Hamiltonian symmetrization failed.");
     }
 
-    BandNonCol_DenseGpu_ReleasePreMagmaBuffers(1);
+    if (cache_buffers){
+        wait_hipfunc(hipDeviceSynchronize());
+    }
+    else {
+        BandNonCol_DenseGpu_ReleasePreMagmaBuffers(1);
+    }
     if (BandNonCol_GemmWorkspaceTurnRelease()){
         openmx_gemmul8ReleaseWorkspaces();
     }
@@ -2682,27 +2915,15 @@ static void BandNonCol_RootDenseSolveOneK_HIP(int rebuild_overlap,
     }
 
     if (!need_evec){
-        BandNonCol_DenseGpu_Destroy();
+        if (!cache_buffers){
+            BandNonCol_DenseGpu_Destroy();
+        }
         return;
     }
 
-    BandNonCol_DenseGpu_RestoreS(n,rdw->s_all);
-    BandNonCol_DenseGpu_EnsureWaveBuffers(n2);
-    if (BandNonCol_BuildDenseSs2_HIP(n,n2,w->d_S,w->d_S2) != 0){
-        BandNonCol_AbortWithMessage("Band_DFT_NonCol HIP Ss2 build failed.");
+    if (!defer_backtransform){
+        BandNonCol_RootDenseBacktransform_HIP(n,n2,MaxN,copy_evec_to_host,rdw);
     }
-
-    BandNonCol_DenseGpu_EnsureHipblas();
-    wait_hipfunc(openmx_gemmul8Zgemm(w->hipblas,HIPBLAS_OP_T,HIPBLAS_OP_T,MaxN,n2,n2,&alpha,
-                                      (const hipDoubleComplex*)w->d_H2,n2,
-                                      (const hipDoubleComplex*)w->d_S2,n2,&beta,
-                                      (hipDoubleComplex*)w->d_C2,n2));
-    wait_hipfunc(hipMemcpy2D(rdw->cs2,sizeof(dcomplex)*(size_t)n2,
-                              w->d_C2,sizeof(dcomplex)*(size_t)n2,
-                              sizeof(dcomplex)*(size_t)MaxN,(size_t)n2,
-                              hipMemcpyDeviceToHost));
-    BandNonCol_DenseGpu_ReleaseWaveBuffers();
-    BandNonCol_DenseGpu_Destroy();
 }
 
 static void BandNonCol_MakeEigenRange(int id, int numprocs, int MaxN, int *is, int *ie)
@@ -3091,6 +3312,8 @@ double Band_DFT_NonCol(
   int parallel_mode;
   int use_root_dense_gpusolver;
   int use_k_dense_gpusolver;
+  int use_device_eigenvector_dm;
+  int use_backtransform_barrier;
   int root_dense_serial_gpusolver_worlds = 0;
   int owns_dense_k_rank;
   int *dense_k_owner = NULL;
@@ -3548,6 +3771,22 @@ double Band_DFT_NonCol(
 			    use_root_dense_gpusolver = (gpu_diag_fit && all_knum==1);
 			    use_k_dense_gpusolver = (gpu_diag_fit && all_knum!=1 && strcasecmp(mode,"scf")==0);
 			  }
+			  {
+			    int local_requests[2];
+			    int request_sums[2];
+
+			    local_requests[0] = BandNonCol_DeviceEigenvectorDMRequested() ? 1 : 0;
+			    local_requests[1] = BandNonCol_BacktransformBarrierRequested() ? 1 : 0;
+			    MPI_Allreduce(local_requests,request_sums,2,MPI_INT,MPI_SUM,mpi_comm_level1);
+			    if ((request_sums[0]!=0 && request_sums[0]!=numprocs0) ||
+			        (request_sums[1]!=0 && request_sums[1]!=numprocs0)){
+			      BandNonCol_AbortWithMessage("Non-collinear GPU opt-ins must be consistent across MPI ranks.");
+			    }
+			    use_device_eigenvector_dm =
+			      (request_sums[0]==numprocs0 && use_root_dense_gpusolver && strcasecmp(mode,"scf")==0);
+			    use_backtransform_barrier =
+			      (request_sums[1]==numprocs0 && use_root_dense_gpusolver && strcasecmp(mode,"scf")==0);
+			  }
 			  owns_dense_k_rank = (use_k_dense_gpusolver && Set_Hamiltonian_OpenMP_Rank_Is_Selected());
 			  if (use_k_dense_gpusolver){
 			    dense_k_owner = (int*)malloc(sizeof(int)*(size_t)T_knum);
@@ -3820,7 +4059,7 @@ double Band_DFT_NonCol(
         BandNonCol_RootDenseSolveOneK_HIP(1,n,n2,MaxN,kloop,k1,k2,k3,
                                           m_olp,m_h11,m_h22,m_h12,m_h12i,
                                           m_i11,m_i22,m_i12,
-	                                          order_GA,MP,ko,EIGEN,0,rdw);
+	                                          order_GA,MP,ko,EIGEN,0,0,0,rdw);
 	      }
 
 	      if (owns_dense_k_group){
@@ -3983,14 +4222,55 @@ double Band_DFT_NonCol(
 	            BandNonCol_RootDenseSolveOneK_HIP(rebuild_overlap,n,n2,MaxN,kloop,k1,k2,k3,
 	                                              m_olp,m_h11,m_h22,m_h12,m_h12i,
 	                                              m_i11,m_i22,m_i12,
-	                                              packed_order_GA,MP,ko,EIGEN,1,rdw);
+	                                              packed_order_GA,MP,ko,EIGEN,1,
+	                                              !use_device_eigenvector_dm,
+	                                              use_backtransform_barrier,rdw);
 	          }
 
-	          BandNonCol_DistributeDenseEvecGlobal(kloop,n2,MaxN,myid0,myworld2,NPROCS_WD2,
-	                                               Comm_World_StartID2,root_dense_owner,
-	                                               owns_root_dense ? rdw->cs2 : NULL,EVec1[0]);
+	          if (!use_backtransform_barrier){
+	            if (!use_device_eigenvector_dm){
+	              if (owns_root_dense && !rdw->cs2_valid){
+	                BandNonCol_AbortWithMessage("Root dense host eigenvectors are not available for distribution.");
+	              }
+	              BandNonCol_DistributeDenseEvecGlobal(kloop,n2,MaxN,myid0,myworld2,NPROCS_WD2,
+	                                                   Comm_World_StartID2,root_dense_owner,
+	                                                   owns_root_dense ? rdw->cs2 : NULL,EVec1[0]);
+	            }
 
-	          if (owns_root_dense) rdw->s_valid = 1;
+	            if (owns_root_dense) rdw->s_valid = 1;
+	          }
+	        }
+	      }
+
+	      if (use_backtransform_barrier){
+	        /* Every root owner has completed its H eigensolve before any rank
+	           starts the two bandwidth-heavy backtransform GEMMs. */
+	        MPI_Barrier(mpi_comm_level1);
+
+	        for (int root_dense_world=group_first; root_dense_world<group_last; root_dense_world++){
+	          int root_dense_owner = Comm_World_StartID2[root_dense_world];
+	          int owns_root_dense = (myid0==root_dense_owner);
+
+	          if (owns_root_dense || myworld2==root_dense_world){
+	            rdw = BandNonCol_RootDenseWorkspace_Ensure(owns_root_dense,n,n2,MaxN,1,SCF_iter);
+
+	            if (owns_root_dense){
+	              BandNonCol_RootDenseBacktransform_HIP(n,n2,MaxN,
+	                                                     !use_device_eigenvector_dm,rdw);
+	            }
+
+	            if (!use_device_eigenvector_dm){
+	              if (owns_root_dense && !rdw->cs2_valid){
+	                BandNonCol_AbortWithMessage("Deferred root dense host eigenvectors are not available for distribution.");
+	              }
+	              BandNonCol_DistributeDenseEvecGlobal(root_dense_world,n2,MaxN,
+	                                                   myid0,myworld2,NPROCS_WD2,
+	                                                   Comm_World_StartID2,root_dense_owner,
+	                                                   owns_root_dense ? rdw->cs2 : NULL,EVec1[0]);
+	            }
+
+	            if (owns_root_dense) rdw->s_valid = 1;
+	          }
 	        }
 	      }
 
@@ -4017,12 +4297,12 @@ double Band_DFT_NonCol(
 	        BandNonCol_ConstructCache_Reset();
 	      }
 
-	      if (serialize_gpu_turns){
+	      if (serialize_gpu_turns || use_backtransform_barrier){
 	        MPI_Barrier(mpi_comm_level1);
 	      }
 	    }
 
-	    if (!serialize_gpu_turns){
+	    if (!serialize_gpu_turns && !use_backtransform_barrier){
 	      MPI_Barrier(mpi_comm_level1);
 	    }
 	  }
@@ -4704,9 +4984,19 @@ double Band_DFT_NonCol(
 
 	            if (owns_root_dense){
 	              BandNonColRootDenseWorkspace *rdw = &BandNonCol_root_dense_workspace;
+	              const dcomplex *d_dense_evec = NULL;
 
-	              if (!rdw->valid || rdw->cs2==NULL){
+	              if (!rdw->valid){
 	                BandNonCol_AbortWithMessage("Root dense eigenvectors are not available for Band_DFT_NonCol DM.");
+	              }
+	              if (use_device_eigenvector_dm){
+	                d_dense_evec = BandNonCol_DenseGpu_DeviceEigenvectors(n2,MaxN);
+	                if (d_dense_evec==NULL){
+	                  BandNonCol_AbortWithMessage("Root dense device eigenvectors are not available for Band_DFT_NonCol DM.");
+	                }
+	              }
+	              else if (!rdw->cs2_valid || rdw->cs2==NULL){
+	                BandNonCol_AbortWithMessage("Root dense host eigenvectors are not available for Band_DFT_NonCol DM.");
 	              }
 
 	              kloop = root_dense_world;
@@ -4715,7 +5005,10 @@ double Band_DFT_NonCol(
 	              k3 = T_KGrids3[kloop];
 
 	              BandNonCol_AccumulateDMRootDenseK_HIP(size_H1,MP,n,n2,MaxN,k1,k2,k3,
-	                                                    EIGEN[0][kloop],rdw->cs2,
+	                                                    EIGEN[0][kloop],
+	                                                    use_device_eigenvector_dm ? NULL : rdw->cs2,
+	                                                    d_dense_evec,
+	                                                    use_device_eigenvector_dm ? MaxN : 0,
 	                                                    rDM11,rDM22,rDM12,iDM12,iDM11,iDM22,
 	                                                    rEDM11,rEDM22);
 	            }
@@ -4930,9 +5223,9 @@ double Band_DFT_NonCol(
 	          BandNonCol_RootDenseSolveOneK_HIP(1,n,n2,MaxN,kloop,k1,k2,k3,
 	                                            m_olp,m_h11,m_h22,m_h12,m_h12i,
 	                                            m_i11,m_i22,m_i12,
-	                                            order_GA,MP,ko,EIGEN,1,rdw);
+	                                            order_GA,MP,ko,EIGEN,1,1,0,rdw);
 	          BandNonCol_AccumulateDMRootDenseK_HIP(size_H1,MP,n,n2,MaxN,k1,k2,k3,
-	                                                EIGEN[0][kloop],rdw->cs2,
+	                                                EIGEN[0][kloop],rdw->cs2,NULL,0,
 		                                                rDM11,rDM22,rDM12,iDM12,iDM11,iDM22,
 		                                                rEDM11,rEDM22);
 		        }

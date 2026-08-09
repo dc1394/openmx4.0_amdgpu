@@ -67,11 +67,9 @@ void Set_XC_Grid(int SCF_iter, int XC_P_switch, int XC_switch,
   double tmp0,tmp1;
   double cot,sit,sip,cop,phi,theta;
   double detA,igtv[4][4];
-  double **InvMat,**Mat,fden0[30],fden1[30];
-  double up_x[30],up_y[30],up_z[30];
-  double dn_x[30],dn_y[30],dn_z[30];
+  double **InvMat,**Mat;
   double x,y,z,x1,y1,z1,sum0,sum1;
-  int p,q,inv_calc_flag,dDen_Grid_calc_method;
+  int p,q,dDen_Grid_calc_method;
   int numprocs,myid;
 
   /* for OpenMP */
@@ -98,6 +96,35 @@ void Set_XC_Grid(int SCF_iter, int XC_P_switch, int XC_switch,
     for (i=0; i<30; i++){
       InvMat[i] = (double*)malloc(sizeof(double)*30); 
     }
+
+    /* The 27-point interpolation matrix depends only on the grid cell, not
+       on MN.  Build it once per Set_XC_Grid call before the grid loops so the
+       loops themselves can be safely distributed across OpenMP threads. */
+    p = 0;
+    for (i1=-1; i1<=1; i1++){
+      for (j1=-1; j1<=1; j1++){
+        for (k1=-1; k1<=1; k1++){
+          x = (double)i1*gtv[1][1] + (double)j1*gtv[2][1] + (double)k1*gtv[3][1];
+          y = (double)i1*gtv[1][2] + (double)j1*gtv[2][2] + (double)k1*gtv[3][2];
+          z = (double)i1*gtv[1][3] + (double)j1*gtv[2][3] + (double)k1*gtv[3][3];
+
+          q = 0;
+          for (i2=0; i2<=2; i2++){
+            x1 = pow(x,(double)i2);
+            for (j2=0; j2<=2; j2++){
+              y1 = pow(y,(double)j2);
+              for (k2=0; k2<=2; k2++){
+                z1 = pow(z,(double)k2);
+                Mat[p][q] = x1*y1*z1;
+                q++;
+              }
+            }
+          }
+          p++;
+        }
+      }
+    }
+    Inverse(26,Mat,InvMat);
   }
   
   if ( XC_switch==4 && dDen_Grid==NULL){
@@ -291,142 +318,77 @@ void Set_XC_Grid(int SCF_iter, int XC_P_switch, int XC_switch,
       Ng2 = Max_Grid_Index_D[2] - Min_Grid_Index_D[2] + 1;
       Ng3 = Max_Grid_Index_D[3] - Min_Grid_Index_D[3] + 1;
 
-      inv_calc_flag = 0;
+      /* Each grid point writes a disjoint output element.  The old loop was
+         serial only because its 27-point scratch arrays and lazy inverse were
+         shared.  Keep the q accumulation order unchanged, but give every
+         OpenMP thread private scratch storage. */
+#pragma omp parallel
+      {
+        double fden0_local[27], fden1_local[27];
 
-      for (MN=0; MN<My_NumGridD; MN++){
+#pragma omp for schedule(static)
+        for (int MN_local=0; MN_local<My_NumGridD; MN_local++){
+          if (den_min < (Den0[MN_local] + Den1[MN_local])){
+            int i_local = MN_local/(Ng2*Ng3);
+            int j_local = (MN_local-i_local*Ng2*Ng3)/Ng3;
+            int k_local = MN_local-i_local*Ng2*Ng3-j_local*Ng3;
 
-	if ( den_min<(Den0[MN]+Den1[MN]) ){
+            if (i_local==0 || i_local==(Ng1-1) ||
+                j_local==0 || j_local==(Ng2-1) ||
+                k_local==0 || k_local==(Ng3-1)){
+              dDen_Grid[0][0][MN_local] = 0.0;
+              dDen_Grid[0][1][MN_local] = 0.0;
+              dDen_Grid[0][2][MN_local] = 0.0;
+              dDen_Grid[1][0][MN_local] = 0.0;
+              dDen_Grid[1][1][MN_local] = 0.0;
+              dDen_Grid[1][2][MN_local] = 0.0;
+            }
+            else {
+              int p_local = 0;
+              for (int di=-1; di<=1; di++){
+                for (int dj=-1; dj<=1; dj++){
+                  for (int dk=-1; dk<=1; dk++){
+                    int ni = i_local + di;
+                    int nj = j_local + dj;
+                    int nk = k_local + dk;
+                    int MN2_local = ni*Ng2*Ng3 + nj*Ng3 + nk;
 
-	  i = MN/(Ng2*Ng3);
-	  j = (MN-i*Ng2*Ng3)/Ng3;
-	  k = MN - i*Ng2*Ng3 - j*Ng3; 
+                    if (PCC_switch==0){
+                      fden0_local[p_local] = Den0[MN2_local];
+                      fden1_local[p_local] = Den1[MN2_local];
+                    }
+                    else if (PCC_switch==1) {
+                      fden0_local[p_local] = Den0[MN2_local] + PCCDensity_Grid_D[0][MN2_local];
+                      fden1_local[p_local] = Den1[MN2_local] + PCCDensity_Grid_D[1][MN2_local];
+                    }
+                    p_local++;
+                  }
+                }
+              }
 
-	  if ( i==0 || i==(Ng1-1) || j==0 || j==(Ng2-1) || k==0 || k==(Ng3-1) ){
-
-	    dDen_Grid[0][0][MN] = 0.0;
-	    dDen_Grid[0][1][MN] = 0.0;
-	    dDen_Grid[0][2][MN] = 0.0;
-	    dDen_Grid[1][0][MN] = 0.0;
-	    dDen_Grid[1][1][MN] = 0.0;
-	    dDen_Grid[1][2][MN] = 0.0;
-	  }
-
-	  else {
-
-	    if (inv_calc_flag==0){
-
-	      p = 0;
-	      for ( i1=-1; i1<=1; i1++ ){
-		for ( j1=-1; j1<=1; j1++ ){
-		  for ( k1=-1; k1<=1; k1++ ){
-
-		    x = (double)i1*gtv[1][1] + (double)j1*gtv[2][1] + (double)k1*gtv[3][1];
-		    y = (double)i1*gtv[1][2] + (double)j1*gtv[2][2] + (double)k1*gtv[3][2];
-		    z = (double)i1*gtv[1][3] + (double)j1*gtv[2][3] + (double)k1*gtv[3][3];
-
-		    q = 0;
-		    for ( i2=0; i2<=2; i2++ ){
-		      x1 = pow(x,(double)i2);
-		      for ( j2=0; j2<=2; j2++ ){
-			y1 = pow(y,(double)j2);
-			for ( k2=0; k2<=2; k2++ ){
-			  z1 = pow(z,(double)k2);
-
-			  Mat[p][q] = x1*y1*z1;
-			  q++;
-
-			} // k2
-		      } // j2
-		    } // i2
-
-		    p++;
-
-		  } // k1
-		} // j1
-	      } // i1
-
-	      Inverse( 26, Mat, InvMat );          
-	      inv_calc_flag = 1; 
-
-	    } // end of if (inv_calc_flag==0)
-
-	    p = 0;
-	    for ( i1=-1; i1<=1; i1++ ){
-	      for ( j1=-1; j1<=1; j1++ ){
-		for ( k1=-1; k1<=1; k1++ ){
-
-		  i2 = i + i1;
-		  j2 = j + j1;
-		  k2 = k + k1;
-
-		  MN2 = i2*Ng2*Ng3 + j2*Ng3 + k2;
-
-		  if (PCC_switch==0) {
-		    fden0[p] = Den0[MN2];
-		    fden1[p] = Den1[MN2];
-		  }
-		  else if (PCC_switch==1) {
-		    fden0[p] = Den0[MN2] + PCCDensity_Grid_D[0][MN2];
-		    fden1[p] = Den1[MN2] + PCCDensity_Grid_D[1][MN2];
-		  }
-
-		  p++;
-
-		} // k1
-	      } // j1
-	    } // i1
-
-	    /* derivative w.r.t. x */
-
-	    p = 9; 
-	    sum0 = 0.0; sum1 = 0.0; 
-	    for (q=0; q<27; q++){
-	      sum0 += InvMat[p][q]*fden0[q]; 
-	      sum1 += InvMat[p][q]*fden1[q]; 
-	    } 
-
-	    dDen_Grid[0][0][MN] = sum0;
-	    dDen_Grid[1][0][MN] = sum1;
-          
-	    /* derivative w.r.t. y */
-
-	    p = 3; 
-	    sum0 = 0.0; sum1 = 0.0; 
-	    for (q=0; q<27; q++){
-	      sum0 += InvMat[p][q]*fden0[q]; 
-	      sum1 += InvMat[p][q]*fden1[q]; 
-	    } 
-
-	    dDen_Grid[0][1][MN] = sum0;
-	    dDen_Grid[1][1][MN] = sum1;
-
-	    /* derivative w.r.t. z */
-
-	    p = 1; 
-	    sum0 = 0.0; sum1 = 0.0; 
-	    for (q=0; q<27; q++){
-	      sum0 += InvMat[p][q]*fden0[q]; 
-	      sum1 += InvMat[p][q]*fden1[q]; 
-	    } 
-
-	    dDen_Grid[0][2][MN] = sum0;
-	    dDen_Grid[1][2][MN] = sum1;
-
-	  } // else 
-
-	} // if ( den_min<(Den0[MN]+Den1[MN]) )
-
-	else { 
-
-	  dDen_Grid[0][0][MN] = 0.0;
-	  dDen_Grid[0][1][MN] = 0.0;
-	  dDen_Grid[0][2][MN] = 0.0;
-	  dDen_Grid[1][0][MN] = 0.0;
-	  dDen_Grid[1][1][MN] = 0.0;
-	  dDen_Grid[1][2][MN] = 0.0;
-	} // else 
-
-      } // MN
+              for (int axis=0; axis<3; axis++){
+                const int row = (axis==0 ? 9 : (axis==1 ? 3 : 1));
+                double sum0_local = 0.0;
+                double sum1_local = 0.0;
+                for (int q_local=0; q_local<27; q_local++){
+                  sum0_local += InvMat[row][q_local]*fden0_local[q_local];
+                  sum1_local += InvMat[row][q_local]*fden1_local[q_local];
+                }
+                dDen_Grid[0][axis][MN_local] = sum0_local;
+                dDen_Grid[1][axis][MN_local] = sum1_local;
+              }
+            }
+          }
+          else {
+            dDen_Grid[0][0][MN_local] = 0.0;
+            dDen_Grid[0][1][MN_local] = 0.0;
+            dDen_Grid[0][2][MN_local] = 0.0;
+            dDen_Grid[1][0][MN_local] = 0.0;
+            dDen_Grid[1][1][MN_local] = 0.0;
+            dDen_Grid[1][2][MN_local] = 0.0;
+          }
+        }
+      }
     } // end of else if (dDen_Grid_calc_method==2)
 
   } /* if (XC_switch==4) */ 
@@ -880,148 +842,83 @@ void Set_XC_Grid(int SCF_iter, int XC_P_switch, int XC_switch,
       Ng2 = Max_Grid_Index_D[2] - Min_Grid_Index_D[2] + 1;
       Ng3 = Max_Grid_Index_D[3] - Min_Grid_Index_D[3] + 1;
 
-      inv_calc_flag = 0;
+      /* The divergence at each interior grid point is independent.  Use
+         private 27-point vector scratch per thread and preserve the original
+         x, y, z and q accumulation order. */
+#pragma omp parallel
+      {
+        double up_x_local[27], up_y_local[27], up_z_local[27];
+        double dn_x_local[27], dn_y_local[27], dn_z_local[27];
 
-      for (MN=0; MN<My_NumGridD; MN++){
+#pragma omp for schedule(static)
+        for (int MN_local=0; MN_local<My_NumGridD; MN_local++){
+          if (den_min < (Den0[MN_local] + Den1[MN_local])){
+            int i_local = MN_local/(Ng2*Ng3);
+            int j_local = (MN_local-i_local*Ng2*Ng3)/Ng3;
+            int k_local = MN_local-i_local*Ng2*Ng3-j_local*Ng3;
 
-	if ( den_min<(Den0[MN]+Den1[MN]) ){
+            if (i_local<=1 || (Ng1-2)<=i_local ||
+                j_local<=1 || (Ng2-2)<=j_local ||
+                k_local<=1 || (Ng3-2)<=k_local){
+              Vxc0[MN_local] = 0.0;
+              Vxc1[MN_local] = 0.0;
+            }
+            else {
+              int p_local = 0;
+              for (int di=-1; di<=1; di++){
+                for (int dj=-1; dj<=1; dj++){
+                  for (int dk=-1; dk<=1; dk++){
+                    int ni = i_local + di;
+                    int nj = j_local + dj;
+                    int nk = k_local + dk;
+                    int MN2_local = ni*Ng2*Ng3 + nj*Ng3 + nk;
 
-	  i = MN/(Ng2*Ng3);
-	  j = (MN-i*Ng2*Ng3)/Ng3;
-	  k = MN - i*Ng2*Ng3 - j*Ng3; 
+                    up_x_local[p_local] = dEXC_dGD[0][0][MN2_local];
+                    up_y_local[p_local] = dEXC_dGD[0][1][MN2_local];
+                    up_z_local[p_local] = dEXC_dGD[0][2][MN2_local];
+                    dn_x_local[p_local] = dEXC_dGD[1][0][MN2_local];
+                    dn_y_local[p_local] = dEXC_dGD[1][1][MN2_local];
+                    dn_z_local[p_local] = dEXC_dGD[1][2][MN2_local];
+                    p_local++;
+                  }
+                }
+              }
 
-	  if ( i<=1 || (Ng1-2)<=i || j<=1 || (Ng2-2)<=j || k<=1 || (Ng3-2)<=k ){
+              double sum0_local = 0.0;
+              double sum1_local = 0.0;
+              for (int q_local=0; q_local<27; q_local++){
+                sum0_local += InvMat[9][q_local]*up_x_local[q_local];
+                sum1_local += InvMat[9][q_local]*dn_x_local[q_local];
+              }
+              for (int q_local=0; q_local<27; q_local++){
+                sum0_local += InvMat[3][q_local]*up_y_local[q_local];
+                sum1_local += InvMat[3][q_local]*dn_y_local[q_local];
+              }
+              for (int q_local=0; q_local<27; q_local++){
+                sum0_local += InvMat[1][q_local]*up_z_local[q_local];
+                sum1_local += InvMat[1][q_local]*dn_z_local[q_local];
+              }
 
-	    Vxc0[MN] = 0.0;
-	    Vxc1[MN] = 0.0;
-	  }
-
-	  else {
-
-	    if (inv_calc_flag==0){
-
-	      p = 0;
-	      for ( i1=-1; i1<=1; i1++ ){
-		for ( j1=-1; j1<=1; j1++ ){
-		  for ( k1=-1; k1<=1; k1++ ){
-
-		    x = (double)i1*gtv[1][1] + (double)j1*gtv[2][1] + (double)k1*gtv[3][1];
-		    y = (double)i1*gtv[1][2] + (double)j1*gtv[2][2] + (double)k1*gtv[3][2];
-		    z = (double)i1*gtv[1][3] + (double)j1*gtv[2][3] + (double)k1*gtv[3][3];
-
-		    q = 0;
-		    for ( i2=0; i2<=2; i2++ ){
-		      x1 = pow(x,(double)i2);
-		      for ( j2=0; j2<=2; j2++ ){
-			y1 = pow(y,(double)j2);
-			for ( k2=0; k2<=2; k2++ ){
-			  z1 = pow(z,(double)k2);
-
-			  Mat[p][q] = x1*y1*z1;
-			  q++;
-
-			} // k2
-		      } // j2
-		    } // i2
-
-		    p++;
-
-		  } // k1
-		} // j1
-	      } // i1
-
-	      Inverse( 26, Mat, InvMat );          
-	      inv_calc_flag = 1; 
-
-	    } // end of if (inv_calc_flag==0)
-
-	    p = 0;
-	    for ( i1=-1; i1<=1; i1++ ){
-	      for ( j1=-1; j1<=1; j1++ ){
-		for ( k1=-1; k1<=1; k1++ ){
-
-		  i2 = i + i1;
-		  j2 = j + j1;
-		  k2 = k + k1;
-
-		  MN2 = i2*Ng2*Ng3 + j2*Ng3 + k2;
-
-                  up_x[p] = dEXC_dGD[0][0][MN2];
-                  up_y[p] = dEXC_dGD[0][1][MN2];
-                  up_z[p] = dEXC_dGD[0][2][MN2];
-
-                  dn_x[p] = dEXC_dGD[1][0][MN2];
-                  dn_y[p] = dEXC_dGD[1][1][MN2];
-                  dn_z[p] = dEXC_dGD[1][2][MN2];
-
-		  p++;
-
-		} // k1
-	      } // j1
-	    } // i1
-
-            /****************************************/
-	    /* derivative of up_x and dn_x w.r.t. x */
-            /****************************************/
-
-	    sum0 = 0.0; sum1 = 0.0; 
-
-	    p = 9; 
-	    for (q=0; q<27; q++){
-	      sum0 += InvMat[p][q]*up_x[q]; 
-	      sum1 += InvMat[p][q]*dn_x[q];
-	    } 
-
-            /****************************************/
-	    /* derivative of up_y and dn_y w.r.t. y */
-            /****************************************/
-
-	    p = 3; 
-	    for (q=0; q<27; q++){
-	      sum0 += InvMat[p][q]*up_y[q]; 
-	      sum1 += InvMat[p][q]*dn_y[q]; 
-	    } 
-
-            /****************************************/
-	    /* derivative of up_z and dn_z w.r.t. z */
-            /****************************************/
-
-	    p = 1; 
-	    for (q=0; q<27; q++){
-	      sum0 += InvMat[p][q]*up_z[q]; 
-	      sum1 += InvMat[p][q]*dn_z[q]; 
-	    } 
-
-            /* XC potential */
-
-            if (XC_P_switch==1){
-	      Vxc0[MN] -= sum0; 
-	      Vxc1[MN] -= sum1;
-	    }
-
-            /* XC energy density - XC potential */
-
-	    else if (XC_P_switch==2){
-	      Vxc0[MN] += sum0; 
-	      Vxc1[MN] += sum1;
-	    }
-
-	  } // else 
-
-	} // if ( den_min<(Den0[MN]+Den1[MN]) )
-
-	else { 
-
-	  dDen_Grid[0][0][MN] = 0.0;
-	  dDen_Grid[0][1][MN] = 0.0;
-	  dDen_Grid[0][2][MN] = 0.0;
-	  dDen_Grid[1][0][MN] = 0.0;
-	  dDen_Grid[1][1][MN] = 0.0;
-	  dDen_Grid[1][2][MN] = 0.0;
-
-	} // else 
-
-      } // MN
+              if (XC_P_switch==1){
+                Vxc0[MN_local] -= sum0_local;
+                Vxc1[MN_local] -= sum1_local;
+              }
+              else if (XC_P_switch==2){
+                Vxc0[MN_local] += sum0_local;
+                Vxc1[MN_local] += sum1_local;
+              }
+            }
+          }
+          else {
+            dDen_Grid[0][0][MN_local] = 0.0;
+            dDen_Grid[0][1][MN_local] = 0.0;
+            dDen_Grid[0][2][MN_local] = 0.0;
+            dDen_Grid[1][0][MN_local] = 0.0;
+            dDen_Grid[1][1][MN_local] = 0.0;
+            dDen_Grid[1][2][MN_local] = 0.0;
+          }
+        }
+      }
 
     } // end of if (dDen_Grid_calc_method==2)
 
