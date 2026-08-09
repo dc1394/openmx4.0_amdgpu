@@ -26,6 +26,8 @@
 #include "mpi.h"
 #include <omp.h>
 
+extern int openmx_gpu_is_apu(void);
+
 static double Set_ProExpn(double ****HVNA, Type_DS_VNA *****DS_VNA);
 static double Set_VNA2(double ****HVNA, double *****HVNA2);
 static double Set_VNA3(double *****HVNA3);
@@ -143,6 +145,15 @@ static int SetPro_collective_env_flag(const char *name, int default_value)
   return value;
 }
 
+/* The OpenMP-target projector batches are tuned for discrete accelerators.
+   On a unified-memory APU, several MPI ranks issuing the small batches to one
+   device are slower than the already distributed host implementation.  Keep
+   an explicit environment override for experiments and future kernels. */
+static int SetPro_gpu_default_enabled(void)
+{
+  return openmx_gpu_is_apu() ? 0 : 1;
+}
+
 static int SetPro_HVNA_GpuBegin(Type_DS_VNA *****DS_VNA, int *VNA_List,
                                 int *VNA_List2, int Num_RVNA)
 {
@@ -157,7 +168,7 @@ static int SetPro_HVNA_GpuBegin(Type_DS_VNA *****DS_VNA, int *VNA_List,
   g->num_rvna = Num_RVNA;
 
   if (scf_eigen_lib_flag!=GPUSOLVER) return 0;
-  if (!SetPro_collective_env_flag("OPENMX_SETPRO_GPU",1)) return 0;
+  if (!SetPro_collective_env_flag("OPENMX_SETPRO_GPU",SetPro_gpu_default_enabled())) return 0;
 
   MPI_Comm_split_type(mpi_comm_level1,MPI_COMM_TYPE_SHARED,0,MPI_INFO_NULL,&node_comm);
   MPI_Comm_size(node_comm,&node_ranks);
@@ -347,7 +358,7 @@ static void SetPro_HVNA_GpuRun(double ****HVNA)
   int Mc_AN,j,k;
   int nitems = 0,kslots = 0;
   size_t out_count = 0;
-  int *item_atom,*item_j,*item_koff,*item_kn,*item_tnoC,*item_tnoH;
+  int *item_atom,*item_j,*item_koff,*item_kn,*item_tnoC,*item_tnoH,*out_item;
   size_t *item_out;
   size_t *krowA,*krowB;
   int *krow_halo,*krow_ene;
@@ -381,6 +392,7 @@ static void SetPro_HVNA_GpuRun(double ****HVNA)
   item_tnoC = (int*)SetPro_checked_malloc(sizeof(int)*(size_t)nitems);
   item_tnoH = (int*)SetPro_checked_malloc(sizeof(int)*(size_t)nitems);
   item_out = (size_t*)SetPro_checked_malloc(sizeof(size_t)*(size_t)nitems);
+  out_item = (int*)SetPro_checked_malloc(sizeof(int)*(out_count==0 ? 1 : out_count));
   krowA = (size_t*)SetPro_checked_malloc(sizeof(size_t)*(size_t)(kslots==0 ? 1 : kslots));
   krowB = (size_t*)SetPro_checked_malloc(sizeof(size_t)*(size_t)(kslots==0 ? 1 : kslots));
   krow_halo = (int*)SetPro_checked_malloc(sizeof(int)*(size_t)(kslots==0 ? 1 : kslots));
@@ -404,6 +416,7 @@ static void SetPro_HVNA_GpuRun(double ****HVNA)
       item_tnoC[p] = tnoC;
       item_tnoH[p] = tnoH;
       item_out[p] = opos;
+      for (int idx=0; idx<tnoC*tnoH; idx++) out_item[opos+(size_t)idx] = p;
       opos += (size_t)tnoC*(size_t)tnoH;
 
       for (k=0; k<=FNAN[Gc_AN]; k++){
@@ -452,52 +465,51 @@ static void SetPro_HVNA_GpuRun(double ****HVNA)
 
 #pragma omp target data map(to:item_koff[0:nitems_c], item_kn[0:nitems_c], \
                         item_tnoC[0:nitems_c], item_tnoH[0:nitems_c], \
-                        item_out[0:nitems_c], \
+                        item_out[0:nitems_c], out_item[0:out_c], \
                         krowA[0:kslots_c], krowB[0:kslots_c], \
                         krow_halo[0:kslots_c], krow_ene[0:kslots_c], \
                         halo[0:halo_len], ene[0:ene_len], l2p1[0:num_rvna]) \
                  map(from:out[0:out_c]) \
                  map(to:flat[0:flat_len])
     {
-#pragma omp target teams distribute parallel for
-      for (int pp=0; pp<nitems_c; pp++){
+#pragma omp target teams distribute parallel for thread_limit(256)
+      for (size_t oe=0; oe<out_c; oe++){
+        const int pp = out_item[oe];
         const int tnoC = item_tnoC[pp];
         const int tnoH = item_tnoH[pp];
         const int k_off = item_koff[pp];
         const int k_n = item_kn[pp];
         const size_t out_off = item_out[pp];
-        const int mn = tnoC*tnoH;
+        const int idx = (int)(oe - out_off);
+        const int m = idx/tnoH;
+        const int n = idx - m*tnoH;
+        double nlh = 0.0;
 
-        for (int idx=0; idx<mn; idx++){
-          const int m = idx/tnoH;
-          const int n = idx - m*tnoH;
-          double nlh = 0.0;
+        (void)tnoC;
+        for (int kk=0; kk<k_n; kk++){
+          const float *a = flat + krowA[k_off+kk] + (size_t)m*(size_t)num_proj;
+          const float *b = (krow_halo[k_off+kk]
+                            ? (halo + krowB[k_off+kk])
+                            : (flat + krowB[k_off+kk])) + (size_t)n*(size_t)num_proj;
+          const double *el = ene + krow_ene[k_off+kk];
+          double sum = 0.0;
+          int L = 0;
 
-          for (int kk=0; kk<k_n; kk++){
-            const float *a = flat + krowA[k_off+kk] + (size_t)m*(size_t)num_proj;
-            const float *b = (krow_halo[k_off+kk]
-                              ? (halo + krowB[k_off+kk])
-                              : (flat + krowB[k_off+kk])) + (size_t)n*(size_t)num_proj;
-            const double *el = ene + krow_ene[k_off+kk];
-            double sum = 0.0;
-            int L = 0;
+          for (int L1=0; L1<num_rvna; L1++){
+            const int g1 = l2p1[L1];
+            double tmp0 = 0.0;
 
-            for (int L1=0; L1<num_rvna; L1++){
-              const int g1 = l2p1[L1];
-              double tmp0 = 0.0;
-
-              for (int l3=0; l3<g1; l3++){
-                tmp0 += (double)(a[L]*b[L]);
-                L++;
-              }
-              sum += el[L1]*tmp0;
+            for (int l3=0; l3<g1; l3++){
+              tmp0 += (double)(a[L]*b[L]);
+              L++;
             }
-
-            nlh += sum;
+            sum += el[L1]*tmp0;
           }
 
-          out[out_off + (size_t)idx] = nlh;
+          nlh += sum;
         }
+
+        out[oe] = nlh;
       }
     }
   }
@@ -531,6 +543,7 @@ static void SetPro_HVNA_GpuRun(double ****HVNA)
   free(item_out);
   free(item_tnoH);
   free(item_tnoC);
+  free(out_item);
   free(item_kn);
   free(item_koff);
   free(item_j);
@@ -685,7 +698,7 @@ static int SetPro_DSVNA_GpuBegin(int *VNA_List, int *VNA_List2, int Num_RVNA,
   memset(g,0,sizeof(*g));
 
   if (scf_eigen_lib_flag!=GPUSOLVER) return 0;
-  if (!SetPro_collective_env_flag("OPENMX_SETPRO_GPU",1)) return 0;
+  if (!SetPro_collective_env_flag("OPENMX_SETPRO_GPU",SetPro_gpu_default_enabled())) return 0;
 
   MPI_Comm_split_type(mpi_comm_level1,MPI_COMM_TYPE_SHARED,0,MPI_INFO_NULL,&node_comm);
   MPI_Comm_size(node_comm,&node_ranks);
@@ -1354,7 +1367,7 @@ static int SetPro_VNA23_GpuBegin(void)
   memset(g,0,sizeof(*g));
 
   if (scf_eigen_lib_flag!=GPUSOLVER) return 0;
-  if (!SetPro_collective_env_flag("OPENMX_SETPRO_GPU",1)) return 0;
+  if (!SetPro_collective_env_flag("OPENMX_SETPRO_GPU",SetPro_gpu_default_enabled())) return 0;
 
   MPI_Comm_split_type(mpi_comm_level1,MPI_COMM_TYPE_SHARED,0,MPI_INFO_NULL,&node_comm);
   MPI_Comm_size(node_comm,&node_ranks);

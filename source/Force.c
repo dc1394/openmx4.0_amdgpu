@@ -19,6 +19,8 @@
 #include <stdlib.h>
 #include <stdint.h>
 
+extern int openmx_gpu_is_apu(void);
+
 /* Device-memory compatibility helpers for the OpenACC arenas used by the
    NVIDIA implementation.  The AMD port keeps their explicit device-pointer
    layout and backs it directly with HIP allocations and copies. */
@@ -83,6 +85,19 @@ static int Force_env_flag(const char* name, int default_value)
     }
 
     return atoi(value) != 0;
+}
+
+static int Force_gpu_default_enabled(void)
+{
+    return openmx_gpu_is_apu() ? 0 : 1;
+}
+
+/* OPENMX_FORCE_GPU is the umbrella.  A per-stage variable can still opt an
+   individual kernel back in, but an umbrella value of zero must not leave
+   Force3, Force4B, or Force_HNL running on the device unexpectedly. */
+static int Force_gpu_stage_default(void)
+{
+    return Force_env_flag("OPENMX_FORCE_GPU", Force_gpu_default_enabled());
 }
 
 static int Force_collective_env_flag(const char* name, int default_value,
@@ -892,7 +907,7 @@ static size_t Force3_GpuChunkBudget(void)
     MPI_Comm node_comm = MPI_COMM_NULL;
 
     if (scf_eigen_lib_flag != GPUSOLVER) return 0;
-    if (!Force_collective_env_flag("OPENMX_FORCE3_GPU", 1, mpi_comm_level1)) return 0;
+    if (!Force_collective_env_flag("OPENMX_FORCE3_GPU", Force_gpu_stage_default(), mpi_comm_level1)) return 0;
 
     MPI_Comm_split_type(mpi_comm_level1, MPI_COMM_TYPE_SHARED, 0, MPI_INFO_NULL, &node_comm);
     MPI_Comm_size(node_comm, &node_ranks);
@@ -2177,7 +2192,7 @@ double Force(double***** H0,
     const int force_profile = Force_collective_env_flag(
         "OPENMX_FORCE_PROFILE", 0, mpi_comm_level1);
     const int use_force_openacc = (scf_eigen_lib_flag == GPUSOLVER
-        && Force_collective_env_flag("OPENMX_FORCE_GPU", 1,
+        && Force_collective_env_flag("OPENMX_FORCE_GPU", Force_gpu_default_enabled(),
             mpi_comm_level1));
     const int use_force4_openacc = (use_force_openacc
         && F_VNA_flag == 1
@@ -3551,7 +3566,8 @@ double Force(double***** H0,
 
     if (myid == Host_ID && 0 < level_stdout) {
         printf("  Force calculation #3%s\n",
-            (scf_eigen_lib_flag == GPUSOLVER && Force_env_flag("OPENMX_FORCE3_GPU", 1))
+            (scf_eigen_lib_flag == GPUSOLVER &&
+             Force_env_flag("OPENMX_FORCE3_GPU", Force_gpu_stage_default()))
                 ? " (GPU-accelerated)" : "");
         fflush(stdout);
     }
@@ -3581,7 +3597,7 @@ double Force(double***** H0,
         printf("  Force calculation #4%s\n",
             (ProExpn_VNA == 0 && use_force4_openacc) ? " (GPU reduction)"
             : (ProExpn_VNA == 1 && F_VNA_flag == 1 && scf_eigen_lib_flag == GPUSOLVER &&
-               Force_env_flag("OPENMX_FORCE4B_GPU", 1)) ? " (GPU-accelerated)" : "");
+               Force_env_flag("OPENMX_FORCE4B_GPU", Force_gpu_stage_default())) ? " (GPU-accelerated)" : "");
         fflush(stdout);
     }
 
@@ -3653,7 +3669,7 @@ double Force(double***** H0,
 
     else {
     // comment out June 2nd, 2023 H. Kawai
-#if NVHPC_VERSION >= 250000
+#if !defined(__NVCOMPILER) || NVHPC_VERSION >= 250000
         #pragma omp parallel shared(Dis,time_per_atom,Fx,Fy,Fz,CntOLP,OLP,Cnt_switch,EDM,SpinP_switch,Spe_Total_CNO,natn,FNAN,WhatSpecies,M2G,Matomnum) private(OMPID,Nthrds,Nprocs,Mc_AN,Stime_atom,Etime_atom,Gc_AN,Cwan,h_AN,Gh_AN,Hwan,i,j,dum,dx,dy,dz)
 #endif
         {
@@ -6865,15 +6881,11 @@ void Force_HNL(double***** CDM0, double***** iDM0)
 
             if (!fhnl_gpu) {
 
-            /* get Nthrds0 */
-            // comment out May 20th, 2023 H. Kawai
-            //
-#if NVHPC_VERSION >= 250000
-            #pragma omp parallel shared(Nthrds0)
-#endif
-            {
-                Nthrds0 = omp_get_num_threads();
-            }
+            /* Size the reduction arrays for any team the following parallel
+               region may create.  Sampling a separate team's size is racy
+               and OpenMP does not require two regions to use equal teams. */
+            Nthrds0 = omp_get_max_threads();
+            if (Nthrds0 < 1) Nthrds0 = 1;
 
             /* allocation of arrays */
             dEx_threads = (double*)malloc(sizeof(double) * Nthrds0);
@@ -6913,7 +6925,7 @@ void Force_HNL(double***** CDM0, double***** iDM0)
             }
 
             // comment out April 28th, 2023 H. Kawai
-#if NVHPC_VERSION >= 250000
+#if !defined(__NVCOMPILER) || NVHPC_VERSION >= 250000
             #pragma omp parallel shared(ODNloop,OneD2h_AN,OneD2q_AN,Mc_AN,Gc_AN,dEx_threads,dEy_threads,dEz_threads,CDM0,SpinP_switch,SO_switch,Hub_U_switch,Constraint_NCS_switch,Zeeman_NCS_switch,Zeeman_NCO_switch,DS_NL,RMI1,Spe_Total_CNO,WhatSpecies,F_G2M,natn,FNAN,List_YOUSO,Solver,F_NL_flag,F_U_flag) private(OMPID,Nthrds,Nprocs,Hx,Hy,Hz,i,j,h_AN,Gh_AN,Mh_AN,Hwan,ian,q_AN,Gq_AN,Mq_AN,Qwan,jan,kl,km,Nloop,pref)
 #endif
             {
@@ -7239,7 +7251,7 @@ static int Force4B_GpuBegin(Type_DS_VNA***** DS_VNA)
     g->num_proj = (List_YOUSO[35] + 1) * (List_YOUSO[35] + 1) * List_YOUSO[34];
 
     if (scf_eigen_lib_flag != GPUSOLVER) return 0;
-    if (!Force_collective_env_flag("OPENMX_FORCE4B_GPU", 1, mpi_comm_level1)) return 0;
+    if (!Force_collective_env_flag("OPENMX_FORCE4B_GPU", Force_gpu_stage_default(), mpi_comm_level1)) return 0;
 
     MPI_Comm_split_type(mpi_comm_level1, MPI_COMM_TYPE_SHARED, 0, MPI_INFO_NULL, &node_comm);
     MPI_Comm_size(node_comm, &node_ranks);
@@ -8013,7 +8025,7 @@ static int Force_HNL_GpuBegin(double****** DS_NL)
     memset(g, 0, sizeof(*g));
 
     if (scf_eigen_lib_flag != GPUSOLVER) return 0;
-    if (!Force_collective_env_flag("OPENMX_FORCEHNL_GPU", 1, mpi_comm_level1)) return 0;
+    if (!Force_collective_env_flag("OPENMX_FORCEHNL_GPU", Force_gpu_stage_default(), mpi_comm_level1)) return 0;
     if (F_NL_flag != 1) return 0;
 
     /* only the real scalar-relativistic trace branches are batched */
@@ -10158,7 +10170,7 @@ void Force4B(double***** CDM0)
                     free(weights);
                 }
             } else {
-#if NVHPC_VERSION >= 250000
+#if !defined(__NVCOMPILER) || NVHPC_VERSION >= 250000
                 #pragma omp parallel shared(use_force4b_fused,ODNloop,OneD2h_AN,OneD2q_AN,Mc_AN,Gc_AN,CDM0,SpinP_switch,DS_VNA,RMI1,Spe_Total_CNO,WhatSpecies,F_G2M,natn,FNAN,List_YOUSO,Solver,ActiveHVNA2,ActiveHVNA3) private(HVNAx,HVNAy,HVNAz,i,j,h_AN,Gh_AN,Mh_AN,Hwan,ian,q_AN,Gq_AN,Mq_AN,Qwan,jan,kl,Nloop,pref) reduction(+:dEx,dEy,dEz)
 #endif
                 {

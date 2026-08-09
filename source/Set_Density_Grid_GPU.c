@@ -17,6 +17,8 @@
 #include <stdlib.h>
 #include <string.h>
 
+extern int openmx_gpu_is_apu(void);
+
 _Static_assert(sizeof(uint32_t) == sizeof(unsigned int), "uint32_t must match MPI_UNSIGNED");
 _Static_assert(sizeof(uint16_t) == sizeof(unsigned short), "uint16_t must match MPI_UNSIGNED_SHORT");
 
@@ -123,6 +125,14 @@ static size_t SDG_env_mib(const char *name, size_t fallback_mib)
   if (endp == value || *endp != '\0') return fallback_mib * 1024ULL * 1024ULL;
   if (mib > (unsigned long long)SIZE_MAX / (1024ULL * 1024ULL)) return SIZE_MAX;
   return (size_t)mib * 1024ULL * 1024ULL;
+}
+
+/* The single-owner and per-rank target kernels are effective on discrete
+   GPUs.  On an APU shared by many MPI ranks, the distributed host quadrature
+   avoids target-runtime serialization and is substantially faster. */
+static int SDG_gpu_default_enabled(void)
+{
+  return openmx_gpu_is_apu() ? 0 : 1;
 }
 
 static int SDG_bits_for(unsigned int max_value)
@@ -874,7 +884,7 @@ int Set_Density_Grid_GPU_Service(int Cnt_kind, int Calc_CntOrbital_ON, double **
 
   if (myid == owner) {
     int requested = SDG_env_bool("OPENMX_DENSITY_GRID_GPU",
-                                SDG_env_bool("OPENMX_SETDENSITY_GPU", 1));
+                                SDG_env_bool("OPENMX_SETDENSITY_GPU", SDG_gpu_default_enabled()));
     enabled = requested && scf_eigen_lib_flag == GPUSOLVER && (Solver == 2 || Solver == 3) &&
               Cnt_switch == 0 && (Cnt_kind == 0 || Cnt_kind == 1) &&
               (SpinP_switch == 0 || SpinP_switch == 1 || SpinP_switch == 3);
@@ -1222,7 +1232,8 @@ int Set_Density_Grid_GPU_Local_Prepare(int Cnt_kind, int Calc_CntOrbital_ON)
   }
 
   enabled = (mode != 0) &&
-            SDG_env_bool("OPENMX_DENSITY_GRID_GPU", SDG_env_bool("OPENMX_SETDENSITY_GPU", 1)) &&
+            SDG_env_bool("OPENMX_DENSITY_GRID_GPU",
+                         SDG_env_bool("OPENMX_SETDENSITY_GPU", SDG_gpu_default_enabled())) &&
             scf_eigen_lib_flag == GPUSOLVER && (Solver == 2 || Solver == 3) &&
             Cnt_switch == 0 && (Cnt_kind == 0 || Cnt_kind == 1) &&
             (SpinP_switch == 0 || SpinP_switch == 1 || SpinP_switch == 3) &&

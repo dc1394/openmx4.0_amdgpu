@@ -3709,13 +3709,13 @@ diagonalize1:
 
         /* sum of CDM1 and EDM1 by Allreduce in MPI */
 
-        MPI_Allreduce(CDM1, H1, size_H1, MPI_DOUBLE, MPI_SUM, MPI_CommWD1[myworld1]);
-        for (i = 0; i < size_H1; i++)
-            CDM1[i] = H1[i];
-
-        MPI_Allreduce(EDM1, H1, size_H1, MPI_DOUBLE, MPI_SUM, MPI_CommWD1[myworld1]);
-        for (i = 0; i < size_H1; i++)
-            EDM1[i] = H1[i];
+        /* CDM1 and EDM1 are no longer needed in their rank-local form.  Reduce
+           directly into them so the large matrix-element buffers are not
+           copied through H1 after every SCF. */
+        MPI_Allreduce(MPI_IN_PLACE, CDM1, size_H1, MPI_DOUBLE, MPI_SUM,
+                      MPI_CommWD1[myworld1]);
+        MPI_Allreduce(MPI_IN_PLACE, EDM1, size_H1, MPI_DOUBLE, MPI_SUM,
+                      MPI_CommWD1[myworld1]);
 
         if (measure_time) {
             dtime(&Etime0);

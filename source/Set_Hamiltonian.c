@@ -24,6 +24,8 @@
 #include <string.h>
 #include <time.h>
 
+extern int openmx_gpu_is_apu(void);
+
 #define measure_time 0
 
 void Calc_MatrixElements_dVH_Vxc_VNA(int Cnt_kind);
@@ -233,11 +235,14 @@ static int Set_Hamiltonian_MatrixElements_OpenMP_Enabled(void)
      * The matrix-elements OpenMP path spends too much time in packing and
      * host-device copies for the current cluster workloads.  Keep the kernel
      * available for future tuning, but use the CPU path for this phase.
-     */
+    */
     const char *value = getenv("OPENMX_SETHAM_GPU");
-    return scf_eigen_lib_flag == GPUSOLVER &&
-           gpu_rank_device_usable() &&
-           (value == NULL || atoi(value) != 0);
+    int requested = (value != NULL ? atoi(value) != 0 : !openmx_gpu_is_apu());
+
+    /* Avoid initializing an OpenMP target context merely to choose the host
+       path on an APU. */
+    return scf_eigen_lib_flag == GPUSOLVER && requested &&
+           gpu_rank_device_usable();
 }
 
 static int Set_Hamiltonian_DeviceMemoryOK(size_t required_bytes, const char *where, int myid, int use_device)
@@ -362,18 +367,25 @@ static int Set_Hamiltonian_Base_Use_OpenMP(int SCF_iter, int myid)
 static int Set_Hamiltonian_MatrixElements_Use_OpenMP(int Cnt_kind, int myid)
 {
     size_t required_bytes;
-    int memory_ok;
+    int local_enabled, any_enabled, local_use, memory_ok;
 
-    if (!Set_Hamiltonian_MatrixElements_OpenMP_Enabled()) {
+    local_enabled = Set_Hamiltonian_MatrixElements_OpenMP_Enabled();
+    MPI_Allreduce(&local_enabled, &any_enabled, 1, MPI_INT, MPI_MAX,
+                  mpi_comm_level1);
+    if (!any_enabled) {
         return 0;
     }
 
-    required_bytes = Set_Hamiltonian_OpenMP_Rank_Selected ?
+    /* Every rank must enter Set_Hamiltonian_DeviceMemoryOK because it creates
+       node/device communicators.  A failed local probe or a rank-specific
+       override may still select the host implementation for that rank. */
+    local_use = local_enabled && Set_Hamiltonian_OpenMP_Rank_Selected;
+    required_bytes = local_use ?
         Set_Hamiltonian_MatrixElements_OpenMP_DeviceBytes(Cnt_kind, myid) : 0;
     memory_ok = Set_Hamiltonian_DeviceMemoryOK(required_bytes, "matrix-elements OpenMP path", myid,
-                                               Set_Hamiltonian_OpenMP_Rank_Selected);
+                                               local_use);
 
-    return Set_Hamiltonian_OpenMP_Rank_Selected && memory_ok;
+    return local_use && memory_ok;
 }
 
 static void *Set_Hamiltonian_malloc(size_t bytes, const char *name, int myid)

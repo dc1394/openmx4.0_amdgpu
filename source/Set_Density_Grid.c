@@ -13,6 +13,7 @@
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdint.h>
 #include <time.h>
 #include <math.h>
 #include "openmx_common.h"
@@ -20,6 +21,46 @@
 #include <omp.h>
 
 #define  measure_time   0
+
+static size_t SDG_checked_add(size_t a, size_t b, const char *name, int myid)
+{
+  if (a>SIZE_MAX-b){
+    fprintf(stderr,"Set_Density_Grid: rank %d size overflow for %s\n",myid,name);
+    fflush(stderr);
+    MPI_Abort(mpi_comm_level1,1);
+    abort();
+  }
+  return a+b;
+}
+
+static size_t SDG_checked_mul(size_t a, size_t b, const char *name, int myid)
+{
+  if (a!=0 && SIZE_MAX/a<b){
+    fprintf(stderr,"Set_Density_Grid: rank %d size overflow for %s\n",myid,name);
+    fflush(stderr);
+    MPI_Abort(mpi_comm_level1,1);
+    abort();
+  }
+  return a*b;
+}
+
+static void *SDG_checked_alloc(size_t count, size_t element_size, int clear,
+                               const char *name, int myid)
+{
+  void *p;
+
+  if (count==0) count = 1;
+  (void)SDG_checked_mul(count,element_size,name,myid);
+  p = clear ? calloc(count,element_size) : malloc(count*element_size);
+  if (p==NULL){
+    fprintf(stderr,"Set_Density_Grid: rank %d cannot allocate %s (%zu bytes)\n",
+            myid,name,count*element_size);
+    fflush(stderr);
+    MPI_Abort(mpi_comm_level1,1);
+    abort();
+  }
+  return p;
+}
 
 
 
@@ -33,9 +74,9 @@ double Set_Density_Grid(int Cnt_kind, int Calc_CntOrbital_ON, double *****CDM, d
   int NN_S,NN_R;
   unsigned long long int N2D,n2D,GN; 
   int Max_Size,My_Max;
-  int size_Tmp_Den_Grid;
-  int size_Den_Snd_Grid_A2B;
-  int size_Den_Rcv_Grid_A2B;
+  size_t size_Tmp_Den_Grid;
+  size_t size_Den_Snd_Grid_A2B;
+  size_t size_Den_Rcv_Grid_A2B;
   int h_AN,Gh_AN,Rnh,spin,Nc,GRc,Nh,Nog;
   int Nc_0,Nc_1,Nc_2,Nc_3,Nh_0,Nh_1,Nh_2,Nh_3;
 
@@ -47,8 +88,11 @@ double Set_Density_Grid(int Cnt_kind, int Calc_CntOrbital_ON, double *****CDM, d
   double x,y,z,Cxyz[4];
   double TStime,TEtime;
   double ***Tmp_Den_Grid;
+  double **Tmp_Den_Grid_storage;
   double **Den_Snd_Grid_A2B;
   double **Den_Rcv_Grid_A2B;
+  double *Den_Snd_Grid_A2B_storage;
+  double *Den_Rcv_Grid_A2B_storage;
   double *tmp_array;
   double *tmp_array2;
   double *orbs0,*orbs1;
@@ -91,43 +135,83 @@ double Set_Density_Grid(int Cnt_kind, int Calc_CntOrbital_ON, double *****CDM, d
   /* allocation of arrays */
 
   size_Tmp_Den_Grid = 0;
-  Tmp_Den_Grid = (double***)malloc(sizeof(double**)*(SpinP_switch+1)); 
+  Tmp_Den_Grid = (double***)SDG_checked_alloc((size_t)(SpinP_switch+1),sizeof(double**),0,
+                                               "Tmp_Den_Grid pointers",myid);
+  Tmp_Den_Grid_storage = (double**)SDG_checked_alloc((size_t)(SpinP_switch+1),sizeof(double*),0,
+                                                      "Tmp_Den_Grid storage pointers",myid);
   for (i=0; i<(SpinP_switch+1); i++){
-    Tmp_Den_Grid[i] = (double**)malloc(sizeof(double*)*(Matomnum+1)); 
-    Tmp_Den_Grid[i][0] = (double*)malloc(sizeof(double)*1); 
+    size_t atom_grid_count = 1;
+    size_t atom_grid_offset = 1;
+
     for (Mc_AN=1; Mc_AN<=Matomnum; Mc_AN++){
       Gc_AN = F_M2G[Mc_AN];
-      Tmp_Den_Grid[i][Mc_AN] = (double*)malloc(sizeof(double)*GridN_Atom[Gc_AN]);
-	  
-      /* AITUNE */
-      for (Nc=0; Nc<GridN_Atom[Gc_AN]; Nc++){
-	Tmp_Den_Grid[i][Mc_AN][Nc] = 0.0;
-      }
-      
-      size_Tmp_Den_Grid += GridN_Atom[Gc_AN];
+      atom_grid_count = SDG_checked_add(atom_grid_count,(size_t)GridN_Atom[Gc_AN],
+                                        "Tmp_Den_Grid",myid);
+    }
+    Tmp_Den_Grid[i] = (double**)SDG_checked_alloc((size_t)(Matomnum+1),sizeof(double*),0,
+                                                   "Tmp_Den_Grid atom pointers",myid);
+    Tmp_Den_Grid_storage[i] = (double*)SDG_checked_alloc(atom_grid_count,sizeof(double),1,
+                                                         "Tmp_Den_Grid",myid);
+    Tmp_Den_Grid[i][0] = Tmp_Den_Grid_storage[i];
+    for (Mc_AN=1; Mc_AN<=Matomnum; Mc_AN++){
+      Gc_AN = F_M2G[Mc_AN];
+      Tmp_Den_Grid[i][Mc_AN] = Tmp_Den_Grid_storage[i] + atom_grid_offset;
+      atom_grid_offset += (size_t)GridN_Atom[Gc_AN];
+      size_Tmp_Den_Grid = SDG_checked_add(size_Tmp_Den_Grid,(size_t)GridN_Atom[Gc_AN],
+                                          "Tmp_Den_Grid total",myid);
     }
   }
 
-  size_Den_Snd_Grid_A2B = 0; 
-  Den_Snd_Grid_A2B = (double**)malloc(sizeof(double*)*numprocs);
+  size_Den_Snd_Grid_A2B = 0;
   for (ID=0; ID<numprocs; ID++){
-    Den_Snd_Grid_A2B[ID] = (double*)malloc(sizeof(double)*Num_Snd_Grid_A2B[ID]*(SpinP_switch+1));
-    size_Den_Snd_Grid_A2B += Num_Snd_Grid_A2B[ID]*(SpinP_switch+1);
-  }  
+    size_t count = SDG_checked_mul((size_t)Num_Snd_Grid_A2B[ID],(size_t)(SpinP_switch+1),
+                                   "Den_Snd_Grid_A2B rank count",myid);
+    size_Den_Snd_Grid_A2B = SDG_checked_add(size_Den_Snd_Grid_A2B,count,
+                                            "Den_Snd_Grid_A2B total",myid);
+  }
+  Den_Snd_Grid_A2B = (double**)SDG_checked_alloc((size_t)numprocs,sizeof(double*),0,
+                                                  "Den_Snd_Grid_A2B pointers",myid);
+  Den_Snd_Grid_A2B_storage = (double*)SDG_checked_alloc(size_Den_Snd_Grid_A2B,sizeof(double),0,
+                                                        "Den_Snd_Grid_A2B",myid);
+  {
+    size_t offset = 0;
+    for (ID=0; ID<numprocs; ID++){
+      Den_Snd_Grid_A2B[ID] = Den_Snd_Grid_A2B_storage + offset;
+      offset += (size_t)Num_Snd_Grid_A2B[ID]*(size_t)(SpinP_switch+1);
+    }
+  }
 
-  size_Den_Rcv_Grid_A2B = 0;   
-  Den_Rcv_Grid_A2B = (double**)malloc(sizeof(double*)*numprocs);
+  size_Den_Rcv_Grid_A2B = 0;
   for (ID=0; ID<numprocs; ID++){
-    Den_Rcv_Grid_A2B[ID] = (double*)malloc(sizeof(double)*Num_Rcv_Grid_A2B[ID]*(SpinP_switch+1));
-    size_Den_Rcv_Grid_A2B += Num_Rcv_Grid_A2B[ID]*(SpinP_switch+1);   
+    size_t count = SDG_checked_mul((size_t)Num_Rcv_Grid_A2B[ID],(size_t)(SpinP_switch+1),
+                                   "Den_Rcv_Grid_A2B rank count",myid);
+    size_Den_Rcv_Grid_A2B = SDG_checked_add(size_Den_Rcv_Grid_A2B,count,
+                                            "Den_Rcv_Grid_A2B total",myid);
+  }
+  Den_Rcv_Grid_A2B = (double**)SDG_checked_alloc((size_t)numprocs,sizeof(double*),0,
+                                                  "Den_Rcv_Grid_A2B pointers",myid);
+  Den_Rcv_Grid_A2B_storage = (double*)SDG_checked_alloc(size_Den_Rcv_Grid_A2B,sizeof(double),0,
+                                                        "Den_Rcv_Grid_A2B",myid);
+  {
+    size_t offset = 0;
+    for (ID=0; ID<numprocs; ID++){
+      Den_Rcv_Grid_A2B[ID] = Den_Rcv_Grid_A2B_storage + offset;
+      offset += (size_t)Num_Rcv_Grid_A2B[ID]*(size_t)(SpinP_switch+1);
+    }
   }
 
   /* PrintMemory */
 
   if (firsttime==1){
-    PrintMemory("Set_Density_Grid: AtomDen_Grid",    sizeof(double)*size_Tmp_Den_Grid, NULL);
-    PrintMemory("Set_Density_Grid: Den_Snd_Grid_A2B",sizeof(double)*size_Den_Snd_Grid_A2B, NULL);
-    PrintMemory("Set_Density_Grid: Den_Rcv_Grid_A2B",sizeof(double)*size_Den_Rcv_Grid_A2B, NULL);
+    PrintMemory("Set_Density_Grid: AtomDen_Grid",
+                (long int)SDG_checked_mul(sizeof(double),size_Tmp_Den_Grid,
+                                          "Tmp_Den_Grid bytes",myid), NULL);
+    PrintMemory("Set_Density_Grid: Den_Snd_Grid_A2B",
+                (long int)SDG_checked_mul(sizeof(double),size_Den_Snd_Grid_A2B,
+                                          "Den_Snd_Grid_A2B bytes",myid), NULL);
+    PrintMemory("Set_Density_Grid: Den_Rcv_Grid_A2B",
+                (long int)SDG_checked_mul(sizeof(double),size_Den_Rcv_Grid_A2B,
+                                          "Den_Rcv_Grid_A2B bytes",myid), NULL);
     firsttime = 0;
   }
 
@@ -783,21 +867,16 @@ double Set_Density_Grid(int Cnt_kind, int Calc_CntOrbital_ON, double *****CDM, d
   /* freeing of arrays */
 
   for (i=0; i<(SpinP_switch+1); i++){
-    for (Mc_AN=0; Mc_AN<=Matomnum; Mc_AN++){
-      free(Tmp_Den_Grid[i][Mc_AN]);
-    }
+    free(Tmp_Den_Grid_storage[i]);
     free(Tmp_Den_Grid[i]);
   }
+  free(Tmp_Den_Grid_storage);
   free(Tmp_Den_Grid);
 
-  for (ID=0; ID<numprocs; ID++){
-    free(Den_Snd_Grid_A2B[ID]);
-  }  
+  free(Den_Snd_Grid_A2B_storage);
   free(Den_Snd_Grid_A2B);
 
-  for (ID=0; ID<numprocs; ID++){
-    free(Den_Rcv_Grid_A2B[ID]);
-  }
+  free(Den_Rcv_Grid_A2B_storage);
   free(Den_Rcv_Grid_A2B);
 
   /* elapsed time */
