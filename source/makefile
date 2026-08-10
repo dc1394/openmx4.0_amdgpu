@@ -87,6 +87,11 @@ else
 SDG_CPU_BASELINE_FLAGS ?=
 endif
 
+# Set_Hamiltonian contains separately targeted AVX-512 and AVX2 kernels.
+# Keep every dispatcher, fallback, and unrelated function in this translation
+# unit on the same non-AVX baseline used by Set_Density_Grid.
+SETH_CPU_BASELINE_FLAGS ?= $(SDG_CPU_BASELINE_FLAGS)
+
 # OpenMPI built against the same ROCm as $(ROCM); override MPI_HOME elsewhere.
 # (module load openmpi/5.0.10/rocm7.2.0_amdflang)
 # The Fortran-90 "mpi" module is compiler-specific: the plain rocm7.2.0 build
@@ -697,7 +702,7 @@ Set_CoreHoleMatrix.o: Set_CoreHoleMatrix.c openmx_common.h
 Set_OLP_p.o: Set_OLP_p.c openmx_common.h 
 	$(CC) -c Set_OLP_p.c
 Set_Hamiltonian.o: Set_Hamiltonian.c openmx_common.h set_hip_default_device_from_local_rank.h
-	$(CC) -c Set_Hamiltonian.c
+	$(CC) $(SETH_CPU_BASELINE_FLAGS) -c Set_Hamiltonian.c
 set_hamiltonian_hip.o: set_hamiltonian_hip.cu
 	$(HIPCC) $(HIPCC_GEMMUL8_FLAGS) -c set_hamiltonian_hip.cu -o set_hamiltonian_hip.o
 Set_Vpot.o: Set_Vpot.c openmx_common.h

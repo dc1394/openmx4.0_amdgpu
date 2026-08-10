@@ -1,6 +1,8 @@
 #include <hip/hip_runtime.h>
 #include <stddef.h>
 #include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 
 static double ClusterCol_hip_dense_build_kernel_time = 0.0;
 static double ClusterCol_hip_dm_kernel_time = 0.0;
@@ -334,6 +336,177 @@ __global__ static void BandColDMKernel(int entry_count, int nk, int evec_stride,
     }
 }
 
+typedef struct {
+    int initialized;
+    int device_id;
+    size_t entry_capacity;
+    size_t pair_capacity;
+    size_t state_capacity;
+    int *d_basis0;
+    int *d_basis1;
+    int *d_phase_index;
+    double *d_phase_r;
+    double *d_phase_i;
+    double *d_eigen;
+    double *d_occ_weight;
+    double *d_cdm;
+    double *d_edm;
+} BandColDMDeviceWorkspace;
+
+static BandColDMDeviceWorkspace BandCol_dm_device_workspace = {0};
+static int BandCol_dm_device_atexit_registered = 0;
+
+/* The eigenvector matrix is owned by Band_DFT_Col.  Keep only the small
+   metadata and output arrays here so repeated SCF steps do not serialize on
+   nine hipMalloc/hipFree pairs per k-point owner. */
+static void BandCol_DMDeviceWorkspaceFreeOwned(BandColDMDeviceWorkspace *w)
+{
+    if (w->d_edm        != NULL) (void)hipFree(w->d_edm);
+    if (w->d_cdm        != NULL) (void)hipFree(w->d_cdm);
+    if (w->d_occ_weight != NULL) (void)hipFree(w->d_occ_weight);
+    if (w->d_eigen      != NULL) (void)hipFree(w->d_eigen);
+    if (w->d_phase_i    != NULL) (void)hipFree(w->d_phase_i);
+    if (w->d_phase_r    != NULL) (void)hipFree(w->d_phase_r);
+    if (w->d_phase_index!= NULL) (void)hipFree(w->d_phase_index);
+    if (w->d_basis1     != NULL) (void)hipFree(w->d_basis1);
+    if (w->d_basis0     != NULL) (void)hipFree(w->d_basis0);
+
+    memset(w,0,sizeof(*w));
+    w->device_id = -1;
+}
+
+static int BandCol_DMDeviceWorkspaceRelease(int report_errors)
+{
+    BandColDMDeviceWorkspace *w = &BandCol_dm_device_workspace;
+    int saved_device = -1;
+    int switched_device = 0;
+    int release_failed = 0;
+    hipError_t err;
+
+    if (!w->initialized) return 0;
+
+    err = hipGetDevice(&saved_device);
+    if (err!=hipSuccess){
+        if (report_errors) BandColReportHipError("hipGetDevice(DM workspace release)",err);
+        return 1;
+    }
+    if (saved_device!=w->device_id){
+        err = hipSetDevice(w->device_id);
+        if (err!=hipSuccess){
+            if (report_errors) BandColReportHipError("hipSetDevice(DM workspace owner)",err);
+            return 1;
+        }
+        switched_device = 1;
+    }
+
+    err = hipDeviceSynchronize();
+    if (err!=hipSuccess){
+        if (report_errors){
+            BandColReportHipError("hipDeviceSynchronize(DM workspace release)",err);
+        }
+        release_failed = 1;
+    }
+    BandCol_DMDeviceWorkspaceFreeOwned(w);
+
+    if (switched_device){
+        err = hipSetDevice(saved_device);
+        if (err!=hipSuccess){
+            if (report_errors) BandColReportHipError("hipSetDevice(DM workspace restore)",err);
+            return 1;
+        }
+    }
+    return release_failed;
+}
+
+static void BandCol_DMDeviceWorkspaceProcessCleanup(void)
+{
+    BandColDMDeviceWorkspace *w = &BandCol_dm_device_workspace;
+    int saved_device = -1;
+
+    /* MPI may already be finalized when atexit handlers run. */
+    if (!w->initialized) return;
+    (void)hipGetDevice(&saved_device);
+    if (hipSetDevice(w->device_id)==hipSuccess){
+        (void)hipDeviceSynchronize();
+        BandCol_DMDeviceWorkspaceFreeOwned(w);
+    }
+    if (0<=saved_device) (void)hipSetDevice(saved_device);
+}
+
+static int BandCol_DMDeviceWorkspaceRegisterCleanup(void)
+{
+    if (!BandCol_dm_device_atexit_registered){
+        if (atexit(BandCol_DMDeviceWorkspaceProcessCleanup)!=0){
+            fprintf(stderr,"<Band> Failed to register HIP collinear DM workspace cleanup.\n");
+            fflush(stderr);
+            return 1;
+        }
+        BandCol_dm_device_atexit_registered = 1;
+    }
+    return 0;
+}
+
+static int BandCol_DMDeviceWorkspaceEnsure(int device_id, size_t entry_count,
+                                           size_t pair_count, size_t state_count)
+{
+    BandColDMDeviceWorkspace *w = &BandCol_dm_device_workspace;
+    BandColDMDeviceWorkspace replacement;
+    hipError_t err;
+
+    if (BandCol_DMDeviceWorkspaceRegisterCleanup()!=0) return 1;
+
+    if (w->initialized && w->device_id!=device_id){
+        if (BandCol_DMDeviceWorkspaceRelease(1)!=0) return 1;
+    }
+    if (w->initialized && entry_count<=w->entry_capacity &&
+        pair_count<=w->pair_capacity && state_count<=w->state_capacity){
+        return 0;
+    }
+
+    memset(&replacement,0,sizeof(replacement));
+    replacement.device_id = device_id;
+    replacement.entry_capacity = w->entry_capacity<entry_count ? entry_count : w->entry_capacity;
+    replacement.pair_capacity = w->pair_capacity<pair_count ? pair_count : w->pair_capacity;
+    replacement.state_capacity = w->state_capacity<state_count ? state_count : w->state_capacity;
+
+    err = hipMalloc((void **)&replacement.d_basis0,
+                    sizeof(int)*replacement.entry_capacity);
+    if (BandColReportHipError("hipMalloc(cached DM basis0)",err)) goto allocation_failed;
+    err = hipMalloc((void **)&replacement.d_basis1,
+                    sizeof(int)*replacement.entry_capacity);
+    if (BandColReportHipError("hipMalloc(cached DM basis1)",err)) goto allocation_failed;
+    err = hipMalloc((void **)&replacement.d_phase_index,
+                    sizeof(int)*replacement.entry_capacity);
+    if (BandColReportHipError("hipMalloc(cached DM phase_index)",err)) goto allocation_failed;
+    err = hipMalloc((void **)&replacement.d_phase_r,
+                    sizeof(double)*replacement.pair_capacity);
+    if (BandColReportHipError("hipMalloc(cached DM phase_r)",err)) goto allocation_failed;
+    err = hipMalloc((void **)&replacement.d_phase_i,
+                    sizeof(double)*replacement.pair_capacity);
+    if (BandColReportHipError("hipMalloc(cached DM phase_i)",err)) goto allocation_failed;
+    err = hipMalloc((void **)&replacement.d_eigen,
+                    sizeof(double)*replacement.state_capacity);
+    if (BandColReportHipError("hipMalloc(cached DM eigen)",err)) goto allocation_failed;
+    err = hipMalloc((void **)&replacement.d_occ_weight,
+                    sizeof(double)*replacement.state_capacity);
+    if (BandColReportHipError("hipMalloc(cached DM occ)",err)) goto allocation_failed;
+    err = hipMalloc((void **)&replacement.d_cdm,
+                    sizeof(double)*replacement.entry_capacity);
+    if (BandColReportHipError("hipMalloc(cached DM cdm)",err)) goto allocation_failed;
+    err = hipMalloc((void **)&replacement.d_edm,
+                    sizeof(double)*replacement.entry_capacity);
+    if (BandColReportHipError("hipMalloc(cached DM edm)",err)) goto allocation_failed;
+    replacement.initialized = 1;
+
+    if (w->initialized) BandCol_DMDeviceWorkspaceFreeOwned(w);
+    *w = replacement;
+    return 0;
+
+allocation_failed:
+    BandCol_DMDeviceWorkspaceFreeOwned(&replacement);
+    return 1;
+}
+
 extern "C" int BandCol_AccumulateDenseTransposedDM_HIP(int entry_count, int pair_count, int nk, int evec_stride,
                                                        const int *basis0, const int *basis1, const int *phase_index,
                                                        const double *phase_r, const double *phase_i,
@@ -348,15 +521,16 @@ extern "C" int BandCol_AccumulateDenseTransposedDM_HIP(int entry_count, int pair
     int entries_per_block;
     dim3 block(block_size);
     dim3 grid;
-    int *d_basis0 = NULL;
-    int *d_basis1 = NULL;
-    int *d_phase_index = NULL;
-    double *d_phase_r = NULL;
-    double *d_phase_i = NULL;
-    double *d_eigen = NULL;
-    double *d_occ_weight = NULL;
-    double *d_cdm = NULL;
-    double *d_edm = NULL;
+    BandColDMDeviceWorkspace *device_ws = NULL;
+    int *d_basis0;
+    int *d_basis1;
+    int *d_phase_index;
+    double *d_phase_r;
+    double *d_phase_i;
+    double *d_eigen;
+    double *d_occ_weight;
+    double *d_cdm;
+    double *d_edm;
     hipError_t err;
     size_t entry_int_bytes = sizeof(int) * (size_t)entry_count;
     size_t pair_bytes = sizeof(double) * (size_t)pair_count;
@@ -386,24 +560,20 @@ extern "C" int BandCol_AccumulateDenseTransposedDM_HIP(int entry_count, int pair
     }
     grid = dim3((unsigned int)((entry_count + entries_per_block - 1) / entries_per_block));
 
-    err = hipMalloc((void **)&d_basis0, entry_int_bytes);
-    if (BandColReportHipError("hipMalloc(DM basis0)", err)) goto cleanup_failed;
-    err = hipMalloc((void **)&d_basis1, entry_int_bytes);
-    if (BandColReportHipError("hipMalloc(DM basis1)", err)) goto cleanup_failed;
-    err = hipMalloc((void **)&d_phase_index, entry_int_bytes);
-    if (BandColReportHipError("hipMalloc(DM phase_index)", err)) goto cleanup_failed;
-    err = hipMalloc((void **)&d_phase_r, pair_bytes);
-    if (BandColReportHipError("hipMalloc(DM phase_r)", err)) goto cleanup_failed;
-    err = hipMalloc((void **)&d_phase_i, pair_bytes);
-    if (BandColReportHipError("hipMalloc(DM phase_i)", err)) goto cleanup_failed;
-    err = hipMalloc((void **)&d_eigen, state_bytes);
-    if (BandColReportHipError("hipMalloc(DM eigen)", err)) goto cleanup_failed;
-    err = hipMalloc((void **)&d_occ_weight, state_bytes);
-    if (BandColReportHipError("hipMalloc(DM occ)", err)) goto cleanup_failed;
-    err = hipMalloc((void **)&d_cdm, dm_bytes);
-    if (BandColReportHipError("hipMalloc(DM cdm)", err)) goto cleanup_failed;
-    err = hipMalloc((void **)&d_edm, dm_bytes);
-    if (BandColReportHipError("hipMalloc(DM edm)", err)) goto cleanup_failed;
+    if (BandCol_DMDeviceWorkspaceEnsure(device_id,(size_t)entry_count,
+                                        (size_t)pair_count,(size_t)nk)!=0){
+        goto cleanup_failed;
+    }
+    device_ws = &BandCol_dm_device_workspace;
+    d_basis0 = device_ws->d_basis0;
+    d_basis1 = device_ws->d_basis1;
+    d_phase_index = device_ws->d_phase_index;
+    d_phase_r = device_ws->d_phase_r;
+    d_phase_i = device_ws->d_phase_i;
+    d_eigen = device_ws->d_eigen;
+    d_occ_weight = device_ws->d_occ_weight;
+    d_cdm = device_ws->d_cdm;
+    d_edm = device_ws->d_edm;
 
     err = hipMemcpy(d_basis0, basis0, entry_int_bytes, hipMemcpyHostToDevice);
     if (BandColReportHipError("hipMemcpy(DM basis0)", err)) goto cleanup_failed;
@@ -443,15 +613,7 @@ cleanup_failed:
     failed = 1;
 
 cleanup:
-    if (d_edm != NULL) hipFree(d_edm);
-    if (d_cdm != NULL) hipFree(d_cdm);
-    if (d_occ_weight != NULL) hipFree(d_occ_weight);
-    if (d_eigen != NULL) hipFree(d_eigen);
-    if (d_phase_i != NULL) hipFree(d_phase_i);
-    if (d_phase_r != NULL) hipFree(d_phase_r);
-    if (d_phase_index != NULL) hipFree(d_phase_index);
-    if (d_basis1 != NULL) hipFree(d_basis1);
-    if (d_basis0 != NULL) hipFree(d_basis0);
+    if (failed && device_ws!=NULL) (void)BandCol_DMDeviceWorkspaceRelease(1);
     return failed;
 }
 
