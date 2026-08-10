@@ -10,6 +10,8 @@
 #include <mutex>
 #include <strings.h>
 
+extern "C" int MYID_MPI_COMM_WORLD;
+
 namespace {
 
 std::once_flag g_magma_once;
@@ -261,7 +263,7 @@ extern "C" int openmx_gpu_is_apu(void)
     }
     cached = (prop.integrated != 0) ? 1 : 0;
 
-    if (std::getenv("OPENMX_GPU_VERBOSE") != nullptr) {
+    if (std::getenv("OPENMX_GPU_VERBOSE") != nullptr && MYID_MPI_COMM_WORLD == 0) {
         std::fprintf(stderr, "openmx: GPU '%s' integrated(APU)=%d\n", prop.gcnArchName, cached);
         std::fflush(stderr);
     }

@@ -5,6 +5,7 @@
 #include <cstdlib>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <mutex>
 #include <unordered_map>
 
@@ -307,14 +308,21 @@ void log_workspace_fallback_once(const WorkspaceReport &report, const char *targ
         return;
     }
 
-    fprintf(stderr,
-            "openmx_gemmul8%sgemm: GEMMul8 workspace fallback by %s; "
-            "need %.3f MiB, CUDA free %.3f MiB / total %.3f MiB, "
-            "reserve %.3f MiB, max-workspace %u%% shared by %u rank(s). Falling back to %s.\n",
-            is_complex ? "Z" : "D", report.reason, (double)report.required_bytes / (1024.0 * 1024.0),
-            (double)report.free_bytes / (1024.0 * 1024.0), (double)report.total_bytes / (1024.0 * 1024.0),
-            (double)report.reserve_bytes / (1024.0 * 1024.0), report.max_workspace_percent, report.ranks_per_gpu,
-            target);
+    if (std::strcmp(report.reason, "environment disable") == 0) {
+        fprintf(stderr,
+                "openmx_gemmul8%sgemm: GEMMul8 disabled by environment; using %s.\n",
+                is_complex ? "Z" : "D", target);
+    }
+    else {
+        fprintf(stderr,
+                "openmx_gemmul8%sgemm: GEMMul8 workspace fallback by %s; "
+                "need %.3f MiB, HIP device free %.3f MiB / total %.3f MiB, "
+                "reserve %.3f MiB, max-workspace %u%% shared by %u rank(s). Falling back to %s.\n",
+                is_complex ? "Z" : "D", report.reason, (double)report.required_bytes / (1024.0 * 1024.0),
+                (double)report.free_bytes / (1024.0 * 1024.0), (double)report.total_bytes / (1024.0 * 1024.0),
+                (double)report.reserve_bytes / (1024.0 * 1024.0), report.max_workspace_percent,
+                report.ranks_per_gpu, target);
+    }
     fflush(stderr);
     warned = true;
 }
@@ -349,7 +357,7 @@ extern "C" hipblasStatus_t openmx_gemmul8Dgemm(hipblasHandle_t handle,
 
     if (gemmul8_disabled("OPENMX_GEMMUL8_DISABLE_D", "GEMMUL8_DISABLE_D")) {
         report.reason = "environment disable";
-        log_workspace_fallback_once<false>(report, "native cuBLAS");
+        log_workspace_fallback_once<false>(report, "native hipBLAS");
         return hipblasDgemm(handle, gemmul8_transa, gemmul8_transb, m, n, k, alpha, A, lda, B, ldb, beta, C, ldc);
     }
 
@@ -357,7 +365,7 @@ extern "C" hipblasStatus_t openmx_gemmul8Dgemm(hipblasHandle_t handle,
         ensure_workspace<false>(handle, static_cast<size_t>(m), static_cast<size_t>(n), static_cast<size_t>(k),
                                 num_moduli, &work, &report);
     if (status == HIPBLAS_STATUS_ALLOC_FAILED) {
-        log_workspace_fallback_once<false>(report, "native cuBLAS");
+        log_workspace_fallback_once<false>(report, "native hipBLAS");
         return hipblasDgemm(handle, gemmul8_transa, gemmul8_transb, m, n, k, alpha, A, lda, B, ldb, beta, C, ldc);
     }
     if (status != HIPBLAS_STATUS_SUCCESS) {
@@ -439,7 +447,7 @@ extern "C" hipblasStatus_t openmx_gemmul8Zgemm(hipblasHandle_t handle,
 
     if (gemmul8_disabled("OPENMX_GEMMUL8_DISABLE_Z", "GEMMUL8_DISABLE_Z")) {
         report.reason = "environment disable";
-        log_workspace_fallback_once<true>(report, "native cuBLAS");
+        log_workspace_fallback_once<true>(report, "native hipBLAS");
         return hipblasZgemm(handle, transa, transb, m, n, k, alpha, A, lda, B, ldb, beta, C, ldc);
     }
 
@@ -450,7 +458,7 @@ extern "C" hipblasStatus_t openmx_gemmul8Zgemm(hipblasHandle_t handle,
         /* GPU memory is too tight for the GEMMul8 workspace: fall back to native
            hipBLAS (hipblasZgemm), which needs no extra workspace. If even that fails,
            its status propagates so the caller can fall back to CPU BLAS. */
-        log_workspace_fallback_once<true>(report, "native cuBLAS (hipBLAS)");
+        log_workspace_fallback_once<true>(report, "native hipBLAS");
         return hipblasZgemm(handle, transa, transb, m, n, k, alpha, A, lda, B, ldb, beta, C, ldc);
     }
     if (status != HIPBLAS_STATUS_SUCCESS) {
