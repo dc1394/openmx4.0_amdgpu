@@ -140,25 +140,22 @@ static void Set_Hamiltonian_ME_Disassociate(void *host)
     }
 }
 
+int Band_DFT_NonCol_GpuSwitchNum(void);
+
+/* mirrors the noncollinear band path's own GPU/CPU decision so the demote
+   choice below tracks the solver that actually runs */
 static int Set_Hamiltonian_NonColGpuEigensolverActive(void)
 {
-    const char *threshold_env;
-    int threshold = GPU_CPU_SWITCH_NUM;
     int basis_count = 0;
 
     if (scf_eigen_lib_flag != GPUSOLVER || Solver != 3 || SpinP_switch != 3) {
         return 0;
     }
 
-    threshold_env = getenv("OPENMX_BAND_GPU_THRESHOLD");
-    if (threshold_env != NULL && threshold_env[0] != '\0') {
-        int requested = atoi(threshold_env);
-        if (0 < requested) threshold = requested;
-    }
     for (int GA_AN = 1; GA_AN <= atomnum; GA_AN++) {
         basis_count += Spe_Total_CNO[WhatSpecies[GA_AN]];
     }
-    return threshold <= 2*basis_count;
+    return Band_DFT_NonCol_GpuSwitchNum() <= 2*basis_count;
 }
 
 static int Set_Hamiltonian_ME_KeepDeviceResident(void)

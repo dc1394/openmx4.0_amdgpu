@@ -148,7 +148,7 @@ MPI_FORTRAN_LIBS := \
   $(MPI_LIBDIR)/libmpi_mpifh.so \
   $(MPI_LIBDIR)/libmpi.so
 
-LIB= $(RPATHS) $(FFTW_LIBS) $(MATH_GROUP) $(MPI_FORTRAN_LIBS) $(ROCM_GPU_LIBS) $(FLANG_RTL_LIBS) -lstdc++ -lpthread -lm -ldl
+LIB= $(RPATHS) $(FFTW_LIBS) $(GPUSOLVER2_LIBS) $(MATH_GROUP) $(MPI_FORTRAN_LIBS) $(ROCM_GPU_LIBS) $(FLANG_RTL_LIBS) -lstdc++ -lpthread -lm -ldl
 
 GEMMUL8_REPO_URL ?= https://github.com/RIKEN-RCCS/GEMMul8.git
 GEMMUL8_REPO_DIR ?= third_party/GEMMul8
@@ -172,7 +172,43 @@ MAGMA_STAMP ?= $(MAGMA_DIR)/.openmx-magma-$(MAGMA_VERSION).stamp
 MAGMA_EXTRA_GFXS ?= 1200
 HIPCC_MAGMA_FLAGS = $(HIPCC_GEMMUL8_FLAGS) -I$(MAGMA_DIR)/include -I$(MAGMA_DIR)/control
 
-CFLAGS  = -g 
+# ============================================================================
+# gpusolver2 (scf.eigen.lib=gpusolver2): distributed multi-GPU cluster
+# diagonalization via ELPA 2026.02 with AMD GPU kernels (eigensolver) and
+# COSMA (pdgemm).  Both are built from the release archives bundled in
+# third_party/dist by third_party/build_gpusolver2_stack.sh.
+# ============================================================================
+GPUSOLVER2_DIST      ?= $(CURDIR)/third_party/dist
+GPUSOLVER2_BUILD     ?= $(CURDIR)/build/gpusolver2
+GPUSOLVER2_PREFIX    ?= $(CURDIR)/third_party/gpusolver2-install
+GPUSOLVER2_HOST_CC   ?= gcc
+GPUSOLVER2_HOST_CXX  ?= g++
+GPUSOLVER2_HIPCC     ?= $(HIPCC)
+GPUSOLVER2_GPU_ARCH  ?= $(ARCH)
+GPUSOLVER2_MPI_BIN   ?= $(MPI_HOME)/bin
+GPUSOLVER2_MPI_LIBDIR ?= $(MPI_LIBDIR)
+GPUSOLVER2_ROCM      ?= $(ROCM)
+GPUSOLVER2_AOCL_LIB  ?= $(AOCL_LIB)
+GPUSOLVER2_AOCL_INC  ?= $(AOCL_INC)
+GPUSOLVER2_AOCC_LIB  ?= $(AOCC_LIB)
+GPUSOLVER2_SCALAPACK_SO ?= $(AOCL_LIB)/libscalapack.so
+GPUSOLVER2_CMAKE     ?=
+GPUSOLVER2_JOBS      ?= $(shell nproc 2>/dev/null || echo 8)
+GPUSOLVER2_ELPA_VER  ?= 2026.02.002
+GPUSOLVER2_ELPA_INCLUDE ?= $(GPUSOLVER2_PREFIX)/include/elpa-$(GPUSOLVER2_ELPA_VER)
+GPUSOLVER2_STAMP     = $(GPUSOLVER2_BUILD)/stamp/02_cosma.done
+
+GPUSOLVER2_LIBS = $(GPUSOLVER2_PREFIX)/lib/elpa_isolated.o \
+ -Wl,--start-group \
+ $(GPUSOLVER2_PREFIX)/lib/libcosma_prefixed_pxgemm.a \
+ $(GPUSOLVER2_PREFIX)/lib/libcosma.a \
+ $(GPUSOLVER2_PREFIX)/lib/libcosta_scalapack.a \
+ $(GPUSOLVER2_PREFIX)/lib/libcosta_prefixed_scalapack.a \
+ $(GPUSOLVER2_PREFIX)/lib/libcosta.a \
+ $(GPUSOLVER2_PREFIX)/lib/libTiled-MM.a \
+ -Wl,--end-group
+
+CFLAGS  = -g
 CPPFLAGS =
 
 OBJS    = openmx.o openmx_common.o Input_std.o Inputtools.o init.o LU_inverse.o ReLU_inverse.o \
@@ -199,7 +235,7 @@ OBJS    = openmx.o openmx_common.o Input_std.o Inputtools.o init.o LU_inverse.o 
           Get_Cnt_dOrbitals.o Gaunt.o Find_CGrids.o MD_pac.o \
           RestartFileDFT.o Output_CompTime.o Merge_LogFile.o Make_FracCoord.o \
           Make_InputFile_with_FinalCoord.o Output_Energy_Decomposition.o \
-          Divide_Conquer.o Divide_Conquer_LNO.o my_hipblasDgemm.o my_hipblasZgemm.o gemmul8_bridge.o magma_openmx.o Krylov.o \
+          Divide_Conquer.o Divide_Conquer_LNO.o my_hipblasDgemm.o my_hipblasZgemm.o gemmul8_bridge.o elpa_cosma_bridge.o magma_openmx.o Krylov.o \
           Divide_Conquer_Dosout.o EGAC_DFT.o LNO.o Calc_LNAO.o Calc_LNBO.o \
           Eigen_lapack.o gpusolver_Syevd.o gpusolver_Syevdx.o set_hip_default_device_from_local_rank.o set_openmp_device_from_local_rank.o Eigen_lapack2.o Eigen_lapack3.o EigenBand_lapack.o \
           Eigen_PReHH.o BroadCast_ReMatrix.o \
@@ -281,7 +317,7 @@ UTIL 	= DosMain cohp jx analysis_example esp polB calB Z2FH bandgnu13 bin2txt cu
 # FFTW3
 #
 
-.PHONY: fftw3 fftw3-clean gemmul8-clean magma-clean clean
+.PHONY: fftw3 fftw3-clean gemmul8-clean magma-clean gpusolver2-stack gpusolver2-clean clean
 
 fftw3: $(FFTW3_LIB)
 
@@ -733,6 +769,28 @@ my_hipblasZgemm.o: my_hipblasZgemm.c openmx_common.h
 	$(CC) -c my_hipblasZgemm.c
 gemmul8_bridge.o: gemmul8_bridge.cu openmx_common.h $(GEMMUL8_DIR)/include/gemmul8.hpp $(GEMMUL8_LIB)
 	$(HIPCC) $(HIPCC_GEMMUL8_FLAGS) -c gemmul8_bridge.cu -o gemmul8_bridge.o
+
+gpusolver2-stack: $(GPUSOLVER2_STAMP)
+
+$(GPUSOLVER2_STAMP): third_party/build_gpusolver2_stack.sh
+	GPUSOLVER2_DIST="$(GPUSOLVER2_DIST)" GPUSOLVER2_BUILD="$(GPUSOLVER2_BUILD)" \
+	GPUSOLVER2_PREFIX="$(GPUSOLVER2_PREFIX)" \
+	GPUSOLVER2_HOST_CC="$(GPUSOLVER2_HOST_CC)" GPUSOLVER2_HOST_CXX="$(GPUSOLVER2_HOST_CXX)" \
+	GPUSOLVER2_HIPCC="$(GPUSOLVER2_HIPCC)" GPUSOLVER2_GPU_ARCH="$(GPUSOLVER2_GPU_ARCH)" \
+	GPUSOLVER2_MPI_BIN="$(GPUSOLVER2_MPI_BIN)" GPUSOLVER2_MPI_LIBDIR="$(GPUSOLVER2_MPI_LIBDIR)" \
+	GPUSOLVER2_ROCM="$(GPUSOLVER2_ROCM)" \
+	GPUSOLVER2_AOCL_LIB="$(GPUSOLVER2_AOCL_LIB)" GPUSOLVER2_AOCL_INC="$(GPUSOLVER2_AOCL_INC)" \
+	GPUSOLVER2_AOCC_LIB="$(GPUSOLVER2_AOCC_LIB)" \
+	GPUSOLVER2_SCALAPACK_SO="$(GPUSOLVER2_SCALAPACK_SO)" \
+	GPUSOLVER2_ELPA_VER="$(GPUSOLVER2_ELPA_VER)" \
+	GPUSOLVER2_CMAKE="$(GPUSOLVER2_CMAKE)" GPUSOLVER2_JOBS="$(GPUSOLVER2_JOBS)" \
+	sh third_party/build_gpusolver2_stack.sh
+
+gpusolver2-clean:
+	rm -rf "$(GPUSOLVER2_BUILD)" "$(GPUSOLVER2_PREFIX)"
+
+elpa_cosma_bridge.o: elpa_cosma_bridge.c elpa_cosma_bridge.h $(GPUSOLVER2_STAMP)
+	$(CC_NOACC_O3) -I$(GPUSOLVER2_ELPA_INCLUDE) -c elpa_cosma_bridge.c
 $(GEMMUL8_DIR)/Makefile:
 	mkdir -p $(GEMMUL8_REPO_DIR)
 	cd $(GEMMUL8_REPO_DIR) && \

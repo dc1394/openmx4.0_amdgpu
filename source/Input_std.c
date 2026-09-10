@@ -774,21 +774,51 @@ void Input_std(char *file)
   i_vec[0]=2;        i_vec[1]=0;        i_vec[2]=1;        i_vec[3]=3;        
   input_string2int("scf.lapack.dste", &dste_flag, 4, s_vec,i_vec);
 
-  /* "cusolver" is a deprecated alias of "gpusolver"; it is mapped to a
+  /* default=gpusolver; input_string2int() returns i_vec[0] when the keyword
+     is absent, so the GPU paths are enabled unless the input file selects a
+     CPU eigensolver.  A run that finds no usable GPU demotes itself to
+     ELPA2 in DFT.c, so this default is also safe on CPU-only machines.
+     "cusolver" is a deprecated alias of "gpusolver"; it is mapped to a
      negative sentinel so that the deprecation warning can be issued below. */
-  s_vec[0]="elpa2"; s_vec[1]="lapack"; s_vec[2]="elpa1";    s_vec[3]="gpusolver"; s_vec[4]="cusolver";
-  i_vec[0]=ELPA2;   i_vec[1]=0;        i_vec[2]=ELPA1;       i_vec[3]=GPUSOLVER;   i_vec[4]=-GPUSOLVER;
-  input_string2int("scf.eigen.lib", &scf_eigen_lib_flag, 5, s_vec,i_vec);
+  s_vec[0]="gpusolver"; s_vec[1]="lapack"; s_vec[2]="elpa1"; s_vec[3]="elpa2"; s_vec[4]="cusolver";
+  i_vec[0]=GPUSOLVER;   i_vec[1]=0;        i_vec[2]=ELPA1;   i_vec[3]=ELPA2;   i_vec[4]=-GPUSOLVER;
+  s_vec[5]="gpusolver2";
+  i_vec[5]=GPUSOLVER2;
+  input_string2int("scf.eigen.lib", &scf_eigen_lib_flag, 6, s_vec,i_vec);
   if (scf_eigen_lib_flag==-GPUSOLVER){
     if (myid==Host_ID){
       printf("Warning: scf.eigen.lib=cusolver is deprecated; use scf.eigen.lib=gpusolver instead.\n");
     }
     scf_eigen_lib_flag = GPUSOLVER;
   }
+
+  /* gpusolver2 = gpusolver + distributed multi-GPU cluster diagonalization
+     (ELPA GPU kernels + COSMA).  Outside the mainline cluster solvers
+     everything must behave exactly like gpusolver, so the flag is folded to
+     GPUSOLVER here and the request is remembered in gpusolver2_flag. */
+  gpusolver2_flag = 0;
+  if (scf_eigen_lib_flag==GPUSOLVER2){
+    gpusolver2_flag = 1;
+    scf_eigen_lib_flag = GPUSOLVER;
+  }
+
   scf_eigen_lib_flag_input = scf_eigen_lib_flag;
 
   /* use GPU? (added by H.Kawai, February 2024) */
   input_int("scf.Gpu.Num", &SCF_Gpu_Num, 30);
+
+  /* GEMMul8 on/off for the GPU dense-GEMM bridge, so its contribution can
+     be isolated: off routes every openmx_gemmul8{D,Z}gemm call to plain
+     hipBLAS FP64 GEMM.  Absent keyword = on (the production default). */
+  {
+    int gemmul8_enable;
+
+    input_logical("scf.gemmul8.enable", &gemmul8_enable, 1);
+    openmx_gemmul8SetEnabled(gemmul8_enable);
+    if (gemmul8_enable==0 && myid==Host_ID){
+      printf("<Input_std> scf.gemmul8.enable=off: GPU dense GEMMs use plain hipBLAS instead of GEMMul8.\n");
+    }
+  }
 
   if (Solver==1){
     if (myid==Host_ID){
@@ -1146,6 +1176,18 @@ void Input_std(char *file)
     if (myid==Host_ID){
     printf("When only the gamma point is considered, the eigenvalue solver is changed to 'Cluster' with the periodic boundary condition.\n");fflush(stdout);
     }
+  }
+
+  /* scf.eigen.lib=gpusolver2 supports only the mainline collinear and
+     non-collinear cluster calculations */
+  if (gpusolver2_flag==1 && Solver!=2){
+    if (myid==Host_ID){
+      printf("scf.eigen.lib=gpusolver2 supports only scf.EigenvalueSolver=cluster\n");
+      printf("(collinear or non-collinear).  Use gpusolver or elpa for other solvers.\n");
+      printf("Check your input file.\n\n");
+    }
+    MPI_Finalize();
+    exit(0);
   }
 
   input_double("scf.ElectronicTemperature",&E_Temp,(double)300.0);

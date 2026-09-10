@@ -24,6 +24,7 @@
 #include "flpq_dm.h"
 #include "set_hip_default_device_from_local_rank.h"
 #include "set_openmp_device_from_local_rank.h"
+#include "elpa_cosma_bridge.h"
 #include <omp.h>
 #include <omp.h>
 
@@ -31,10 +32,15 @@
 int TRAN_SCF_Iter_Band;
 
 static int DFT_GPU_BasisCount(void);
+static int DFT_GPU_DenseSwitchNum(void);
 static int DFT_SetOLPKinUseGPU(void);
 static int DFT_SetProExpnVNAUseGPU(void);
 double Cluster_DFT_NonCol_ScatterGpuSolverCachedEVec(int n2, int *is2, int *ie2, dcomplex *EVec1);
 extern int BandNonCol_HamiltonianUseHipSolver(void);
+int Band_DFT_Col_GpuSwitchNum(void);
+int Band_DFT_NonCol_GpuSwitchNum(void);
+int Cluster_DFT_Col_GpuSwitchNum(void);
+int Cluster_DFT_NonCol_GpuSwitchNum(void);
 
 static int DFT_SetOLPKinUseGPU(void)
 {
@@ -46,18 +52,22 @@ static int DFT_SetProExpnVNAUseGPU(void)
     return 0;
 }
 
-static int DFT_GPU_GlobalThreshold(void)
+/* effective GPU/CPU crossover of the global dense eigensolver paths; each
+   band/cluster path has its own default and OPENMX_*_GPU_SWITCH_NUM knob
+   (see the *_GpuSwitchNum helpers in the solver files) */
+static int DFT_GPU_DenseSwitchNum(void)
 {
-    const char *env=getenv("OPENMX_BAND_GPU_THRESHOLD");
-    int threshold=GPU_CPU_SWITCH_NUM;
-    if (env!=NULL && env[0]!='\0') { int v=atoi(env); if (0<v) threshold=v; }
-    return threshold;
+    if (Solver==3) return (SpinP_switch==3) ? Band_DFT_NonCol_GpuSwitchNum()
+                                            : Band_DFT_Col_GpuSwitchNum();
+    if (Solver==2) return (SpinP_switch==3) ? Cluster_DFT_NonCol_GpuSwitchNum()
+                                            : Cluster_DFT_Col_GpuSwitchNum();
+    return GPU_CPU_SWITCH_NUM;
 }
 
 /* GPU device initialization helper for SCF (added by H.Kawai, ported from 3.9.9 GPU)
  * Uses MPI_COMM_TYPE_SHARED to assign GPU per node-local rank. Global dense
- * solvers may fall back for small matrices; DC paths use their local cluster
- * matrix sizes and thresholds. */
+ * solvers may fall back for small matrices; DC, DC-LNO and Krylov paths use
+ * their local cluster matrix sizes and thresholds. */
 static void DFT_GPU_DeviceInit(int basis_count)
 {
     int myid0;
@@ -67,9 +77,9 @@ static void DFT_GPU_DeviceInit(int basis_count)
     MPI_Comm_rank(mpi_comm_level1,&myid0);
     scf_eigen_lib_flag = GPUSOLVER;
 
-    if (Solver!=5 && Solver!=11 && basis_count < DFT_GPU_GlobalThreshold() && myid0==Host_ID && 0<level_stdout) {
+    if (Solver!=5 && Solver!=8 && Solver!=11 && basis_count < DFT_GPU_DenseSwitchNum() && myid0==Host_ID && 0<level_stdout) {
         printf("<DFT> gpusolver requested; global matrix dimension %d is below %d, so global dense eigensolver paths use a CPU fallback while GPU kernels remain enabled.\n",
-               basis_count,DFT_GPU_GlobalThreshold());
+               basis_count,DFT_GPU_DenseSwitchNum());
         fflush(stdout);
     }
 
@@ -132,6 +142,9 @@ static void DFT_GPU_DeviceInit(int basis_count)
         int numprocs, my_fail, nfail, worst_err, inbuf[2], outbuf[2];
 
         scf_eigen_lib_flag = ELPA2;
+        /* without GPUs the gpusolver2 (ELPA-GPU/COSMA) cluster path is
+           demoted to the ELPA2 path as well */
+        gpusolver2_flag = 0;
         MPI_Comm_size(mpi_comm_level1,&numprocs);
         my_fail = hip_ok ? 0 : 1;
         MPI_Allreduce(&my_fail, &nfail, 1, MPI_INT, MPI_SUM, mpi_comm_level1);
@@ -171,8 +184,8 @@ extern int openmx_gpu_eigensolver_use_hipsolver(void);
 static int DFT_GPU_EigensolverActive(void)
 {
     if (scf_eigen_lib_flag!=GPUSOLVER) return 0;
-    if (Solver==5 || Solver==11) return 1;
-    return (DFT_GPU_GlobalThreshold()<=DFT_GPU_BasisCount());
+    if (Solver==5 || Solver==8 || Solver==11) return 1;
+    return (DFT_GPU_DenseSwitchNum()<=DFT_GPU_BasisCount());
 }
 
 static int DFT_GPU_BasisCount(void)
@@ -915,7 +928,7 @@ double DFT(int MD_iter, int Cnt_Now)
       }
       printf("<%s>  Solving the eigenvalue problem%s...\n",
              s_vec[Solver-1],gpu_solver_label);
-      if (!DFT_GPU_EigensolverActive() && DFT_GPU_GlobalThreshold()<=DFT_GPU_BasisCount()){
+      if (!DFT_GPU_EigensolverActive() && DFT_GPU_DenseSwitchNum()<=DFT_GPU_BasisCount()){
         static int cpu_diag_notice_done = 0;
         if (!cpu_diag_notice_done){
           cpu_diag_notice_done = 1;
@@ -4382,6 +4395,7 @@ void Allocate_Free_Cluster_Col(int todo_flag)
 
     /* setting for BLACS */
 
+    if (gpusolver2_flag) openmx_gs2_grid_free(ictxt1);
     Cfree_blacs_system_handle(bhandle1);
     Cblacs_gridexit(ictxt1);
 
@@ -4635,6 +4649,7 @@ void Allocate_Free_Cluster_NonCol(int todo_flag)
     free(iHs22_Re);
     free(Cs_Re);
 
+    if (gpusolver2_flag) openmx_gs2_grid_free(ictxt1);
     Cfree_blacs_system_handle(bhandle1);
     Cblacs_gridexit(ictxt1);
 
@@ -4646,6 +4661,7 @@ void Allocate_Free_Cluster_NonCol(int todo_flag)
     free(Ss2_Cx);
     free(Cs2_Cx);
 
+    if (gpusolver2_flag) openmx_gs2_grid_free(ictxt1_2);
     if (bhandle1 != bhandle1_2) Cfree_blacs_system_handle(bhandle1_2);
     Cblacs_gridexit(ictxt1_2);
   }

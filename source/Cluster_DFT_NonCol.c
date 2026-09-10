@@ -14,6 +14,7 @@
 #include "openmx_common.h"
 #include "lapack_prototypes.h"
 #include "set_hip_default_device_from_local_rank.h"
+#include "elpa_cosma_bridge.h"
 #include <limits.h>
 #include <math.h>
 #include <omp.h>
@@ -46,12 +47,30 @@ static int ClusterNonCol_GpuVerbose(void)
     return (value != NULL && value[0] == '1');
 }
 
-static int ClusterNonCol_GpuThreshold(void)
+/* GPU/CPU crossover of the noncollinear cluster dense eigensolver path,
+   compared against n2 = 2n.  As in the collinear path the root-dense GPU
+   solve beats the multi-rank ELPA fallback at every measured size (on one
+   RTX 5080 shared by 8 ranks: total 1.49x at n2=960 down to 1.13x at
+   n2=480, the complex n2 x n2 problem favors the GPU even more than Col),
+   so the default sits far below the global GPU_CPU_SWITCH_NUM.
+   OPENMX_CLUSTER_NONCOL_GPU_SWITCH_NUM=<dim> overrides it.  Also consulted
+   by DFT.c so the startup fallback notice reports the effective value. */
+#define CLUSTER_NONCOL_GPU_CPU_SWITCH_NUM 400
+
+int Cluster_DFT_NonCol_GpuSwitchNum(void)
 {
-    const char *env=getenv("OPENMX_CLUSTER_GPU_THRESHOLD");
-    int threshold=GPU_CPU_SWITCH_NUM;
-    if (env!=NULL && env[0]!='\0') { int v=atoi(env); if (0<v) threshold=v; }
-    return threshold;
+    static int cached = -1;
+
+    if (cached < 0) {
+        const char *value = getenv("OPENMX_CLUSTER_NONCOL_GPU_SWITCH_NUM");
+        int parsed;
+
+        cached = CLUSTER_NONCOL_GPU_CPU_SWITCH_NUM;
+        if (value != NULL && 0 < (parsed = atoi(value))) {
+            cached = parsed;
+        }
+    }
+    return cached;
 }
 
 static size_t ClusterNonCol_CheckedMulCount(size_t a, size_t b, const char *label)
@@ -1889,13 +1908,13 @@ double Cluster_DFT_NonCol(
   n2 = 2*n;
 
   /* GPU dispatch (added by H.Kawai): assign HIP/OpenMP target device when GPUSOLVER is requested */
-    if (scf_eigen_lib_flag == GPUSOLVER && n2 >= ClusterNonCol_GpuThreshold() &&
+    if (scf_eigen_lib_flag == GPUSOLVER && n2 >= Cluster_DFT_NonCol_GpuSwitchNum() &&
         Set_Hamiltonian_OpenMP_Rank_Is_Selected()) {
       set_hip_default_device_from_local_rank_noncollective();
     }
 
   use_gpusolver_direct_cluster_dm =
-    (scf_eigen_lib_flag == GPUSOLVER && ClusterNonCol_GpuThreshold() <= n2 &&
+    (scf_eigen_lib_flag == GPUSOLVER && gpusolver2_flag == 0 && Cluster_DFT_NonCol_GpuSwitchNum() <= n2 &&
      ClusterNonCol_GpuDiagFits(n2,myid) &&
      (getenv("OPENMX_CLUSTER_GPU_ROOT_DENSE")==NULL ||
       atoi(getenv("OPENMX_CLUSTER_GPU_ROOT_DENSE"))!=0) &&
@@ -2086,11 +2105,20 @@ double Cluster_DFT_NonCol(
 
     /* diagonalize Cs */
 
-    if (scf_eigen_lib_flag==1){
+    if (gpusolver2_flag){
+
+      /* distributed multi-GPU eigensolver (ELPA, AMD GPU kernels) */
+      int gs2_info = openmx_gs2_eigen_real(n, n, Cs, descC, &ko[1], Ss, descS);
+      if (gs2_info!=0){
+        printf("Cluster_DFT_NonCol: the gpusolver2 overlap eigensolver failed (info=%d)\n",gs2_info);
+        MPI_Abort(mpi_comm_level1,1);
+      }
+    }
+    else if (scf_eigen_lib_flag==1){
       F77_NAME(solve_evp_real,SOLVE_EVP_REAL)( &n, &n, Cs, &na_rows, &ko[1], Ss, &na_rows, &nblk,
                                                &mpi_comm_rows_int, &mpi_comm_cols_int );
     }
-    else if (scf_eigen_lib_flag==GPUSOLVER && ClusterNonCol_GpuThreshold()<=n2 &&
+    else if (scf_eigen_lib_flag==GPUSOLVER && Cluster_DFT_NonCol_GpuSwitchNum()<=n2 &&
             ClusterNonCol_GpuDiagFits(n2,myid) && na_rows==n && na_cols==n){
       ClusterNonCol_GpuSolver_DenseDsyevx(Cs,Ss,ko,n,n,"Cluster_DFT_NonCol overlap");
     }
@@ -2188,72 +2216,108 @@ double Cluster_DFT_NonCol(
   for (i=0; i<na_rows*na_cols; i++) Cs[i] = 0.0;
 
   Cblacs_barrier(ictxt1,"A");
-  F77_NAME(pdgemm,PDGEMM)("N","N",&n,&n,&n,&Re_alpha,rHs11,&ONE,&ONE,descH,Ss,&ONE,&ONE,descS,&Re_beta,Cs,&ONE,&ONE,descC);
+  if (gpusolver2_flag)
+    openmx_gs2_pdgemm_("N","N",&n,&n,&n,&Re_alpha,rHs11,&ONE,&ONE,descH,Ss,&ONE,&ONE,descS,&Re_beta,Cs,&ONE,&ONE,descC);
+  else
+    F77_NAME(pdgemm,PDGEMM)("N","N",&n,&n,&n,&Re_alpha,rHs11,&ONE,&ONE,descH,Ss,&ONE,&ONE,descS,&Re_beta,Cs,&ONE,&ONE,descC);
 
   for (i=0; i<na_rows*na_cols; i++) rHs11[i] = 0.0;
 
   Cblacs_barrier(ictxt1,"C");
-  F77_NAME(pdgemm,PDGEMM)("T","N",&n,&n,&n,&Re_alpha,Ss,&ONE,&ONE,descS,Cs,&ONE,&ONE,descC,&Re_beta,rHs11,&ONE,&ONE,descH);
+  if (gpusolver2_flag)
+    openmx_gs2_pdgemm_("T","N",&n,&n,&n,&Re_alpha,Ss,&ONE,&ONE,descS,Cs,&ONE,&ONE,descC,&Re_beta,rHs11,&ONE,&ONE,descH);
+  else
+    F77_NAME(pdgemm,PDGEMM)("T","N",&n,&n,&n,&Re_alpha,Ss,&ONE,&ONE,descS,Cs,&ONE,&ONE,descC,&Re_beta,rHs11,&ONE,&ONE,descH);
 
   /* S^t x rHs12 x S */
 
   for (i=0; i<na_rows*na_cols; i++) Cs[i] = 0.0;
 
   Cblacs_barrier(ictxt1,"A");
-  F77_NAME(pdgemm,PDGEMM)("N","N",&n,&n,&n,&Re_alpha,rHs12,&ONE,&ONE,descH,Ss,&ONE,&ONE,descS,&Re_beta,Cs,&ONE,&ONE,descC);
+  if (gpusolver2_flag)
+    openmx_gs2_pdgemm_("N","N",&n,&n,&n,&Re_alpha,rHs12,&ONE,&ONE,descH,Ss,&ONE,&ONE,descS,&Re_beta,Cs,&ONE,&ONE,descC);
+  else
+    F77_NAME(pdgemm,PDGEMM)("N","N",&n,&n,&n,&Re_alpha,rHs12,&ONE,&ONE,descH,Ss,&ONE,&ONE,descS,&Re_beta,Cs,&ONE,&ONE,descC);
 
   for (i=0; i<na_rows*na_cols; i++) rHs12[i] = 0.0;
 
   Cblacs_barrier(ictxt1,"C");
-  F77_NAME(pdgemm,PDGEMM)("T","N",&n,&n,&n,&Re_alpha,Ss,&ONE,&ONE,descS,Cs,&ONE,&ONE,descC,&Re_beta,rHs12,&ONE,&ONE,descH);
+  if (gpusolver2_flag)
+    openmx_gs2_pdgemm_("T","N",&n,&n,&n,&Re_alpha,Ss,&ONE,&ONE,descS,Cs,&ONE,&ONE,descC,&Re_beta,rHs12,&ONE,&ONE,descH);
+  else
+    F77_NAME(pdgemm,PDGEMM)("T","N",&n,&n,&n,&Re_alpha,Ss,&ONE,&ONE,descS,Cs,&ONE,&ONE,descC,&Re_beta,rHs12,&ONE,&ONE,descH);
 
   /* S^t x rHs22 x S */
 
   for (i=0; i<na_rows*na_cols; i++) Cs[i] = 0.0;
 
   Cblacs_barrier(ictxt1,"A");
-  F77_NAME(pdgemm,PDGEMM)("N","N",&n,&n,&n,&Re_alpha,rHs22,&ONE,&ONE,descH,Ss,&ONE,&ONE,descS,&Re_beta,Cs,&ONE,&ONE,descC);
+  if (gpusolver2_flag)
+    openmx_gs2_pdgemm_("N","N",&n,&n,&n,&Re_alpha,rHs22,&ONE,&ONE,descH,Ss,&ONE,&ONE,descS,&Re_beta,Cs,&ONE,&ONE,descC);
+  else
+    F77_NAME(pdgemm,PDGEMM)("N","N",&n,&n,&n,&Re_alpha,rHs22,&ONE,&ONE,descH,Ss,&ONE,&ONE,descS,&Re_beta,Cs,&ONE,&ONE,descC);
 
   for (i=0; i<na_rows*na_cols; i++) rHs22[i] = 0.0;
 
   Cblacs_barrier(ictxt1,"C");
-  F77_NAME(pdgemm,PDGEMM)("T","N",&n,&n,&n,&Re_alpha,Ss,&ONE,&ONE,descS,Cs,&ONE,&ONE,descC,&Re_beta,rHs22,&ONE,&ONE,descH);
+  if (gpusolver2_flag)
+    openmx_gs2_pdgemm_("T","N",&n,&n,&n,&Re_alpha,Ss,&ONE,&ONE,descS,Cs,&ONE,&ONE,descC,&Re_beta,rHs22,&ONE,&ONE,descH);
+  else
+    F77_NAME(pdgemm,PDGEMM)("T","N",&n,&n,&n,&Re_alpha,Ss,&ONE,&ONE,descS,Cs,&ONE,&ONE,descC,&Re_beta,rHs22,&ONE,&ONE,descH);
 
   /* S^t x iHs11 x S */
 
   for (i=0; i<na_rows*na_cols; i++) Cs[i] = 0.0;
 
   Cblacs_barrier(ictxt1,"A");
-  F77_NAME(pdgemm,PDGEMM)("N","N",&n,&n,&n,&Re_alpha,iHs11,&ONE,&ONE,descH,Ss,&ONE,&ONE,descS,&Re_beta,Cs,&ONE,&ONE,descC);
+  if (gpusolver2_flag)
+    openmx_gs2_pdgemm_("N","N",&n,&n,&n,&Re_alpha,iHs11,&ONE,&ONE,descH,Ss,&ONE,&ONE,descS,&Re_beta,Cs,&ONE,&ONE,descC);
+  else
+    F77_NAME(pdgemm,PDGEMM)("N","N",&n,&n,&n,&Re_alpha,iHs11,&ONE,&ONE,descH,Ss,&ONE,&ONE,descS,&Re_beta,Cs,&ONE,&ONE,descC);
 
   for (i=0; i<na_rows*na_cols; i++) iHs11[i] = 0.0;
 
   Cblacs_barrier(ictxt1,"C");
-  F77_NAME(pdgemm,PDGEMM)("T","N",&n,&n,&n,&Re_alpha,Ss,&ONE,&ONE,descS,Cs,&ONE,&ONE,descC,&Re_beta,iHs11,&ONE,&ONE,descH);
+  if (gpusolver2_flag)
+    openmx_gs2_pdgemm_("T","N",&n,&n,&n,&Re_alpha,Ss,&ONE,&ONE,descS,Cs,&ONE,&ONE,descC,&Re_beta,iHs11,&ONE,&ONE,descH);
+  else
+    F77_NAME(pdgemm,PDGEMM)("T","N",&n,&n,&n,&Re_alpha,Ss,&ONE,&ONE,descS,Cs,&ONE,&ONE,descC,&Re_beta,iHs11,&ONE,&ONE,descH);
 
   /* S^t x iHs12 x S */
 
   for (i=0; i<na_rows*na_cols; i++) Cs[i] = 0.0;
 
   Cblacs_barrier(ictxt1,"A");
-  F77_NAME(pdgemm,PDGEMM)("N","N",&n,&n,&n,&Re_alpha,iHs12,&ONE,&ONE,descH,Ss,&ONE,&ONE,descS,&Re_beta,Cs,&ONE,&ONE,descC);
+  if (gpusolver2_flag)
+    openmx_gs2_pdgemm_("N","N",&n,&n,&n,&Re_alpha,iHs12,&ONE,&ONE,descH,Ss,&ONE,&ONE,descS,&Re_beta,Cs,&ONE,&ONE,descC);
+  else
+    F77_NAME(pdgemm,PDGEMM)("N","N",&n,&n,&n,&Re_alpha,iHs12,&ONE,&ONE,descH,Ss,&ONE,&ONE,descS,&Re_beta,Cs,&ONE,&ONE,descC);
 
   for (i=0; i<na_rows*na_cols; i++) iHs12[i] = 0.0;
 
   Cblacs_barrier(ictxt1,"C");
-  F77_NAME(pdgemm,PDGEMM)("T","N",&n,&n,&n,&Re_alpha,Ss,&ONE,&ONE,descS,Cs,&ONE,&ONE,descC,&Re_beta,iHs12,&ONE,&ONE,descH);
+  if (gpusolver2_flag)
+    openmx_gs2_pdgemm_("T","N",&n,&n,&n,&Re_alpha,Ss,&ONE,&ONE,descS,Cs,&ONE,&ONE,descC,&Re_beta,iHs12,&ONE,&ONE,descH);
+  else
+    F77_NAME(pdgemm,PDGEMM)("T","N",&n,&n,&n,&Re_alpha,Ss,&ONE,&ONE,descS,Cs,&ONE,&ONE,descC,&Re_beta,iHs12,&ONE,&ONE,descH);
 
   /* S^t x iHs22 x S */
 
   for (i=0; i<na_rows*na_cols; i++) Cs[i] = 0.0;
 
   Cblacs_barrier(ictxt1,"A");
-  F77_NAME(pdgemm,PDGEMM)("N","N",&n,&n,&n,&Re_alpha,iHs22,&ONE,&ONE,descH,Ss,&ONE,&ONE,descS,&Re_beta,Cs,&ONE,&ONE,descC);
+  if (gpusolver2_flag)
+    openmx_gs2_pdgemm_("N","N",&n,&n,&n,&Re_alpha,iHs22,&ONE,&ONE,descH,Ss,&ONE,&ONE,descS,&Re_beta,Cs,&ONE,&ONE,descC);
+  else
+    F77_NAME(pdgemm,PDGEMM)("N","N",&n,&n,&n,&Re_alpha,iHs22,&ONE,&ONE,descH,Ss,&ONE,&ONE,descS,&Re_beta,Cs,&ONE,&ONE,descC);
 
   for (i=0; i<na_rows*na_cols; i++) iHs22[i] = 0.0;
 
   Cblacs_barrier(ictxt1,"C");
-  F77_NAME(pdgemm,PDGEMM)("T","N",&n,&n,&n,&Re_alpha,Ss,&ONE,&ONE,descS,Cs,&ONE,&ONE,descC,&Re_beta,iHs22,&ONE,&ONE,descH);
+  if (gpusolver2_flag)
+    openmx_gs2_pdgemm_("T","N",&n,&n,&n,&Re_alpha,Ss,&ONE,&ONE,descS,Cs,&ONE,&ONE,descC,&Re_beta,iHs22,&ONE,&ONE,descH);
+  else
+    F77_NAME(pdgemm,PDGEMM)("T","N",&n,&n,&n,&Re_alpha,Ss,&ONE,&ONE,descS,Cs,&ONE,&ONE,descC,&Re_beta,iHs22,&ONE,&ONE,descH);
 
   if (measure_time){
     dtime(&etime);
@@ -2277,11 +2341,21 @@ double Cluster_DFT_NonCol(
   mpi_comm_rows_int = MPI_Comm_c2f(mpi_comm_rows);
   mpi_comm_cols_int = MPI_Comm_c2f(mpi_comm_cols);
 
-  if (scf_eigen_lib_flag==1){
+  if (gpusolver2_flag){
+
+    /* distributed multi-GPU eigensolver (ELPA, AMD GPU kernels); all n2
+       eigenvalues are returned but only the lowest MaxN eigenvectors */
+    int gs2_info = openmx_gs2_eigen_complex(n2, MaxN, Hs2, descH2, &ko[1], Cs2, descC2);
+    if (gs2_info!=0){
+      printf("Cluster_DFT_NonCol: the gpusolver2 Hamiltonian eigensolver failed (info=%d)\n",gs2_info);
+      MPI_Abort(mpi_comm_level1,1);
+    }
+  }
+  else if (scf_eigen_lib_flag==1){
     F77_NAME(solve_evp_complex,SOLVE_EVP_COMPLEX)( &n2, &MaxN, Hs2, &na_rows2, &ko[1], Cs2, &na_rows2,
                                                    &nblk2, &mpi_comm_rows_int, &mpi_comm_cols_int );
   }
-  else if (scf_eigen_lib_flag==GPUSOLVER && ClusterNonCol_GpuThreshold()<=n2 &&
+  else if (scf_eigen_lib_flag==GPUSOLVER && Cluster_DFT_NonCol_GpuSwitchNum()<=n2 &&
            ClusterNonCol_GpuDiagFits(n2,myid) && na_rows2==n2 && na_cols2==n2){
     ClusterNonCol_GpuSolver_DenseZheevx(Hs2,Cs2,ko,n2,MaxN,"Cluster_DFT_NonCol Hamiltonian");
   }
@@ -2326,7 +2400,12 @@ double Cluster_DFT_NonCol(
   }
 
   Cblacs_barrier(ictxt1_2,"A");
-  F77_NAME(pzgemm,PZGEMM)("T","T", &n2,&n2,&n2,&alpha,Cs2,&ONE,&ONE,
+  if (gpusolver2_flag)
+    openmx_gs2_pzgemm_("T","T", &n2,&n2,&n2,(const double*)&alpha,(const double*)Cs2,&ONE,&ONE,
+                           descC2,(const double*)Ss2,&ONE,&ONE,descS2,(const double*)&beta,
+                           (double*)Hs2,&ONE,&ONE,descH2);
+  else
+    F77_NAME(pzgemm,PZGEMM)("T","T", &n2,&n2,&n2,&alpha,Cs2,&ONE,&ONE,
 			           descC2,Ss2,&ONE,&ONE,descS2,&beta,Hs2,
 			           &ONE,&ONE,descH2);
 

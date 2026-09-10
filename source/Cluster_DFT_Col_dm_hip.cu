@@ -184,28 +184,29 @@ __global__ static void BandColDenseCsHsKernel(int need_s, int count,
     }
 }
 
+/* d_entries is DEVICE-resident: Band_DFT_Col.c keeps the construct entry
+   table on the device only (uploaded once per geometry), so this build no
+   longer stages the multi-hundred-MB table on every k point. */
 extern "C" int BandCol_BuildDenseCsHs_HIP(int need_s, int count, int h_count, int phase_count, int n,
-                                          const BandColHipConstructEntry *entries, const double *phase_r,
+                                          const BandColHipConstructEntry *d_entries, const double *phase_r,
                                           const double *phase_i, const double *H1, const double *S1,
                                           BandColHipComplex *d_H, BandColHipComplex *d_S)
 {
     const int block_size = 256;
     dim3 block(block_size);
     dim3 grid((unsigned int)((count + block_size - 1) / block_size));
-    BandColHipConstructEntry *d_entries = NULL;
     double *d_H1 = NULL;
     double *d_S1 = NULL;
     double *d_phase_r = NULL;
     double *d_phase_i = NULL;
     hipError_t err;
-    size_t entry_bytes = sizeof(BandColHipConstructEntry) * (size_t)count;
     size_t h_bytes = sizeof(double) * (size_t)h_count;
     size_t phase_bytes = sizeof(double) * (size_t)phase_count;
     size_t dense_bytes = sizeof(BandColHipComplex) * (size_t)n * (size_t)n;
     int failed = 0;
 
     if (count < 0 || h_count <= 0 || phase_count <= 0 || n <= 0 ||
-        entries == NULL || phase_r == NULL || phase_i == NULL || H1 == NULL || d_H == NULL) {
+        (0 < count && d_entries == NULL) || phase_r == NULL || phase_i == NULL || H1 == NULL || d_H == NULL) {
         fprintf(stderr, "<Band> HIP dense matrix build received invalid arguments.\n");
         fflush(stderr);
         return 1;
@@ -216,8 +217,6 @@ extern "C" int BandCol_BuildDenseCsHs_HIP(int need_s, int count, int h_count, in
         return 1;
     }
 
-    err = hipMalloc((void **)&d_entries, entry_bytes);
-    if (BandColReportHipError("hipMalloc(entries)", err)) goto cleanup_failed;
     err = hipMalloc((void **)&d_H1, h_bytes);
     if (BandColReportHipError("hipMalloc(H1)", err)) goto cleanup_failed;
     if (need_s) {
@@ -229,10 +228,6 @@ extern "C" int BandCol_BuildDenseCsHs_HIP(int need_s, int count, int h_count, in
     err = hipMalloc((void **)&d_phase_i, phase_bytes);
     if (BandColReportHipError("hipMalloc(phase_i)", err)) goto cleanup_failed;
 
-    if (0 < count) {
-        err = hipMemcpy(d_entries, entries, entry_bytes, hipMemcpyHostToDevice);
-        if (BandColReportHipError("hipMemcpy(entries)", err)) goto cleanup_failed;
-    }
     err = hipMemcpy(d_H1, H1, h_bytes, hipMemcpyHostToDevice);
     if (BandColReportHipError("hipMemcpy(H1)", err)) goto cleanup_failed;
     if (need_s) {
@@ -271,7 +266,6 @@ cleanup:
     if (d_phase_r != NULL) hipFree(d_phase_r);
     if (d_S1 != NULL) hipFree(d_S1);
     if (d_H1 != NULL) hipFree(d_H1);
-    if (d_entries != NULL) hipFree(d_entries);
     return failed;
 }
 

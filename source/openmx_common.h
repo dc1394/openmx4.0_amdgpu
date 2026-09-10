@@ -2809,8 +2809,15 @@ typedef enum
 {
     ELPA1    = 1,
     ELPA2    = 2,
-    GPUSOLVER = 3
+    GPUSOLVER = 3,
+    GPUSOLVER2 = 4
 } SCF_Eigen_Lib;
+/* scf.eigen.lib=gpusolver2: the mainline collinear/non-collinear cluster
+   diagonalization runs distributed over all ranks/GPUs with ELPA GPU kernels
+   (eigensolver) and COSMA (pdgemm); everywhere else the run behaves exactly
+   like gpusolver, so scf_eigen_lib_flag itself is kept at GPUSOLVER and this
+   flag marks the gpusolver2 request (added July 2026) */
+int gpusolver2_flag;
 int KrylovH_order,KrylovS_order,recalc_EM,EKC_invS_flag;
 int EC_Sub_Dim,Energy_Decomposition_flag;
 int EKC_Exact_invS_flag,EKC_expand_core_flag,orderN_FNAN_SNAN_flag;
@@ -4183,6 +4190,10 @@ hipblasStatus_t openmx_gemmul8Zgemm(hipblasHandle_t handle, hipblasOperation_t t
                                    const hipDoubleComplex *B, int ldb, const hipDoubleComplex *beta, hipDoubleComplex *C,
                                    int ldc);
 void openmx_gemmul8ReleaseWorkspaces(void);
+/* scf.gemmul8.enable: 0 sends every openmx_gemmul8{D,Z}gemm call straight to
+   plain hipBLAS FP64 GEMM (workspace queries then report 0).  Default on;
+   set from Input_std.c on every rank. */
+void openmx_gemmul8SetEnabled(int enabled);
 size_t openmx_gemmul8ZWorkspaceSize(int m, int n, int k);
 size_t openmx_gemmul8DWorkspaceSize(int m, int n, int k);
 

@@ -13,6 +13,7 @@
 #include "openmx_common.h"
 #include "lapack_prototypes.h"
 #include "set_hip_default_device_from_local_rank.h"
+#include "elpa_cosma_bridge.h"
 #include <fftw3.h>
 #include <math.h>
 #include <omp.h>
@@ -119,12 +120,31 @@ static int ClusterCol_GpuVerbose(void)
     return (value != NULL && value[0] == '1');
 }
 
-static int ClusterCol_GpuThreshold(void)
+/* GPU/CPU crossover of the collinear cluster dense eigensolver path.  The
+   cluster diagonalization runs once per SCF step and the root-dense GPU
+   solve of one rank beats the multi-rank ELPA fallback at every measured
+   size (on one RTX 5080 shared by 8 ranks: total 1.27x at n=780 down to
+   1.06x at n=240), so the default sits far below the global
+   GPU_CPU_SWITCH_NUM; below it the remaining gain is within noise of the
+   grid-dominated runtime.  OPENMX_CLUSTER_GPU_SWITCH_NUM=<dim> overrides
+   it.  Also consulted by DFT.c so the startup fallback notice reports the
+   effective value. */
+#define CLUSTER_GPU_CPU_SWITCH_NUM 400
+
+int Cluster_DFT_Col_GpuSwitchNum(void)
 {
-    const char *env=getenv("OPENMX_CLUSTER_GPU_THRESHOLD");
-    int threshold=GPU_CPU_SWITCH_NUM;
-    if (env!=NULL && env[0]!='\0') { int v=atoi(env); if (0<v) threshold=v; }
-    return threshold;
+    static int cached = -1;
+
+    if (cached < 0) {
+        const char *value = getenv("OPENMX_CLUSTER_GPU_SWITCH_NUM");
+        int parsed;
+
+        cached = CLUSTER_GPU_CPU_SWITCH_NUM;
+        if (value != NULL && 0 < (parsed = atoi(value))) {
+            cached = parsed;
+        }
+    }
+    return cached;
 }
 
 static size_t ClusterCol_CheckedMulCount(size_t a, size_t b, const char *label)
@@ -1514,7 +1534,7 @@ double Cluster_DFT_Col(
   n2 = n + 2;
 
   /* GPU dispatch (added by H.Kawai): assign HIP/OpenMP target device when GPUSOLVER is requested */
-  if (scf_eigen_lib_flag == GPUSOLVER && n >= ClusterCol_GpuThreshold() &&
+  if (scf_eigen_lib_flag == GPUSOLVER && n >= Cluster_DFT_Col_GpuSwitchNum() &&
       Set_Hamiltonian_OpenMP_Rank_Is_Selected()) {
       set_hip_default_device_from_local_rank_noncollective();
   }
@@ -1592,7 +1612,7 @@ double Cluster_DFT_Col(
     }
   }
 
-  if (scf_eigen_lib_flag==GPUSOLVER && ClusterCol_GpuThreshold()<=n &&
+  if (scf_eigen_lib_flag==GPUSOLVER && gpusolver2_flag==0 && Cluster_DFT_Col_GpuSwitchNum()<=n &&
       ClusterCol_GpuDiagFits(n,myworld1,myid1)){
     ClusterCol_SetMaxNAndPartitions(SCF_iter,mode,TZ,n,numprocs1, &MaxN,is2,ie2);
     use_gpusolver_direct_cluster_dm = 1;
@@ -1633,7 +1653,17 @@ double Cluster_DFT_Col(
     mpi_comm_rows_int = MPI_Comm_c2f(mpi_comm_rows);
     mpi_comm_cols_int = MPI_Comm_c2f(mpi_comm_cols);
 
-    if (scf_eigen_lib_flag==1){
+    if (gpusolver2_flag){
+
+      /* distributed multi-GPU eigensolver (ELPA, AMD GPU kernels) */
+      int gs2_info = openmx_gs2_eigen_real(n, n, Cs, descC, &ko[0][1], Ss, descS);
+      if (gs2_info!=0){
+        printf("Cluster_DFT_Col: the gpusolver2 overlap eigensolver failed (info=%d)\n",gs2_info);
+        MPI_Abort(mpi_comm_level1,1);
+      }
+    }
+
+    else if (scf_eigen_lib_flag==1){
 
       F77_NAME(solve_evp_real,SOLVE_EVP_REAL)(&n, &n, Cs, &na_rows, &ko[0][1], Ss, &na_rows, &nblk, &mpi_comm_rows_int, &mpi_comm_cols_int);
     }
@@ -1819,7 +1849,7 @@ double Cluster_DFT_Col(
   }
   firsttime=0;
 
-  if (scf_eigen_lib_flag==GPUSOLVER && ClusterCol_GpuThreshold()<=n &&
+  if (scf_eigen_lib_flag==GPUSOLVER && gpusolver2_flag==0 && Cluster_DFT_Col_GpuSwitchNum()<=n &&
       !(SpinP_switch==1 && numprocs0!=1)){
     ClusterCol_GpuSolverDensePath(SCF_iter,SpinP_switch,ko,nh,CntOLP,
                                  numprocs0,myworld1,myid1,MP,is2,ie2,
@@ -1844,7 +1874,10 @@ double Cluster_DFT_Col(
   }
 
   Cblacs_barrier(ictxt1,"A");
-  F77_NAME(pdgemm,PDGEMM)("N","N",&n,&n,&n,&alpha,Hs,&ONE,&ONE,descH,Ss,&ONE,&ONE,descS,&beta,Cs,&ONE,&ONE,descC);
+  if (gpusolver2_flag)
+    openmx_gs2_pdgemm_("N","N",&n,&n,&n,&alpha,Hs,&ONE,&ONE,descH,Ss,&ONE,&ONE,descS,&beta,Cs,&ONE,&ONE,descC);
+  else
+    F77_NAME(pdgemm,PDGEMM)("N","N",&n,&n,&n,&alpha,Hs,&ONE,&ONE,descH,Ss,&ONE,&ONE,descS,&beta,Cs,&ONE,&ONE,descC);
 
   /* 1.0/sqrt(ko[l]) * U^+ H * U * 1.0/sqrt(ko[l]) */
 
@@ -1853,7 +1886,10 @@ double Cluster_DFT_Col(
   }
 
   Cblacs_barrier(ictxt1,"C");
-  F77_NAME(pdgemm,PDGEMM)("T","N",&n,&n,&n,&alpha,Ss,&ONE,&ONE,descS,Cs,&ONE,&ONE,descC,&beta,Hs,&ONE,&ONE,descH);
+  if (gpusolver2_flag)
+    openmx_gs2_pdgemm_("T","N",&n,&n,&n,&alpha,Ss,&ONE,&ONE,descS,Cs,&ONE,&ONE,descC,&beta,Hs,&ONE,&ONE,descH);
+  else
+    F77_NAME(pdgemm,PDGEMM)("T","N",&n,&n,&n,&alpha,Ss,&ONE,&ONE,descS,Cs,&ONE,&ONE,descC,&beta,Hs,&ONE,&ONE,descH);
 
   if (measure_time){
     dtime(&etime);
@@ -1873,8 +1909,18 @@ double Cluster_DFT_Col(
   mpi_comm_rows_int = MPI_Comm_c2f(mpi_comm_rows);
   mpi_comm_cols_int = MPI_Comm_c2f(mpi_comm_cols);
 
-  if (scf_eigen_lib_flag==1){
-    F77_NAME(solve_evp_real,SOLVE_EVP_REAL)(&n, &MaxN, Hs, &na_rows, &ko[spin][1], Cs, 
+  if (gpusolver2_flag){
+
+    /* distributed multi-GPU eigensolver (ELPA, AMD GPU kernels); all n
+       eigenvalues are returned but only the lowest MaxN eigenvectors */
+    int gs2_info = openmx_gs2_eigen_real(n, MaxN, Hs, descH, &ko[spin][1], Cs, descC);
+    if (gs2_info!=0){
+      printf("Cluster_DFT_Col: the gpusolver2 Hamiltonian eigensolver failed (info=%d)\n",gs2_info);
+      MPI_Abort(mpi_comm_level1,1);
+    }
+  }
+  else if (scf_eigen_lib_flag==1){
+    F77_NAME(solve_evp_real,SOLVE_EVP_REAL)(&n, &MaxN, Hs, &na_rows, &ko[spin][1], Cs,
                                             &na_rows, &nblk, &mpi_comm_rows_int, &mpi_comm_cols_int);
   }
   else if (scf_eigen_lib_flag==2 || scf_eigen_lib_flag==GPUSOLVER){
@@ -1908,7 +1954,10 @@ double Cluster_DFT_Col(
   for (i=0; i<na_rows*na_cols; i++) Hs[i] = 0.0;
 
   Cblacs_barrier(ictxt1,"A");
-  F77_NAME(pdgemm,PDGEMM)("T","T",&n,&n,&n,&alpha,Cs,&ONE,&ONE,descC,Ss,&ONE,&ONE,descS,&beta,Hs,&ONE,&ONE,descH);
+  if (gpusolver2_flag)
+    openmx_gs2_pdgemm_("T","T",&n,&n,&n,&alpha,Cs,&ONE,&ONE,descC,Ss,&ONE,&ONE,descS,&beta,Hs,&ONE,&ONE,descH);
+  else
+    F77_NAME(pdgemm,PDGEMM)("T","T",&n,&n,&n,&alpha,Cs,&ONE,&ONE,descC,Ss,&ONE,&ONE,descS,&beta,Hs,&ONE,&ONE,descH);
 
   /* MPI communications of Hs */
 

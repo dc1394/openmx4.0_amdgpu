@@ -133,8 +133,9 @@ typedef struct
     int phase_index;
 } BandColConstructEntry;
 
+/* d_entries is DEVICE-resident (the construct cache keeps no host copy) */
 extern int BandCol_BuildDenseCsHs_HIP(int need_s, int count, int h_count, int phase_count, int n,
-                                      const BandColConstructEntry *entries, const double *phase_r,
+                                      const BandColConstructEntry *d_entries, const double *phase_r,
                                       const double *phase_i, const double *H1, const double *S1,
                                       dcomplex *d_H, dcomplex *d_S);
 extern int BandCol_AccumulateDenseTransposedDM_HIP(int entry_count, int pair_count, int nk, int evec_stride,
@@ -159,13 +160,16 @@ typedef struct
     int                    local_count;
     int                    h_count;
     int                    dense_phase_count;
-    int                    dense_device_valid;
+    int                    has_dense;
+    int                    has_local;
     int *                  dense_phase_l1;
     int *                  dense_phase_l2;
     int *                  dense_phase_l3;
     double *               dense_phase_r;
     double *               dense_phase_i;
-    BandColConstructEntry *dense_entries;
+    /* device-resident: the entries are only ever read by the device
+       construct kernel, so no host copy is kept */
+    BandColConstructEntry *dense_entries_dev;
     BandColConstructEntry *local_entries;
 } BandColConstructCache;
 
@@ -178,12 +182,31 @@ static void BandCol_AbortWithMessage(const char * msg)
     exit(1);
 }
 
-static int BandCol_GpuThreshold(void)
+/* GPU/CPU crossover of the collinear band dense eigensolver path.  The CPU
+   fallback of this path solves every k point twice with a serial ELPA per
+   k-point world, so the GPU-dense path pays off well below the global
+   GPU_CPU_SWITCH_NUM: measured on one RTX 5080 shared by 8 ranks (14
+   irreducible k points), the GPU path is 2.0x at n=832 and 1.4x at n=416,
+   with the crossover near n=300-400.  800 matches the DC-LNO threshold
+   GPU_CPU_SWITCH_NUM2.  OPENMX_BAND_GPU_SWITCH_NUM=<dim> overrides the
+   default for this path only.  Also consulted by DFT.c so the startup
+   fallback notice reports the effective value. */
+#define BAND_GPU_CPU_SWITCH_NUM 800
+
+int Band_DFT_Col_GpuSwitchNum(void)
 {
-    const char *env=getenv("OPENMX_BAND_GPU_THRESHOLD");
-    int threshold=GPU_CPU_SWITCH_NUM;
-    if (env!=NULL && env[0]!='\0') { int v=atoi(env); if (0<v) threshold=v; }
-    return threshold;
+    static int cached = -1;
+
+    if (cached < 0) {
+        const char *value = getenv("OPENMX_BAND_GPU_SWITCH_NUM");
+        int parsed;
+
+        cached = BAND_GPU_CPU_SWITCH_NUM;
+        if (value != NULL && 0 < (parsed = atoi(value))) {
+            cached = parsed;
+        }
+    }
+    return cached;
 }
 
 static int BandCol_DefaultGpuTurnGroup(void)
@@ -422,22 +445,10 @@ static int BandCol_GpuDenseFits(int n, int owns_dense)
 
 static void BandCol_ConstructCache_Reset(void)
 {
-    if (BandCol_construct_cache.dense_device_valid) {
-        BandColConstructEntry *dense_entries = BandCol_construct_cache.dense_entries;
-        double *               phase_r       = BandCol_construct_cache.dense_phase_r;
-        double *               phase_i       = BandCol_construct_cache.dense_phase_i;
-        int                    dense_count   = BandCol_construct_cache.dense_count;
-        int                    phase_count   = BandCol_construct_cache.dense_phase_count;
-
-        if (dense_entries != NULL && 0 < dense_count) {
-#pragma omp target exit data map(delete: dense_entries[0 : dense_count])
-        }
-        if (phase_r != NULL && phase_i != NULL && 0 < phase_count) {
-#pragma omp target exit data map(delete: phase_r[0 : phase_count], phase_i[0 : phase_count])
-        }
+    if (BandCol_construct_cache.dense_entries_dev != NULL) {
+        wait_hipfunc(hipFree(BandCol_construct_cache.dense_entries_dev));
     }
 
-    free(BandCol_construct_cache.dense_entries);
     free(BandCol_construct_cache.local_entries);
     free(BandCol_construct_cache.dense_phase_l1);
     free(BandCol_construct_cache.dense_phase_l2);
@@ -476,7 +487,7 @@ static unsigned long long BandCol_ConstructFingerprint(int *order_GA, int *MP)
     return h;
 }
 
-static void BandCol_ConstructCache_Ensure(int *order_GA, int *MP, int n)
+static void BandCol_ConstructCache_Ensure(int *order_GA, int *MP, int n, int want_dense)
 {
     BandColConstructCache *cache = &BandCol_construct_cache;
     unsigned long long     fingerprint = BandCol_ConstructFingerprint(order_GA, MP);
@@ -484,10 +495,17 @@ static void BandCol_ConstructCache_Ensure(int *order_GA, int *MP, int n)
     int                    local_count = 0;
     int                    dense_phase_count = 0;
     int                    prev_dense_l1 = 0x7fffffff, prev_dense_l2 = 0x7fffffff, prev_dense_l3 = 0x7fffffff;
+    BandColConstructEntry *dense_host = NULL;
 
+    /* Only the side this rank actually consumes is built: the dense side
+       feeds the device construct kernel of the GPU owner ranks, the local
+       side feeds the host ScaLAPACK/ELPA construction.  Building both cost
+       every ELPA rank the full dense table (~28 B per matrix element pair)
+       it never read. */
     if (cache->valid && cache->n == n && cache->na_rows == na_rows && cache->na_cols == na_cols &&
         cache->nblk == nblk && cache->np_rows == np_rows && cache->np_cols == np_cols && cache->my_prow == my_prow &&
-        cache->my_pcol == my_pcol && cache->fingerprint == fingerprint) {
+        cache->my_pcol == my_pcol && cache->fingerprint == fingerprint &&
+        ((want_dense && cache->has_dense) || (!want_dense && cache->has_local))) {
         return;
     }
 
@@ -546,19 +564,28 @@ static void BandCol_ConstructCache_Ensure(int *order_GA, int *MP, int n)
         }
     }
 
-    cache->dense_entries = (BandColConstructEntry *)malloc(sizeof(BandColConstructEntry) * (size_t)(dense_count + 1));
-    cache->local_entries = (BandColConstructEntry *)malloc(sizeof(BandColConstructEntry) * (size_t)(local_count + 1));
-    cache->dense_phase_l1 = (int *)malloc(sizeof(int) * (size_t)(dense_phase_count + 1));
-    cache->dense_phase_l2 = (int *)malloc(sizeof(int) * (size_t)(dense_phase_count + 1));
-    cache->dense_phase_l3 = (int *)malloc(sizeof(int) * (size_t)(dense_phase_count + 1));
-    cache->dense_phase_r  = (double *)malloc(sizeof(double) * (size_t)(dense_phase_count + 1));
-    cache->dense_phase_i  = (double *)malloc(sizeof(double) * (size_t)(dense_phase_count + 1));
+    if (want_dense) {
+        dense_host = (BandColConstructEntry *)malloc(sizeof(BandColConstructEntry) * (size_t)(dense_count + 1));
+        cache->dense_phase_l1 = (int *)malloc(sizeof(int) * (size_t)(dense_phase_count + 1));
+        cache->dense_phase_l2 = (int *)malloc(sizeof(int) * (size_t)(dense_phase_count + 1));
+        cache->dense_phase_l3 = (int *)malloc(sizeof(int) * (size_t)(dense_phase_count + 1));
+        cache->dense_phase_r  = (double *)malloc(sizeof(double) * (size_t)(dense_phase_count + 1));
+        cache->dense_phase_i  = (double *)malloc(sizeof(double) * (size_t)(dense_phase_count + 1));
 
-    if (cache->dense_entries == NULL || cache->local_entries == NULL || cache->dense_phase_l1 == NULL ||
-        cache->dense_phase_l2 == NULL || cache->dense_phase_l3 == NULL || cache->dense_phase_r == NULL ||
-        cache->dense_phase_i == NULL) {
-        BandCol_ConstructCache_Reset();
-        BandCol_AbortWithMessage("Failed to allocate Construct_Band_CsHs cache in Band_DFT_Col.c.");
+        if (dense_host == NULL || cache->dense_phase_l1 == NULL ||
+            cache->dense_phase_l2 == NULL || cache->dense_phase_l3 == NULL || cache->dense_phase_r == NULL ||
+            cache->dense_phase_i == NULL) {
+            free(dense_host);
+            BandCol_ConstructCache_Reset();
+            BandCol_AbortWithMessage("Failed to allocate Construct_Band_CsHs cache in Band_DFT_Col.c.");
+        }
+    } else {
+        cache->local_entries = (BandColConstructEntry *)malloc(sizeof(BandColConstructEntry) * (size_t)(local_count + 1));
+
+        if (cache->local_entries == NULL) {
+            BandCol_ConstructCache_Reset();
+            BandCol_AbortWithMessage("Failed to allocate Construct_Band_CsHs cache in Band_DFT_Col.c.");
+        }
     }
 
     dense_count = 0;
@@ -600,7 +627,7 @@ static void BandCol_ConstructCache_Ensure(int *order_GA, int *MP, int n)
                 for (int j = 0; j < tnoB; j++, h_index++) {
                     int jg = Bnum + j;
 
-                    if (j_start <= j) {
+                    if (want_dense && j_start <= j) {
                         if (phase_index < 0) {
                             if (l1 != prev_dense_l1 || l2 != prev_dense_l2 || l3 != prev_dense_l3) {
                                 phase_index = dense_phase_count++;
@@ -615,7 +642,7 @@ static void BandCol_ConstructCache_Ensure(int *order_GA, int *MP, int n)
                             }
                         }
 
-                        BandColConstructEntry *entry = &cache->dense_entries[dense_count++];
+                        BandColConstructEntry *entry = &dense_host[dense_count++];
                         entry->h_index = h_index;
                         entry->index0  = (jg - 1) * n + (ig - 1);
                         entry->index1  = (jg > ig) ? (ig - 1) * n + (jg - 1) : -1;
@@ -628,7 +655,7 @@ static void BandCol_ConstructCache_Ensure(int *order_GA, int *MP, int n)
                     int bcol = (jg - 1) / nblk;
                     int pcol = bcol % np_cols;
 
-                    if (my_prow == prow && my_pcol == pcol) {
+                    if (!want_dense && my_prow == prow && my_pcol == pcol) {
                         int il = (brow / np_rows + 1) * nblk + 1;
                         int jl = (bcol / np_cols + 1) * nblk + 1;
 
@@ -660,6 +687,17 @@ static void BandCol_ConstructCache_Ensure(int *order_GA, int *MP, int n)
         }
     }
 
+    if (want_dense && 0 < dense_count) {
+        /* the dense entry table is read exclusively by the device construct
+           kernel, so it lives in device memory only; the host copy above is
+           a build scratch and is released right here */
+        size_t dense_bytes = sizeof(BandColConstructEntry) * (size_t)dense_count;
+
+        wait_hipfunc(hipMalloc((void **)&cache->dense_entries_dev, dense_bytes));
+        wait_hipfunc(hipMemcpy(cache->dense_entries_dev, dense_host, dense_bytes, hipMemcpyHostToDevice));
+    }
+    free(dense_host);
+
     cache->valid       = 1;
     cache->n           = n;
     cache->na_rows     = na_rows;
@@ -674,30 +712,8 @@ static void BandCol_ConstructCache_Ensure(int *order_GA, int *MP, int n)
     cache->local_count = local_count;
     cache->h_count     = h_index;
     cache->dense_phase_count = dense_phase_count;
-}
-
-static void BandCol_ConstructCache_EnsureDenseDevice(void)
-{
-    BandColConstructCache *cache = &BandCol_construct_cache;
-
-    if (cache->dense_device_valid) {
-        return;
-    }
-
-    if (0 < cache->dense_count) {
-        BandColConstructEntry *entries = cache->dense_entries;
-        int count = cache->dense_count;
-#pragma omp target enter data map(to: entries[0 : count])
-    }
-
-    if (0 < cache->dense_phase_count) {
-        double *phase_r = cache->dense_phase_r;
-        double *phase_i = cache->dense_phase_i;
-        int phase_count = cache->dense_phase_count;
-#pragma omp target enter data map(alloc: phase_r[0 : phase_count], phase_i[0 : phase_count])
-    }
-
-    cache->dense_device_valid = 1;
+    cache->has_dense   = want_dense;
+    cache->has_local   = !want_dense;
 }
 
 static void BandCol_DMWorkspace_Reset(void)
@@ -997,7 +1013,7 @@ static void BandCol_AccumulateDenseTransposedDM(int n, int nk, int max_tno, int 
 static void BandCol_AccumulateDenseTransposedDM_Device(int n, int nk, int spin, int kloop, double k1, double k2,
                                                        double k3, const dcomplex *evec_device, int evec_stride, int *MP,
                                                        int *order_GA, double ***EIGEN, const double *occ_weight,
-                                                       double *CDM1, double *EDM1, int size_H1)
+                                                       double *CDM1, double *EDM1, int size_H1, int state_first)
 {
     BandColDMEntryCache *cache;
     const int *          basis0;
@@ -1026,7 +1042,7 @@ static void BandCol_AccumulateDenseTransposedDM_Device(int n, int nk, int spin, 
     phase_index = cache->phase_index;
     phase_r     = cache->phase_r;
     phase_i     = cache->phase_i;
-    eigen       = &EIGEN[spin][kloop][1];
+    eigen       = &EIGEN[spin][kloop][state_first];
     entry_count = cache->entry_count;
     pair_count  = cache->pair_count;
 
@@ -1035,6 +1051,51 @@ static void BandCol_AccumulateDenseTransposedDM_Device(int n, int nk, int spin, 
                                                 eigen, occ_weight, evec_ptr, CDM1, EDM1) != 0) {
         BandCol_AbortWithMessage("Band_DFT_Col HIP density matrix generation failed.");
     }
+}
+
+/* GPU DM accumulation inside the ScaLAPACK/ELPA fallback of the collinear
+   band path.  The preflight refuses the full dense solve when its three
+   n x n matrices plus the gpusolver workspace do not fit, but the DM step
+   only needs the eigenvector panel and the packed DM arrays, which are far
+   smaller, so it can stay on the GPU (the collinear cluster and the
+   noncollinear band already keep their fallback DM there).  Sizes below the
+   band threshold keep the CPU loop, which wins at those sizes.  Opt out
+   with OPENMX_BAND_GPU_DM=0. */
+static int BandCol_UseGpuFallbackDM(int n)
+{
+    const char *value = getenv("OPENMX_BAND_GPU_DM");
+
+    if (value != NULL && atoi(value) == 0) return 0;
+    return (scf_eigen_lib_flag == GPUSOLVER && Band_DFT_Col_GpuSwitchNum() <= n);
+}
+
+/* Uploads the host eigenvector panel of one fallback k point; returns NULL
+   (leaving no latched HIP error behind) when the device cannot take it, so
+   the caller falls back to the CPU loop. */
+static dcomplex *BandCol_FallbackDMUpload(const dcomplex *host, size_t count)
+{
+    size_t bytes = count * sizeof(dcomplex);
+    size_t free_bytes = 0, total_bytes = 0;
+    void  *device = NULL;
+
+    if (hipMemGetInfo(&free_bytes, &total_bytes) != hipSuccess) {
+        (void)hipGetLastError();
+        return NULL;
+    }
+    /* keep headroom for the entry-cache copyins and the other users of the
+       shared device */
+    if (free_bytes < bytes + 256ULL * 1024ULL * 1024ULL) return NULL;
+    if (hipMalloc(&device, bytes) != hipSuccess) {
+        (void)hipGetLastError();
+        return NULL;
+    }
+    if (hipMemcpy(device, host, bytes, hipMemcpyHostToDevice) != hipSuccess) {
+        (void)hipGetLastError();
+        if (hipFree(device) != hipSuccess)
+            (void)hipGetLastError();
+        return NULL;
+    }
+    return (dcomplex *)device;
 }
 
 static void BandCol_GpuSolver_ReleaseDeviceMemory(void)
@@ -1667,7 +1728,7 @@ static void BandCol_ConstructDenseCsHs_HIP(int need_s, int n, double k1, double 
 {
     BandColConstructCache *cache = &BandCol_construct_cache;
     BandColGpuSolverCtx *   ctx = &BandCol_gpusolver_ctx;
-    BandColConstructEntry *entries = cache->dense_entries;
+    BandColConstructEntry *entries = cache->dense_entries_dev;
     double *phase_r = cache->dense_phase_r;
     double *phase_i = cache->dense_phase_i;
     int count = cache->dense_count;
@@ -1676,6 +1737,10 @@ static void BandCol_ConstructDenseCsHs_HIP(int need_s, int n, double k1, double 
     long long matrix_count = (long long)n * (long long)n;
     dcomplex *d_H;
     dcomplex *d_S;
+
+    if (entries == NULL && 0 < count) {
+        BandCol_AbortWithMessage("The dense construct cache is not device-resident in Band_DFT_Col.c.");
+    }
 
     BandCol_GpuSolver_EnsureMatrixCapacity(n);
 
@@ -1884,7 +1949,7 @@ double Band_DFT_Col(int SCF_iter, int knum_i, int knum_j, int knum_k, int SpinP_
         if (max_tno < tnoA)
             max_tno = tnoA;
     }
-    use_gpusolver_dense = (scf_eigen_lib_flag == GPUSOLVER && BandCol_GpuThreshold() <= n &&
+    use_gpusolver_dense = (scf_eigen_lib_flag == GPUSOLVER && Band_DFT_Col_GpuSwitchNum() <= n &&
                            BandCol_GpuDenseFits(n,myid1==0));
 
     /****************************************************
@@ -3526,7 +3591,7 @@ diagonalize1:
                                                                    BandCol_GpuSolver_EigenvectorStride(),
                                                                    MP, use_setham_packed_cache ? setham_order_GA : order_GA, EIGEN,
                                                                    BandCol_dm_workspace.OccWeight, CDM1, EDM1,
-                                                                   size_H1);
+                                                                   size_H1, 1);
                         if (!BandCol_GpuPersistentDecide()) {
                             BandCol_GpuSolver_ClearHostEigenvectors();
                             BandCol_GpuSolver_ReleaseDeviceMemory();
@@ -3588,7 +3653,33 @@ diagonalize1:
                 dtime(&Stime0);
             }
 
-            if (kmin <= kmax) {
+            int gpu_dm_done = 0;
+
+            if (kmin <= kmax && BandCol_UseGpuFallbackDM(n)) {
+                /* EVec1 already carries sqrt(kw*FermiF) from the loop above,
+                   so the kernel runs with unit occupation weights */
+                const int nk     = kmax - kmin + 1;
+                const int stride = ie2[myid2] - is2[myid2] + 1;
+                dcomplex *evec_dev = BandCol_FallbackDMUpload(EVec1[spin], (size_t)n * (size_t)stride);
+
+                if (evec_dev != NULL) {
+                    double *unit_occ;
+
+                    BandCol_DMWorkspace_Ensure(max_tno, nk);
+                    unit_occ = BandCol_dm_workspace.OccWeight;
+                    for (int k = 0; k < nk; k++)
+                        unit_occ[k] = 1.0;
+
+                    BandCol_AccumulateDenseTransposedDM_Device(n, nk, spin, kloop, k1, k2, k3,
+                                                               evec_dev + (kmin - is2[myid2]), stride, MP, order_GA,
+                                                               EIGEN, unit_occ, CDM1, EDM1, size_H1, kmin);
+                    if (hipFree(evec_dev) != hipSuccess)
+                        (void)hipGetLastError();
+                    gpu_dm_done = 1;
+                }
+            }
+
+            if (!gpu_dm_done && kmin <= kmax) {
                 const int nk      = kmax - kmin + 1;
                 double * TmpEIGEN_local;
                 double **ReEVec0_local;
@@ -4103,7 +4194,7 @@ diagonalize1:
                     BandCol_AccumulateDenseTransposedDM_Device(n, MaxN, spin, kloop, k1, k2, k3, evec_device,
                                                                BandCol_GpuSolver_EigenvectorStride(),
                                                                MP, use_setham_packed_cache ? setham_order_GA : order_GA,
-                                                               EIGEN, occ_weight, CDM1, EDM1, size_H1);
+                                                               EIGEN, occ_weight, CDM1, EDM1, size_H1, 1);
                     BandCol_GpuSolver_ReleaseDeviceMemory();
 
                     if (measure_time) {
@@ -4320,8 +4411,26 @@ diagonalize1:
                     dtime(&Stime1);
                 }
 
-                BandCol_AccumulateDenseTransposedDM(n, MaxN, max_tno, spin, kloop, k1, k2, k3, Hs, na_rows, MP,
-                                                     EIGEN, occ_weight, CDM1, EDM1);
+                {
+                    int gpu_dm_done = 0;
+
+                    if (BandCol_UseGpuFallbackDM(n)) {
+                        dcomplex *evec_dev = BandCol_FallbackDMUpload(Hs, (size_t)n * (size_t)na_rows);
+
+                        if (evec_dev != NULL) {
+                            BandCol_AccumulateDenseTransposedDM_Device(n, MaxN, spin, kloop, k1, k2, k3, evec_dev,
+                                                                       na_rows, MP, order_GA, EIGEN, occ_weight,
+                                                                       CDM1, EDM1, size_H1, 1);
+                            if (hipFree(evec_dev) != hipSuccess)
+                                (void)hipGetLastError();
+                            gpu_dm_done = 1;
+                        }
+                    }
+                    if (!gpu_dm_done) {
+                        BandCol_AccumulateDenseTransposedDM(n, MaxN, max_tno, spin, kloop, k1, k2, k3, Hs, na_rows,
+                                                            MP, EIGEN, occ_weight, CDM1, EDM1);
+                    }
+                }
 
                 if (measure_time) {
                     dtime(&Etime1);
@@ -4770,7 +4879,7 @@ void Construct_Band_CsHs(int SCF_iter, int all_knum, int * order_GA, int * MP, d
                          double k2, double k3, dcomplex * Cs, dcomplex * Hs, int n, int owns_global_dense_rank)
 {
     const int need_s = (SCF_iter == 1 || all_knum != 1);
-    const int use_gpusolver_dense = (scf_eigen_lib_flag == GPUSOLVER && BandCol_GpuThreshold() <= n);
+    const int use_gpusolver_dense = (scf_eigen_lib_flag == GPUSOLVER && Band_DFT_Col_GpuSwitchNum() <= n);
     const int dense_gpusolver_owner =
         (use_gpusolver_dense &&
          ((all_knum == 1 && owns_global_dense_rank) ||
@@ -4782,7 +4891,7 @@ void Construct_Band_CsHs(int SCF_iter, int all_knum, int * order_GA, int * MP, d
         return;
     }
 
-    BandCol_ConstructCache_Ensure(order_GA, MP, n);
+    BandCol_ConstructCache_Ensure(order_GA, MP, n, dense_gpusolver_owner);
 
     if (dense_gpusolver_owner) {
         BandCol_ConstructDenseCsHs_HIP(need_s, n, k1, k2, k3, S1, H1);
