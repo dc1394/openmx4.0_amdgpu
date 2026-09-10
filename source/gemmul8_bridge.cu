@@ -129,6 +129,45 @@ bool gemmul8_disabled(const char *openmx_env, const char *gemmul8_env)
     return disabled;
 }
 
+/* GEMMul8 >= 3.3.0 memory-saving mode: OPENMX_GEMMUL8_MAX_WORKSPACE_MB caps
+   the per-GEMM workspace to an absolute size and GEMMul8 runs the GEMM in
+   blocks that fit it, instead of this bridge falling back to plain FP64
+   hipBLAS.  0 / unset keeps the pre-3.3.0 behavior (uncapped workspace,
+   fraction-based fallback below).  Caps under 256 MiB are raised to 256:
+   below the minimum viable block GEMMul8 asserts (and with NDEBUG would
+   silently skip the multiplication). */
+constexpr size_t kMinMemorySavingBytes = size_t(256) * kMiB;
+
+size_t memory_saving_cap_bytes()
+{
+    static std::once_flag once;
+    static size_t         cap = 0;
+
+    std::call_once(once, [] {
+        cap = env_mib("OPENMX_GEMMUL8_MAX_WORKSPACE_MB", "GEMMUL8_MAX_WORKSPACE_MB", 0u);
+        if (cap != 0 && cap < kMinMemorySavingBytes) {
+            std::fprintf(stderr,
+                         "openmx_gemmul8: OPENMX_GEMMUL8_MAX_WORKSPACE_MB below the %zu MiB minimum; using %zu MiB.\n",
+                         kMinMemorySavingBytes / kMiB, kMinMemorySavingBytes / kMiB);
+            std::fflush(stderr);
+            cap = kMinMemorySavingBytes;
+        }
+    });
+    return cap;
+}
+
+/* apply the handle-local memory-saving configuration before a GEMM; cheap
+   (a registry lookup inside GEMMul8), and idempotent */
+void apply_memory_saving(hipblasHandle_t handle)
+{
+    const size_t cap = memory_saving_cap_bytes();
+
+    if (cap != 0) {
+        gemmul8::set_memory_saving(handle, true);
+        gemmul8::set_max_worksize(handle, cap);
+    }
+}
+
 unsigned gemmul8_num_moduli(const char *openmx_env, const char *gemmul8_env)
 {
     unsigned num_moduli = env_u32(gemmul8_env, kDefaultNumModuli);
@@ -222,7 +261,13 @@ hipblasStatus_t ensure_workspace(hipblasHandle_t handle, size_t m, size_t n, siz
         return HIPBLAS_STATUS_INTERNAL_ERROR;
     }
 
-    const size_t required = gemmul8::workSize<is_complex, gemmul8::Backend::INT8>(m, n, k, num_moduli);
+    size_t required = gemmul8::workSize<is_complex, gemmul8::Backend::INT8>(m, n, k, num_moduli);
+    /* with the memory-saving cap the GEMM runs blocked inside cap bytes, so
+       that is all the workspace it will touch */
+    const size_t ms_cap = memory_saving_cap_bytes();
+    if (ms_cap != 0 && ms_cap < required) {
+        required = ms_cap;
+    }
     WorkspaceKey key      = {device, stream};
 
     const unsigned ranks_per_gpu = ranks_sharing_gpu();
@@ -373,6 +418,8 @@ extern "C" hipblasStatus_t openmx_gemmul8Dgemm(hipblasHandle_t handle,
         return hipblasDgemm(handle, gemmul8_transa, gemmul8_transb, m, n, k, alpha, A, lda, B, ldb, beta, C, ldc);
     }
 
+    apply_memory_saving(handle);
+
     hipblasStatus_t status =
         ensure_workspace<false>(handle, static_cast<size_t>(m), static_cast<size_t>(n), static_cast<size_t>(k),
                                 num_moduli, &work, &report);
@@ -403,7 +450,10 @@ extern "C" size_t openmx_gemmul8ZWorkspaceSize(int m, int n, int k)
     if (m<=0 || n<=0 || k<=0 || !g_input_enabled ||
         gemmul8_disabled("OPENMX_GEMMUL8_DISABLE_Z","GEMMUL8_DISABLE_Z")) return 0;
     const unsigned num_moduli=gemmul8_num_moduli("OPENMX_GEMMUL8_NUM_MOD_Z","GEMMUL8_NUM_MOD_Z");
-    return gemmul8::workSize<true,gemmul8::Backend::INT8>((size_t)m,(size_t)n,(size_t)k,num_moduli);
+    size_t size = gemmul8::workSize<true,gemmul8::Backend::INT8>((size_t)m,(size_t)n,(size_t)k,num_moduli);
+    const size_t ms_cap = memory_saving_cap_bytes();
+    if (ms_cap != 0 && ms_cap < size) size = ms_cap;
+    return size;
 }
 
 extern "C" size_t openmx_gemmul8DWorkspaceSize(int m, int n, int k)
@@ -411,7 +461,10 @@ extern "C" size_t openmx_gemmul8DWorkspaceSize(int m, int n, int k)
     if (m<=0 || n<=0 || k<=0 || !g_input_enabled ||
         gemmul8_disabled("OPENMX_GEMMUL8_DISABLE_D","GEMMUL8_DISABLE_D")) return 0;
     const unsigned num_moduli=gemmul8_num_moduli("OPENMX_GEMMUL8_NUM_MOD_D","GEMMUL8_NUM_MOD_D");
-    return gemmul8::workSize<false,gemmul8::Backend::INT8>((size_t)m,(size_t)n,(size_t)k,num_moduli);
+    size_t size = gemmul8::workSize<false,gemmul8::Backend::INT8>((size_t)m,(size_t)n,(size_t)k,num_moduli);
+    const size_t ms_cap = memory_saving_cap_bytes();
+    if (ms_cap != 0 && ms_cap < size) size = ms_cap;
+    return size;
 }
 
 extern "C" void openmx_gemmul8ReleaseWorkspaces(void)
@@ -474,6 +527,8 @@ extern "C" hipblasStatus_t openmx_gemmul8Zgemm(hipblasHandle_t handle,
         log_workspace_fallback_once<true>(report, "native hipBLAS");
         return hipblasZgemm(handle, transa, transb, m, n, k, alpha, A, lda, B, ldb, beta, C, ldc);
     }
+
+    apply_memory_saving(handle);
 
     hipblasStatus_t status =
         ensure_workspace<true>(handle, static_cast<size_t>(m), static_cast<size_t>(n), static_cast<size_t>(k),

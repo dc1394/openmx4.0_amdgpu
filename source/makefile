@@ -154,11 +154,16 @@ GEMMUL8_REPO_URL ?= https://github.com/RIKEN-RCCS/GEMMul8.git
 GEMMUL8_REPO_DIR ?= third_party/GEMMul8
 # gemmul8_openmx.cu instantiates GEMMul8 internals directly, so the
 # checkout must stay pinned to a commit whose internal layout it matches.
-# 6bf409b is the v3.1.1 release.
-GEMMUL8_COMMIT ?= 6bf409bdc69a638970ad5f91948a8b3e44c5378b
+# 9131544 is the v3.3.0 release (memory-saving mode, handle-local config).
+GEMMUL8_COMMIT ?= 91315445ea07294e71b4671861b20f42cbf06f12
 GEMMUL8_DIR ?= $(GEMMUL8_REPO_DIR)
 GEMMUL8_LIB ?= $(GEMMUL8_DIR)/lib/libgemmul8.a
 GEMMUL8_OPENMX_OBJ ?= $(GEMMUL8_DIR)/src/gemmul8_openmx.o
+# v3.3.0 keeps the handle-local configuration (memory-saving mode) in a
+# registry defined in this host-only TU; the gemm path queries it via
+# gemmul8::config::get_config, so it must be part of the library.
+GEMMUL8_CONFIG_SRC ?= $(GEMMUL8_DIR)/src/worksize/cu_recipe/memory_saving.cu
+GEMMUL8_CONFIG_OBJ ?= $(GEMMUL8_DIR)/src/gemmul8_config.o
 GEMMUL8_GPU_ARCH ?= $(ARCH)
 HIPCC_GEMMUL8_FLAGS = -std=c++20 -O3 --offload-arch=$(GEMMUL8_GPU_ARCH) -I. -I$(GEMMUL8_DIR)/include -I$(GEMMUL8_DIR)/src -I$(ROCM)/include -D__HIP_PLATFORM_AMD__ -ffp-contract=off -Wno-unused-result -Wno-unused-command-line-argument -Wno-unused-value -DOCML_BASIC_ROUNDED_OPERATIONS -DGPU_ARCH=$(GEMMUL8_GPU_ARCH)
 MAGMA_VERSION ?= 2.10.0
@@ -802,9 +807,11 @@ $(GEMMUL8_DIR)/include/gemmul8.hpp: | $(GEMMUL8_DIR)/Makefile
 	@:
 $(GEMMUL8_OPENMX_OBJ): gemmul8_openmx.cu $(GEMMUL8_DIR)/Makefile
 	$(HIPCC) $(HIPCC_GEMMUL8_FLAGS) -c gemmul8_openmx.cu -o $(GEMMUL8_OPENMX_OBJ)
-$(GEMMUL8_LIB): $(GEMMUL8_OPENMX_OBJ)
+$(GEMMUL8_CONFIG_OBJ): $(GEMMUL8_CONFIG_SRC) $(GEMMUL8_DIR)/Makefile
+	$(HIPCC) $(HIPCC_GEMMUL8_FLAGS) -c $(GEMMUL8_CONFIG_SRC) -o $(GEMMUL8_CONFIG_OBJ)
+$(GEMMUL8_LIB): $(GEMMUL8_OPENMX_OBJ) $(GEMMUL8_CONFIG_OBJ)
 	mkdir -p $(GEMMUL8_DIR)/lib
-	ar rcs $(GEMMUL8_LIB) $(GEMMUL8_OPENMX_OBJ)
+	ar rcs $(GEMMUL8_LIB) $(GEMMUL8_OPENMX_OBJ) $(GEMMUL8_CONFIG_OBJ)
 $(MAGMA_ARCHIVE):
 	@echo "Bundled MAGMA archive was not found: $(MAGMA_ARCHIVE)"
 	@echo "Place magma-$(MAGMA_VERSION).tar.gz from https://icl.utk.edu/magma/ under $(MAGMA_DIR)/, or override MAGMA_ARCHIVE."
