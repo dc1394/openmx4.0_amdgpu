@@ -1152,6 +1152,11 @@ static void Force3_GpuTrace(const double* dchi_all, const size_t* dchi_off,
         size_t max_pairs = 0, max_gl = 0, max_fn = 0, max_dm = 0;
         size_t max_dchi = 0, max_npts = 0;
         size_t max_atoms = 0;
+        /* per-task force staging (3 doubles x npairs x max n_olg of the
+           chunk): it must live inside the planned arena -- a separate
+           allocation after the arena claim finds the device already spoken
+           for and used to abort the run on memory-tight nodes */
+        size_t max_tf = 0;
 
         chunk_bound[0] = 1;
         chunk_lo = 1;
@@ -1162,11 +1167,12 @@ static void Force3_GpuTrace(const double* dchi_all, const size_t* dchi_off,
             int chunk_hi = chunk_lo; /* exclusive */
             int npairs = 0;
             size_t gl_count = 0, fn_count = 0, dm_count = 0;
+            size_t chunk_maxolg = 0;
 
             while (chunk_hi <= Matomnum) {
                 int Gc_AN = M2G[chunk_hi];
                 int NO0 = Spe_Total_CNO[WhatSpecies[Gc_AN]];
-                size_t a_gl = 0, a_fn = 0, a_dm = 0;
+                size_t a_gl = 0, a_fn = 0, a_dm = 0, a_maxolg = 0, cand_maxolg;
                 size_t chunk_bytes;
                 int a_pairs = 0;
 
@@ -1178,12 +1184,15 @@ static void Force3_GpuTrace(const double* dchi_all, const size_t* dchi_off,
                     a_pairs++;
                     a_gl += nolg;
                     a_dm += (size_t)spins * (size_t)NO0 * (size_t)NO1;
+                    if (a_maxolg < nolg) a_maxolg = nolg;
                     if (!f3_use_seth_orbs1 && G2ID[Gh_AN] != myid) a_fn += nolg * (size_t)NO1;
                 }
 
+                cand_maxolg = (chunk_maxolg < a_maxolg) ? a_maxolg : chunk_maxolg;
                 chunk_bytes = (gl_count + a_gl) * 2 * sizeof(int)
                     + (fn_count + a_fn) * sizeof(float)
                     + (dm_count + a_dm) * sizeof(double)
+                    + (size_t)(npairs + a_pairs) * cand_maxolg * 3 * sizeof(double)
                     + (dchi_off[chunk_hi + 1] - dchi_off[chunk_lo]) * sizeof(double);
 
                 if (chunk_lo < chunk_hi && chunk_budget < chunk_bytes) break;
@@ -1192,6 +1201,7 @@ static void Force3_GpuTrace(const double* dchi_all, const size_t* dchi_off,
                 fn_count += a_fn;
                 dm_count += a_dm;
                 npairs += a_pairs;
+                chunk_maxolg = cand_maxolg;
                 chunk_hi++;
             }
 
@@ -1202,6 +1212,7 @@ static void Force3_GpuTrace(const double* dchi_all, const size_t* dchi_off,
             n_chunks++;
             chunk_bound[n_chunks] = chunk_hi;
 
+            if (max_tf < (size_t)npairs * chunk_maxolg) max_tf = (size_t)npairs * chunk_maxolg;
             if (max_pairs < (size_t)npairs) max_pairs = (size_t)npairs;
             if (max_gl < gl_count) max_gl = gl_count;
             if (max_fn < fn_count) max_fn = fn_count;
@@ -1263,6 +1274,7 @@ static void Force3_GpuTrace(const double* dchi_all, const size_t* dchi_off,
             const size_t o_fn   = Force_gpu_arena_off(&arena_pos, sizeof(float) * fnb_n);
             const size_t o_dm   = Force_gpu_arena_off(&arena_pos, sizeof(double) * dmb_n);
             const size_t o_pf   = Force_gpu_arena_off(&arena_pos, sizeof(double) * pf_n);
+            const size_t o_tf   = Force_gpu_arena_off(&arena_pos, sizeof(double) * 3U * (max_tf == 0 ? 1 : max_tf));
             const size_t o_pt   = Force_gpu_arena_off(&arena_pos, sizeof(int) * pt_n);
             const size_t o_awan = Force_gpu_arena_off(&arena_pos, sizeof(int) * am_n);
             const size_t o_ano0 = Force_gpu_arena_off(&arena_pos, sizeof(int) * am_n);
@@ -1775,11 +1787,13 @@ static void Force3_GpuTrace(const double* dchi_all, const size_t* dchi_off,
                         if (max_n_olg < pm[pp].n_olg) max_n_olg = pm[pp].n_olg;
                     }
                     task_count = (size_t)npairs_c * (size_t)max_n_olg;
+                    if (max_tf < task_count)
+                        Force3_gpu_abort("Force3 GPU trace: task-force slot smaller than planned.");
                     task_f = (double*)Force_checked_malloc(
                         sizeof(double) * 3U * task_count, __FILE__, __LINE__);
-                    task_f_dev = (double*)ForceHipMalloc(sizeof(double) * 3U * task_count);
-                    if (task_f_dev == NULL)
-                        Force3_gpu_abort("Force3 GPU trace: task-force allocation failed.");
+                    /* lives in the planned arena; a separate allocation here
+                       used to fail once the arena had claimed the free memory */
+                    task_f_dev = (double*)(void*)(chunk_arena + o_tf);
 
                     {
                         const Force3GpuPair* pm = (const Force3GpuPair*)(const void*)(chunk_arena + o_pm);
@@ -1852,7 +1866,6 @@ static void Force3_GpuTrace(const double* dchi_all, const size_t* dchi_off,
 
                     ForceHipMemcpyFromDevice(task_f, task_f_dev,
                         sizeof(double) * 3U * task_count);
-                    hipFree(task_f_dev);
                     memset(pair_f, 0, sizeof(double) * 3U * (size_t)npairs_c);
                     for (size_t task = 0; task < task_count; task++) {
                         const int pp = (int)(task / (size_t)max_n_olg);

@@ -129,14 +129,18 @@ bool gemmul8_disabled(const char *openmx_env, const char *gemmul8_env)
     return disabled;
 }
 
-/* GEMMul8 >= 3.3.0 memory-saving mode: OPENMX_GEMMUL8_MAX_WORKSPACE_MB caps
-   the per-GEMM workspace to an absolute size and GEMMul8 runs the GEMM in
-   blocks that fit it, instead of this bridge falling back to plain FP64
-   hipBLAS.  0 / unset keeps the pre-3.3.0 behavior (uncapped workspace,
-   fraction-based fallback below).  Caps under 256 MiB are raised to 256:
+/* GEMMul8 >= 3.3.0 memory-saving mode: the per-GEMM workspace is capped and
+   GEMMul8 runs the GEMM in blocks that fit the cap, instead of this bridge
+   falling back to plain FP64 hipBLAS.  Default cap: 256 MiB per rank -- the
+   blocked path matches the uncapped result bit-for-bit in accuracy class
+   (verified against hipBLAS FP64 at n=4096) and keeps many-rank shared GPUs
+   out of workspace-driven OOM.  OPENMX_GEMMUL8_MAX_WORKSPACE_MB overrides:
+   0 disables the cap (pre-3.3.0 behavior, uncapped workspace with the
+   fraction-based fallback below); values under 256 MiB are raised to 256,
    below the minimum viable block GEMMul8 asserts (and with NDEBUG would
    silently skip the multiplication). */
 constexpr size_t kMinMemorySavingBytes = size_t(256) * kMiB;
+constexpr unsigned kDefaultMemorySavingMiB = 256u;
 
 size_t memory_saving_cap_bytes()
 {
@@ -144,7 +148,8 @@ size_t memory_saving_cap_bytes()
     static size_t         cap = 0;
 
     std::call_once(once, [] {
-        cap = env_mib("OPENMX_GEMMUL8_MAX_WORKSPACE_MB", "GEMMUL8_MAX_WORKSPACE_MB", 0u);
+        cap = env_mib("OPENMX_GEMMUL8_MAX_WORKSPACE_MB", "GEMMUL8_MAX_WORKSPACE_MB",
+                      kDefaultMemorySavingMiB);
         if (cap != 0 && cap < kMinMemorySavingBytes) {
             std::fprintf(stderr,
                          "openmx_gemmul8: OPENMX_GEMMUL8_MAX_WORKSPACE_MB below the %zu MiB minimum; using %zu MiB.\n",

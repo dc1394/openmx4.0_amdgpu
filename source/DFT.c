@@ -37,6 +37,8 @@ static int DFT_SetOLPKinUseGPU(void);
 static int DFT_SetProExpnVNAUseGPU(void);
 double Cluster_DFT_NonCol_ScatterGpuSolverCachedEVec(int n2, int *is2, int *ie2, dcomplex *EVec1);
 extern int BandNonCol_HamiltonianUseHipSolver(void);
+extern int openmx_magma_release_z_workspace(void);
+extern int openmx_hipsolver_release_workspace(void);
 int Band_DFT_Col_GpuSwitchNum(void);
 int Band_DFT_NonCol_GpuSwitchNum(void);
 int Cluster_DFT_Col_GpuSwitchNum(void);
@@ -2429,6 +2431,14 @@ double DFT(int MD_iter, int Cnt_Now)
   Cluster_DFT_NonCol_Release_GPU_Solver();
   Divide_Conquer_Release_GPU_SCache();
   Krylov_Release_GPU_KUCache();
+  /* The dense-GEMM and eigensolver library workspaces of the SCF loop are
+     dead weight from here on (they are re-created on demand at the next SCF
+     step), but on a device shared by many ranks they can hold the very GiBs
+     the force-stage batches need: a 216-atom noncollinear cluster run on one
+     16-GiB GPU died in Force3's task-force allocation with them resident. */
+  openmx_gemmul8ReleaseWorkspaces();
+  (void)openmx_magma_release_z_workspace();
+  (void)openmx_hipsolver_release_workspace();
   if (!orbitalOpt_Force_Skip) time7 += Force(H0,DS_NL,OLP,DM[0],EDM);
   
   if (scf_stress_flag){

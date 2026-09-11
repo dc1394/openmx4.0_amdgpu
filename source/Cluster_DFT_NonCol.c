@@ -900,7 +900,12 @@ static int ClusterNonCol_GpuDiagFits(int n2, int myid)
     const char *env = getenv("OPENMX_CLUSTER_GPU_DIAG");
     const char *reserve_env = getenv("OPENMX_CLUSTER_GPU_DIAG_RESERVE_MB");
     size_t free_bytes = 0, total_bytes = 0;
-    size_t reserve = (size_t)1024 * 1024 * 1024;
+    /* 256 MB headroom by default: the dense buffers are transient (freed
+       inside every solve) and the SCF-loop library workspaces are released
+       before the force stage, so the old 1-GiB reserve only pushed VRAM-
+       tight shared GPUs into the ELPA fallback.  Override with
+       OPENMX_CLUSTER_GPU_DIAG_RESERVE_MB. */
+    size_t reserve = (size_t)256 * 1024 * 1024;
     size_t required = 0;
     int local_fit = 1, fit = 1;
 

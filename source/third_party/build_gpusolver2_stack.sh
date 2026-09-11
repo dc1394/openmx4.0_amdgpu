@@ -106,25 +106,43 @@ step_elpa() {
   mkdir -p "$BLD/elpa" && cd "$BLD/elpa"
   # -I.../include/rocsolver: ROCm >= 6 nests rocsolver.h in its own
   # subdirectory but ELPA's ROCm sources include plain <rocsolver.h>.
+  # The SSE/AVX/AVX2 kernels stay enabled (their default) and the whole
+  # library is built with the x86-64-v3 baseline so ELPA's intrinsics
+  # probes pass; ELPA picks the best kernel by CPUID at run time, which is
+  # what the CPU-kernel fallback of the memory guard runs on.  AVX-512 is
+  # disabled: it would raise the baseline beyond Zen 2 build/dev hosts, and
+  # on the Zen 4 target its double-pumped AVX-512 gains little over AVX2.
+  # (The NVIDIA-side script disables all SIMD kernels for its NVHPC
+  # toolchain.)
   "$SRC/elpa/configure" --prefix="$P" \
     FC="$GPUSOLVER2_MPI_BIN/mpif90" CC="$GPUSOLVER2_MPI_BIN/mpicc" CXX="$GPUSOLVER2_MPI_BIN/mpicxx" \
     HIPCC="$GPUSOLVER2_HIPCC" \
-    FCFLAGS="-O2" CFLAGS="-O2" CXXFLAGS="-O2" \
+    FCFLAGS="-O2 -march=x86-64-v3" CFLAGS="-O2 -march=x86-64-v3" CXXFLAGS="-O2 -march=x86-64-v3" \
     HIPCCFLAGS="-O2 --offload-arch=$GPUSOLVER2_GPU_ARCH -I$GPUSOLVER2_ROCM/include/rocsolver" \
     CPPFLAGS="-I$GPUSOLVER2_ROCM/include -I$GPUSOLVER2_ROCM/include/rocsolver" \
     LDFLAGS="-L$GPUSOLVER2_MPI_LIBDIR -L$GPUSOLVER2_AOCL_LIB -L$GPUSOLVER2_AOCC_LIB -L$GPUSOLVER2_ROCM/lib" \
     LIBS="-lscalapack -lflame -lblis -lrocblas -lamdhip64 -lstdc++" \
     --enable-amd-gpu-kernels --disable-shared --enable-static \
-    --disable-sse-assembly --disable-sse --disable-avx --disable-avx2 --disable-avx512 \
+    --disable-avx512 \
     --disable-c-tests --disable-cpp-tests --disable-fortran-tests --disable-Fortran-tests
+  # amdflang's -O2 middle end blows up (tens of GiB of RSS) on the
+  # generated elpa2_compute.F90 once the SIMD kernel templates are enabled;
+  # build that one driver TU at -O1 up front.  The hot kernels live in
+  # their own TUs and keep the full optimization level.
+  make FCFLAGS="-O1 -march=x86-64-v3" src/elpa2/libelpa_private_la-elpa2_compute.lo
   # bin_PROGRAMS= noinst_PROGRAMS=: skip the elpa2_print_kernels diagnostic
   # binary and the validate_* self-test binaries ("make all" builds both
   # even with the test suites disabled).  Their libtool links expand
   # OpenMPI's .la dependency_libs (-levent_core, -lhwloc) whose dev
   # symlinks plain distro hosts do not ship; nothing in the gpusolver2
-  # stack runs them.
-  make -j "$J" bin_PROGRAMS= noinst_PROGRAMS=
-  make install bin_PROGRAMS= noinst_PROGRAMS=
+  # stack runs them.  The noinst override also drops libelpatest (its
+  # Fortran-module build order is racy and only the skipped validate
+  # binaries link it) while keeping the two convenience libraries that
+  # make up libelpa itself.
+  make -j "$J" bin_PROGRAMS= noinst_PROGRAMS= \
+    noinst_LTLIBRARIES="libelpa_public.la libelpa_private.la"
+  make install bin_PROGRAMS= noinst_PROGRAMS= \
+    noinst_LTLIBRARIES="libelpa_public.la libelpa_private.la"
 
   # The OpenMX source tree embeds ELPA 2018.05 for the elpa1/elpa2 keywords,
   # and its Fortran module symbols (elpa_utilities_*, elpa2_workload_*,
