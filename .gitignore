@@ -57,7 +57,8 @@ libtool
 # === gpusolver2 stack build artifacts (built from source/third_party/dist) ===
 /source/third_party/gpusolver2-install/
 /source/build/
-# the *.md rule above is for OpenMX MD outputs; keep the dist manifest
+# the *.md rule above is for OpenMX MD outputs; keep the real Markdown docs
+!/README.md
 !/source/third_party/dist/README.md
 
 # === Test/benchmark output dirs ===

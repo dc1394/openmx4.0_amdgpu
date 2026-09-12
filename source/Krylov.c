@@ -128,6 +128,21 @@ static int Krylov_GPU_Enabled(void)
   return KRYLOV_ENABLE_GPU && scf_eigen_lib_flag == GPUSOLVER;
 }
 
+/*
+  Verdict of the device-memory preflight of the current Krylov call
+  (Krylov_GPU_Preflight): 0 routes every GPU helper below to its CPU path.
+  A failed device allocation inside a call also clears it, so the rest of
+  the call stays on the CPU instead of racing the other ranks for the last
+  free bytes.  It has to be decided up front: hipBLASLt terminates the
+  process when an allocation inside a GEMM fails, it does not return an
+  error the caller could recover from.
+*/
+static int Krylov_gpu_fits = 1;
+static int Krylov_gpu_alloc_failure_reported = 0;
+/* set by the preflight; the KU cache of the same call is sized from them */
+static int Krylov_gpu_device_ranks = 1;
+static unsigned long long Krylov_gpu_need_total = 0;
+
 typedef struct {
   int active;
   hipblasHandle_t hipblas;
@@ -145,7 +160,10 @@ typedef struct {
 static void Krylov_GPU_InitOnce(void);
 static void Krylov_GPU_Workspace_Init(Krylov_GPU_Workspace *ws);
 static void Krylov_GPU_Workspace_Free(Krylov_GPU_Workspace *ws);
-static void Krylov_GPU_EnsureHipblas(Krylov_GPU_Workspace *ws);
+static int  Krylov_GPU_EnsureHipblas(Krylov_GPU_Workspace *ws);
+static int  Krylov_GPU_EnsureDouble(double **ptr, size_t *capacity, size_t count);
+static int  Krylov_GPU_Usable(const Krylov_GPU_Workspace *ws);
+static void Krylov_GPU_Preflight(int matomnum, const int *Msize, const int *Msize3);
 static void Krylov_GPU_PreparePool(int nthrds);
 static Krylov_GPU_Workspace *Krylov_GPU_GetWorkspace(int thread_id);
 static void Krylov_Dgemm(Krylov_GPU_Workspace *ws,
@@ -222,13 +240,49 @@ static Krylov_GPU_Workspace *Krylov_GPU_GetWorkspace(int thread_id)
   return ws;
 }
 
-static void Krylov_GPU_EnsureDouble(double **ptr, size_t *capacity, size_t count)
+static void Krylov_GPU_ReportAllocFailure(const char *what, size_t bytes, const char *reason)
+{
+  if (Krylov_gpu_alloc_failure_reported) return;
+  Krylov_gpu_alloc_failure_reported = 1;
+  if (bytes != 0)
+    fprintf(stderr,
+            "Krylov: %s of %.3f MiB on the GPU failed (%s); "
+            "the remaining local solves of this call run on the CPU.\n",
+            what, (double)bytes/(1024.0*1024.0), reason);
+  else
+    fprintf(stderr,
+            "Krylov: %s on the GPU failed (%s); "
+            "the remaining local solves of this call run on the CPU.\n",
+            what, reason);
+  fflush(stderr);
+}
+
+/* Grows a device buffer; returns 0 (and demotes the rest of the call to
+   the CPU) when the device is out of memory instead of aborting. */
+static int Krylov_GPU_EnsureDouble(double **ptr, size_t *capacity, size_t count)
 {
   if (*capacity < count){
+    hipError_t err;
+
     if (*ptr != NULL) wait_hipfunc(hipFree(*ptr));
-    wait_hipfunc(hipMalloc((void**)ptr, sizeof(double)*count));
+    *ptr = NULL;
+    *capacity = 0;
+    err = hipMalloc((void**)ptr, sizeof(double)*count);
+    if (err != hipSuccess){
+      (void)hipGetLastError();
+      *ptr = NULL;
+      Krylov_gpu_fits = 0;
+      Krylov_GPU_ReportAllocFailure("hipMalloc", sizeof(double)*count, hipGetErrorString(err));
+      return 0;
+    }
     *capacity = count;
   }
+  return 1;
+}
+
+static int Krylov_GPU_Usable(const Krylov_GPU_Workspace *ws)
+{
+  return ws != NULL && ws->active && Krylov_gpu_fits;
 }
 
 static void Krylov_GPU_EnsureHostMatrix(Krylov_GPU_Workspace *ws, size_t count)
@@ -266,12 +320,24 @@ static void Krylov_GPU_Workspace_Free(Krylov_GPU_Workspace *ws)
   memset(ws,0,sizeof(Krylov_GPU_Workspace));
 }
 
-static void Krylov_GPU_EnsureHipblas(Krylov_GPU_Workspace *ws)
+static int Krylov_GPU_EnsureHipblas(Krylov_GPU_Workspace *ws)
 {
   if (ws->hipblas == NULL){
-    wait_hipfunc(hipblasCreate(&ws->hipblas));
-    wait_hipfunc(hipblasSetStream(ws->hipblas, ws->stream));
+    hipblasHandle_t handle = NULL;
+    hipblasStatus_t status = hipblasCreate(&handle);
+
+    /* the handle owns the BLAS workspace pool, so this is where a full
+       device shows up first */
+    if (status != HIPBLAS_STATUS_SUCCESS){
+      (void)hipGetLastError();
+      Krylov_gpu_fits = 0;
+      Krylov_GPU_ReportAllocFailure("hipblasCreate", 0, "hipBLAS handle creation failed");
+      return 0;
+    }
+    wait_hipfunc(hipblasSetStream(handle, ws->stream));
+    ws->hipblas = handle;
   }
+  return 1;
 }
 
 static void Krylov_Dgemm(Krylov_GPU_Workspace *ws,
@@ -283,26 +349,28 @@ static void Krylov_Dgemm(Krylov_GPU_Workspace *ws,
 {
   const double alpha = 1.0;
   const double beta  = 0.0;
+  size_t cols_A = (transa == HIPBLAS_OP_N) ? (size_t)k : (size_t)m;
+  size_t cols_B = (transb == HIPBLAS_OP_N) ? (size_t)n : (size_t)k;
+  size_t count_A = (size_t)lda*cols_A;
+  size_t count_B = (size_t)ldb*cols_B;
+  size_t count_C = (size_t)ldc*(size_t)n;
+  int on_gpu = Krylov_GPU_Usable(ws) &&
+               !((double)m*(double)n*(double)k < Krylov_gpu_dgemm_min_flops);
 
-  if (ws == NULL || !ws->active || ((double)m*(double)n*(double)k < Krylov_gpu_dgemm_min_flops)){
+  if (on_gpu){
+    on_gpu = Krylov_GPU_EnsureHipblas(ws) &&
+             Krylov_GPU_EnsureDouble(&ws->d_A, &ws->d_A_count, count_A) &&
+             Krylov_GPU_EnsureDouble(&ws->d_B, &ws->d_B_count, count_B) &&
+             Krylov_GPU_EnsureDouble(&ws->d_C, &ws->d_C_count, count_C);
+  }
+
+  if (!on_gpu){
     char ta = (transa == HIPBLAS_OP_N) ? 'N' : 'T';
     char tb = (transb == HIPBLAS_OP_N) ? 'N' : 'T';
     F77_NAME(dgemm,DGEMM)(&ta, &tb, &m, &n, &k, (double*)&alpha,
                           (double*)A, &lda, (double*)B, &ldb, (double*)&beta, C, &ldc);
     return;
   }
-
-  Krylov_GPU_EnsureHipblas(ws);
-
-  size_t cols_A = (transa == HIPBLAS_OP_N) ? (size_t)k : (size_t)m;
-  size_t cols_B = (transb == HIPBLAS_OP_N) ? (size_t)n : (size_t)k;
-  size_t count_A = (size_t)lda*cols_A;
-  size_t count_B = (size_t)ldb*cols_B;
-  size_t count_C = (size_t)ldc*(size_t)n;
-
-  Krylov_GPU_EnsureDouble(&ws->d_A, &ws->d_A_count, count_A);
-  Krylov_GPU_EnsureDouble(&ws->d_B, &ws->d_B_count, count_B);
-  Krylov_GPU_EnsureDouble(&ws->d_C, &ws->d_C_count, count_C);
 
   wait_hipfunc(hipMemcpyAsync(ws->d_A, A, sizeof(double)*count_A,
                                 hipMemcpyHostToDevice, ws->stream));
@@ -322,13 +390,16 @@ static void Krylov_Eigen2(Krylov_GPU_Workspace *ws, double *a, int csize, double
   int i,j;
   int info, mout;
 
-  if (ws == NULL || !ws->active || n < Krylov_gpu_eigen_min){
+  if (!Krylov_GPU_Usable(ws) || n < Krylov_gpu_eigen_min){
     Eigen_lapack2(a,csize,ko,n,EVmax);
     return;
   }
 
   Krylov_GPU_EnsureHostMatrix(ws,(size_t)n*(size_t)n);
-  Krylov_GPU_EnsureDouble(&ws->d_A, &ws->d_A_count, (size_t)n*(size_t)n);
+  if (!Krylov_GPU_EnsureDouble(&ws->d_A, &ws->d_A_count, (size_t)n*(size_t)n)){
+    Eigen_lapack2(a,csize,ko,n,EVmax);
+    return;
+  }
 
   for (i=0; i<n; i++){
     for (j=0; j<n; j++){
@@ -389,16 +460,19 @@ void Krylov_Release_GPU_KUCache(void)
   memset(&Krylov_kucache,0,sizeof(Krylov_kucache));
 }
 
+/* keep_free: device memory the preflight of this call has already claimed
+   for the solves themselves, summed over the device_ranks ranks sharing
+   the GPU.  The cache is sized from what is left beyond that and the
+   reserve; otherwise it would starve the very solves it accelerates. */
 static void Krylov_KUCache_Prepare(int matomnum, int nspin, const int *Msize,
-                                   const int *Msize3, int scf_iter)
+                                   const int *Msize3, int scf_iter,
+                                   int device_ranks, unsigned long long keep_free)
 {
   const char *enable = getenv("OPENMX_KRYLOV_GPU_KU_CACHE");
   const char *reserve_env = getenv("OPENMX_KRYLOV_GPU_KU_RESERVE_MB");
   size_t nslot = (size_t)nspin*(size_t)(matomnum+1);
   size_t free_bytes=0,total_bytes=0,reserve=(size_t)4096*1024*1024;
   size_t budget,used=0;
-  int node_ranks=1;
-  MPI_Comm node_comm=MPI_COMM_NULL;
 
   if (enable!=NULL && atoi(enable)==0) return;
   if (reserve_env!=NULL){
@@ -431,16 +505,15 @@ static void Krylov_KUCache_Prepare(int matomnum, int nspin, const int *Msize,
     MPI_Abort(MPI_COMM_WORLD,1);
   }
 
-  MPI_Comm_split_type(mpi_comm_level1,MPI_COMM_TYPE_SHARED,0,MPI_INFO_NULL,&node_comm);
-  MPI_Comm_size(node_comm,&node_ranks);
-  MPI_Comm_free(&node_comm);
-  if (node_ranks<1) node_ranks=1;
+  if (device_ranks<1) device_ranks=1;
   if (hipMemGetInfo(&free_bytes,&total_bytes)!=hipSuccess){
+    (void)hipGetLastError();
     Krylov_Release_GPU_KUCache();
     Krylov_kucache.state=-1;
     return;
   }
-  budget=free_bytes>reserve ? (free_bytes-reserve)/(size_t)node_ranks : 0;
+  reserve += (size_t)keep_free;
+  budget=free_bytes>reserve ? (free_bytes-reserve)/(size_t)device_ranks : 0;
   for (int spin=0;spin<nspin;spin++) for (int a=1;a<=matomnum;a++){
     size_t slot=(size_t)spin*(size_t)(matomnum+1)+(size_t)a;
     size_t elems=(size_t)Msize[a]*(size_t)Msize3[a];
@@ -460,6 +533,117 @@ static void Krylov_KUCache_Prepare(int matomnum, int nspin, const int *Msize,
   Krylov_kucache.matomnum=matomnum;
   Krylov_kucache.nspin=nspin;
   Krylov_kucache.arena_elems=used;
+}
+
+/*
+  Device-memory preflight of one Krylov call.  The projected solves of the
+  ranks sharing a GPU run concurrently, so the estimate is summed over
+  those ranks and compared with the free memory of the device: the growth
+  of the per-thread device buffers (H_DC, KU and the product, the largest
+  local atom), the MAGMA workspace of the projected eigenproblem, and a
+  per-rank reserve for the BLAS library workspaces
+  (OPENMX_KRYLOV_GPU_RESERVE_MB, default 512 MiB).  It runs at every call
+  because the free memory shrinks over the SCF loop (mixing history, ...),
+  before the KU cache of the call is sized so that the cache only takes
+  what the solves leave over, and its verdict is collective over the ranks
+  of the device so that they take the same path.  The default reserve is
+  deliberately generous: the failure it guards against is not a returned
+  error but the process exiting inside hipBLASLt.
+*/
+static void Krylov_GPU_Preflight(int matomnum, const int *Msize, const int *Msize3)
+{
+  static MPI_Comm device_comm = MPI_COMM_NULL;
+  static int hip_device = 0;
+  static size_t reserve_bytes = (size_t)512*1024*1024;
+  static int env_checked = 0;
+  const double MiB = 1024.0*1024.0;
+  size_t free_bytes = 0, total_bytes = 0;
+  size_t nn_max = 0, nm_max = 0, mm_max = 0, m3_max = 0, n_max = 0;
+  size_t growth = 0, magma_bytes, lib_bytes, need_rank;
+  unsigned long long need_local, need_total, free_local, free_min;
+  int myid, Mc_AN, t;
+
+  Krylov_gpu_fits = 1;
+  Krylov_gpu_need_total = 0;
+  if (!Krylov_GPU_Enabled()) return;
+
+  if (!env_checked){
+    const char *env = getenv("OPENMX_KRYLOV_GPU_RESERVE_MB");
+    env_checked = 1;
+    if (env != NULL && env[0] != '\0'){
+      long mib = atol(env);
+      if (0 <= mib) reserve_bytes = (size_t)mib*1024U*1024U;
+    }
+  }
+
+  if (device_comm == MPI_COMM_NULL){
+    MPI_Comm node_comm;
+    MPI_Comm_split_type(mpi_comm_level1, MPI_COMM_TYPE_SHARED, 0, MPI_INFO_NULL, &node_comm);
+    if (hipGetDevice(&hip_device) != hipSuccess) hip_device = 0;
+    MPI_Comm_split(node_comm, hip_device, 0, &device_comm);
+    MPI_Comm_free(&node_comm);
+    MPI_Comm_size(device_comm, &Krylov_gpu_device_ranks);
+  }
+
+  for (Mc_AN=1; Mc_AN<=matomnum; Mc_AN++){
+    size_t n = (size_t)Msize[Mc_AN], m3 = (size_t)Msize3[Mc_AN];
+    if (nn_max < n*n)   nn_max = n*n;
+    if (nm_max < n*m3)  nm_max = n*m3;
+    if (mm_max < m3*m3) mm_max = m3*m3;
+    if (m3_max < m3)    m3_max = m3;
+    if (n_max < n)      n_max = n;
+  }
+
+  /* buffers already grown in an earlier call are not needed again */
+  for (t=0; t<Krylov_gpu_ws_pool_size; t++){
+    const Krylov_GPU_Workspace *ws = &Krylov_gpu_ws_pool[t];
+    size_t a = nn_max > mm_max ? nn_max : mm_max;
+    if (ws->d_A_count < a)      growth += a - ws->d_A_count;
+    if (ws->d_B_count < nm_max) growth += nm_max - ws->d_B_count;
+    if (ws->d_C_count < nm_max) growth += nm_max - ws->d_C_count;
+  }
+  growth *= sizeof(double);
+
+  /* magma_dsyevdx_gpu: lddc*n plus the tridiagonalization panels */
+  magma_bytes = sizeof(double)*(2*m3_max*m3_max + 256*m3_max);
+  /* Measured on a 16 GB gfx1200 with n=492, m=320 (operands of ~2 MB):
+     the solves crashed inside hipBLASLt with 171 MiB per rank available
+     and held with 313 MiB, so the library side costs a fixed 200-300 MiB
+     per rank regardless of the operand size -- that is what the reserve
+     covers.  Four copies of the largest operand are added on top so the
+     margin also grows with the cluster size. */
+  lib_bytes = 4*sizeof(double)*nn_max;
+  need_rank = growth + magma_bytes + lib_bytes + reserve_bytes;
+
+  if (hipMemGetInfo(&free_bytes, &total_bytes) != hipSuccess){
+    (void)hipGetLastError();
+    free_bytes = 0;
+  }
+
+  need_local = (unsigned long long)need_rank;
+  free_local = (unsigned long long)free_bytes;
+  MPI_Allreduce(&need_local, &need_total, 1, MPI_UNSIGNED_LONG_LONG, MPI_SUM, device_comm);
+  MPI_Allreduce(&free_local, &free_min,   1, MPI_UNSIGNED_LONG_LONG, MPI_MIN, device_comm);
+
+  Krylov_gpu_fits = (need_total <= free_min);
+  Krylov_gpu_need_total = need_total;
+
+  if (!Krylov_gpu_fits){
+    /* a cache kept from an earlier call would only pin memory the other
+       stages need now; a later call that fits rebuilds it from scratch */
+    Krylov_Release_GPU_KUCache();
+    MPI_Comm_rank(mpi_comm_level1, &myid);
+    if (myid == Host_ID){
+      fprintf(stderr,
+              "Krylov: GPU device %d is shared by %d rank(s), has %.3f MiB free "
+              "(%.3f MiB total on rank %d), but %.3f MiB is required for the GPU projected "
+              "solves (largest local cluster n=%d, m=%d; %.3f MiB reserve per rank); "
+              "switching to CPU path.\n",
+              hip_device, Krylov_gpu_device_ranks, (double)free_min/MiB, (double)total_bytes/MiB,
+              myid, (double)need_total/MiB, (int)n_max, (int)m3_max, (double)reserve_bytes/MiB);
+      fflush(stderr);
+    }
+  }
 }
 
 static const double *Krylov_KUCache_Get(Krylov_GPU_Workspace *ws,int spin,int Mc_AN,
@@ -495,19 +679,21 @@ static int Krylov_ProjectedSolve_GPU(Krylov_GPU_Workspace *ws,int spin,int Mc_AN
   size_t nm=(size_t)n*(size_t)m3;
   size_t mm=(size_t)m3*(size_t)m3;
 
-  if (ws==NULL || !ws->active || !Krylov_gpu_fused) return 0;
+  if (!Krylov_GPU_Usable(ws) || !Krylov_gpu_fused) return 0;
   if ((double)n*(double)m3*(double)n<Krylov_gpu_dgemm_min_flops ||
       (double)m3*(double)m3*(double)n<Krylov_gpu_dgemm_min_flops ||
       (double)m3*(double)n*(double)m3<Krylov_gpu_dgemm_min_flops) return 0;
 
-  Krylov_GPU_EnsureHipblas(ws);
-  Krylov_GPU_EnsureDouble(&ws->d_A,&ws->d_A_count,nn>mm?nn:mm);
-  Krylov_GPU_EnsureDouble(&ws->d_C,&ws->d_C_count,nm);
+  /* a failed allocation hands the whole atom to the CPU path (return 0);
+     nothing computed so far is reused there */
+  if (!Krylov_GPU_EnsureHipblas(ws) ||
+      !Krylov_GPU_EnsureDouble(&ws->d_A,&ws->d_A_count,nn>mm?nn:mm) ||
+      !Krylov_GPU_EnsureDouble(&ws->d_C,&ws->d_C_count,nm)) return 0;
   d_KU=Krylov_KUCache_Get(ws,spin,Mc_AN,n,m3,Msize2[Mc_AN],Krylov_U,KU);
   if (d_KU==NULL){
     for (int i=0;i<n;i++) for (int j=0;j<m3;j++)
       KU[(size_t)j*(size_t)n+(size_t)i]=Krylov_U[spin][Mc_AN][j*Msize2[Mc_AN]+i+1];
-    Krylov_GPU_EnsureDouble(&ws->d_B,&ws->d_B_count,nm);
+    if (!Krylov_GPU_EnsureDouble(&ws->d_B,&ws->d_B_count,nm)) return 0;
     wait_hipfunc(hipMemcpyAsync(ws->d_B,KU,sizeof(double)*nm,hipMemcpyHostToDevice,ws->stream));
     d_KU=ws->d_B;
   }
@@ -760,8 +946,12 @@ static double Krylov_Col(char *mode,
     Msize4[Mc_AN] = rlmax_EC2[Mc_AN]*EKC_core_size[Mc_AN];
   }
 
-  if (Krylov_GPU_Enabled())
-    Krylov_KUCache_Prepare(Matomnum,SpinP_switch+1,Msize,Msize3,SCF_iter);
+  if (Krylov_GPU_Enabled()){
+    Krylov_GPU_Preflight(Matomnum,Msize,Msize3);
+    if (Krylov_gpu_fits)
+      Krylov_KUCache_Prepare(Matomnum,SpinP_switch+1,Msize,Msize3,SCF_iter,
+                             Krylov_gpu_device_ranks,Krylov_gpu_need_total);
+  }
 
   m_size = 0;
 
@@ -5963,8 +6153,12 @@ static double Krylov_Col_trd(char *mode,
     Msize4[Mc_AN] = rlmax_EC2[Mc_AN]*EKC_core_size[Mc_AN];
   }
 
-  if (Krylov_GPU_Enabled())
-    Krylov_KUCache_Prepare(Matomnum,SpinP_switch+1,Msize,Msize3,SCF_iter);
+  if (Krylov_GPU_Enabled()){
+    Krylov_GPU_Preflight(Matomnum,Msize,Msize3);
+    if (Krylov_gpu_fits)
+      Krylov_KUCache_Prepare(Matomnum,SpinP_switch+1,Msize,Msize3,SCF_iter,
+                             Krylov_gpu_device_ranks,Krylov_gpu_need_total);
+  }
 
   m_size = 0;
 

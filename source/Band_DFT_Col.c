@@ -44,7 +44,7 @@ extern int openmx_gpu_is_apu(void);
 
 static void Construct_Band_CsHs(int SCF_iter, int all_knum, int * order_GA, int * MP, double * S1, double * H1,
                                 double k1, double k2, double k3, dcomplex * Cs, dcomplex * Hs, int n,
-                                int owns_global_dense_rank);
+                                int use_gpusolver_dense, int owns_global_dense_rank);
 static int  BandCol_LastConstructOnDevice(void);
 
 static double get_max_value(double localValue);
@@ -412,12 +412,65 @@ static int BandCol_MaxConcurrentKGpuTurns(void)
     return BandCol_DefaultGpuTurnGroup();
 }
 
+/* Fixed per-rank device cost of the BLAS/eigensolver libraries beyond the
+   dense matrices (handle workspaces, kernel code objects): 200-300 MiB per
+   rank measured on ROCm 7.2, independent of n, and an allocation failing
+   inside hipBLASLt terminates the process.  Charged per concurrently solving
+   rank; OPENMX_BAND_GPU_RESERVE_MB overrides the default of 512 MiB. */
+static size_t BandCol_GpuLibraryReserveBytes(void)
+{
+    static size_t reserve = 0;
+    static int checked = 0;
+
+    if (!checked){
+        const char *env = getenv("OPENMX_BAND_GPU_RESERVE_MB");
+        long mib = 512L;
+        if (env!=NULL && env[0]!='\0'){
+            long value = atol(env);
+            if (0L<=value) mib = value;
+        }
+        reserve = (size_t)mib*1024U*1024U;
+        checked = 1;
+    }
+    return reserve;
+}
+
+/* Ranks of mpi_comm_level1 that share this rank's GPU.  Collective on the
+   first call; every rank reaches BandCol_GpuDenseFits together. */
+static int BandCol_device_ranks_cached = 0;
+
+static int BandCol_DeviceRanks(void)
+{
+    if (BandCol_device_ranks_cached==0){
+        MPI_Comm node_comm, device_comm;
+        int hip_device = 0;
+        int device_ranks = 0;
+
+        MPI_Comm_split_type(mpi_comm_level1,MPI_COMM_TYPE_SHARED,0,MPI_INFO_NULL,&node_comm);
+        if (hipGetDevice(&hip_device)!=hipSuccess) hip_device = 0;
+        MPI_Comm_split(node_comm,hip_device,0,&device_comm);
+        MPI_Comm_size(device_comm,&device_ranks);
+        MPI_Comm_free(&device_comm);
+        MPI_Comm_free(&node_comm);
+        BandCol_device_ranks_cached = (device_ranks<1) ? 1 : device_ranks;
+    }
+    return BandCol_device_ranks_cached;
+}
+
+/* non-collective: for the per-k-point paths, which not every rank reaches
+   the same number of times (BandCol_GpuDenseFits fills the cache first) */
+static int BandCol_DeviceRanksCached(void)
+{
+    return (BandCol_device_ranks_cached<1) ? 1 : BandCol_device_ranks_cached;
+}
+
 static int BandCol_GpuDenseFits(int n, int owns_dense)
 {
     const char *env = getenv("OPENMX_BAND_GPU_DIAG");
     const char *reserve_env = getenv("OPENMX_BAND_GPU_DIAG_RESERVE_MB");
     size_t free_bytes=0,total_bytes=0,reserve=(size_t)1024*1024*1024;
-    size_t per_rank,required;
+    size_t per_rank,required,fixed_all;
+    int device_ranks;
     int turns=BandCol_MaxConcurrentKGpuTurns();
     int local_fit=1,fit=1;
 
@@ -432,11 +485,31 @@ static int BandCol_GpuDenseFits(int n, int owns_dense)
         per_rank=SIZE_MAX;
     }
     else per_rank=(size_t)5*(size_t)n*(size_t)n*sizeof(dcomplex)+(size_t)n*sizeof(double);
-    if (per_rank!=SIZE_MAX && (size_t)turns<=(SIZE_MAX-reserve)/per_rank){
-        required=per_rank*(size_t)turns+reserve;
+    /* every rank sharing the device pays the library-side fixed cost,
+       however many of them solve at a time; collective, so keep it before
+       the owner-only check */
+    device_ranks=BandCol_DeviceRanks();
+    fixed_all=BandCol_GpuLibraryReserveBytes()*(size_t)device_ranks;
+    if (per_rank!=SIZE_MAX && reserve<=SIZE_MAX-fixed_all &&
+        (size_t)turns<=(SIZE_MAX-reserve-fixed_all)/per_rank){
+        required=per_rank*(size_t)turns+reserve+fixed_all;
         OpenMX_GpuPhaseNeed_Register("band_col",required);
         if (local_fit && owns_dense &&
-            (hipMemGetInfo(&free_bytes,&total_bytes)!=hipSuccess || free_bytes<required)) local_fit=0;
+            (hipMemGetInfo(&free_bytes,&total_bytes)!=hipSuccess || free_bytes<required)){
+            int myid;
+            local_fit=0;
+            MPI_Comm_rank(mpi_comm_level1,&myid);
+            if (myid==Host_ID){
+                const double MiB=1024.0*1024.0;
+                fprintf(stderr,
+                        "Band_DFT_Col: GPU device is shared by %d rank(s), has %.3f MiB free "
+                        "(%.3f MiB total), but %.3f MiB is required for the dense GPU diagonalization "
+                        "(%.3f MiB library reserve per rank); switching to CPU path.\n",
+                        device_ranks,(double)free_bytes/MiB,(double)total_bytes/MiB,
+                        (double)required/MiB,(double)BandCol_GpuLibraryReserveBytes()/MiB);
+                fflush(stderr);
+            }
+        }
     }
     else local_fit=0;
     MPI_Allreduce(&local_fit,&fit,1,MPI_INT,MPI_MIN,mpi_comm_level1);
@@ -1010,10 +1083,13 @@ static void BandCol_AccumulateDenseTransposedDM(int n, int nk, int max_tno, int 
     }
 }
 
-static void BandCol_AccumulateDenseTransposedDM_Device(int n, int nk, int spin, int kloop, double k1, double k2,
-                                                       double k3, const dcomplex *evec_device, int evec_stride, int *MP,
-                                                       int *order_GA, double ***EIGEN, const double *occ_weight,
-                                                       double *CDM1, double *EDM1, int size_H1, int state_first)
+/* Returns 0 on success and -1 when the HIP path failed (the device buffers
+   are released in that case, CDM1/EDM1 are untouched); the fallback loops
+   then redo the k point on the CPU, the dense paths abort. */
+static int BandCol_AccumulateDenseTransposedDM_Device(int n, int nk, int spin, int kloop, double k1, double k2,
+                                                      double k3, const dcomplex *evec_device, int evec_stride, int *MP,
+                                                      int *order_GA, double ***EIGEN, const double *occ_weight,
+                                                      double *CDM1, double *EDM1, int size_H1, int state_first)
 {
     BandColDMEntryCache *cache;
     const int *          basis0;
@@ -1049,8 +1125,9 @@ static void BandCol_AccumulateDenseTransposedDM_Device(int n, int nk, int spin, 
     if (BandCol_AccumulateDenseTransposedDM_HIP(entry_count, pair_count, nk, evec_stride,
                                                 basis0, basis1, phase_index, phase_r, phase_i,
                                                 eigen, occ_weight, evec_ptr, CDM1, EDM1) != 0) {
-        BandCol_AbortWithMessage("Band_DFT_Col HIP density matrix generation failed.");
+        return -1;
     }
+    return 0;
 }
 
 /* GPU DM accumulation inside the ScaLAPACK/ELPA fallback of the collinear
@@ -1082,9 +1159,12 @@ static dcomplex *BandCol_FallbackDMUpload(const dcomplex *host, size_t count)
         (void)hipGetLastError();
         return NULL;
     }
-    /* keep headroom for the entry-cache copyins and the other users of the
-       shared device */
-    if (free_bytes < bytes + 256ULL * 1024ULL * 1024ULL) return NULL;
+    /* Every rank sharing the device uploads its own panel and launches its
+       own kernel at about the same time, and the launch pays the library
+       reserve like the eigensolvers do, so the check is device-wide; a
+       kernel that fails to launch for lack of memory cannot be caught. */
+    if (bytes > SIZE_MAX / (size_t)BandCol_DeviceRanksCached() ||
+        free_bytes < (bytes + BandCol_GpuLibraryReserveBytes()) * (size_t)BandCol_DeviceRanksCached()) return NULL;
     if (hipMalloc(&device, bytes) != hipSuccess) {
         (void)hipGetLastError();
         return NULL;
@@ -2704,7 +2784,7 @@ diagonalize1:
                 Construct_Band_CsHs(SCF_iter, all_knum, use_setham_packed_cache ? setham_order_GA : order_GA, MP,
                                     use_setham_packed_cache ? setham_S1 : S1,
                                     use_setham_packed_cache ? setham_H1 : H1, k1, k2, k3, Ss, Hs, n,
-                                    owns_global_dense_rank);
+                                    use_gpusolver_dense, owns_global_dense_rank);
                 construct_on_device = BandCol_LastConstructOnDevice();
 
                 /* for blas */
@@ -2804,7 +2884,7 @@ diagonalize1:
                         Construct_Band_CsHs(construct_scf_iter, all_knum, use_setham_packed_cache ? setham_order_GA : order_GA, MP,
                                             use_setham_packed_cache ? setham_S1 : S1,
                                             use_setham_packed_cache ? setham_H1 : H1, k1, k2, k3, Ss, Hs,
-                                            n, owns_global_dense_rank);
+                                            n, use_gpusolver_dense, owns_global_dense_rank);
                         const int construct_on_device = BandCol_LastConstructOnDevice();
 
                         if (measure_time) {
@@ -2922,7 +3002,7 @@ diagonalize1:
                 Construct_Band_CsHs(SCF_iter, all_knum, use_setham_packed_cache ? setham_order_GA : order_GA, MP,
                                     use_setham_packed_cache ? setham_S1 : S1,
                                     use_setham_packed_cache ? setham_H1 : H1, k1, k2, k3, Cs, Hs, n,
-                                    owns_global_dense_rank);
+                                    use_gpusolver_dense, owns_global_dense_rank);
 
                 if (measure_time) {
                     dtime(&endtime);
@@ -3587,11 +3667,13 @@ diagonalize1:
                             evec_device = BandCol_GpuSolver_UploadHostEigenvectors(n);
                         }
 
-                        BandCol_AccumulateDenseTransposedDM_Device(n, MaxN, spin, kloop, k1, k2, k3, evec_device,
-                                                                   BandCol_GpuSolver_EigenvectorStride(),
-                                                                   MP, use_setham_packed_cache ? setham_order_GA : order_GA, EIGEN,
-                                                                   BandCol_dm_workspace.OccWeight, CDM1, EDM1,
-                                                                   size_H1, 1);
+                        if (BandCol_AccumulateDenseTransposedDM_Device(n, MaxN, spin, kloop, k1, k2, k3, evec_device,
+                                                                       BandCol_GpuSolver_EigenvectorStride(),
+                                                                       MP, use_setham_packed_cache ? setham_order_GA : order_GA, EIGEN,
+                                                                       BandCol_dm_workspace.OccWeight, CDM1, EDM1,
+                                                                       size_H1, 1) != 0) {
+                            BandCol_AbortWithMessage("Band_DFT_Col HIP density matrix generation failed.");
+                        }
                         if (!BandCol_GpuPersistentDecide()) {
                             BandCol_GpuSolver_ClearHostEigenvectors();
                             BandCol_GpuSolver_ReleaseDeviceMemory();
@@ -3670,12 +3752,13 @@ diagonalize1:
                     for (int k = 0; k < nk; k++)
                         unit_occ[k] = 1.0;
 
-                    BandCol_AccumulateDenseTransposedDM_Device(n, nk, spin, kloop, k1, k2, k3,
-                                                               evec_dev + (kmin - is2[myid2]), stride, MP, order_GA,
-                                                               EIGEN, unit_occ, CDM1, EDM1, size_H1, kmin);
+                    /* a failed launch leaves CDM1/EDM1 untouched, so the
+                       CPU loop below simply redoes this k point */
+                    gpu_dm_done = (BandCol_AccumulateDenseTransposedDM_Device(n, nk, spin, kloop, k1, k2, k3,
+                                                                              evec_dev + (kmin - is2[myid2]), stride, MP, order_GA,
+                                                                              EIGEN, unit_occ, CDM1, EDM1, size_H1, kmin) == 0);
                     if (hipFree(evec_dev) != hipSuccess)
                         (void)hipGetLastError();
-                    gpu_dm_done = 1;
                 }
             }
 
@@ -4086,7 +4169,7 @@ diagonalize1:
                     Construct_Band_CsHs(SCF_iter, all_knum, use_setham_packed_cache ? setham_order_GA : order_GA, MP,
                                         use_setham_packed_cache ? setham_S1 : S1,
                                         use_setham_packed_cache ? setham_H1 : H1, k1, k2, k3, Ss, Hs, n,
-                                        owns_global_dense_rank);
+                                        use_gpusolver_dense, owns_global_dense_rank);
                     construct_on_device = BandCol_LastConstructOnDevice();
 
                     /* diagonalize S */
@@ -4191,10 +4274,12 @@ diagonalize1:
                         dtime(&Stime1);
                     }
 
-                    BandCol_AccumulateDenseTransposedDM_Device(n, MaxN, spin, kloop, k1, k2, k3, evec_device,
-                                                               BandCol_GpuSolver_EigenvectorStride(),
-                                                               MP, use_setham_packed_cache ? setham_order_GA : order_GA,
-                                                               EIGEN, occ_weight, CDM1, EDM1, size_H1, 1);
+                    if (BandCol_AccumulateDenseTransposedDM_Device(n, MaxN, spin, kloop, k1, k2, k3, evec_device,
+                                                                   BandCol_GpuSolver_EigenvectorStride(),
+                                                                   MP, use_setham_packed_cache ? setham_order_GA : order_GA,
+                                                                   EIGEN, occ_weight, CDM1, EDM1, size_H1, 1) != 0) {
+                        BandCol_AbortWithMessage("Band_DFT_Col HIP density matrix generation failed.");
+                    }
                     BandCol_GpuSolver_ReleaseDeviceMemory();
 
                     if (measure_time) {
@@ -4222,7 +4307,7 @@ diagonalize1:
                 Construct_Band_CsHs(SCF_iter, all_knum, use_setham_packed_cache ? setham_order_GA : order_GA, MP,
                                     use_setham_packed_cache ? setham_S1 : S1,
                                     use_setham_packed_cache ? setham_H1 : H1, k1, k2, k3, Cs, Hs, n,
-                                    owns_global_dense_rank);
+                                    use_gpusolver_dense, owns_global_dense_rank);
 
 
                 /* diagonalize S */
@@ -4418,12 +4503,11 @@ diagonalize1:
                         dcomplex *evec_dev = BandCol_FallbackDMUpload(Hs, (size_t)n * (size_t)na_rows);
 
                         if (evec_dev != NULL) {
-                            BandCol_AccumulateDenseTransposedDM_Device(n, MaxN, spin, kloop, k1, k2, k3, evec_dev,
-                                                                       na_rows, MP, order_GA, EIGEN, occ_weight,
-                                                                       CDM1, EDM1, size_H1, 1);
+                            gpu_dm_done = (BandCol_AccumulateDenseTransposedDM_Device(n, MaxN, spin, kloop, k1, k2, k3, evec_dev,
+                                                                                      na_rows, MP, order_GA, EIGEN, occ_weight,
+                                                                                      CDM1, EDM1, size_H1, 1) == 0);
                             if (hipFree(evec_dev) != hipSuccess)
                                 (void)hipGetLastError();
-                            gpu_dm_done = 1;
                         }
                     }
                     if (!gpu_dm_done) {
@@ -4876,10 +4960,11 @@ diagonalize1:
 }
 
 void Construct_Band_CsHs(int SCF_iter, int all_knum, int * order_GA, int * MP, double * S1, double * H1, double k1,
-                         double k2, double k3, dcomplex * Cs, dcomplex * Hs, int n, int owns_global_dense_rank)
+                         double k2, double k3, dcomplex * Cs, dcomplex * Hs, int n, int use_gpusolver_dense,
+                         int owns_global_dense_rank)
 {
     const int need_s = (SCF_iter == 1 || all_knum != 1);
-    const int use_gpusolver_dense = (scf_eigen_lib_flag == GPUSOLVER && Band_DFT_Col_GpuSwitchNum() <= n);
+    /* Honor the caller's memory-based fallback, including host matrix construction. */
     const int dense_gpusolver_owner =
         (use_gpusolver_dense &&
          ((all_knum == 1 && owns_global_dense_rank) ||
