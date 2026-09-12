@@ -51,6 +51,22 @@ bool device_alloc_copy(T **dst, const T *src, std::size_t count)
     return true;
 }
 
+int launch_matrix_elements(int pair_count, int spin_count, int max_output_count, std::size_t total_nolg,
+                           const int *d_no0, const int *d_no1, const int *d_nolg,
+                           const std::size_t *d_hoff, const std::size_t *d_noff,
+                           const std::size_t *d_o0off, const std::size_t *d_o1off,
+                           const double *d_vpot, const float *d_o0, const float *d_o1, double *d_h)
+{
+    const dim3 block(kThreads);
+    const dim3 grid(static_cast<unsigned>(pair_count),
+                    static_cast<unsigned>((max_output_count + kThreads - 1) / kThreads));
+    hipLaunchKernelGGL(matrix_elements_kernel, grid, block, 0, 0,
+                       pair_count, spin_count, total_nolg, d_no0, d_no1, d_nolg,
+                       d_hoff, d_noff, d_o0off, d_o1off, d_vpot, d_o0, d_o1, d_h);
+    if (hipGetLastError() != hipSuccess || hipDeviceSynchronize() != hipSuccess) return 2;
+    return 0;
+}
+
 } // namespace
 
 extern "C" int Set_Hamiltonian_Hip_MatrixElements(
@@ -84,24 +100,55 @@ extern "C" int Set_Hamiltonian_Hip_MatrixElements(
     COPY_DEVICE(d_h, hbuf, total_h);
 #undef COPY_DEVICE
 
-    {
-        const dim3 block(kThreads);
-        const dim3 grid(static_cast<unsigned>(pair_count),
-                        static_cast<unsigned>((max_output_count + kThreads - 1) / kThreads));
-        hipLaunchKernelGGL(matrix_elements_kernel, grid, block, 0, 0,
-                           pair_count, spin_count, total_nolg, d_no0, d_no1, d_nolg,
-                           d_hoff, d_noff, d_o0off, d_o1off, d_vpot, d_o0, d_o1, d_h);
-        if (hipGetLastError() != hipSuccess || hipDeviceSynchronize() != hipSuccess) {
-            result = 2;
-            goto cleanup;
-        }
-    }
+    result = launch_matrix_elements(pair_count, spin_count, max_output_count, total_nolg,
+                                    d_no0, d_no1, d_nolg, d_hoff, d_noff, d_o0off, d_o1off,
+                                    d_vpot, d_o0, d_o1, d_h);
+    if (result != 0) goto cleanup;
     if (hipMemcpy(hbuf, d_h, sizeof(double) * total_h, hipMemcpyDeviceToHost) != hipSuccess) result = 2;
 
 cleanup:
     hipFree(d_h); hipFree(d_o1); hipFree(d_o0); hipFree(d_vpot);
     hipFree(d_o1off); hipFree(d_o0off); hipFree(d_noff); hipFree(d_hoff);
     hipFree(d_nolg); hipFree(d_no1); hipFree(d_no0);
+    (void)hipGetLastError();
+    return result;
+}
+
+/* The same kernel on the tables Set_Hamiltonian keeps resident on the device
+   between SCF iterations (device pointers of the associated copies): only
+   the potential and the output travel. */
+extern "C" int Set_Hamiltonian_Hip_MatrixElements_Resident(
+    int pair_count, int spin_count, int max_output_count,
+    std::size_t total_h, std::size_t total_nolg,
+    const int *d_no0, const int *d_no1, const int *d_nolg,
+    const std::size_t *d_hoff, const std::size_t *d_noff,
+    const std::size_t *d_o0off, const std::size_t *d_o1off,
+    const float *d_o0, const float *d_o1,
+    const double *vpotbuf, double *hbuf)
+{
+    double *d_vpot = nullptr, *d_h = nullptr;
+    int result = 0;
+
+    if (pair_count <= 0 || spin_count <= 0 || max_output_count <= 0) return 0;
+    if (d_no0 == nullptr || d_no1 == nullptr || d_nolg == nullptr || d_hoff == nullptr ||
+        d_noff == nullptr || d_o0off == nullptr || d_o1off == nullptr || d_o0 == nullptr || d_o1 == nullptr) {
+        return 1;
+    }
+    (void)hipGetLastError();
+
+    if (!device_alloc_copy(&d_vpot, vpotbuf, static_cast<std::size_t>(spin_count) * total_nolg) ||
+        !device_alloc_copy(&d_h, hbuf, total_h)) {
+        result = 1;
+        goto cleanup;
+    }
+    result = launch_matrix_elements(pair_count, spin_count, max_output_count, total_nolg,
+                                    d_no0, d_no1, d_nolg, d_hoff, d_noff, d_o0off, d_o1off,
+                                    d_vpot, d_o0, d_o1, d_h);
+    if (result != 0) goto cleanup;
+    if (hipMemcpy(hbuf, d_h, sizeof(double) * total_h, hipMemcpyDeviceToHost) != hipSuccess) result = 2;
+
+cleanup:
+    hipFree(d_h); hipFree(d_vpot);
     (void)hipGetLastError();
     return result;
 }

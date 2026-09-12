@@ -24,7 +24,6 @@
 #include <strings.h>
 #include <time.h>
 
-extern int openmx_gpu_is_apu(void);
 
 #define measure_time 0
 
@@ -100,6 +99,14 @@ int Set_Hamiltonian_Hip_MatrixElements(
     const size_t *pair_h_offset, const size_t *pair_nolg_offset,
     const size_t *pair_orbs0_offset, const size_t *pair_orbs1_offset,
     const double *vpotbuf, const float *orbs0buf, const float *orbs1buf, double *hbuf);
+int Set_Hamiltonian_Hip_MatrixElements_Resident(
+    int pair_count, int spin_count, int max_output_count,
+    size_t total_h, size_t total_nolg,
+    const int *d_pair_NO0, const int *d_pair_NO1, const int *d_pair_NOLG,
+    const size_t *d_pair_h_offset, const size_t *d_pair_nolg_offset,
+    const size_t *d_pair_orbs0_offset, const size_t *d_pair_orbs1_offset,
+    const float *d_orbs0buf, const float *d_orbs1buf,
+    const double *vpotbuf, double *hbuf);
 
 static int Set_Hamiltonian_OpenMP_Rank_Selected = 1;
 
@@ -288,15 +295,15 @@ static int Set_Hamiltonian_OpenMP_Enabled(void)
 static int Set_Hamiltonian_MatrixElements_OpenMP_Enabled(void)
 {
     /*
-     * The matrix-elements OpenMP path spends too much time in packing and
-     * host-device copies for the current cluster workloads.  Keep the kernel
-     * available for future tuning, but use the CPU path for this phase.
+     * The matrix-elements HIP path keeps its packed orbital tables resident
+     * on the device across the SCF loop and re-uploads only the potential,
+     * so it is enabled by default on every GPU; the device-memory preflight
+     * still sends it to the host path when the tables do not fit.
     */
     const char *value = getenv("OPENMX_SETHAM_GPU");
-    int requested = (value != NULL ? atoi(value) != 0 : !openmx_gpu_is_apu());
+    /* on by default everywhere, APUs included (OPENMX_SETHAM_GPU=0 opts out) */
+    int requested = (value == NULL || value[0] == '\0') ? 1 : (atoi(value) != 0);
 
-    /* Avoid initializing an OpenMP target context merely to choose the host
-       path on an APU. */
     return scf_eigen_lib_flag == GPUSOLVER && requested &&
            gpu_rank_device_usable();
 }
@@ -403,6 +410,46 @@ static int Set_Hamiltonian_DeviceMemoryOK(size_t required_bytes, const char *whe
     return 1;
 }
 
+/* Device bytes held by the resident copies of the matrix-elements tables. */
+static size_t Set_Hamiltonian_ME_ResidentBytes(void)
+{
+    const SetHamiltonianMETables *t = &Set_Hamiltonian_ME_Tables.t;
+    size_t bytes = 0;
+
+    if (!Set_Hamiltonian_ME_Tables.ready) return 0;
+    if (t->meta_resident) bytes += (size_t)t->pair_count * (3 * sizeof(int) + 4 * sizeof(size_t));
+    if (t->nolg_resident) bytes += 2 * sizeof(int) * t->total_nolg;
+    if (t->orbs0_resident) bytes += sizeof(Type_Orbs_Grid) * t->total_orbs0;
+    if (t->orbs1_resident) bytes += sizeof(Type_Orbs_Grid) * t->total_orbs1;
+    return bytes;
+}
+
+/* The tables of the previous OpenMP call serve the next one unchanged when
+   nothing invalidated them since -- every change of the geometry, of
+   Orbs_Grid or of Cnt_kind goes through
+   Set_Hamiltonian_Invalidate_OpenMP_MatrixElements_Cache -- and all of them
+   still have their device copies; only the potential and the output then
+   need to travel. */
+static int Set_Hamiltonian_ME_CacheReusable(int Cnt_kind)
+{
+    const SetHamiltonianMETableCache *c = &Set_Hamiltonian_ME_Tables;
+    const void *host[9];
+    int ompdev, k;
+
+    if (!c->ready || c->cnt_kind != Cnt_kind || c->t.pair_count <= 0) return 0;
+    if (!(c->t.meta_resident && c->t.nolg_resident && c->t.orbs0_resident && c->t.orbs1_resident)) return 0;
+
+    ompdev = omp_get_default_device();
+    host[0] = c->pair_NO0;         host[1] = c->pair_NO1;          host[2] = c->pair_NOLG;
+    host[3] = c->pair_h_offset;    host[4] = c->pair_nolg_offset;
+    host[5] = c->pair_orbs0_offset; host[6] = c->pair_orbs1_offset;
+    host[7] = c->orbs0buf;         host[8] = c->orbs1buf;
+    for (k = 0; k < 9; k++) {
+        if (host[k] == NULL || omp_get_mapped_ptr((void *)host[k], ompdev) == NULL) return 0;
+    }
+    return 1;
+}
+
 static int Set_Hamiltonian_Base_Use_OpenMP(int SCF_iter, int myid)
 {
     size_t required_bytes;
@@ -440,6 +487,24 @@ static int Set_Hamiltonian_MatrixElements_Use_OpenMP(int Cnt_kind, int myid)
         Set_Hamiltonian_MatrixElements_OpenMP_DeviceBytes(Cnt_kind, myid) : 0;
     memory_ok = Set_Hamiltonian_DeviceMemoryOK(required_bytes, "matrix-elements OpenMP path", myid,
                                                local_use);
+
+    /* Tables left resident by an earlier call cannot serve the CPU path and
+       would only pin memory the other stages need; the next call that fits
+       rebuilds them. */
+    if (local_use && !memory_ok) {
+        size_t resident = Set_Hamiltonian_ME_ResidentBytes();
+
+        if (0 < resident) {
+            Set_Hamiltonian_Invalidate_OpenMP_MatrixElements_Cache();
+            if (myid == Host_ID) {
+                fprintf(stderr,
+                        "Set_Hamiltonian: matrix-elements OpenMP path: released the resident orbital tables "
+                        "(%.3f MiB on rank %d) that the CPU path cannot use.\n",
+                        (double)resident / (1024.0 * 1024.0), myid);
+                fflush(stderr);
+            }
+        }
+    }
 
     return local_use && memory_ok;
 }
@@ -1143,6 +1208,20 @@ static size_t Set_Hamiltonian_MatrixElements_OpenMP_DeviceBytes(int Cnt_kind, in
 
     spin_count = (SpinP_switch == 3) ? 4 : (SpinP_switch + 1);
 
+    /* with the previous call's tables still resident only the potential and
+       the output are uploaded */
+    if (Set_Hamiltonian_ME_CacheReusable(Cnt_kind)) {
+        const SetHamiltonianMETables *t = &Set_Hamiltonian_ME_Tables.t;
+
+        bytes = 0;
+        Set_Hamiltonian_add_array_bytes(&bytes, t->total_h, sizeof(double), "matrix-elements hbuf", myid);
+        Set_Hamiltonian_add_array_bytes(&bytes,
+                                        Set_Hamiltonian_checked_mul((size_t)spin_count, t->total_nolg,
+                                                                    "matrix-elements vpotbuf", myid),
+                                        sizeof(double), "matrix-elements vpotbuf", myid);
+        return bytes;
+    }
+
     pair_count = 0;
     total_h = 0;
     total_nolg = 0;
@@ -1404,6 +1483,148 @@ static void Set_Hamiltonian_Base_OpenMP(int SCF_iter, double *****H0, double ***
     free(pair_Mc_AN);
 }
 
+/* Calc_MatrixElements_dVH_Vxc_VNA_OpenMP on the tables the previous call left
+   resident on the device (Set_Hamiltonian_ME_CacheReusable): nothing is
+   rebuilt or re-uploaded except the potential and the output, so an
+   iteration moves the vpotbuf/hbuf arrays instead of the multi-GB orbital
+   tables, and the resident copies earn their keep instead of merely
+   waiting for Force3. */
+static void Calc_MatrixElements_dVH_Vxc_VNA_OpenMP_Resident(int Cnt_kind)
+{
+    const SetHamiltonianMETableCache *c = &Set_Hamiltonian_ME_Tables;
+    const int ompdev = omp_get_default_device();
+    const int spin_count = (SpinP_switch == 3) ? 4 : (SpinP_switch + 1);
+    const int pair_count = c->t.pair_count;
+    const size_t total_h = c->t.total_h;
+    const size_t total_nolg = c->t.total_nolg;
+    const int *pair_Mc_AN = c->pair_Mc_AN;
+    const int *pair_h_AN = c->pair_h_AN;
+    const int *pair_NO0 = c->pair_NO0;
+    const int *pair_NO1 = c->pair_NO1;
+    const int *pair_NOLG = c->pair_NOLG;
+    const int *nolg_MN = c->nolg_MN;
+    const size_t *pair_h_offset = c->pair_h_offset;
+    const size_t *pair_nolg_offset = c->pair_nolg_offset;
+    const size_t *pair_orbs0_offset = c->pair_orbs0_offset;
+    const size_t *pair_orbs1_offset = c->pair_orbs1_offset;
+    const Type_Orbs_Grid *orbs0buf = c->orbs0buf;
+    const Type_Orbs_Grid *orbs1buf = c->orbs1buf;
+    int max_output_count = 0;
+    int myid, pair, spin;
+    size_t k;
+    double *hbuf, *vpotbuf;
+
+    MPI_Comm_rank(mpi_comm_level1, &myid);
+
+    for (pair = 0; pair < pair_count; pair++) {
+        int count = spin_count * pair_NO0[pair] * pair_NO1[pair];
+        if (max_output_count < count) max_output_count = count;
+    }
+
+    hbuf = (double *)Set_Hamiltonian_malloc(sizeof(double) * total_h, "openmp hbuf", myid);
+    vpotbuf = (double *)Set_Hamiltonian_malloc(sizeof(double) * (size_t)spin_count * total_nolg,
+                                               "openmp vpotbuf", myid);
+
+    for (pair = 0; pair < pair_count; pair++) {
+        const int Mc_AN = pair_Mc_AN[pair];
+        const int h_AN = pair_h_AN[pair];
+        const int NO0 = pair_NO0[pair];
+        const int NO1 = pair_NO1[pair];
+        const size_t mat_size = (size_t)NO0 * (size_t)NO1;
+        const size_t h_off = pair_h_offset[pair];
+        int i, j;
+
+        for (spin = 0; spin < spin_count; spin++) {
+            for (i = 0; i < NO0; i++) {
+                for (j = 0; j < NO1; j++) {
+                    size_t idx = h_off + (size_t)spin * mat_size + (size_t)i * (size_t)NO1 + (size_t)j;
+                    hbuf[idx] = (Cnt_kind == 0) ? H[spin][Mc_AN][h_AN][i][j] : CntH[spin][Mc_AN][h_AN][i][j];
+                }
+            }
+        }
+    }
+
+    for (spin = 0; spin < spin_count; spin++) {
+        const double *vpot = Vpot_Grid[spin];
+        double *dst = vpotbuf + (size_t)spin * total_nolg;
+
+        for (k = 0; k < total_nolg; k++) {
+            dst[k] = GridVol * vpot[nolg_MN[k]];
+        }
+    }
+
+    if (Set_Hamiltonian_Hip_MatrixElements_Resident(
+            pair_count, spin_count, max_output_count, total_h, total_nolg,
+            (const int *)omp_get_mapped_ptr((void *)pair_NO0, ompdev),
+            (const int *)omp_get_mapped_ptr((void *)pair_NO1, ompdev),
+            (const int *)omp_get_mapped_ptr((void *)pair_NOLG, ompdev),
+            (const size_t *)omp_get_mapped_ptr((void *)pair_h_offset, ompdev),
+            (const size_t *)omp_get_mapped_ptr((void *)pair_nolg_offset, ompdev),
+            (const size_t *)omp_get_mapped_ptr((void *)pair_orbs0_offset, ompdev),
+            (const size_t *)omp_get_mapped_ptr((void *)pair_orbs1_offset, ompdev),
+            (const float *)omp_get_mapped_ptr((void *)orbs0buf, ompdev),
+            (const float *)omp_get_mapped_ptr((void *)orbs1buf, ompdev),
+            vpotbuf, hbuf) != 0) {
+        /* the host fallback of the build path, on the cached tables */
+#pragma omp parallel for
+        for (pair = 0; pair < pair_count; pair++) {
+            int NO0 = pair_NO0[pair];
+            int NO1 = pair_NO1[pair];
+            int NOLG = pair_NOLG[pair];
+            size_t mat_size = (size_t)NO0 * (size_t)NO1;
+            size_t h_off = pair_h_offset[pair];
+            size_t nolg_off = pair_nolg_offset[pair];
+            size_t orbs0_off = pair_orbs0_offset[pair];
+            size_t orbs1_off = pair_orbs1_offset[pair];
+            size_t e;
+
+            for (e = 0; e < (size_t)spin_count * mat_size; e++) {
+                int sp = (int)(e / mat_size);
+                size_t ij = e - (size_t)sp * mat_size;
+                int i = (int)(ij / (size_t)NO1);
+                int j = (int)(ij - (size_t)i * (size_t)NO1);
+                size_t hidx = h_off + e;
+                double sum = hbuf[hidx];
+                int Nog;
+
+                for (Nog = 0; Nog < NOLG; Nog++) {
+                    sum += vpotbuf[(size_t)sp * total_nolg + nolg_off + (size_t)Nog] *
+                           orbs0buf[orbs0_off + (size_t)Nog * (size_t)NO0 + (size_t)i] *
+                           orbs1buf[orbs1_off + (size_t)Nog * (size_t)NO1 + (size_t)j];
+                }
+
+                hbuf[hidx] = sum;
+            }
+        }
+    }
+
+    for (pair = 0; pair < pair_count; pair++) {
+        const int Mc_AN = pair_Mc_AN[pair];
+        const int h_AN = pair_h_AN[pair];
+        const int NO0 = pair_NO0[pair];
+        const int NO1 = pair_NO1[pair];
+        const size_t mat_size = (size_t)NO0 * (size_t)NO1;
+        const size_t h_off = pair_h_offset[pair];
+        int i, j;
+
+        for (spin = 0; spin < spin_count; spin++) {
+            for (i = 0; i < NO0; i++) {
+                for (j = 0; j < NO1; j++) {
+                    size_t idx = h_off + (size_t)spin * mat_size + (size_t)i * (size_t)NO1 + (size_t)j;
+                    if (Cnt_kind == 0) {
+                        H[spin][Mc_AN][h_AN][i][j] = hbuf[idx];
+                    } else {
+                        CntH[spin][Mc_AN][h_AN][i][j] = hbuf[idx];
+                    }
+                }
+            }
+        }
+    }
+
+    free(vpotbuf);
+    free(hbuf);
+}
+
 static void Calc_MatrixElements_dVH_Vxc_VNA_OpenMP(int Cnt_kind)
 {
     int Mc_AN, Gc_AN, h_AN, Gh_AN, Mh_AN, Cwan, Hwan;
@@ -1420,6 +1641,12 @@ static void Calc_MatrixElements_dVH_Vxc_VNA_OpenMP(int Cnt_kind)
 
     MPI_Comm_size(mpi_comm_level1, &numprocs);
     MPI_Comm_rank(mpi_comm_level1, &myid);
+    (void)numprocs;
+
+    if (Set_Hamiltonian_ME_CacheReusable(Cnt_kind)) {
+        Calc_MatrixElements_dVH_Vxc_VNA_OpenMP_Resident(Cnt_kind);
+        return;
+    }
     Set_Hamiltonian_Invalidate_OpenMP_MatrixElements_Cache();
 
     if (Cnt_kind != 0 && Cnt_kind != 1) {
