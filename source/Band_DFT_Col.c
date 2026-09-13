@@ -205,6 +205,15 @@ int Band_DFT_Col_GpuSwitchNum(void)
         if (value != NULL && 0 < (parsed = atoi(value))) {
             cached = parsed;
         }
+
+        /* See Band_DFT_NonCol_GpuSwitchNum: a GPU shared by too many ranks
+           serializes the per-rank dense solves and contends on the packed
+           H/S gather, so the CPU (ELPA2) path wins and is stable.  The
+           validated 8-rank GPU configuration stays below the default limit
+           and is unaffected. */
+        if (openmx_band_gpu_dense_oversubscribed() && cached < INT_MAX) {
+            cached = INT_MAX;
+        }
     }
     return cached;
 }

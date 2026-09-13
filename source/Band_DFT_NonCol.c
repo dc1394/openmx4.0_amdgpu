@@ -972,6 +972,18 @@ int Band_DFT_NonCol_GpuSwitchNum(void)
         if (value != NULL && 0 < (parsed = atoi(value))) {
             cached = parsed;
         }
+
+        /* When one GPU is shared by too many ranks the per-rank dense solve
+           serializes on the device and its large packed-matrix gather can
+           trip a UCX shared-memory assertion (observed on GGFF at 24 ranks
+           on one MI300A); the CPU ELPA2 path is both faster and stable
+           there.  Report an unreachable threshold so every n2 takes it.
+           An explicit OPENMX_BAND_NONCOL_GPU_SWITCH_NUM still stands unless
+           it too is above the matrix, i.e. the user can lower it but we do
+           not silently re-enable the GPU path here. */
+        if (openmx_band_gpu_dense_oversubscribed() && cached < INT_MAX) {
+            cached = INT_MAX;
+        }
     }
     return cached;
 }

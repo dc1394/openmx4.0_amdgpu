@@ -23,6 +23,22 @@ int openmx_gpu_map_rank_to_device(int local_rank, int local_size, int device_cou
 int openmx_gpu_local_rank_noncollective(void);
 int openmx_gpu_local_size_noncollective(void);
 
+/* Ranks sharing one GPU (node-local size / visible devices), no
+   communication.  The dense-GPU band eigensolvers fall back to the CPU
+   (ELPA2) path when this exceeds OPENMX_BAND_GPU_MAX_DEVICE_RANKS, because a
+   heavily shared device serializes their per-rank solves and contends on the
+   large packed-matrix gather (a UCX shared-memory assertion was observed in
+   that gather for the 40-atom noncollinear GGFF at 24 ranks on one MI300A),
+   while the CPU path parallelizes across every rank's cores and is both
+   faster and stable in that regime. */
+int openmx_gpu_ranks_per_device_noncollective(void);
+
+/* True when the GPU is shared by more ranks than the dense-GPU band
+   eigensolvers use well (see above); the band switch-number functions then
+   report an unreachable threshold so the CPU (ELPA2) path is taken, and the
+   packed H/S gather that feeds the dense GPU path is not built. */
+int openmx_band_gpu_dense_oversubscribed(void);
+
 /* One-time, noncollective, per-rank answer to "may this rank touch the GPU
    at all?".  Creates the rank's HIP context through error-returning runtime
    calls, verifies a free-memory margin, and forces OpenMP target

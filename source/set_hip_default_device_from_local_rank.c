@@ -88,6 +88,50 @@ int openmx_gpu_map_rank_to_device(int local_rank, int local_size, int device_cou
     return dev;
 }
 
+/* Number of MPI ranks that share one GPU, computed without communication
+   from the launcher-provided node-local size and the visible device count
+   (clamped by scf.Gpu.Num, matching the rank->device binding).  Used by the
+   dense-GPU eigensolver paths to decide whether the device is so
+   oversubscribed that the all-ranks-parallel CPU (ELPA2) path is the better
+   and safer choice.  Returns at least 1. */
+int openmx_gpu_ranks_per_device_noncollective(void)
+{
+    int local_size = openmx_gpu_local_size_noncollective();
+    int ndev = omp_get_num_devices();
+    int per;
+
+    if (0 < SCF_Gpu_Num && SCF_Gpu_Num < ndev) ndev = SCF_Gpu_Num;
+    if (ndev <= 0) ndev = 1;
+    if (local_size <= 0) local_size = 1;
+
+    per = (local_size + ndev - 1) / ndev;
+    return (per < 1) ? 1 : per;
+}
+
+/* True when one GPU is shared by more ranks than the dense-GPU band
+   eigensolver can use well.  Default limit 16 keeps the validated 8-rank GPU
+   configuration on the GPU and demotes the 24-ranks-per-APU case to the CPU
+   path; override with OPENMX_BAND_GPU_MAX_DEVICE_RANKS (0 disables the
+   demotion entirely). */
+#define BAND_GPU_DEFAULT_MAX_DEVICE_RANKS 16
+
+int openmx_band_gpu_dense_oversubscribed(void)
+{
+    static int cached = -1;
+
+    if (cached < 0) {
+        const char *value = getenv("OPENMX_BAND_GPU_MAX_DEVICE_RANKS");
+        int limit = BAND_GPU_DEFAULT_MAX_DEVICE_RANKS;
+
+        if (value != NULL && value[0] != '\0') {
+            int parsed = atoi(value);
+            if (0 <= parsed) limit = parsed;
+        }
+        cached = (0 < limit && limit < openmx_gpu_ranks_per_device_noncollective()) ? 1 : 0;
+    }
+    return cached;
+}
+
 #define GPU_PROBE_DEFAULT_RESERVE_MB 256
 
 static size_t gpu_probe_reserve_bytes(void)
