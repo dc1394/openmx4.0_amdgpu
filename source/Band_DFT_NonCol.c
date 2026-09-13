@@ -2887,6 +2887,23 @@ static void BandNonCol_RootDenseWorkspace_Reset(void)
     memset(ws,0,sizeof(*ws));
 }
 
+/* Hard reset for a run boundary (between -runtest/-runtestL inputs): drop
+   every device buffer, handle and geometry-derived table of this module so
+   no validity check can accept data of the previous input after its host
+   arrays were freed and their addresses reused.  Idempotent. */
+void Band_DFT_NonCol_Release_GPU_Caches(void)
+{
+    BandNonCol_ConstructCache_Reset();
+    BandNonCol_DMEntryCache_Reset();
+    BandNonCol_RootDenseWorkspace_Reset();
+    BandNonCol_DenseGpu_ReleaseWaveBuffers();
+    BandNonCol_DenseGpu_ReleaseOverlapMagmaScratch();
+    BandNonCol_GpuSolver_ReleaseDeviceWorkspace();
+    BandNonCol_GpuSolver_Destroy();
+    BandNonCol_DMGpu_Destroy();
+    BandNonCol_DenseGpu_Destroy();
+}
+
 static BandNonColRootDenseWorkspace *BandNonCol_RootDenseWorkspace_Ensure(int owns_root_dense,
                                                                            int n, int n2, int MaxN,
                                                                            int T_knum, int SCF_iter)

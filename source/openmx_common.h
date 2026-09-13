@@ -3363,6 +3363,18 @@ void Cluster_DFT_Col_Release_GPU_Solver(void);
 void Cluster_DFT_NonCol_Release_GPU_Solver(void);
 void Divide_Conquer_Release_GPU_SCache(void);
 void Krylov_Release_GPU_KUCache(void);
+/* Run-boundary GPU cache resets: called from Free_Arrays(0) so that no
+   device-resident cache can survive into the next input of the -runtest /
+   -runtestL suites (a host array reallocated at a reused address would
+   otherwise satisfy pointer-based validity checks with stale device data). */
+void Band_DFT_Col_Release_GPU_Caches(void);
+void Band_DFT_NonCol_Release_GPU_Caches(void);
+void Cluster_DFT_Col_Release_GPU_Caches(void);
+void Cluster_DFT_NonCol_Release_GPU_Caches(void);
+void Divide_Conquer_Release_GPU_Caches(void);
+void Divide_Conquer_LNO_Release_GPU_Caches(void);
+void Krylov_Release_GPU_Caches(void);
+
 
 typedef struct {
   int pair_count;

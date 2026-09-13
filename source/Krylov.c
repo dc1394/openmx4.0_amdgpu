@@ -460,6 +460,24 @@ void Krylov_Release_GPU_KUCache(void)
   memset(&Krylov_kucache,0,sizeof(Krylov_kucache));
 }
 
+/* Run-boundary reset (between -runtest/-runtestL inputs): also return the
+   per-thread GPU workspaces, whose sizes derive from the previous system.
+   Idempotent; called from serial code, never inside the OpenMP regions
+   that use the pool. */
+void Krylov_Release_GPU_Caches(void)
+{
+  int i;
+
+  for (i=0; i<Krylov_gpu_ws_pool_size; i++){
+    Krylov_GPU_Workspace_Free(&Krylov_gpu_ws_pool[i]);
+  }
+  free(Krylov_gpu_ws_pool);
+  Krylov_gpu_ws_pool = NULL;
+  Krylov_gpu_ws_pool_size = 0;
+
+  Krylov_Release_GPU_KUCache();
+}
+
 /* keep_free: device memory the preflight of this call has already claimed
    for the solves themselves, summed over the device_ranks ranks sharing
    the GPU.  The cache is sized from what is left beyond that and the

@@ -392,6 +392,15 @@ static void DCLNO_GPUProxy_Finalize(void)
     DCLNO_is_gpu_owner          = 0;
 }
 
+/* Run-boundary reset (between -runtest/-runtestL inputs).  The proxy
+   finalizer is guarded by DCLNO_gpu_proxy_initialized, and its communicator
+   frees are collective; Free_Arrays() calls this on every rank at the same
+   point, which satisfies that. */
+void Divide_Conquer_LNO_Release_GPU_Caches(void)
+{
+    DCLNO_GPUProxy_Finalize();
+}
+
 static void DCLNO_GpuSolver_Init(void)
 {
     DCLNO_GpuSolverCtx *ctx = &DCLNO_gpusolver_ctx;

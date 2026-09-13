@@ -1247,6 +1247,19 @@ static void BandCol_GpuSolver_Destroy(void)
     ctx->h_transformed_s_dim = 0;
 }
 
+/* Hard reset for a run boundary (between -runtest/-runtestL inputs every
+   host array of the previous system is freed and reallocated, so a device
+   cache validated through a host address or a matrix size could accept
+   stale data once malloc reuses an address).  Idempotent; every branch is
+   a no-op when the corresponding path never ran. */
+void Band_DFT_Col_Release_GPU_Caches(void)
+{
+    BandCol_ConstructCache_Reset();
+    BandCol_DMWorkspace_Reset();
+    BandCol_DMEntryCache_Reset();
+    BandCol_GpuSolver_Destroy();
+}
+
 static dcomplex *BandCol_GpuSolver_SaveDeviceEigenvectors(dcomplex *evec_device, int n, int stride)
 {
     BandColGpuSolverCtx *ctx = &BandCol_gpusolver_ctx;

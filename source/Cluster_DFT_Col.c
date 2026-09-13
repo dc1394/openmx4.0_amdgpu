@@ -479,6 +479,19 @@ void Cluster_DFT_Col_Release_GPU_Solver(void)
     ClusterCol_GpuSolver_Destroy();
 }
 
+/* Run-boundary reset (between -runtest/-runtestL inputs): additionally drop
+   the geometry-derived DM entry cache, the root DM workspace and the cached
+   dense eigenvectors, none of which may survive into a different system.
+   Idempotent; only the root rank ever owns the cached eigenvectors, and on
+   the other ranks the pointers are NULL. */
+void Cluster_DFT_Col_Release_GPU_Caches(void)
+{
+    ClusterCol_DMEntryCache_Reset();
+    ClusterCol_RootDMWorkspace_Reset();
+    ClusterCol_ReleaseGpuSolverCachedEVec(0);
+    ClusterCol_GpuSolver_Destroy();
+}
+
 /* A MAGMA solve owns four dense panels here and may reserve additional
    device work internally.  Decide collectively before entering the root
    GPU path so a permanently crowded shared device falls back to ELPA

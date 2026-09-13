@@ -895,6 +895,17 @@ void Cluster_DFT_NonCol_Release_GPU_Solver(void)
     Cluster_DFT_NonCol_DemoteGpuSolverCachedEVec();
 }
 
+/* Run-boundary reset (between -runtest/-runtestL inputs): the cached dense
+   eigenvectors and the geometry-derived DM tables must not survive into a
+   different system.  Idempotent; only the host rank owns the cached
+   eigenvectors and the other ranks hold NULL. */
+void Cluster_DFT_NonCol_Release_GPU_Caches(void)
+{
+    ClusterNonCol_DMEntryCache_Reset();
+    ClusterNonCol_RootDMWorkspace_Reset();
+    ClusterNonCol_ReleaseGpuSolverCachedEVec(Host_ID);
+}
+
 static int ClusterNonCol_GpuDiagFits(int n2, int myid)
 {
     const char *env = getenv("OPENMX_CLUSTER_GPU_DIAG");

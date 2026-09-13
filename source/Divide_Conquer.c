@@ -553,6 +553,17 @@ static void DC_GpuSolver_ReleaseOverlapBuffer(void)
     ctx->loaded_s_dim = 0;
 }
 
+/* Run-boundary reset (between -runtest/-runtestL inputs): drop every scratch
+   buffer and the overlap cache, all sized and indexed by the previous
+   system.  Idempotent. */
+void Divide_Conquer_Release_GPU_Caches(void)
+{
+    DC_GpuSolver_ReleaseGemmScratch();
+    DC_GpuSolver_ReleaseTransformScratch();
+    DC_GpuSolver_ReleaseOverlapBuffer();
+    Divide_Conquer_Release_GPU_SCache();
+}
+
 static void DC_GpuSolver_DisableEigenPathInfo(const char *where, int32_t info)
 {
     int rank = -1;
