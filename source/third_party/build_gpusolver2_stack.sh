@@ -197,6 +197,7 @@ echo "gpusolver2 stack: using cmake: $CMAKE ($($CMAKE --version | head -n1))"
 # API, so the whole C++ side is compiled with hipcc (clang); the C side stays
 # on the host GCC.
 COMMON="-DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=$P \
+ -DCMAKE_INSTALL_LIBDIR=lib \
  -DCMAKE_PREFIX_PATH=$P;$GPUSOLVER2_ROCM \
  -DBUILD_SHARED_LIBS=OFF -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
  -DCMAKE_C_COMPILER=$GPUSOLVER2_HOST_CC -DCMAKE_CXX_COMPILER=$GPUSOLVER2_HIPCC \
