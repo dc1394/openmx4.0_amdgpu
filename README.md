@@ -127,7 +127,67 @@ Si, `scf.EigenvalueSolver cluster`, `scf.SpinPolarization NC`, n2 = 5616; 6 SCF 
 At 18 ranks the per-rank contexts exhaust the card and the dense solve falls back to the CPU (the GPU still wins the total through the construction stages); at 16 ranks the dense GPU diagonalization engages and the diagonalization drops 10%. An RDNA GPU runs FP64 at 1/32 of its FP32 rate, so the headroom here is modest.
 
 ### AMD Instinct MI300A
-To be added.
+One APU of a 4-APU MI300A node: 24 Zen 4 cores and one CDNA 3 GPU sharing 128 GB of unified HBM3; ROCm 7.2.0, Open MPI 5.0.10 built with the ROCm compilers, AOCL 5.1.0; 24 MPI ranks on the APU, flat MPI, the same binary for every column. GPU columns use the input-file defaults, CPU columns `OPENMX_GPU=0`:
+
+```sh
+export HSA_XNACK=1 UCX_RCACHE_ENABLE=n LIBOMPTARGET_MEMORY_MANAGER_THRESHOLD=0
+mpirun -np 24 ./openmx -runtestL -nt 1                  # GPU (defaults)
+OPENMX_GPU=0 mpirun -np 24 ./openmx -runtestL -nt 1     # CPU reference, same binary
+```
+
+`HSA_XNACK=1` is required for GPU runs on an MI300A: without it the OpenMP-target host mappings that stay alive across the SCF loop slow every kernel of every rank by an order of magnitude.
+
+24 ranks on one GPU is above the sharing limit of the dense band eigensolvers (`OPENMX_BAND_GPU_MAX_DEVICE_RANKS`, default 16), so in this configuration the band diagonalizations, the Krylov projected solves and the resident Hamiltonian tables all keep to their CPU paths by default — on an APU the cores read the same HBM, and 24 Zen 4 cores beat one GPU serializing the small solves of 24 ranks. What stays on the device is the collinear cluster diagonalization (solved by the root rank) and its construction feeds.
+
+`-runtest` (14 small systems; seconds from runtest.result):
+
+| input | CPU (s) | GPU (s) |
+|---|---:|---:|
+| Benzene | 3.35 | 7.51 |
+| C60 | 6.77 | 9.82 |
+| CO | 6.49 | 9.94 |
+| Cr2 | 5.33 | 6.72 |
+| Crys-MnO | 9.29 | 11.54 |
+| GaAs | 12.79 | 15.06 |
+| Glycine | 3.58 | 5.21 |
+| Graphite4 | 3.33 | 5.02 |
+| H2O-EF | 3.51 | 5.06 |
+| H2O | 3.47 | 6.02 |
+| HMn | 7.27 | 8.71 |
+| Methane | 2.74 | 4.24 |
+| Mol_MnO | 5.55 | 6.86 |
+| Ndia2 | 4.04 | 6.28 |
+| **Total** | **77.49** | **108.00** |
+
+As on the desktop card these systems sit below the eigensolver switching thresholds, so the GPU column only pays per-input setup. All 14 pass in both columns, max diff Utot 4.4e-11 Hartree on the GPU (CPU: 2.7e-10).
+
+`-runtestL` (16 medium/large systems; ratio = CPU / GPU):
+
+| input | atoms | solver | CPU (s) | GPU (s) | ratio |
+|---|---:|---|---:|---:|---:|
+| 5_5_13COb2 | 155 | band | 42.19 | 74.34 | 0.57 |
+| B2C62_Band | 64 | band | 420.94 | 450.39 | 0.93 |
+| CG15c-DC-LNO | 650 | dc-lno | 78.79 | 79.57 | 0.99 |
+| DIA512-1 | 512 | krylov | 97.17 | 97.55 | 1.00 |
+| FeBCC | 16 | band (sp) | 95.01 | 101.40 | 0.94 |
+| GEL | 40 | band | 33.49 | 41.05 | 0.82 |
+| GFRAG | 54 | cluster | 20.70 | 52.61 | 0.39 |
+| GGFF | 40 | band (NC) | 685.51 | 826.32 | 0.83 |
+| MCCN | 564 | krylov | 155.04 | 163.43 | 0.95 |
+| Mn12_148_F | 148 | cluster (sp) | 55.30 | 97.15 | 0.57 |
+| N1C999 | 1000 | dc-lno (sp) | 748.48 | 844.70 | 0.89 |
+| Ni63-O64 | 127 | band (sp) | 61.18 | 93.49 | 0.65 |
+| Pt63 | 63 | cluster | 38.39 | 78.41 | 0.49 |
+| SialicAcid | 40 | cluster | 12.81 | 17.47 | 0.73 |
+| ZrB2_2x2 | 76 | band | 159.90 | 161.30 | 0.99 |
+| nsV4Bz5 | 64 | cluster | 67.20 | 97.44 | 0.69 |
+| **Total** | | | **2772.11** | **3276.62** | **0.85** |
+
+All 16 pass in both columns (max diff Utot 2.5e-9 Hartree on the GPU, largest on Pt63 as in the official references; CPU 1.2e-9). With the demoted stages on the CPU the O(N) and band inputs run within a few percent of the CPU reference — the difference there is mostly the fixed cost of keeping the ROCm runtime and `HSA_XNACK=1` active. The remaining gap is concentrated in the collinear cluster inputs (GFRAG, Pt63, Mn12, and the gamma-point-only 5_5_13COb2, which OpenMX reroutes to the cluster solver): their dense solve is collected onto the root rank while the other 23 ranks wait, which loses to 24 cores working in parallel at these sizes.
+
+In short, at 24 ranks per APU these correctness suites run fastest with `OPENMX_GPU=0`. The GPU pays off on an MI300A when a dense diagonalization dominates and at most `OPENMX_BAND_GPU_MAX_DEVICE_RANKS` ranks share the device: for a 333-atom collinear band system (n=2808) at 8 ranks per APU, hipSOLVER runs the full-spectrum dense eigensolve in 0.13–0.18 s where the same rank count on the CPU takes seconds.
+
+One practical note on this machine: long 24-rank suite runs occasionally abort in a UCX shared-memory assertion (`mm_ep.c:458`) of the system Open MPI 5.0.10/UCX build, at a random input and independent of the physics; single inputs and reruns pass unchanged.
 
 ## Important notes
 GPU-accelerated OpenMX pays off for systems of hundreds of atoms with a dense solver; for fewer than a hundred atoms use standard OpenMX or `scf.eigen.lib elpa2`. Please use with caution as it may contain bugs — reports via GitHub issues or [my X account](https://x.com/dc1394) are appreciated.
