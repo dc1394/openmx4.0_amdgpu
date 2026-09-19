@@ -291,13 +291,20 @@ static void DFT_ConfigureSetHamiltonianOpenMP(int myid0)
 
 static void DFT_PrepareGpuSolverHSPackedCache(int SCF_iter)
 {
-    /* The packed H/S cache feeds only the dense-GPU band paths.  When the GPU
-       is oversubscribed those paths fall back to the CPU (their switch number
-       is forced unreachable), so building the cache would be wasted work and
-       would still run the large MPI_Gatherv that trips UCX's shared-memory
-       assertion on this regime.  Skip it and keep any stale copy invalidated. */
-    if (scf_eigen_lib_flag == GPUSOLVER && (Solver == 2 || Solver == 3) &&
-        !openmx_band_gpu_dense_oversubscribed()) {
+    /* The packed H/S cache feeds the dense-GPU band paths AND the collinear
+       cluster solver (Cluster_DFT_Col consumes it whenever it is ready; a
+       gamma-point-only band input is rerouted to Solver==2 by Input_std, so
+       it lands there too).  Only the BAND consumers are demoted on an
+       oversubscribed GPU (their switch number is forced unreachable), so only
+       Solver==3 may skip the build then - that also avoids the large
+       MPI_Gatherv that trips UCX's shared-memory assertion in that regime.
+       For Solver==2 the cache must always be built: without it the cluster
+       path takes a rarely exercised fallback that produced wrong total
+       energies for large systems (5_5_13COb2, GFRAG in -runtestL) at
+       24 ranks per GPU. */
+    if (scf_eigen_lib_flag == GPUSOLVER &&
+        (Solver == 2 ||
+         (Solver == 3 && !openmx_band_gpu_dense_oversubscribed()))) {
         /* Atom order and overlap are invariant during an uncontracted SCF
            cycle.  Rebuild them at SCF 1 (and whenever contracted orbitals may
            change), then refresh only the Hamiltonian on later iterations. */
