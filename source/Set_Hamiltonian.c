@@ -301,8 +301,16 @@ static int Set_Hamiltonian_MatrixElements_OpenMP_Enabled(void)
      * still sends it to the host path when the tables do not fit.
     */
     const char *value = getenv("OPENMX_SETHAM_GPU");
-    /* on by default everywhere, APUs included (OPENMX_SETHAM_GPU=0 opts out) */
-    int requested = (value == NULL || value[0] == '\0') ? 1 : (atoi(value) != 0);
+    /* On by default, APUs included (OPENMX_SETHAM_GPU=0 opts out) -- except
+       when the GPU is shared by more ranks than the dense band eigensolvers
+       accept (openmx_band_gpu_dense_oversubscribed): the many small
+       matrix-element kernels of all ranks then serialize on the device and
+       the resident tables feed a solver path that is demoted anyway.  On the
+       40-atom noncollinear GGFF at 24 ranks on one MI300A this path took
+       0.51 s/SCF against 0.27 s/SCF for the AVX-512 host path.
+       OPENMX_SETHAM_GPU=1 still forces it on. */
+    int default_on = !openmx_band_gpu_dense_oversubscribed();
+    int requested = (value == NULL || value[0] == '\0') ? default_on : (atoi(value) != 0);
 
     return scf_eigen_lib_flag == GPUSOLVER && requested &&
            gpu_rank_device_usable();
