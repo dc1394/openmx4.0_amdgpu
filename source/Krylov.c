@@ -19,9 +19,22 @@
 #include "mpi.h"
 #include "openmx_common.h"
 #include "lapack_prototypes.h"
+#include "set_hip_default_device_from_local_rank.h"
 #include <omp.h>
 
-#define  measure_time   0
+/* Stage timing of the Krylov solver (the time1..time16 blocks below, printed
+   per rank at the end of each call): set OPENMX_KRYLOV_MEASURE_TIME=1.
+   Diagnostic; replaces the old compile-time "#define measure_time 0". */
+static int Krylov_measure_time_env = -1;
+static int Krylov_MeasureTime(void)
+{
+  if (Krylov_measure_time_env < 0){
+    const char *v = getenv("OPENMX_KRYLOV_MEASURE_TIME");
+    Krylov_measure_time_env = (v != NULL && atoi(v) != 0);
+  }
+  return Krylov_measure_time_env;
+}
+#define  measure_time   (Krylov_MeasureTime())
 #define  error_check    0
 #define  cutoff_value   Threshold_OLP_Eigen
 #define  KRYLOV_ENABLE_GPU  1
@@ -124,8 +137,27 @@ static int Krylov_GPU_Enabled(void)
   /*
     Keep Krylov's local dense GPU path behind one switch so it is easy to
     fall back to the CPU BLAS/LAPACK path when needed.
+
+    Off by default when the GPU is shared by more ranks than the dense band
+    eigensolvers accept (openmx_band_gpu_dense_oversubscribed): every rank
+    then funnels its many small per-cluster projected eigensolves into the
+    one device and they serialize behind each other's launches, while the
+    CPU path solves them rank-locally in parallel.  Measured on MCCN
+    (564 atoms, Krylov, 24 ranks on one MI300A, 12 SCF steps): the
+    projected eigensolve (Krylov_Eigen2) took 2737 s summed over ranks on
+    the GPU against 264 s on the CPU, i.e. the whole Krylov stage went
+    167.9 s -> 22.4 s by keeping it on the CPU.  OPENMX_KRYLOV_GPU=1
+    forces the offload back on, =0 forces it off everywhere.
   */
-  return KRYLOV_ENABLE_GPU && scf_eigen_lib_flag == GPUSOLVER;
+  static int requested = -1;
+
+  if (requested < 0) {
+    const char *v = getenv("OPENMX_KRYLOV_GPU");
+    if (v != NULL && v[0] != '\0') requested = (atoi(v) != 0);
+    else requested = !openmx_band_gpu_dense_oversubscribed();
+  }
+
+  return KRYLOV_ENABLE_GPU && scf_eigen_lib_flag == GPUSOLVER && requested;
 }
 
 /*
