@@ -2139,7 +2139,7 @@ static void dHVNA(int where_flag, int Mc_AN, int h_AN, int q_AN,
     double***** TmpHVNA2, double***** TmpHVNA3,
     double** Hx, double** Hy, double** Hz);
 
-static void dHNL_SO(
+static void dHNL_SO_rows(
     double* sumx0r,
     double* sumy0r,
     double* sumz0r,
@@ -2163,10 +2163,10 @@ static void dHNL_SO(
     double PFm,
     double ene_p,
     double ene_m,
-    int l2, int* l,
-    int Mc_AN, int k, int m,
-    int Mj_AN, int kl, int n,
-    double****** DS_NL1);
+        int l2, int* l,
+    const double* restrict A0x, const double* restrict A0y, const double* restrict A0z,
+    const double* restrict A1x, const double* restrict A1y, const double* restrict A1z,
+    const double* restrict B0, const double* restrict B1);
 
 static void dHCH(int where_flag,
     int Mc_AN, int h_AN, int q_AN,
@@ -10455,9 +10455,12 @@ void dHNL(int where_flag,
     kl = RMI1[Mc_AN][h_AN][q_AN];
     dmp = dampingF(rcut, Dis[ig][kl]);
 
+    /* every consumer of Hx/Hy/Hz reads only the ian x jan block of this
+       pair (and the damping tail below scales the same block), so clearing
+       the full List_YOUSO[7]^2 matrices would just stream ~100 KB per call */
     for (so = 0; so < 3; so++) {
-        for (i = 0; i < List_YOUSO[7]; i++) {
-            for (j = 0; j < List_YOUSO[7]; j++) {
+        for (i = 0; i < ian; i++) {
+            for (j = 0; j < jan; j++) {
                 Hx[so][i][j] = Complex(0.0, 0.0);
                 Hy[so][i][j] = Complex(0.0, 0.0);
                 Hz[so][i][j] = Complex(0.0, 0.0);
@@ -10580,7 +10583,7 @@ void dHNL(int where_flag,
                                 PFm = 3.0 / 7.0;
                             }
 
-                            dHNL_SO(&sumx0.r, &sumy0.r, &sumz0.r,
+                            dHNL_SO_rows(&sumx0.r, &sumy0.r, &sumz0.r,
                                 &sumx1.r, &sumy1.r, &sumz1.r,
                                 &sumx2.r, &sumy2.r, &sumz2.r,
                                 &sumx0.i, &sumy0.i, &sumz0.i,
@@ -10590,9 +10593,9 @@ void dHNL(int where_flag,
                                 PFp, PFm,
                                 ene_p, ene_m,
                                 l2, &l,
-                                Mc_AN, k, m,
-                                Mj_AN2, kl, n,
-                                DS_NL1);
+                                DS_NL1[0][1][Mc_AN][k][m], DS_NL1[0][2][Mc_AN][k][m], DS_NL1[0][3][Mc_AN][k][m],
+                                DS_NL1[1][1][Mc_AN][k][m], DS_NL1[1][2][Mc_AN][k][m], DS_NL1[1][3][Mc_AN][k][m],
+                                DS_NL1[0][0][Mj_AN2][kl][n], DS_NL1[1][0][Mj_AN2][kl][n]);
                         }
 
                         if (q_AN == 0) {
@@ -10621,7 +10624,7 @@ void dHNL(int where_flag,
                                     PFm = 3.0 / 7.0;
                                 }
 
-                                dHNL_SO(&sumx0.r, &sumy0.r, &sumz0.r,
+                                dHNL_SO_rows(&sumx0.r, &sumy0.r, &sumz0.r,
                                     &sumx1.r, &sumy1.r, &sumz1.r,
                                     &sumx2.r, &sumy2.r, &sumz2.r,
                                     &sumx0.i, &sumy0.i, &sumz0.i,
@@ -10631,9 +10634,9 @@ void dHNL(int where_flag,
                                     PFp, PFm,
                                     ene_p, ene_m,
                                     l2, &l,
-                                    Mj_AN2, kl, n,
-                                    Mc_AN, k, m,
-                                    DS_NL1);
+                                    DS_NL1[0][1][Mj_AN2][kl][n], DS_NL1[0][2][Mj_AN2][kl][n], DS_NL1[0][3][Mj_AN2][kl][n],
+                                DS_NL1[1][1][Mj_AN2][kl][n], DS_NL1[1][2][Mj_AN2][kl][n], DS_NL1[1][3][Mj_AN2][kl][n],
+                                DS_NL1[0][0][Mc_AN][k][m], DS_NL1[1][0][Mc_AN][k][m]);
                             }
                         }
 
@@ -10814,7 +10817,7 @@ void dHNL(int where_flag,
 
                             /* 1 */
 
-                            dHNL_SO(&sumx0.r, &sumy0.r, &sumz0.r,
+                            dHNL_SO_rows(&sumx0.r, &sumy0.r, &sumz0.r,
                                 &sumx1.r, &sumy1.r, &sumz1.r,
                                 &sumx2.r, &sumy2.r, &sumz2.r,
                                 &sumx0.i, &sumy0.i, &sumz0.i,
@@ -10824,9 +10827,9 @@ void dHNL(int where_flag,
                                 PFp, PFm,
                                 -ene_p, -ene_m,
                                 l2, &l,
-                                Mj_AN2, kl2, n,
-                                Mc_AN, 0, m,
-                                DS_NL1);
+                                DS_NL1[0][1][Mj_AN2][kl2][n], DS_NL1[0][2][Mj_AN2][kl2][n], DS_NL1[0][3][Mj_AN2][kl2][n],
+                                DS_NL1[1][1][Mj_AN2][kl2][n], DS_NL1[1][2][Mj_AN2][kl2][n], DS_NL1[1][3][Mj_AN2][kl2][n],
+                                DS_NL1[0][0][Mc_AN][0][m], DS_NL1[1][0][Mc_AN][0][m]);
                         }
 
                         Hx[0][m][n].r += sumx0.r; /* up-up */
@@ -10930,7 +10933,7 @@ void dHNL(int where_flag,
                                 PFm = 3.0 / 7.0;
                             }
 
-                            dHNL_SO(&sumx0.r, &sumy0.r, &sumz0.r,
+                            dHNL_SO_rows(&sumx0.r, &sumy0.r, &sumz0.r,
                                 &sumx1.r, &sumy1.r, &sumz1.r,
                                 &sumx2.r, &sumy2.r, &sumz2.r,
                                 &sumx0.i, &sumy0.i, &sumz0.i,
@@ -10940,9 +10943,9 @@ void dHNL(int where_flag,
                                 PFp, PFm,
                                 ene_p, ene_m,
                                 l2, &l,
-                                Mj_AN, k, n,
-                                Mi_AN2, kl, m,
-                                DS_NL1);
+                                DS_NL1[0][1][Mj_AN][k][n], DS_NL1[0][2][Mj_AN][k][n], DS_NL1[0][3][Mj_AN][k][n],
+                                DS_NL1[1][1][Mj_AN][k][n], DS_NL1[1][2][Mj_AN][k][n], DS_NL1[1][3][Mj_AN][k][n],
+                                DS_NL1[0][0][Mi_AN2][kl][m], DS_NL1[1][0][Mi_AN2][kl][m]);
                         }
 
                         Hx[0][m][n].r += sumx0.r; /* up-up */
@@ -11097,7 +11100,7 @@ void dHNL(int where_flag,
 
                         /* 2 */
 
-                        dHNL_SO(&sumx0.r, &sumy0.r, &sumz0.r,
+                        dHNL_SO_rows(&sumx0.r, &sumy0.r, &sumz0.r,
                             &sumx1.r, &sumy1.r, &sumz1.r,
                             &sumx2.r, &sumy2.r, &sumz2.r,
                             &sumx0.i, &sumy0.i, &sumz0.i,
@@ -11107,9 +11110,9 @@ void dHNL(int where_flag,
                             PFp, PFm,
                             -ene_p, -ene_m,
                             l2, &l,
-                            Matomnum + 1, kl1, m,
-                            Matomnum + 1, kl2, n,
-                            DS_NL1);
+                            DS_NL1[0][1][Matomnum + 1][kl1][m], DS_NL1[0][2][Matomnum + 1][kl1][m], DS_NL1[0][3][Matomnum + 1][kl1][m],
+                                DS_NL1[1][1][Matomnum + 1][kl1][m], DS_NL1[1][2][Matomnum + 1][kl1][m], DS_NL1[1][3][Matomnum + 1][kl1][m],
+                                DS_NL1[0][0][Matomnum + 1][kl2][n], DS_NL1[1][0][Matomnum + 1][kl2][n]);
                     }
 
                     Hx[0][m][n].r = sumx0.r; /* up-up */
@@ -11243,7 +11246,7 @@ void dHNL(int where_flag,
 
                             /* 4 */
 
-                            dHNL_SO(&sumx0.r, &sumy0.r, &sumz0.r,
+                            dHNL_SO_rows(&sumx0.r, &sumy0.r, &sumz0.r,
                                 &sumx1.r, &sumy1.r, &sumz1.r,
                                 &sumx2.r, &sumy2.r, &sumz2.r,
                                 &sumx0.i, &sumy0.i, &sumz0.i,
@@ -11253,9 +11256,9 @@ void dHNL(int where_flag,
                                 PFp, PFm,
                                 -ene_p, -ene_m,
                                 l2, &l,
-                                Matomnum + 1, kl2, n,
-                                Matomnum + 1, kl1, m,
-                                DS_NL1);
+                                DS_NL1[0][1][Matomnum + 1][kl2][n], DS_NL1[0][2][Matomnum + 1][kl2][n], DS_NL1[0][3][Matomnum + 1][kl2][n],
+                                DS_NL1[1][1][Matomnum + 1][kl2][n], DS_NL1[1][2][Matomnum + 1][kl2][n], DS_NL1[1][3][Matomnum + 1][kl2][n],
+                                DS_NL1[0][0][Matomnum + 1][kl1][m], DS_NL1[1][0][Matomnum + 1][kl1][m]);
                         }
 
                         Hx[0][m][n].r += sumx0.r; /* up-up */
@@ -11829,7 +11832,7 @@ void dHVNA(int where_flag, int Mc_AN, int h_AN, int q_AN,
     }
 }
 
-void dHNL_SO(
+static void dHNL_SO_rows(
     double* sumx0r,
     double* sumy0r,
     double* sumz0r,
@@ -11853,11 +11856,14 @@ void dHNL_SO(
     double PFm,
     double ene_p,
     double ene_m,
-    int l2, int* l,
-    int Mc_AN, int k, int m,
-    int Mj_AN, int kl, int n,
-    double****** DS_NL1)
+        int l2, int* l,
+    const double* restrict A0x, const double* restrict A0y, const double* restrict A0z,
+    const double* restrict A1x, const double* restrict A1y, const double* restrict A1z,
+    const double* restrict B0, const double* restrict B1)
 {
+    const double* restrict A0v[4] = { NULL, A0x, A0y, A0z };
+    const double* restrict A1v[4] = { NULL, A1x, A1y, A1z };
+    (void)A0v; (void)A1v;
 
     int l3, i;
     double tmpx, tmpy, tmpz;
@@ -11876,11 +11882,11 @@ void dHNL_SO(
         if (l2 == 2) {
 
             /* real contribution of l+1/2 to off diagonal up-down matrix */
-            tmpx = fugou * (ene_p / 3.0 * DS_NL1[0][1][Mc_AN][k][m][*l] * DS_NL1[0][0][Mj_AN][kl][n][*l + 2] - ene_p / 3.0 * DS_NL1[0][1][Mc_AN][k][m][*l + 2] * DS_NL1[0][0][Mj_AN][kl][n][*l]);
+            tmpx = fugou * (ene_p / 3.0 * A0x[*l] * B0[*l + 2] - ene_p / 3.0 * A0x[*l + 2] * B0[*l]);
 
-            tmpy = fugou * (ene_p / 3.0 * DS_NL1[0][2][Mc_AN][k][m][*l] * DS_NL1[0][0][Mj_AN][kl][n][*l + 2] - ene_p / 3.0 * DS_NL1[0][2][Mc_AN][k][m][*l + 2] * DS_NL1[0][0][Mj_AN][kl][n][*l]);
+            tmpy = fugou * (ene_p / 3.0 * A0y[*l] * B0[*l + 2] - ene_p / 3.0 * A0y[*l + 2] * B0[*l]);
 
-            tmpz = fugou * (ene_p / 3.0 * DS_NL1[0][3][Mc_AN][k][m][*l] * DS_NL1[0][0][Mj_AN][kl][n][*l + 2] - ene_p / 3.0 * DS_NL1[0][3][Mc_AN][k][m][*l + 2] * DS_NL1[0][0][Mj_AN][kl][n][*l]);
+            tmpz = fugou * (ene_p / 3.0 * A0z[*l] * B0[*l + 2] - ene_p / 3.0 * A0z[*l + 2] * B0[*l]);
 
             *sumx2r += tmpx;
             *sumy2r += tmpy;
@@ -11888,11 +11894,11 @@ void dHNL_SO(
 
             /* imaginary contribution of l+1/2 to off diagonal up-down matrix */
 
-            tmpx = fugou * (-ene_p / 3.0 * DS_NL1[0][1][Mc_AN][k][m][*l + 1] * DS_NL1[0][0][Mj_AN][kl][n][*l + 2] + ene_p / 3.0 * DS_NL1[0][1][Mc_AN][k][m][*l + 2] * DS_NL1[0][0][Mj_AN][kl][n][*l + 1]);
+            tmpx = fugou * (-ene_p / 3.0 * A0x[*l + 1] * B0[*l + 2] + ene_p / 3.0 * A0x[*l + 2] * B0[*l + 1]);
 
-            tmpy = fugou * (-ene_p / 3.0 * DS_NL1[0][2][Mc_AN][k][m][*l + 1] * DS_NL1[0][0][Mj_AN][kl][n][*l + 2] + ene_p / 3.0 * DS_NL1[0][2][Mc_AN][k][m][*l + 2] * DS_NL1[0][0][Mj_AN][kl][n][*l + 1]);
+            tmpy = fugou * (-ene_p / 3.0 * A0y[*l + 1] * B0[*l + 2] + ene_p / 3.0 * A0y[*l + 2] * B0[*l + 1]);
 
-            tmpz = fugou * (-ene_p / 3.0 * DS_NL1[0][3][Mc_AN][k][m][*l + 1] * DS_NL1[0][0][Mj_AN][kl][n][*l + 2] + ene_p / 3.0 * DS_NL1[0][3][Mc_AN][k][m][*l + 2] * DS_NL1[0][0][Mj_AN][kl][n][*l + 1]);
+            tmpz = fugou * (-ene_p / 3.0 * A0z[*l + 1] * B0[*l + 2] + ene_p / 3.0 * A0z[*l + 2] * B0[*l + 1]);
 
             *sumx2i += tmpx;
             *sumy2i += tmpy;
@@ -11900,11 +11906,11 @@ void dHNL_SO(
 
             /* real contribution of l-1/2 for to diagonal up-down matrix */
 
-            tmpx = fugou * (ene_m / 3.0 * DS_NL1[1][1][Mc_AN][k][m][*l] * DS_NL1[1][0][Mj_AN][kl][n][*l + 2] - ene_m / 3.0 * DS_NL1[1][1][Mc_AN][k][m][*l + 2] * DS_NL1[1][0][Mj_AN][kl][n][*l]);
+            tmpx = fugou * (ene_m / 3.0 * A1x[*l] * B1[*l + 2] - ene_m / 3.0 * A1x[*l + 2] * B1[*l]);
 
-            tmpy = fugou * (ene_m / 3.0 * DS_NL1[1][2][Mc_AN][k][m][*l] * DS_NL1[1][0][Mj_AN][kl][n][*l + 2] - ene_m / 3.0 * DS_NL1[1][2][Mc_AN][k][m][*l + 2] * DS_NL1[1][0][Mj_AN][kl][n][*l]);
+            tmpy = fugou * (ene_m / 3.0 * A1y[*l] * B1[*l + 2] - ene_m / 3.0 * A1y[*l + 2] * B1[*l]);
 
-            tmpz = fugou * (ene_m / 3.0 * DS_NL1[1][3][Mc_AN][k][m][*l] * DS_NL1[1][0][Mj_AN][kl][n][*l + 2] - ene_m / 3.0 * DS_NL1[1][3][Mc_AN][k][m][*l + 2] * DS_NL1[1][0][Mj_AN][kl][n][*l]);
+            tmpz = fugou * (ene_m / 3.0 * A1z[*l] * B1[*l + 2] - ene_m / 3.0 * A1z[*l + 2] * B1[*l]);
 
             *sumx2r -= tmpx;
             *sumy2r -= tmpy;
@@ -11912,11 +11918,11 @@ void dHNL_SO(
 
             /* imaginary contribution of l-1/2 to off diagonal up-down matrix */
 
-            tmpx = fugou * (-ene_m / 3.0 * DS_NL1[1][1][Mc_AN][k][m][*l + 1] * DS_NL1[1][0][Mj_AN][kl][n][*l + 2] + ene_m / 3.0 * DS_NL1[1][1][Mc_AN][k][m][*l + 2] * DS_NL1[1][0][Mj_AN][kl][n][*l + 1]);
+            tmpx = fugou * (-ene_m / 3.0 * A1x[*l + 1] * B1[*l + 2] + ene_m / 3.0 * A1x[*l + 2] * B1[*l + 1]);
 
-            tmpy = fugou * (-ene_m / 3.0 * DS_NL1[1][2][Mc_AN][k][m][*l + 1] * DS_NL1[1][0][Mj_AN][kl][n][*l + 2] + ene_m / 3.0 * DS_NL1[1][2][Mc_AN][k][m][*l + 2] * DS_NL1[1][0][Mj_AN][kl][n][*l + 1]);
+            tmpy = fugou * (-ene_m / 3.0 * A1y[*l + 1] * B1[*l + 2] + ene_m / 3.0 * A1y[*l + 2] * B1[*l + 1]);
 
-            tmpz = fugou * (-ene_m / 3.0 * DS_NL1[1][3][Mc_AN][k][m][*l + 1] * DS_NL1[1][0][Mj_AN][kl][n][*l + 2] + ene_m / 3.0 * DS_NL1[1][3][Mc_AN][k][m][*l + 2] * DS_NL1[1][0][Mj_AN][kl][n][*l + 1]);
+            tmpz = fugou * (-ene_m / 3.0 * A1z[*l + 1] * B1[*l + 2] + ene_m / 3.0 * A1z[*l + 2] * B1[*l + 1]);
 
             *sumx2i -= tmpx;
             *sumy2i -= tmpy;
@@ -11933,7 +11939,7 @@ void dHNL_SO(
             /* real contribution of l+1/2 to off diagonal up-down matrix */
 
             for (i = 1; i <= 3; i++) {
-                deri[i] = fugou * (-tmp2 * DS_NL1[0][i][Mc_AN][k][m][*l] * DS_NL1[0][0][Mj_AN][kl][n][*l + 3] + tmp2 * DS_NL1[0][i][Mc_AN][k][m][*l + 3] * DS_NL1[0][0][Mj_AN][kl][n][*l] + tmp1 * DS_NL1[0][i][Mc_AN][k][m][*l + 1] * DS_NL1[0][0][Mj_AN][kl][n][*l + 3] - tmp1 * DS_NL1[0][i][Mc_AN][k][m][*l + 3] * DS_NL1[0][0][Mj_AN][kl][n][*l + 1] + tmp1 * DS_NL1[0][i][Mc_AN][k][m][*l + 2] * DS_NL1[0][0][Mj_AN][kl][n][*l + 4] - tmp1 * DS_NL1[0][i][Mc_AN][k][m][*l + 4] * DS_NL1[0][0][Mj_AN][kl][n][*l + 2]);
+                deri[i] = fugou * (-tmp2 * A0v[i][*l] * B0[*l + 3] + tmp2 * A0v[i][*l + 3] * B0[*l] + tmp1 * A0v[i][*l + 1] * B0[*l + 3] - tmp1 * A0v[i][*l + 3] * B0[*l + 1] + tmp1 * A0v[i][*l + 2] * B0[*l + 4] - tmp1 * A0v[i][*l + 4] * B0[*l + 2]);
             }
             *sumx2r += deri[1];
             *sumy2r += deri[2];
@@ -11942,7 +11948,7 @@ void dHNL_SO(
             /* imaginary contribution of l+1/2 to off diagonal up-down matrix */
 
             for (i = 1; i <= 3; i++) {
-                deri[i] = fugou * (+tmp2 * DS_NL1[0][i][Mc_AN][k][m][*l] * DS_NL1[0][0][Mj_AN][kl][n][*l + 4] - tmp2 * DS_NL1[0][i][Mc_AN][k][m][*l + 4] * DS_NL1[0][0][Mj_AN][kl][n][*l] + tmp1 * DS_NL1[0][i][Mc_AN][k][m][*l + 1] * DS_NL1[0][0][Mj_AN][kl][n][*l + 4] - tmp1 * DS_NL1[0][i][Mc_AN][k][m][*l + 4] * DS_NL1[0][0][Mj_AN][kl][n][*l + 1] - tmp1 * DS_NL1[0][i][Mc_AN][k][m][*l + 2] * DS_NL1[0][0][Mj_AN][kl][n][*l + 3] + tmp1 * DS_NL1[0][i][Mc_AN][k][m][*l + 3] * DS_NL1[0][0][Mj_AN][kl][n][*l + 2]);
+                deri[i] = fugou * (+tmp2 * A0v[i][*l] * B0[*l + 4] - tmp2 * A0v[i][*l + 4] * B0[*l] + tmp1 * A0v[i][*l + 1] * B0[*l + 4] - tmp1 * A0v[i][*l + 4] * B0[*l + 1] - tmp1 * A0v[i][*l + 2] * B0[*l + 3] + tmp1 * A0v[i][*l + 3] * B0[*l + 2]);
             }
             *sumx2i += deri[1];
             *sumy2i += deri[2];
@@ -11954,7 +11960,7 @@ void dHNL_SO(
             tmp2 = tmp0 * tmp1;
 
             for (i = 1; i <= 3; i++) {
-                deri[i] = fugou * (-tmp2 * DS_NL1[1][i][Mc_AN][k][m][*l] * DS_NL1[1][0][Mj_AN][kl][n][*l + 3] + tmp2 * DS_NL1[1][i][Mc_AN][k][m][*l + 3] * DS_NL1[1][0][Mj_AN][kl][n][*l] + tmp1 * DS_NL1[1][i][Mc_AN][k][m][*l + 1] * DS_NL1[1][0][Mj_AN][kl][n][*l + 3] - tmp1 * DS_NL1[1][i][Mc_AN][k][m][*l + 3] * DS_NL1[1][0][Mj_AN][kl][n][*l + 1] + tmp1 * DS_NL1[1][i][Mc_AN][k][m][*l + 2] * DS_NL1[1][0][Mj_AN][kl][n][*l + 4] - tmp1 * DS_NL1[1][i][Mc_AN][k][m][*l + 4] * DS_NL1[1][0][Mj_AN][kl][n][*l + 2]);
+                deri[i] = fugou * (-tmp2 * A1v[i][*l] * B1[*l + 3] + tmp2 * A1v[i][*l + 3] * B1[*l] + tmp1 * A1v[i][*l + 1] * B1[*l + 3] - tmp1 * A1v[i][*l + 3] * B1[*l + 1] + tmp1 * A1v[i][*l + 2] * B1[*l + 4] - tmp1 * A1v[i][*l + 4] * B1[*l + 2]);
             }
             *sumx2r -= deri[1];
             *sumy2r -= deri[2];
@@ -11963,7 +11969,7 @@ void dHNL_SO(
             /* imaginary contribution of l-1/2 to off diagonal up-down matrix */
 
             for (i = 1; i <= 3; i++) {
-                deri[i] = fugou * (+tmp2 * DS_NL1[1][i][Mc_AN][k][m][*l] * DS_NL1[1][0][Mj_AN][kl][n][*l + 4] - tmp2 * DS_NL1[1][i][Mc_AN][k][m][*l + 4] * DS_NL1[1][0][Mj_AN][kl][n][*l] + tmp1 * DS_NL1[1][i][Mc_AN][k][m][*l + 1] * DS_NL1[1][0][Mj_AN][kl][n][*l + 4] - tmp1 * DS_NL1[1][i][Mc_AN][k][m][*l + 4] * DS_NL1[1][0][Mj_AN][kl][n][*l + 1] - tmp1 * DS_NL1[1][i][Mc_AN][k][m][*l + 2] * DS_NL1[1][0][Mj_AN][kl][n][*l + 3] + tmp1 * DS_NL1[1][i][Mc_AN][k][m][*l + 3] * DS_NL1[1][0][Mj_AN][kl][n][*l + 2]);
+                deri[i] = fugou * (+tmp2 * A1v[i][*l] * B1[*l + 4] - tmp2 * A1v[i][*l + 4] * B1[*l] + tmp1 * A1v[i][*l + 1] * B1[*l + 4] - tmp1 * A1v[i][*l + 4] * B1[*l + 1] - tmp1 * A1v[i][*l + 2] * B1[*l + 3] + tmp1 * A1v[i][*l + 3] * B1[*l + 2]);
             }
             *sumx2i -= deri[1];
             *sumy2i -= deri[2];
@@ -11985,7 +11991,7 @@ void dHNL_SO(
             tmp6 = tmp0 * tmp3; /* sqrt(6.0)     */
 
             for (i = 1; i <= 3; i++) {
-                deri[i] = fugou * (-tmp6 * DS_NL1[0][i][Mc_AN][k][m][*l] * DS_NL1[0][0][Mj_AN][kl][n][*l + 1] + tmp6 * DS_NL1[0][i][Mc_AN][k][m][*l + 1] * DS_NL1[0][0][Mj_AN][kl][n][*l] - tmp5 * DS_NL1[0][i][Mc_AN][k][m][*l + 1] * DS_NL1[0][0][Mj_AN][kl][n][*l + 3] + tmp5 * DS_NL1[0][i][Mc_AN][k][m][*l + 3] * DS_NL1[0][0][Mj_AN][kl][n][*l + 1] - tmp5 * DS_NL1[0][i][Mc_AN][k][m][*l + 2] * DS_NL1[0][0][Mj_AN][kl][n][*l + 4] + tmp5 * DS_NL1[0][i][Mc_AN][k][m][*l + 4] * DS_NL1[0][0][Mj_AN][kl][n][*l + 2] - tmp4 * DS_NL1[0][i][Mc_AN][k][m][*l + 3] * DS_NL1[0][0][Mj_AN][kl][n][*l + 5] + tmp4 * DS_NL1[0][i][Mc_AN][k][m][*l + 5] * DS_NL1[0][0][Mj_AN][kl][n][*l + 3] - tmp4 * DS_NL1[0][i][Mc_AN][k][m][*l + 4] * DS_NL1[0][0][Mj_AN][kl][n][*l + 6] + tmp4 * DS_NL1[0][i][Mc_AN][k][m][*l + 6] * DS_NL1[0][0][Mj_AN][kl][n][*l + 4]);
+                deri[i] = fugou * (-tmp6 * A0v[i][*l] * B0[*l + 1] + tmp6 * A0v[i][*l + 1] * B0[*l] - tmp5 * A0v[i][*l + 1] * B0[*l + 3] + tmp5 * A0v[i][*l + 3] * B0[*l + 1] - tmp5 * A0v[i][*l + 2] * B0[*l + 4] + tmp5 * A0v[i][*l + 4] * B0[*l + 2] - tmp4 * A0v[i][*l + 3] * B0[*l + 5] + tmp4 * A0v[i][*l + 5] * B0[*l + 3] - tmp4 * A0v[i][*l + 4] * B0[*l + 6] + tmp4 * A0v[i][*l + 6] * B0[*l + 4]);
             }
             *sumx2r += deri[1];
             *sumy2r += deri[2];
@@ -11994,7 +12000,7 @@ void dHNL_SO(
             /* imaginary contribution of l+1/2 to off diagonal up-down matrix */
 
             for (i = 1; i <= 3; i++) {
-                deri[i] = fugou * (+tmp6 * DS_NL1[0][i][Mc_AN][k][m][*l] * DS_NL1[0][0][Mj_AN][kl][n][*l + 2] - tmp6 * DS_NL1[0][i][Mc_AN][k][m][*l + 2] * DS_NL1[0][0][Mj_AN][kl][n][*l] + tmp5 * DS_NL1[0][i][Mc_AN][k][m][*l + 1] * DS_NL1[0][0][Mj_AN][kl][n][*l + 4] - tmp5 * DS_NL1[0][i][Mc_AN][k][m][*l + 4] * DS_NL1[0][0][Mj_AN][kl][n][*l + 1] - tmp5 * DS_NL1[0][i][Mc_AN][k][m][*l + 2] * DS_NL1[0][0][Mj_AN][kl][n][*l + 3] + tmp5 * DS_NL1[0][i][Mc_AN][k][m][*l + 3] * DS_NL1[0][0][Mj_AN][kl][n][*l + 2] + tmp4 * DS_NL1[0][i][Mc_AN][k][m][*l + 3] * DS_NL1[0][0][Mj_AN][kl][n][*l + 6] - tmp4 * DS_NL1[0][i][Mc_AN][k][m][*l + 6] * DS_NL1[0][0][Mj_AN][kl][n][*l + 3] - tmp4 * DS_NL1[0][i][Mc_AN][k][m][*l + 4] * DS_NL1[0][0][Mj_AN][kl][n][*l + 5] + tmp4 * DS_NL1[0][i][Mc_AN][k][m][*l + 5] * DS_NL1[0][0][Mj_AN][kl][n][*l + 4]);
+                deri[i] = fugou * (+tmp6 * A0v[i][*l] * B0[*l + 2] - tmp6 * A0v[i][*l + 2] * B0[*l] + tmp5 * A0v[i][*l + 1] * B0[*l + 4] - tmp5 * A0v[i][*l + 4] * B0[*l + 1] - tmp5 * A0v[i][*l + 2] * B0[*l + 3] + tmp5 * A0v[i][*l + 3] * B0[*l + 2] + tmp4 * A0v[i][*l + 3] * B0[*l + 6] - tmp4 * A0v[i][*l + 6] * B0[*l + 3] - tmp4 * A0v[i][*l + 4] * B0[*l + 5] + tmp4 * A0v[i][*l + 5] * B0[*l + 4]);
             }
             *sumx2i += deri[1];
             *sumy2i += deri[2];
@@ -12008,7 +12014,7 @@ void dHNL_SO(
             tmp6 = tmp0 * tmp3; /* sqrt(6.0)     */
 
             for (i = 1; i <= 3; i++) {
-                deri[i] = fugou * (-tmp6 * DS_NL1[1][i][Mc_AN][k][m][*l] * DS_NL1[1][0][Mj_AN][kl][n][*l + 1] + tmp6 * DS_NL1[1][i][Mc_AN][k][m][*l + 1] * DS_NL1[1][0][Mj_AN][kl][n][*l] - tmp5 * DS_NL1[1][i][Mc_AN][k][m][*l + 1] * DS_NL1[1][0][Mj_AN][kl][n][*l + 3] + tmp5 * DS_NL1[1][i][Mc_AN][k][m][*l + 3] * DS_NL1[1][0][Mj_AN][kl][n][*l + 1] - tmp5 * DS_NL1[1][i][Mc_AN][k][m][*l + 2] * DS_NL1[1][0][Mj_AN][kl][n][*l + 4] + tmp5 * DS_NL1[1][i][Mc_AN][k][m][*l + 4] * DS_NL1[1][0][Mj_AN][kl][n][*l + 2] - tmp4 * DS_NL1[1][i][Mc_AN][k][m][*l + 3] * DS_NL1[1][0][Mj_AN][kl][n][*l + 5] + tmp4 * DS_NL1[1][i][Mc_AN][k][m][*l + 5] * DS_NL1[1][0][Mj_AN][kl][n][*l + 3] - tmp4 * DS_NL1[1][i][Mc_AN][k][m][*l + 4] * DS_NL1[1][0][Mj_AN][kl][n][*l + 6] + tmp4 * DS_NL1[1][i][Mc_AN][k][m][*l + 6] * DS_NL1[1][0][Mj_AN][kl][n][*l + 4]);
+                deri[i] = fugou * (-tmp6 * A1v[i][*l] * B1[*l + 1] + tmp6 * A1v[i][*l + 1] * B1[*l] - tmp5 * A1v[i][*l + 1] * B1[*l + 3] + tmp5 * A1v[i][*l + 3] * B1[*l + 1] - tmp5 * A1v[i][*l + 2] * B1[*l + 4] + tmp5 * A1v[i][*l + 4] * B1[*l + 2] - tmp4 * A1v[i][*l + 3] * B1[*l + 5] + tmp4 * A1v[i][*l + 5] * B1[*l + 3] - tmp4 * A1v[i][*l + 4] * B1[*l + 6] + tmp4 * A1v[i][*l + 6] * B1[*l + 4]);
             }
             *sumx2r -= deri[1];
             *sumy2r -= deri[2];
@@ -12017,7 +12023,7 @@ void dHNL_SO(
             /* imaginary contribution of l-1/2 to off diagonal up-down matrix */
 
             for (i = 1; i <= 3; i++) {
-                deri[i] = fugou * (+tmp6 * DS_NL1[1][i][Mc_AN][k][m][*l] * DS_NL1[1][0][Mj_AN][kl][n][*l + 2] - tmp6 * DS_NL1[1][i][Mc_AN][k][m][*l + 2] * DS_NL1[1][0][Mj_AN][kl][n][*l] + tmp5 * DS_NL1[1][i][Mc_AN][k][m][*l + 1] * DS_NL1[1][0][Mj_AN][kl][n][*l + 4] - tmp5 * DS_NL1[1][i][Mc_AN][k][m][*l + 4] * DS_NL1[1][0][Mj_AN][kl][n][*l + 1] - tmp5 * DS_NL1[1][i][Mc_AN][k][m][*l + 2] * DS_NL1[1][0][Mj_AN][kl][n][*l + 3] + tmp5 * DS_NL1[1][i][Mc_AN][k][m][*l + 3] * DS_NL1[1][0][Mj_AN][kl][n][*l + 2] + tmp4 * DS_NL1[1][i][Mc_AN][k][m][*l + 3] * DS_NL1[1][0][Mj_AN][kl][n][*l + 6] - tmp4 * DS_NL1[1][i][Mc_AN][k][m][*l + 6] * DS_NL1[1][0][Mj_AN][kl][n][*l + 3] - tmp4 * DS_NL1[1][i][Mc_AN][k][m][*l + 4] * DS_NL1[1][0][Mj_AN][kl][n][*l + 5] + tmp4 * DS_NL1[1][i][Mc_AN][k][m][*l + 5] * DS_NL1[1][0][Mj_AN][kl][n][*l + 4]);
+                deri[i] = fugou * (+tmp6 * A1v[i][*l] * B1[*l + 2] - tmp6 * A1v[i][*l + 2] * B1[*l] + tmp5 * A1v[i][*l + 1] * B1[*l + 4] - tmp5 * A1v[i][*l + 4] * B1[*l + 1] - tmp5 * A1v[i][*l + 2] * B1[*l + 3] + tmp5 * A1v[i][*l + 3] * B1[*l + 2] + tmp4 * A1v[i][*l + 3] * B1[*l + 6] - tmp4 * A1v[i][*l + 6] * B1[*l + 3] - tmp4 * A1v[i][*l + 4] * B1[*l + 5] + tmp4 * A1v[i][*l + 5] * B1[*l + 4]);
             }
             *sumx2i -= deri[1];
             *sumy2i -= deri[2];
@@ -12032,11 +12038,11 @@ void dHNL_SO(
     /* p */
     if (l2 == 2) {
 
-        tmpx = fugou * (ene_p / 3.0 * DS_NL1[0][1][Mc_AN][k][m][*l] * DS_NL1[0][0][Mj_AN][kl][n][*l + 1] - ene_p / 3.0 * DS_NL1[0][1][Mc_AN][k][m][*l + 1] * DS_NL1[0][0][Mj_AN][kl][n][*l]);
+        tmpx = fugou * (ene_p / 3.0 * A0x[*l] * B0[*l + 1] - ene_p / 3.0 * A0x[*l + 1] * B0[*l]);
 
-        tmpy = fugou * (ene_p / 3.0 * DS_NL1[0][2][Mc_AN][k][m][*l] * DS_NL1[0][0][Mj_AN][kl][n][*l + 1] - ene_p / 3.0 * DS_NL1[0][2][Mc_AN][k][m][*l + 1] * DS_NL1[0][0][Mj_AN][kl][n][*l]);
+        tmpy = fugou * (ene_p / 3.0 * A0y[*l] * B0[*l + 1] - ene_p / 3.0 * A0y[*l + 1] * B0[*l]);
 
-        tmpz = fugou * (ene_p / 3.0 * DS_NL1[0][3][Mc_AN][k][m][*l] * DS_NL1[0][0][Mj_AN][kl][n][*l + 1] - ene_p / 3.0 * DS_NL1[0][3][Mc_AN][k][m][*l + 1] * DS_NL1[0][0][Mj_AN][kl][n][*l]);
+        tmpz = fugou * (ene_p / 3.0 * A0z[*l] * B0[*l + 1] - ene_p / 3.0 * A0z[*l + 1] * B0[*l]);
 
         /* contribution of l+1/2 for up spin */
         *sumx0i += -tmpx;
@@ -12048,11 +12054,11 @@ void dHNL_SO(
         *sumy1i += tmpy;
         *sumz1i += tmpz;
 
-        tmpx = fugou * (ene_m / 3.0 * DS_NL1[1][1][Mc_AN][k][m][*l] * DS_NL1[1][0][Mj_AN][kl][n][*l + 1] - ene_m / 3.0 * DS_NL1[1][1][Mc_AN][k][m][*l + 1] * DS_NL1[1][0][Mj_AN][kl][n][*l]);
+        tmpx = fugou * (ene_m / 3.0 * A1x[*l] * B1[*l + 1] - ene_m / 3.0 * A1x[*l + 1] * B1[*l]);
 
-        tmpy = fugou * (ene_m / 3.0 * DS_NL1[1][2][Mc_AN][k][m][*l] * DS_NL1[1][0][Mj_AN][kl][n][*l + 1] - ene_m / 3.0 * DS_NL1[1][2][Mc_AN][k][m][*l + 1] * DS_NL1[1][0][Mj_AN][kl][n][*l]);
+        tmpy = fugou * (ene_m / 3.0 * A1y[*l] * B1[*l + 1] - ene_m / 3.0 * A1y[*l + 1] * B1[*l]);
 
-        tmpz = fugou * (ene_m / 3.0 * DS_NL1[1][3][Mc_AN][k][m][*l] * DS_NL1[1][0][Mj_AN][kl][n][*l + 1] - ene_m / 3.0 * DS_NL1[1][3][Mc_AN][k][m][*l + 1] * DS_NL1[1][0][Mj_AN][kl][n][*l]);
+        tmpz = fugou * (ene_m / 3.0 * A1z[*l] * B1[*l + 1] - ene_m / 3.0 * A1z[*l + 1] * B1[*l]);
 
         /* contribution of l-1/2 for up spin */
         *sumx0i += tmpx;
@@ -12068,11 +12074,11 @@ void dHNL_SO(
     /* d */
     else if (l2 == 4) {
 
-        tmpx = fugou * (ene_p * 2.0 / 5.0 * DS_NL1[0][1][Mc_AN][k][m][*l + 1] * DS_NL1[0][0][Mj_AN][kl][n][*l + 2] - ene_p * 2.0 / 5.0 * DS_NL1[0][1][Mc_AN][k][m][*l + 2] * DS_NL1[0][0][Mj_AN][kl][n][*l + 1] + ene_p * 1.0 / 5.0 * DS_NL1[0][1][Mc_AN][k][m][*l + 3] * DS_NL1[0][0][Mj_AN][kl][n][*l + 4] - ene_p * 1.0 / 5.0 * DS_NL1[0][1][Mc_AN][k][m][*l + 4] * DS_NL1[0][0][Mj_AN][kl][n][*l + 3]);
+        tmpx = fugou * (ene_p * 2.0 / 5.0 * A0x[*l + 1] * B0[*l + 2] - ene_p * 2.0 / 5.0 * A0x[*l + 2] * B0[*l + 1] + ene_p * 1.0 / 5.0 * A0x[*l + 3] * B0[*l + 4] - ene_p * 1.0 / 5.0 * A0x[*l + 4] * B0[*l + 3]);
 
-        tmpy = fugou * (ene_p * 2.0 / 5.0 * DS_NL1[0][2][Mc_AN][k][m][*l + 1] * DS_NL1[0][0][Mj_AN][kl][n][*l + 2] - ene_p * 2.0 / 5.0 * DS_NL1[0][2][Mc_AN][k][m][*l + 2] * DS_NL1[0][0][Mj_AN][kl][n][*l + 1] + ene_p * 1.0 / 5.0 * DS_NL1[0][2][Mc_AN][k][m][*l + 3] * DS_NL1[0][0][Mj_AN][kl][n][*l + 4] - ene_p * 1.0 / 5.0 * DS_NL1[0][2][Mc_AN][k][m][*l + 4] * DS_NL1[0][0][Mj_AN][kl][n][*l + 3]);
+        tmpy = fugou * (ene_p * 2.0 / 5.0 * A0y[*l + 1] * B0[*l + 2] - ene_p * 2.0 / 5.0 * A0y[*l + 2] * B0[*l + 1] + ene_p * 1.0 / 5.0 * A0y[*l + 3] * B0[*l + 4] - ene_p * 1.0 / 5.0 * A0y[*l + 4] * B0[*l + 3]);
 
-        tmpz = fugou * (ene_p * 2.0 / 5.0 * DS_NL1[0][3][Mc_AN][k][m][*l + 1] * DS_NL1[0][0][Mj_AN][kl][n][*l + 2] - ene_p * 2.0 / 5.0 * DS_NL1[0][3][Mc_AN][k][m][*l + 2] * DS_NL1[0][0][Mj_AN][kl][n][*l + 1] + ene_p * 1.0 / 5.0 * DS_NL1[0][3][Mc_AN][k][m][*l + 3] * DS_NL1[0][0][Mj_AN][kl][n][*l + 4] - ene_p * 1.0 / 5.0 * DS_NL1[0][3][Mc_AN][k][m][*l + 4] * DS_NL1[0][0][Mj_AN][kl][n][*l + 3]);
+        tmpz = fugou * (ene_p * 2.0 / 5.0 * A0z[*l + 1] * B0[*l + 2] - ene_p * 2.0 / 5.0 * A0z[*l + 2] * B0[*l + 1] + ene_p * 1.0 / 5.0 * A0z[*l + 3] * B0[*l + 4] - ene_p * 1.0 / 5.0 * A0z[*l + 4] * B0[*l + 3]);
 
         /* contribution of l+1/2 for up spin */
         *sumx0i += -tmpx;
@@ -12084,11 +12090,11 @@ void dHNL_SO(
         *sumy1i += tmpy;
         *sumz1i += tmpz;
 
-        tmpx = fugou * (ene_m * 2.0 / 5.0 * DS_NL1[1][1][Mc_AN][k][m][*l + 1] * DS_NL1[1][0][Mj_AN][kl][n][*l + 2] - ene_m * 2.0 / 5.0 * DS_NL1[1][1][Mc_AN][k][m][*l + 2] * DS_NL1[1][0][Mj_AN][kl][n][*l + 1] + ene_m * 1.0 / 5.0 * DS_NL1[1][1][Mc_AN][k][m][*l + 3] * DS_NL1[1][0][Mj_AN][kl][n][*l + 4] - ene_m * 1.0 / 5.0 * DS_NL1[1][1][Mc_AN][k][m][*l + 4] * DS_NL1[1][0][Mj_AN][kl][n][*l + 3]);
+        tmpx = fugou * (ene_m * 2.0 / 5.0 * A1x[*l + 1] * B1[*l + 2] - ene_m * 2.0 / 5.0 * A1x[*l + 2] * B1[*l + 1] + ene_m * 1.0 / 5.0 * A1x[*l + 3] * B1[*l + 4] - ene_m * 1.0 / 5.0 * A1x[*l + 4] * B1[*l + 3]);
 
-        tmpy = fugou * (ene_m * 2.0 / 5.0 * DS_NL1[1][2][Mc_AN][k][m][*l + 1] * DS_NL1[1][0][Mj_AN][kl][n][*l + 2] - ene_m * 2.0 / 5.0 * DS_NL1[1][2][Mc_AN][k][m][*l + 2] * DS_NL1[1][0][Mj_AN][kl][n][*l + 1] + ene_m * 1.0 / 5.0 * DS_NL1[1][2][Mc_AN][k][m][*l + 3] * DS_NL1[1][0][Mj_AN][kl][n][*l + 4] - ene_m * 1.0 / 5.0 * DS_NL1[1][2][Mc_AN][k][m][*l + 4] * DS_NL1[1][0][Mj_AN][kl][n][*l + 3]);
+        tmpy = fugou * (ene_m * 2.0 / 5.0 * A1y[*l + 1] * B1[*l + 2] - ene_m * 2.0 / 5.0 * A1y[*l + 2] * B1[*l + 1] + ene_m * 1.0 / 5.0 * A1y[*l + 3] * B1[*l + 4] - ene_m * 1.0 / 5.0 * A1y[*l + 4] * B1[*l + 3]);
 
-        tmpz = fugou * (ene_m * 2.0 / 5.0 * DS_NL1[1][3][Mc_AN][k][m][*l + 1] * DS_NL1[1][0][Mj_AN][kl][n][*l + 2] - ene_m * 2.0 / 5.0 * DS_NL1[1][3][Mc_AN][k][m][*l + 2] * DS_NL1[1][0][Mj_AN][kl][n][*l + 1] + ene_m * 1.0 / 5.0 * DS_NL1[1][3][Mc_AN][k][m][*l + 3] * DS_NL1[1][0][Mj_AN][kl][n][*l + 4] - ene_m * 1.0 / 5.0 * DS_NL1[1][3][Mc_AN][k][m][*l + 4] * DS_NL1[1][0][Mj_AN][kl][n][*l + 3]);
+        tmpz = fugou * (ene_m * 2.0 / 5.0 * A1z[*l + 1] * B1[*l + 2] - ene_m * 2.0 / 5.0 * A1z[*l + 2] * B1[*l + 1] + ene_m * 1.0 / 5.0 * A1z[*l + 3] * B1[*l + 4] - ene_m * 1.0 / 5.0 * A1z[*l + 4] * B1[*l + 3]);
 
         /* contribution of l-1/2 for up spin */
         *sumx0i += tmpx;
@@ -12105,11 +12111,11 @@ void dHNL_SO(
     /* f */
     else if (l2 == 6) {
 
-        tmpx = fugou * (ene_p * 1.0 / 7.0 * DS_NL1[0][1][Mc_AN][k][m][*l + 1] * DS_NL1[0][0][Mj_AN][kl][n][*l + 2] - ene_p * 1.0 / 7.0 * DS_NL1[0][1][Mc_AN][k][m][*l + 2] * DS_NL1[0][0][Mj_AN][kl][n][*l + 1] + ene_p * 2.0 / 7.0 * DS_NL1[0][1][Mc_AN][k][m][*l + 3] * DS_NL1[0][0][Mj_AN][kl][n][*l + 4] - ene_p * 2.0 / 7.0 * DS_NL1[0][1][Mc_AN][k][m][*l + 4] * DS_NL1[0][0][Mj_AN][kl][n][*l + 3] + ene_p * 3.0 / 7.0 * DS_NL1[0][1][Mc_AN][k][m][*l + 5] * DS_NL1[0][0][Mj_AN][kl][n][*l + 6] - ene_p * 3.0 / 7.0 * DS_NL1[0][1][Mc_AN][k][m][*l + 6] * DS_NL1[0][0][Mj_AN][kl][n][*l + 5]);
+        tmpx = fugou * (ene_p * 1.0 / 7.0 * A0x[*l + 1] * B0[*l + 2] - ene_p * 1.0 / 7.0 * A0x[*l + 2] * B0[*l + 1] + ene_p * 2.0 / 7.0 * A0x[*l + 3] * B0[*l + 4] - ene_p * 2.0 / 7.0 * A0x[*l + 4] * B0[*l + 3] + ene_p * 3.0 / 7.0 * A0x[*l + 5] * B0[*l + 6] - ene_p * 3.0 / 7.0 * A0x[*l + 6] * B0[*l + 5]);
 
-        tmpy = fugou * (ene_p * 1.0 / 7.0 * DS_NL1[0][2][Mc_AN][k][m][*l + 1] * DS_NL1[0][0][Mj_AN][kl][n][*l + 2] - ene_p * 1.0 / 7.0 * DS_NL1[0][2][Mc_AN][k][m][*l + 2] * DS_NL1[0][0][Mj_AN][kl][n][*l + 1] + ene_p * 2.0 / 7.0 * DS_NL1[0][2][Mc_AN][k][m][*l + 3] * DS_NL1[0][0][Mj_AN][kl][n][*l + 4] - ene_p * 2.0 / 7.0 * DS_NL1[0][2][Mc_AN][k][m][*l + 4] * DS_NL1[0][0][Mj_AN][kl][n][*l + 3] + ene_p * 3.0 / 7.0 * DS_NL1[0][2][Mc_AN][k][m][*l + 5] * DS_NL1[0][0][Mj_AN][kl][n][*l + 6] - ene_p * 3.0 / 7.0 * DS_NL1[0][2][Mc_AN][k][m][*l + 6] * DS_NL1[0][0][Mj_AN][kl][n][*l + 5]);
+        tmpy = fugou * (ene_p * 1.0 / 7.0 * A0y[*l + 1] * B0[*l + 2] - ene_p * 1.0 / 7.0 * A0y[*l + 2] * B0[*l + 1] + ene_p * 2.0 / 7.0 * A0y[*l + 3] * B0[*l + 4] - ene_p * 2.0 / 7.0 * A0y[*l + 4] * B0[*l + 3] + ene_p * 3.0 / 7.0 * A0y[*l + 5] * B0[*l + 6] - ene_p * 3.0 / 7.0 * A0y[*l + 6] * B0[*l + 5]);
 
-        tmpz = fugou * (ene_p * 1.0 / 7.0 * DS_NL1[0][3][Mc_AN][k][m][*l + 1] * DS_NL1[0][0][Mj_AN][kl][n][*l + 2] - ene_p * 1.0 / 7.0 * DS_NL1[0][3][Mc_AN][k][m][*l + 2] * DS_NL1[0][0][Mj_AN][kl][n][*l + 1] + ene_p * 2.0 / 7.0 * DS_NL1[0][3][Mc_AN][k][m][*l + 3] * DS_NL1[0][0][Mj_AN][kl][n][*l + 4] - ene_p * 2.0 / 7.0 * DS_NL1[0][3][Mc_AN][k][m][*l + 4] * DS_NL1[0][0][Mj_AN][kl][n][*l + 3] + ene_p * 3.0 / 7.0 * DS_NL1[0][3][Mc_AN][k][m][*l + 5] * DS_NL1[0][0][Mj_AN][kl][n][*l + 6] - ene_p * 3.0 / 7.0 * DS_NL1[0][3][Mc_AN][k][m][*l + 6] * DS_NL1[0][0][Mj_AN][kl][n][*l + 5]);
+        tmpz = fugou * (ene_p * 1.0 / 7.0 * A0z[*l + 1] * B0[*l + 2] - ene_p * 1.0 / 7.0 * A0z[*l + 2] * B0[*l + 1] + ene_p * 2.0 / 7.0 * A0z[*l + 3] * B0[*l + 4] - ene_p * 2.0 / 7.0 * A0z[*l + 4] * B0[*l + 3] + ene_p * 3.0 / 7.0 * A0z[*l + 5] * B0[*l + 6] - ene_p * 3.0 / 7.0 * A0z[*l + 6] * B0[*l + 5]);
 
         /* contribution of l+1/2 for up spin */
         *sumx0i += -tmpx;
@@ -12121,11 +12127,11 @@ void dHNL_SO(
         *sumy1i += tmpy;
         *sumz1i += tmpz;
 
-        tmpx = fugou * (ene_m * 1.0 / 7.0 * DS_NL1[1][1][Mc_AN][k][m][*l + 1] * DS_NL1[1][0][Mj_AN][kl][n][*l + 2] - ene_m * 1.0 / 7.0 * DS_NL1[1][1][Mc_AN][k][m][*l + 2] * DS_NL1[1][0][Mj_AN][kl][n][*l + 1] + ene_m * 2.0 / 7.0 * DS_NL1[1][1][Mc_AN][k][m][*l + 3] * DS_NL1[1][0][Mj_AN][kl][n][*l + 4] - ene_m * 2.0 / 7.0 * DS_NL1[1][1][Mc_AN][k][m][*l + 4] * DS_NL1[1][0][Mj_AN][kl][n][*l + 3] + ene_m * 3.0 / 7.0 * DS_NL1[1][1][Mc_AN][k][m][*l + 5] * DS_NL1[1][0][Mj_AN][kl][n][*l + 6] - ene_m * 3.0 / 7.0 * DS_NL1[1][1][Mc_AN][k][m][*l + 6] * DS_NL1[1][0][Mj_AN][kl][n][*l + 5]);
+        tmpx = fugou * (ene_m * 1.0 / 7.0 * A1x[*l + 1] * B1[*l + 2] - ene_m * 1.0 / 7.0 * A1x[*l + 2] * B1[*l + 1] + ene_m * 2.0 / 7.0 * A1x[*l + 3] * B1[*l + 4] - ene_m * 2.0 / 7.0 * A1x[*l + 4] * B1[*l + 3] + ene_m * 3.0 / 7.0 * A1x[*l + 5] * B1[*l + 6] - ene_m * 3.0 / 7.0 * A1x[*l + 6] * B1[*l + 5]);
 
-        tmpy = fugou * (ene_m * 1.0 / 7.0 * DS_NL1[1][2][Mc_AN][k][m][*l + 1] * DS_NL1[1][0][Mj_AN][kl][n][*l + 2] - ene_m * 1.0 / 7.0 * DS_NL1[1][2][Mc_AN][k][m][*l + 2] * DS_NL1[1][0][Mj_AN][kl][n][*l + 1] + ene_m * 2.0 / 7.0 * DS_NL1[1][2][Mc_AN][k][m][*l + 3] * DS_NL1[1][0][Mj_AN][kl][n][*l + 4] - ene_m * 2.0 / 7.0 * DS_NL1[1][2][Mc_AN][k][m][*l + 4] * DS_NL1[1][0][Mj_AN][kl][n][*l + 3] + ene_m * 3.0 / 7.0 * DS_NL1[1][2][Mc_AN][k][m][*l + 5] * DS_NL1[1][0][Mj_AN][kl][n][*l + 6] - ene_m * 3.0 / 7.0 * DS_NL1[1][2][Mc_AN][k][m][*l + 6] * DS_NL1[1][0][Mj_AN][kl][n][*l + 5]);
+        tmpy = fugou * (ene_m * 1.0 / 7.0 * A1y[*l + 1] * B1[*l + 2] - ene_m * 1.0 / 7.0 * A1y[*l + 2] * B1[*l + 1] + ene_m * 2.0 / 7.0 * A1y[*l + 3] * B1[*l + 4] - ene_m * 2.0 / 7.0 * A1y[*l + 4] * B1[*l + 3] + ene_m * 3.0 / 7.0 * A1y[*l + 5] * B1[*l + 6] - ene_m * 3.0 / 7.0 * A1y[*l + 6] * B1[*l + 5]);
 
-        tmpz = fugou * (ene_m * 1.0 / 7.0 * DS_NL1[1][3][Mc_AN][k][m][*l + 1] * DS_NL1[1][0][Mj_AN][kl][n][*l + 2] - ene_m * 1.0 / 7.0 * DS_NL1[1][3][Mc_AN][k][m][*l + 2] * DS_NL1[1][0][Mj_AN][kl][n][*l + 1] + ene_m * 2.0 / 7.0 * DS_NL1[1][3][Mc_AN][k][m][*l + 3] * DS_NL1[1][0][Mj_AN][kl][n][*l + 4] - ene_m * 2.0 / 7.0 * DS_NL1[1][3][Mc_AN][k][m][*l + 4] * DS_NL1[1][0][Mj_AN][kl][n][*l + 3] + ene_m * 3.0 / 7.0 * DS_NL1[1][3][Mc_AN][k][m][*l + 5] * DS_NL1[1][0][Mj_AN][kl][n][*l + 6] - ene_m * 3.0 / 7.0 * DS_NL1[1][3][Mc_AN][k][m][*l + 6] * DS_NL1[1][0][Mj_AN][kl][n][*l + 5]);
+        tmpz = fugou * (ene_m * 1.0 / 7.0 * A1z[*l + 1] * B1[*l + 2] - ene_m * 1.0 / 7.0 * A1z[*l + 2] * B1[*l + 1] + ene_m * 2.0 / 7.0 * A1z[*l + 3] * B1[*l + 4] - ene_m * 2.0 / 7.0 * A1z[*l + 4] * B1[*l + 3] + ene_m * 3.0 / 7.0 * A1z[*l + 5] * B1[*l + 6] - ene_m * 3.0 / 7.0 * A1z[*l + 6] * B1[*l + 5]);
 
         /* contribution of l-1/2 for up spin */
         *sumx0i += tmpx;
@@ -12146,9 +12152,9 @@ void dHNL_SO(
 
         /* VNL for j=l+1/2 */
 
-        tmpx = PFp * ene_p * DS_NL1[0][1][Mc_AN][k][m][*l] * DS_NL1[0][0][Mj_AN][kl][n][*l];
-        tmpy = PFp * ene_p * DS_NL1[0][2][Mc_AN][k][m][*l] * DS_NL1[0][0][Mj_AN][kl][n][*l];
-        tmpz = PFp * ene_p * DS_NL1[0][3][Mc_AN][k][m][*l] * DS_NL1[0][0][Mj_AN][kl][n][*l];
+        tmpx = PFp * ene_p * A0x[*l] * B0[*l];
+        tmpy = PFp * ene_p * A0y[*l] * B0[*l];
+        tmpz = PFp * ene_p * A0z[*l] * B0[*l];
 
         *sumx0r += tmpx;
         *sumy0r += tmpy;
@@ -12160,9 +12166,9 @@ void dHNL_SO(
 
         /* VNL for j=l-1/2 */
 
-        tmpx = PFm * ene_m * DS_NL1[1][1][Mc_AN][k][m][*l] * DS_NL1[1][0][Mj_AN][kl][n][*l];
-        tmpy = PFm * ene_m * DS_NL1[1][2][Mc_AN][k][m][*l] * DS_NL1[1][0][Mj_AN][kl][n][*l];
-        tmpz = PFm * ene_m * DS_NL1[1][3][Mc_AN][k][m][*l] * DS_NL1[1][0][Mj_AN][kl][n][*l];
+        tmpx = PFm * ene_m * A1x[*l] * B1[*l];
+        tmpy = PFm * ene_m * A1y[*l] * B1[*l];
+        tmpz = PFm * ene_m * A1z[*l] * B1[*l];
 
         *sumx0r += tmpx;
         *sumy0r += tmpy;
@@ -13496,9 +13502,12 @@ void dHCH(int where_flag,
     kl = RMI1[Mc_AN][h_AN][q_AN];
     dmp = dampingF(rcut, Dis[ig][kl]);
 
+    /* every consumer of Hx/Hy/Hz reads only the ian x jan block of this
+       pair (and the damping tail below scales the same block), so clearing
+       the full List_YOUSO[7]^2 matrices would just stream ~100 KB per call */
     for (so = 0; so < 3; so++) {
-        for (i = 0; i < List_YOUSO[7]; i++) {
-            for (j = 0; j < List_YOUSO[7]; j++) {
+        for (i = 0; i < ian; i++) {
+            for (j = 0; j < jan; j++) {
                 Hx[so][i][j] = Complex(0.0, 0.0);
                 Hy[so][i][j] = Complex(0.0, 0.0);
                 Hz[so][i][j] = Complex(0.0, 0.0);
