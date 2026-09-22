@@ -154,8 +154,9 @@ GEMMUL8_REPO_URL ?= https://github.com/RIKEN-RCCS/GEMMul8.git
 GEMMUL8_REPO_DIR ?= third_party/GEMMul8
 # gemmul8_openmx.cu instantiates GEMMul8 internals directly, so the
 # checkout must stay pinned to a commit whose internal layout it matches.
-# 9131544 is the v3.3.0 release (memory-saving mode, handle-local config).
-GEMMUL8_COMMIT ?= 91315445ea07294e71b4671861b20f42cbf06f12
+# ce56e42 is the v3.4.4 release (2M method for complex GEMM, optimized
+# scaling/modular-arithmetic kernels, HIP compile fix of v3.4.2).
+GEMMUL8_COMMIT ?= ce56e4228881df97782804d4d5dad9125d9a6416
 GEMMUL8_DIR ?= $(GEMMUL8_REPO_DIR)
 GEMMUL8_LIB ?= $(GEMMUL8_DIR)/lib/libgemmul8.a
 GEMMUL8_OPENMX_OBJ ?= $(GEMMUL8_DIR)/src/gemmul8_openmx.o
@@ -165,7 +166,7 @@ GEMMUL8_OPENMX_OBJ ?= $(GEMMUL8_DIR)/src/gemmul8_openmx.o
 GEMMUL8_CONFIG_SRC ?= $(GEMMUL8_DIR)/src/worksize/cu_recipe/memory_saving.cu
 GEMMUL8_CONFIG_OBJ ?= $(GEMMUL8_DIR)/src/gemmul8_config.o
 GEMMUL8_GPU_ARCH ?= $(ARCH)
-HIPCC_GEMMUL8_FLAGS = -std=c++20 -O3 --offload-arch=$(GEMMUL8_GPU_ARCH) -I. -I$(GEMMUL8_DIR)/include -I$(GEMMUL8_DIR)/src -I$(ROCM)/include -D__HIP_PLATFORM_AMD__ -ffp-contract=off -Wno-unused-result -Wno-unused-command-line-argument -Wno-unused-value -DOCML_BASIC_ROUNDED_OPERATIONS -DGPU_ARCH=$(GEMMUL8_GPU_ARCH)
+HIPCC_GEMMUL8_FLAGS = -std=c++20 -O3 -fPIC --offload-arch=$(GEMMUL8_GPU_ARCH) -I. -I$(GEMMUL8_DIR)/include -I$(GEMMUL8_DIR)/src -I$(ROCM)/include -D__HIP_PLATFORM_AMD__ -ffp-contract=off -Wno-unused-result -Wno-unused-command-line-argument -Wno-unused-value -DOCML_BASIC_ROUNDED_OPERATIONS -DGPU_ARCH=$(GEMMUL8_GPU_ARCH)
 MAGMA_VERSION ?= 2.10.0
 MAGMA_DIR ?= third_party/magma
 MAGMA_ARCHIVE_BASENAME ?= magma-$(MAGMA_VERSION).tar.gz
@@ -382,7 +383,7 @@ $(FFTW3_USERS): | $(FFTW3_LIB)
 .DEFAULT_GOAL := openmx
 
 openmx:	$(FFTW3_LIB) $(GEMMUL8_LIB) $(MAGMA_LIB) $(OBJS)
-	$(CC) $(OBJS) $(STACK) $(GEMMUL8_LIB) $(MAGMA_LIB) $(LIB) -lm -o openmx
+	$(CC) $(OBJS) $(STACK) $(MAGMA_LIB) $(GEMMUL8_LIB) $(LIB) -lm -o openmx
 	
 #
 #
@@ -828,6 +829,15 @@ $(MAGMA_STAMP): $(MAGMA_ARCHIVE) $(MAGMA_MAKE_INC)
 	ln -sf Makefile.gen.hip "$(MAGMA_DIR)/make.gen.hipMAGMA"
 	sed -i 's/^\([[:space:]]*VALID_GFXS =.*\)/\1 $(MAGMA_EXTRA_GFXS)/' "$(MAGMA_DIR)/Makefile"
 	install -m 0644 "$(MAGMA_MAKE_INC)" "$(MAGMA_DIR)/make.inc"
+	patch -d "$(MAGMA_DIR)" -p1 < third_party/magma-ozaki2.patch
+	sleep 1
+	touch "$(MAGMA_DIR)/interface_hip/blas_s_v2.cpp" "$(MAGMA_DIR)/interface_hip/blas_c_v2.cpp" \
+	      "$(MAGMA_DIR)/interface_hip/blas_d_v2.cpp" "$(MAGMA_DIR)/src/slaex3.cpp" \
+	      "$(MAGMA_DIR)/src/ssyevdx_ozaki2.cpp" "$(MAGMA_DIR)/src/ssyevdx_ozaki2_gpu.cpp" \
+	      "$(MAGMA_DIR)/src/dsyevdx_ozaki2.cpp" "$(MAGMA_DIR)/src/dsyevdx_ozaki2_gpu.cpp" \
+	      "$(MAGMA_DIR)/src/cheevdx_ozaki2.cpp" "$(MAGMA_DIR)/src/cheevdx_ozaki2_gpu.cpp" \
+	      "$(MAGMA_DIR)/testing/testing_ssyevdx_ozaki2.cpp" "$(MAGMA_DIR)/testing/testing_dsyevdx_ozaki2.cpp" \
+	      "$(MAGMA_DIR)/testing/testing_cheevdx_ozaki2.cpp"
 	rm -f magma_openmx.o
 	touch "$@"
 

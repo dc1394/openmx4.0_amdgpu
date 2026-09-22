@@ -1,0 +1,615 @@
+You are working in the MAGMA 2.10.0 source tree.
+
+Primary goal
+============
+Add experimental AMD GPU / ROCm / HIP optimized selected-eigensolver routines to MAGMA by applying Ozaki Scheme II through GEMMul8 to the BLAS-3 / BLAS-like matrix update phases of MAGMA’s existing selected symmetric/Hermitian eigensolver path.
+
+The target is NOT the full-spectrum Xsyevd/Xheevd driver first.
+
+The target is the selected-eigenpair family:
+- real symmetric selected EVD:
+  - magma_ssyevdx_ozaki2
+  - magma_dsyevdx_ozaki2
+  - magma_ssyevdx_ozaki2_gpu
+  - magma_dsyevdx_ozaki2_gpu
+
+- complex Hermitian selected EVD:
+  - magma_cheevdx_ozaki2
+  - magma_zheevdx_ozaki2
+  - magma_cheevdx_ozaki2_gpu
+  - magma_zheevdx_ozaki2_gpu
+
+The main performance target is:
+- AMD Instinct GPUs through ROCm/HIP,
+- MAGMA’s HIP implementation as the baseline,
+- selected eigenvalues/eigenvectors requested by index range:
+  - range = MagmaRangeI
+  - il, iu specify the selected eigenvalue index range
+  - number of requested eigenpairs k = iu - il + 1
+  - output m or mout must match existing MAGMA semantics.
+
+Reference material
+==================
+- GEMMul8: https://github.com/RIKEN-RCCS/GEMMul8
+- MAGMA: https://icl.utk.edu/magma/
+- MAGMA sy/heevdx documentation:
+  https://icl.utk.edu/projectsfiles/magma/doxygen/group__magma__heevdx.html
+
+Important AMD-specific premise
+==============================
+On the intended AMD GPU workloads, MAGMA’s selected eigensolver path is already the primary baseline and should not be replaced by hipSOLVER.
+
+Do NOT implement this by calling hipSOLVER.
+
+hipSOLVER may be used only as an optional benchmark/reference comparison when explicitly requested by a test driver. The implementation itself must preserve and extend MAGMA’s HIP eigensolver path.
+
+Important mathematical interpretation
+=====================================
+Ozaki Scheme II is a high-precision GEMM / BLAS-like matrix product emulation technique. It is not a standalone symmetric/Hermitian eigensolver.
+
+Therefore:
+- preserve MAGMA’s existing selected eigensolver structure,
+- preserve the tridiagonal reduction / selected tridiagonal eigensolve / eigenvector backtransform structure,
+- apply GEMMul8 only to BLAS-3 or BLAS-like operations where it is mathematically correct and supported,
+- do not replace scalar Householder logic, tridiagonal eigensolver logic, sorting logic, or LAPACK-style selected-eigenvalue logic with invented algorithms.
+
+Critical selected-eigenpair requirement
+=======================================
+This work must optimize the selected-eigenpair case, especially:
+
+    jobz  = MagmaVec
+    range = MagmaRangeI
+    il, iu chosen so that k = iu - il + 1 << n
+
+Do not accidentally optimize only the all-eigenpair case.
+
+When only k eigenvectors are requested:
+- keep all public output semantics identical to MAGMA’s existing xSYEVDX/xHEEVDX routines,
+- return only the requested m or mout eigenvalues/eigenvectors,
+- ensure eigenvectors occupy the first m or mout columns, exactly as the existing MAGMA GPU selected-eigensolver API specifies,
+- avoid expanding selected eigenvector operations to full n-by-n work unless MAGMA’s existing algorithm fundamentally requires it,
+- where possible, apply accumulated orthogonal/unitary transformations to an n-by-k eigenvector matrix rather than an n-by-n matrix,
+- route large n-by-k GEMM/TRMM-like backtransform operations through GEMMul8 when k is large enough to amortize overhead,
+- fall back to native MAGMA/hipBLAS for very small k when GEMMul8 overhead is likely to dominate.
+
+Primary routines to inspect
+===========================
+Inspect the actual MAGMA 2.10 source before coding.
+
+Find the exact call graph for:
+- magma_ssyevdx
+- magma_dsyevdx
+- magma_cheevdx
+- magma_zheevdx
+- magma_ssyevdx_gpu
+- magma_dsyevdx_gpu
+- magma_cheevdx_gpu
+- magma_zheevdx_gpu
+
+Also inspect the 2-stage and multi-GPU selected-eigensolver variants:
+- magma_ssyevdx_2stage
+- magma_dsyevdx_2stage
+- magma_cheevdx_2stage
+- magma_zheevdx_2stage
+- magma_ssyevdx_2stage_m
+- magma_dsyevdx_2stage_m
+- magma_cheevdx_2stage_m
+- magma_zheevdx_2stage_m
+
+If the 2-stage selected eigensolver is the dominant or recommended AMD GPU path in MAGMA 2.10, implement Ozaki-II support there as the first internal target, while still exposing the public _ozaki2 selected-eigensolver APIs listed above.
+
+Do not guess the internal path. Inspect the source and document the actual path.
+
+AMD/HIP integration rules
+=========================
+This is an AMD GPU first implementation.
+
+Use HIP/ROCm concepts consistently:
+- hipBLAS handle
+- hipBLASLt handle where GEMMul8 requires Lt
+- hipStream_t through MAGMA queue abstractions
+- ROCm/HIP build paths
+- AMD GPU architecture names such as gfx90a, gfx942, or whatever is configured in the build
+
+Do not introduce CUDA-only code into generic paths.
+
+Because MAGMA generates HIP sources from canonical CUDA-style source directories in some parts of the tree, follow MAGMA’s actual generation convention:
+- edit the canonical source if HIP files are generated from it,
+- do not hand-edit generated HIP files unless MAGMA’s build system expects generated files to be committed,
+- ensure make generate or the equivalent generation step keeps the HIP build consistent.
+
+GEMMul8 integration
+===================
+Use GEMMul8 as an optional backend.
+
+GEMMul8 supports HIP and provides Ozaki-II emulation for BLAS-like operations. Use only APIs that exist in the checked-out GEMMul8 headers and examples.
+
+Do not invent GEMMul8 APIs.
+
+Create a small adapter layer rather than scattering GEMMul8 calls throughout eigensolver code.
+
+Suggested files, adjusted to MAGMA’s conventions after source inspection:
+- include/magma_ozaki2.h
+- control/ozaki2.cpp
+- magmablas/ozaki2_blas.hpp
+- magmablas/ozaki2_blas.cpp
+- interface_hip/ozaki2_blas.cpp or generated equivalent if MAGMA requires it
+
+The adapter must:
+- hide GEMMul8 details from eigensolver code,
+- accept MAGMA-style data types,
+- accept and preserve MAGMA queues,
+- preserve the active HIP stream,
+- preserve hipBLAS/hipBLASLt handle behavior,
+- support both host and GPU selected-eigensolver entry points,
+- allow native fallback only when explicitly configured or when building stubs without GEMMul8,
+- clearly report whether a benchmark path used GEMMul8 or native fallback.
+
+Candidate operations to route through GEMMul8
+=============================================
+After inspecting the selected eigensolver call graph, route only supported BLAS-like operations through GEMMul8.
+
+Likely candidates:
+- GEMM
+- SYMM / HEMM
+- SYRK / HERK
+- SYR2K / HER2K
+- TRMM
+- TRSM
+- any supported GEMMul8 operation actually used in MAGMA’s selected-eigensolver reduction or eigenvector backtransform path
+
+Pay special attention to selected eigenvector backtransform:
+- operations of shape n-by-k, panel-by-k, or block-by-k are central when k = iu - il + 1,
+- do not force full n-by-n GEMM when an n-by-k update is sufficient,
+- benchmark GEMMul8 thresholds separately for k = 1, 2, 4, 8, 16, 32, 64, n/10, n/2, n.
+
+Do not route unsupported operations:
+- SYMV / HEMV
+- GEMV
+- scalar Householder updates
+- tridiagonal eigensolver kernels
+- CPU LAPACK calls
+- index selection / eigenvalue sorting logic
+unless GEMMul8 explicitly supports them and the substitution is mathematically identical.
+
+Build integration
+=================
+Add optional build support:
+
+Makefile:
+- MAGMA_USE_GEMMUL8=1
+- GEMMUL8_ROOT=/path/to/GEMMul8
+- GEMMUL8_BACKEND=hip or detect from MAGMA BACKEND=hip
+
+CMake:
+- MAGMA_USE_GEMMUL8=ON
+- GEMMUL8_ROOT
+- ensure HIP/ROCm include and library paths are respected
+
+When MAGMA_USE_GEMMUL8 is OFF:
+- existing MAGMA builds must be unaffected,
+- existing MAGMA tests must still pass,
+- _ozaki2 functions may either be omitted or compiled as stubs returning MAGMA’s existing “not supported” style error; follow MAGMA convention.
+
+When MAGMA_USE_GEMMUL8 is ON:
+- include GEMMul8 headers from GEMMUL8_ROOT,
+- link libgemmul8,
+- build against HIP backend,
+- support hipBLAS and hipBLASLt as required by GEMMul8,
+- do not require LD_PRELOAD for normal library use.
+
+Hook Mode
+=========
+GEMMul8 Hook Mode may be useful for preliminary profiling only.
+
+Add an optional developer-only test mode:
+- run existing MAGMA selected eigensolver tests under GEMMul8 Hook Mode,
+- collect which hipBLAS calls are intercepted,
+- report whether selected-eigenvector paths trigger GEMM/SYMM/HEMM/SYRK/HERK/TRMM/TRSM operations worth replacing.
+
+Do not make Hook Mode the default implementation.
+
+Public API
+==========
+Add selected-eigensolver APIs with _ozaki2 suffix.
+
+Real symmetric, double precision:
+
+magma_int_t magma_dsyevdx_ozaki2(
+    magma_vec_t jobz,
+    magma_range_t range,
+    magma_uplo_t uplo,
+    magma_int_t n,
+    double *A,
+    magma_int_t lda,
+    double vl,
+    double vu,
+    magma_int_t il,
+    magma_int_t iu,
+    magma_int_t *m,
+    double *w,
+    double *work,
+    magma_int_t lwork,
+    magma_int_t *iwork,
+    magma_int_t liwork,
+    magma_int_t *info
+);
+
+magma_int_t magma_dsyevdx_ozaki2_gpu(
+    magma_vec_t jobz,
+    magma_range_t range,
+    magma_uplo_t uplo,
+    magma_int_t n,
+    magmaDouble_ptr dA,
+    magma_int_t ldda,
+    double vl,
+    double vu,
+    magma_int_t il,
+    magma_int_t iu,
+    magma_int_t *mout,
+    double *w,
+    double *wA,
+    magma_int_t ldwa,
+    double *work,
+    magma_int_t lwork,
+    magma_int_t *iwork,
+    magma_int_t liwork,
+    magma_int_t *info
+);
+
+Complex Hermitian, double precision:
+
+magma_int_t magma_zheevdx_ozaki2(
+    magma_vec_t jobz,
+    magma_range_t range,
+    magma_uplo_t uplo,
+    magma_int_t n,
+    magmaDoubleComplex *A,
+    magma_int_t lda,
+    double vl,
+    double vu,
+    magma_int_t il,
+    magma_int_t iu,
+    magma_int_t *m,
+    double *w,
+    magmaDoubleComplex *work,
+    magma_int_t lwork,
+    double *rwork,
+    magma_int_t lrwork,
+    magma_int_t *iwork,
+    magma_int_t liwork,
+    magma_int_t *info
+);
+
+magma_int_t magma_zheevdx_ozaki2_gpu(
+    magma_vec_t jobz,
+    magma_range_t range,
+    magma_uplo_t uplo,
+    magma_int_t n,
+    magmaDoubleComplex_ptr dA,
+    magma_int_t ldda,
+    double vl,
+    double vu,
+    magma_int_t il,
+    magma_int_t iu,
+    magma_int_t *mout,
+    double *w,
+    magmaDoubleComplex *wA,
+    magma_int_t ldwa,
+    magmaDoubleComplex *work,
+    magma_int_t lwork,
+    double *rwork,
+    magma_int_t lrwork,
+    magma_int_t *iwork,
+    magma_int_t liwork,
+    magma_int_t *info
+);
+
+Also add single-precision real and complex versions if MAGMA’s precision-generation system makes this natural:
+- magma_ssyevdx_ozaki2
+- magma_ssyevdx_ozaki2_gpu
+- magma_cheevdx_ozaki2
+- magma_cheevdx_ozaki2_gpu
+
+Expert API
+==========
+Add expert variants only if runtime control cannot fit cleanly into the simple API.
+
+Suggested option type:
+
+typedef enum {
+    MagmaOzaki2BackendAuto = 0,
+    MagmaOzaki2BackendInt8,
+    MagmaOzaki2BackendFp8,
+    MagmaOzaki2BackendNativeFallback
+} magma_ozaki2_backend_t;
+
+typedef struct {
+    magma_ozaki2_backend_t backend;
+    magma_int_t num_moduli;
+    magma_int_t fastmode;
+    magma_int_t use_lt;
+    magma_int_t enable_skip_scaling;
+    magma_int_t min_k_for_gemmul8;
+    magma_int_t min_n_for_gemmul8;
+    size_t max_workspace_bytes;
+    magma_int_t allow_native_fallback;
+    magma_int_t verbose;
+} magma_ozaki2_opts_t;
+
+Provide:
+- magma_ozaki2_opts_init(magma_ozaki2_opts_t *opts)
+
+Expert routines:
+- magma_dsyevdx_ozaki2_expert
+- magma_dsyevdx_ozaki2_gpu_expert
+- magma_zheevdx_ozaki2_expert
+- magma_zheevdx_ozaki2_gpu_expert
+
+and the generated single-precision equivalents if applicable.
+
+Default policy:
+- backend = MagmaOzaki2BackendAuto
+- use HIP backend
+- prefer INT8 first unless GEMMul8 headers and tests show FP8 is valid and accurate on the current AMD GPU
+- fastmode = 0 by default
+- use_lt = auto
+- enable_skip_scaling = 0 unless the GEMMul8 documentation proves it is valid for the specific call
+- min_k_for_gemmul8 and min_n_for_gemmul8 chosen conservatively after benchmarks
+- allow_native_fallback = 0 for benchmark correctness unless explicitly requested
+
+Implementation strategy
+=======================
+1. Start from MAGMA’s existing selected eigensolver code.
+
+Do not write a new eigensolver from scratch.
+
+Create _ozaki2 wrappers and internal variants by:
+- reusing existing argument validation,
+- reusing workspace query logic,
+- reusing matrix scaling/rescaling logic,
+- reusing tridiagonal selected eigensolver logic,
+- reusing eigenvalue sorting semantics,
+- reusing INFO semantics.
+
+2. Identify selected-eigenvector matrix dimensions.
+
+For each BLAS-like operation in the selected-eigenvector path, document:
+- operation name,
+- source file,
+- matrix dimensions,
+- whether dimensions depend on k = iu - il + 1,
+- whether it runs on GPU,
+- whether GEMMul8 supports it,
+- whether it is safe to replace.
+
+3. Add Ozaki-II versions only where useful.
+
+Possible internal variants:
+- dsytrd_ozaki2 / ssytrd_ozaki2
+- zhetrd_ozaki2 / chetrd_ozaki2
+- dormtr_ozaki2 / sormtr_ozaki2
+- zunmtr_ozaki2 / cunmtr_ozaki2
+- selected backtransform helpers that explicitly operate on n-by-k matrices
+
+Create these only if they map to real internal MAGMA routines.
+
+4. Preserve selected output semantics.
+
+For range = MagmaRangeI:
+- validate il and iu exactly as MAGMA currently does,
+- k = iu - il + 1,
+- output m or mout must equal k on success,
+- w[0:k-1] contains requested eigenvalues in ascending order,
+- if jobz = MagmaVec:
+  - A or dA first k columns contain the requested eigenvectors,
+  - columns beyond k must not be treated as valid output,
+  - do not overwrite output layout relative to the existing MAGMA API.
+
+For range = MagmaRangeV:
+- preserve existing behavior,
+- m or mout is determined by eigenvalues in (vl, vu],
+- support Ozaki-II where safe,
+- do not prioritize this over MagmaRangeI.
+
+For range = MagmaRangeAll:
+- behavior should match existing xSYEVDX/xHEEVDX all-eigenpair behavior,
+- but this is not the main optimization target.
+
+5. Avoid full-spectrum work where possible.
+
+When jobz = MagmaVec and range = MagmaRangeI:
+- avoid computing all eigenvectors if MAGMA already has a selected-vector path,
+- if existing MAGMA code internally forms all eigenvectors, investigate whether the backtransform can be restricted to selected columns,
+- do not make risky algorithmic changes without tests,
+- if full-vector formation is unavoidable, document exactly why.
+
+AMD performance design
+======================
+The performance objective is to improve MAGMA’s already strong AMD GPU selected eigensolver path.
+
+Focus on large dense matrices and moderate selected eigenpair counts:
+- n = 2048, 4096, 8192, 12000 if memory allows
+- k = 1, 2, 4, 8, 16, 32, 64, 128, n/100, n/20, n/10, n/2, n
+- lower end of spectrum:
+  - il = 1, iu = k
+- upper end of spectrum:
+  - il = n-k+1, iu = n
+- middle spectrum:
+  - il = n/2-k/2, iu = il+k-1
+
+Benchmark separately:
+- existing MAGMA xSYEVDX/xHEEVDX
+- new xSYEVDX_OZAKI2/xHEEVDX_OZAKI2
+- optional hipSOLVER comparison, clearly labeled as non-implementation baseline
+- optional GEMMul8 Hook Mode profiling
+
+Report phase timing:
+- dense-to-tridiagonal reduction
+- selected tridiagonal eigenproblem
+- eigenvector backtransform
+- GEMMul8-routed BLAS operations
+- native fallback operations
+
+Do not print speedups when the path silently used native fallback.
+
+Testing
+=======
+Add tests based on MAGMA’s selected eigensolver testers.
+
+Suggested files:
+- testing/testing_ssyevdx_ozaki2.cpp
+- testing/testing_dsyevdx_ozaki2.cpp
+- testing/testing_cheevdx_ozaki2.cpp
+- testing/testing_zheevdx_ozaki2.cpp
+
+Add GPU-specific tests if MAGMA uses separate test style for GPU entry points:
+- testing/testing_dsyevdx_ozaki2_gpu.cpp
+- testing/testing_zheevdx_ozaki2_gpu.cpp
+
+Test matrix types:
+- random symmetric real
+- random Hermitian complex with real diagonal and nonzero imaginary off-diagonal entries
+- diagonal with known eigenvalues
+- clustered eigenvalues
+- repeated or nearly repeated eigenvalues
+- scaled matrices with large exponent ranges
+- small n cases:
+  - n = 0
+  - n = 1
+  - n = 2
+  - n below MAGMA’s CPU fallback threshold
+- invalid argument cases
+- workspace query cases:
+  - lwork = -1
+  - lrwork = -1 where applicable
+  - liwork = -1
+
+Test range modes:
+- range = MagmaRangeI, primary
+- range = MagmaRangeV
+- range = MagmaRangeAll
+
+Test job modes:
+- jobz = MagmaNoVec
+- jobz = MagmaVec
+
+For MagmaRangeI, test:
+- k = 1
+- k = 2
+- k = 8
+- k = 32
+- k = n/10
+- k = n
+- il = 1
+- iu = n
+- middle index ranges
+- invalid il/iu
+
+Accuracy checks
+===============
+For real symmetric:
+- compare eigenvalues against LAPACK or existing MAGMA selected eigensolver
+- residual for selected eigenpairs:
+  ||A_original * V_k - V_k * diag(w_k)|| / (||A_original|| * n * eps)
+- orthogonality:
+  ||I_k - V_k^T V_k|| / (k * eps)
+
+For complex Hermitian:
+- compare eigenvalues against LAPACK or existing MAGMA selected eigensolver
+- residual:
+  ||A_original * V_k - V_k * diag(w_k)|| / (||A_original|| * n * eps)
+- orthogonality:
+  ||I_k - V_k^H V_k|| / (k * eps)
+
+For jobz = MagmaNoVec:
+- compare selected eigenvalues only.
+
+The tests must verify that only the first k columns are interpreted as selected eigenvectors.
+
+Command-line test options
+=========================
+Extend the tester with options such as:
+- --range=I|V|A
+- --il=<int>
+- --iu=<int>
+- --k=<int>
+- --which=lowest|highest|middle
+- --ozaki-backend=AUTO|INT8|FP8|NATIVE
+- --ozaki-num-moduli=<int>
+- --ozaki-fastmode=0|1
+- --ozaki-use-lt=0|1
+- --ozaki-min-k=<int>
+- --ozaki-min-n=<int>
+- --ozaki-max-workspace=<bytes>
+- --compare-magma
+- --compare-hipsolver
+- --profile-phases
+- --profile-hook-mode
+
+Documentation
+=============
+Update MAGMA documentation/comments:
+- mark all new routines EXPERIMENTAL,
+- state that these routines target AMD GPU / ROCm / HIP first,
+- state that the implementation preserves MAGMA’s selected eigensolver algorithm,
+- state that Ozaki Scheme II is applied only to selected BLAS-like matrix update phases,
+- explain that the main target is range = MagmaRangeI with k = iu - il + 1,
+- document default GEMMul8 parameters,
+- document thresholds for GEMMul8 vs native fallback,
+- document build instructions for ROCm/HIP and GEMMul8,
+- document how to reproduce benchmarks.
+
+Robustness and style
+====================
+Follow MAGMA coding style:
+- use magma_int_t,
+- use MAGMA complex types and macros,
+- use MAGMA queue abstractions,
+- use magma_malloc / magma_free or existing MAGMA allocation helpers,
+- use magma_xerbla for argument errors where appropriate,
+- no C++ exceptions across C ABI,
+- no memory leaks on early return,
+- no CUDA-only symbols in HIP builds,
+- no process-wide environment mutation inside library routines unless unavoidable and documented,
+- no silent fallback in benchmarks,
+- no changes to existing non-Ozaki routines unless required for clean internal refactoring.
+
+Deliverables
+============
+Produce a complete patch with:
+- _ozaki2 selected eigensolver routines,
+- GEMMul8 adapter layer,
+- AMD/HIP build integration,
+- Makefile and CMake updates,
+- public/internal headers,
+- tests,
+- benchmarks or extended testers,
+- documentation updates,
+- an implementation note.
+
+The implementation note must state:
+- which MAGMA selected eigensolver path was modified,
+- whether one-stage or two-stage selected EVD is used internally,
+- which BLAS-like calls are routed through GEMMul8,
+- which calls are intentionally left native and why,
+- how k = iu - il + 1 affects matrix dimensions,
+- thresholds for GEMMul8 use,
+- AMD GPU architecture tested,
+- ROCm version tested,
+- GEMMul8 build options,
+- exact commands to build and run tests,
+- limitations.
+
+Acceptance criteria
+===================
+- Existing MAGMA xSYEVDX/xHEEVDX routines remain unchanged in behavior.
+- New routines are opt-in and clearly named with _ozaki2.
+- AMD/HIP build works with MAGMA_USE_GEMMUL8=OFF.
+- AMD/HIP build works with MAGMA_USE_GEMMUL8=ON when GEMMul8 is available.
+- Selected eigenpair mode range = MagmaRangeI is tested thoroughly.
+- For k = iu - il + 1, only the requested m or mout eigenpairs are returned.
+- Residual and orthogonality checks pass for selected eigenvectors.
+- Benchmarks clearly distinguish GEMMul8 and native fallback paths.
+- No hipSOLVER dependency is introduced into the implementation.
+- No invented GEMMul8 APIs are used.

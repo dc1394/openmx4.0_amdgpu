@@ -46,6 +46,35 @@ int ensure_magma_initialized()
     return g_magma_init_info;
 }
 
+/* MAGMA Ozaki-II (GEMMul8) routing of the dense eigensolves.  The _ozaki2
+   drivers delegate to the stock MAGMA algorithms and only route the BLAS-3
+   phases (syr2k/her2k, larfb gemm/trmm, dlaex3 gemm) through GEMMul8 INT8
+   emulation inside a scoped activation; OPENMX_MAGMA_OZAKI2=0 restores the
+   stock drivers bit-identically.  The two defaults follow the tuning note
+   (third_party/MAGMA_OZAKI2_NOTES.md): 1-stage because the 2-stage bulge
+   chasing starves under many busy MPI ranks, and a 4-way split of the
+   percent-of-VRAM workspace cap because only the dense root rank solves. */
+int use_magma_ozaki2()
+{
+    static int use = -1;
+
+    if (use < 0) {
+        const char *env = std::getenv("OPENMX_MAGMA_OZAKI2");
+        use = (env == nullptr || env[0] == '\0') ? 1 : (std::atoi(env) != 0);
+        if (use) {
+            setenv("MAGMA_OZAKI2_ALGO", "1stage", 0);
+            setenv("MAGMA_OZAKI2_LOCAL_RANKS", "4", 0);
+            /* A modest per-process workspace plus a 1 GiB free guard routes
+               3x as many backtransform GEMMs on a 16 GB card shared by 16
+               ranks than the adapter's conservative defaults; GEMMul8's
+               memory-saving mode blocks any GEMM to fit the cap. */
+            setenv("MAGMA_OZAKI2_MAX_WS_MB", "512", 0);
+            setenv("MAGMA_OZAKI2_MIN_FREE_MB", "1024", 0);
+        }
+    }
+    return use;
+}
+
 int ensure_host_matrix(size_t elems)
 {
     double *new_ptr = nullptr;
@@ -445,7 +474,8 @@ extern "C" int openmx_magma_dsyevdx_gpu(int n, int maxn, double *d_A, double *w,
         return err;
     }
 
-    magma_int_t ret = magma_dsyevdx_gpu(MagmaVec, range, MagmaLower,
+    magma_int_t ret = (use_magma_ozaki2() ? magma_dsyevdx_ozaki2_gpu : magma_dsyevdx_gpu)(
+                                        MagmaVec, range, MagmaLower,
                                         mn, reinterpret_cast<magmaDouble_ptr>(d_A), mn,
                                         0.0, 0.0, il, iu, &mout, w,
                                         g_host_matrix, mn,
@@ -473,7 +503,8 @@ extern "C" int openmx_magma_dsyevdx_gpu(int n, int maxn, double *d_A, double *w,
 
     mout = 0;
     info = 0;
-    ret = magma_dsyevdx_gpu(MagmaVec, range, MagmaLower,
+    ret = (use_magma_ozaki2() ? magma_dsyevdx_ozaki2_gpu : magma_dsyevdx_gpu)(
+                            MagmaVec, range, MagmaLower,
                             mn, reinterpret_cast<magmaDouble_ptr>(d_A), mn,
                             0.0, 0.0, il, iu, &mout, w,
                             g_host_matrix, mn,
@@ -521,7 +552,8 @@ extern "C" int openmx_magma_zheevdx_gpu(int n, int maxn, void *d_A, double *w, i
         return err;
     }
 
-    magma_int_t ret = magma_zheevdx_gpu(MagmaVec, range, MagmaLower,
+    magma_int_t ret = (use_magma_ozaki2() ? magma_zheevdx_ozaki2_gpu : magma_zheevdx_gpu)(
+                                        MagmaVec, range, MagmaLower,
                                         mn, reinterpret_cast<magmaDoubleComplex_ptr>(d_A), mn,
                                         0.0, 0.0, il, iu, &mout, w,
                                         g_z_host_matrix, mn,
@@ -555,7 +587,8 @@ extern "C" int openmx_magma_zheevdx_gpu(int n, int maxn, void *d_A, double *w, i
 
     mout = 0;
     info = 0;
-    ret = magma_zheevdx_gpu(MagmaVec, range, MagmaLower,
+    ret = (use_magma_ozaki2() ? magma_zheevdx_ozaki2_gpu : magma_zheevdx_gpu)(
+                            MagmaVec, range, MagmaLower,
                             mn, reinterpret_cast<magmaDoubleComplex_ptr>(d_A), mn,
                             0.0, 0.0, il, iu, &mout, w,
                             g_z_host_matrix, mn,
@@ -577,10 +610,18 @@ extern "C" int openmx_magma_zheevdx_gpu(int n, int maxn, void *d_A, double *w, i
    work arrays.  On a unified-memory APU those allocations consume the same
    physical pool as the following GPU turns, so NC band calculations release
    them at a safe, synchronous turn boundary. */
+/* Returns the Ozaki-II adapter's per-stream hipBLAS handles and device
+   workspaces; a no-op when nothing was routed. */
+extern "C" void openmx_magma_ozaki2_release(void)
+{
+    magma_ozaki2_release_workspaces();
+}
+
 extern "C" int openmx_magma_release_z_workspace(void)
 {
     std::lock_guard<std::mutex> lock(g_magma_mutex);
 
+    magma_ozaki2_release_workspaces();
     if (g_z_host_matrix != nullptr) magma_free_cpu(g_z_host_matrix);
     if (g_z_work != nullptr)        magma_free_cpu(g_z_work);
     if (g_z_rwork != nullptr)       magma_free_cpu(g_z_rwork);

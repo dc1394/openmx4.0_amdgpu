@@ -60,6 +60,7 @@ libtool
 # the *.md rule above is for OpenMX MD outputs; keep the real Markdown docs
 !/README.md
 !/source/third_party/dist/README.md
+!/source/third_party/MAGMA_OZAKI2_NOTES.md
 
 # === Test/benchmark output dirs ===
 _runtest*/
