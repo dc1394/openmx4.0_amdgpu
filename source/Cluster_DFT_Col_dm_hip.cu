@@ -7,6 +7,34 @@
 static double ClusterCol_hip_dense_build_kernel_time = 0.0;
 static double ClusterCol_hip_dm_kernel_time = 0.0;
 
+/* Complete the lower triangle in place before the GEMM-based symmetric
+   product. A padded LDS transpose coalesces both sides of the copy. */
+__global__ static void ClusterColSymmetrizeLowerKernel(int n, double *a)
+{
+    if (blockIdx.x < blockIdx.y) return;
+    __shared__ double tile[32][33];
+    const int x = blockIdx.x * 32 + threadIdx.x;
+    const int y = blockIdx.y * 32 + threadIdx.y;
+    for (int j = 0; j < 32; j += 8) {
+        if (x < n && y + j < n)
+            tile[threadIdx.y + j][threadIdx.x] = a[(size_t)(y + j) * n + x];
+    }
+    __syncthreads();
+    const int row = blockIdx.y * 32 + threadIdx.x;
+    const int col = blockIdx.x * 32 + threadIdx.y;
+    for (int j = 0; j < 32; j += 8) {
+        if (row < n && col + j < n && row < col + j)
+            a[(size_t)(col + j) * n + row] = tile[threadIdx.x][threadIdx.y + j];
+    }
+}
+
+extern "C" int ClusterCol_SymmetrizeLower_HIP(int n, double *a, hipStream_t stream)
+{
+    hipLaunchKernelGGL(ClusterColSymmetrizeLowerKernel,
+                       dim3((n + 31) / 32, (n + 31) / 32), dim3(32, 8), 0, stream, n, a);
+    return (int)hipGetLastError();
+}
+
 extern "C" void ClusterCol_HIPDetailTimer_Reset(void)
 {
     ClusterCol_hip_dense_build_kernel_time = 0.0;
@@ -660,7 +688,7 @@ __global__ static void ClusterColDMKernel(int entry_count, int size_H1, int maxn
 extern "C" int ClusterCol_CalcDMRootDense_HIP(int entry_count, int size_H1, int n, int maxn, int nk_occ, int calc_pdm,
                                               const int *basis0, const int *basis1,
                                               const double *occ, const double *occ_e, const double *pocc,
-                                              const double *dense_evec, double *dm_buffer)
+                                              const double *dense_evec, const double *device_evec, double *dm_buffer)
 {
     const int dm_components = calc_pdm ? 3 : 2;
     const int block_size = 256;
@@ -712,8 +740,10 @@ extern "C" int ClusterCol_CalcDMRootDense_HIP(int entry_count, int size_H1, int 
         err = hipMalloc((void **)&d_pocc, occ_bytes);
         if (ClusterColDMReportHipError("hipMalloc(pocc)", err)) goto cleanup_failed;
     }
-    err = hipMalloc((void **)&d_dense_evec, evec_bytes);
-    if (ClusterColDMReportHipError("hipMalloc(dense_evec)", err)) goto cleanup_failed;
+    if (device_evec == NULL) {
+        err = hipMalloc((void **)&d_dense_evec, evec_bytes);
+        if (ClusterColDMReportHipError("hipMalloc(dense_evec)", err)) goto cleanup_failed;
+    }
     err = hipMalloc((void **)&d_dm_buffer, dm_bytes);
     if (ClusterColDMReportHipError("hipMalloc(dm_buffer)", err)) goto cleanup_failed;
 
@@ -729,8 +759,10 @@ extern "C" int ClusterCol_CalcDMRootDense_HIP(int entry_count, int size_H1, int 
         err = hipMemcpy(d_pocc, pocc, occ_bytes, hipMemcpyHostToDevice);
         if (ClusterColDMReportHipError("hipMemcpy(pocc)", err)) goto cleanup_failed;
     }
-    err = hipMemcpy(d_dense_evec, dense_evec, evec_bytes, hipMemcpyHostToDevice);
-    if (ClusterColDMReportHipError("hipMemcpy(dense_evec)", err)) goto cleanup_failed;
+    if (device_evec == NULL) {
+        err = hipMemcpy(d_dense_evec, dense_evec, evec_bytes, hipMemcpyHostToDevice);
+        if (ClusterColDMReportHipError("hipMemcpy(dense_evec)", err)) goto cleanup_failed;
+    }
 
     err = hipEventCreate(&ev_start);
     if (ClusterColDMReportHipError("hipEventCreate(DM start)", err)) goto cleanup_failed;
@@ -742,7 +774,7 @@ extern "C" int ClusterCol_CalcDMRootDense_HIP(int entry_count, int size_H1, int 
     hipLaunchKernelGGL(ClusterColDMKernel, grid, block, 0, 0,
                        entry_count, size_H1, maxn, nk_occ, calc_pdm,
                        d_basis0, d_basis1, d_occ, d_occ_e, d_pocc,
-                       d_dense_evec, d_dm_buffer);
+                       device_evec != NULL ? device_evec : d_dense_evec, d_dm_buffer);
     err = hipGetLastError();
     if (ClusterColDMReportHipError("ClusterColDMKernel launch", err)) goto cleanup_failed;
     err = hipEventRecord(ev_stop, 0);

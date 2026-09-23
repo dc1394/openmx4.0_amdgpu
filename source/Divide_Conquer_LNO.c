@@ -1,17 +1,18 @@
 /**********************************************************************
   Divide_Conquer_LNO.c
 
-  Collinear-focused version with node-local GPU-owner proxy for DC-LNO.
+  DC-LNO with independent local GPU solves and a node-local memory guard.
 
   Policy:
     - Keep global OpenMX MPI decomposition unchanged.
     - Inside DC-LNO only, do not split one eigenproblem across many MPI ranks.
-    - For large local cluster matrices:
+    - For local cluster matrices above the GPU crossover:
         * ranks sharing the same GPU form a node-local GPU-group
-        * rank 0 in that GPU-group is the GPU owner
-        * non-owner ranks send the dense eigen task to the owner
+        * ranks dispatch directly for smaller matrices
+        * large shared-GPU solves retain owner-only GPU dispatch
+        * the combined device footprint is checked before dispatch
     - For small matrices: solve locally on CPU
-    - The optimized proxy path is used for collinear calculations.
+    - The optional owner proxy is disabled by default.
     - The 4.0 noncollinear implementation is kept below.
 
 ***********************************************************************/
@@ -49,6 +50,21 @@ static int DCLNO_GpuEigenThreshold(void)
     return threshold;
 }
 
+/* Small local matrices benefit from concurrent owners. Larger matrices
+   saturate a shared GPU: retain the original owner-GPU/other-ranks-CPU
+   policy there. Zero allows all ranks at every size for controlled A/Bs. */
+static int DCLNO_GpuOwnerThreshold(void)
+{
+    static int threshold = -1;
+    if (threshold < 0) {
+        const char *value = getenv("OPENMX_DCLNO_GPU_OWNER_THRESHOLD");
+        threshold = 2048;
+        if (value != NULL && value[0] != '\0' && atoi(value) >= 0)
+            threshold = atoi(value);
+    }
+    return threshold;
+}
+
 /* noncollinear threshold, compared against the spinor dimension 2*(Anum-1);
    kept separate from the collinear one because the CPU zheev baseline is far
    slower, so the GPU pays off from much smaller local matrices */
@@ -78,6 +94,7 @@ static int DCLNO_NonColGpuEigenThreshold(void)
 #define DCLNO_PROXY_TAG_COL_CVEC   41004
 
 extern int openmx_magma_dsyevdx_gpu(int n, int maxn, double *d_A, double *w, int *mout);
+extern void magma_ozaki2_release_workspaces(void);
 
 /* ------------------------------------------------------------------ */
 /* forward declarations                                               */
@@ -115,9 +132,9 @@ static int      DCLNO_is_gpu_owner   = 0;
 /*
  * On nodes where many MPI ranks share one GPU, forwarding every DC-LNO
  * eigenproblem to a single owner rank destroys the MPI task parallelism.
- * Keep the proxy code available for the one-rank-per-GPU case, but default
- * shared-GPU runs to owner-local GPU acceleration plus CPU work on the other
- * ranks.
+ * Keep the proxy code available. Small local matrices dispatch directly on
+ * all ranks when their buffers fit; above the owner threshold a shared GPU
+ * retains the original owner-only policy, with other ranks solving on CPU.
  */
 #define DCLNO_ENABLE_SHARED_GPU_PROXY 0
 
@@ -216,7 +233,9 @@ static void DCLNO_GPUProxy_Init(void)
     if (0 < SCF_Gpu_Num && SCF_Gpu_Num < DCLNO_ngpu) {
         DCLNO_ngpu = SCF_Gpu_Num;
     }
-    DCLNO_gpu_id = DCLNO_node_rank % DCLNO_ngpu;
+    DCLNO_gpu_id = openmx_gpu_map_rank_to_device(
+        openmx_gpu_local_rank_noncollective(),
+        openmx_gpu_local_size_noncollective(), DCLNO_ngpu);
     color = DCLNO_gpu_id;
 
     MPI_Comm_split(DCLNO_node_comm, color, DCLNO_node_rank, &DCLNO_gpu_group_comm);
@@ -225,15 +244,8 @@ static void DCLNO_GPUProxy_Init(void)
 
     DCLNO_is_gpu_owner = (DCLNO_gpu_group_rank == 0);
 
-    if (DCLNO_is_gpu_owner) {
-        /*
-         * Only the GPU owners enter this branch.
-         * set_hip_default_device_from_local_rank() internally calls
-         * MPI_Comm_split_type(comm, ...), which is collective on comm and
-         * deadlocks if only a subset of ranks calls it.
-         */
-        wait_hipfunc(hipSetDevice(DCLNO_gpu_id));
-    }
+    /* Match the HIP/OpenMP device selected by every other GPU path. */
+    wait_hipfunc(hipSetDevice(DCLNO_gpu_id));
 
     DCLNO_gpu_proxy_initialized = 1;
 }
@@ -1253,6 +1265,9 @@ static double DC_Col(char * mode, int MD_iter, int SCF_iter, int SucceedReadingD
     int             gpu_group_max_msize;
     int             group_max_atoms, atom_slot;
     int             have_local_atom, use_gpu_task;
+    int             gpu_tasks = 0;
+    double          gpu_seconds = 0.0;
+    int             gpu_profile = 0;
     size_t          eig_matrix_count, eig_work_count, eig_iwork_count;
 
     MPI_Comm_size(mpi_comm_level1, &numprocs0);
@@ -1299,6 +1314,8 @@ static double DC_Col(char * mode, int MD_iter, int SCF_iter, int SucceedReadingD
 
     use_gpu_accel = (scf_eigen_lib_flag == GPUSOLVER);
     if (use_gpu_accel) {
+        const char *profile = getenv("OPENMX_DCLNO_GPU_PROFILE");
+        gpu_profile = profile != NULL && atoi(profile) != 0;
         DCLNO_GPUProxy_Init();
     }
     use_gpu_proxy = (use_gpu_accel && DCLNO_ENABLE_SHARED_GPU_PROXY &&
@@ -2067,17 +2084,32 @@ static double DC_Col(char * mode, int MD_iter, int SCF_iter, int SucceedReadingD
                     if (NUM2 < 1)   NUM2 = NUM;
                 }
 
-                use_gpu_task = (use_gpu_accel && (DCLNO_is_gpu_owner || use_gpu_proxy) &&
-                                NUM >= DCLNO_GpuEigenThreshold());
+                use_gpu_task = (use_gpu_accel && NUM >= DCLNO_GpuEigenThreshold() &&
+                                (use_gpu_proxy || DCLNO_is_gpu_owner ||
+                                 DCLNO_gpu_group_size == 1 || DCLNO_GpuOwnerThreshold() == 0 ||
+                                 NUM < DCLNO_GpuOwnerThreshold()));
 
                 if (measure_time) dtime(&stime);
 
                 if (use_gpu_task && !use_gpu_proxy) {
+                    double gpu_start = 0.0, gpu_stop;
+                    if (gpu_profile) dtime(&gpu_start);
                     DCLNO_Solve_Col_GpuSolver(NUM, NUM2,
                                              &BLAS_OLP[spin * NUM * NUM],
                                              &BLAS_H[spin * NUM * NUM],
                                              ko);
                     DCLNO_CopyPackedEigvecsToC(&BLAS_H[spin * NUM * NUM], NUM, NUM2, C);
+                    if (gpu_profile) {
+                        dtime(&gpu_stop);
+                        gpu_seconds += gpu_stop - gpu_start;
+                        ++gpu_tasks;
+                        if (gpu_tasks == 1 || gpu_tasks % 16 == 0) {
+                            printf("DCLNO_GPU rank=%d SCF=%d backend=magma solves=%d n=%d seconds=%.3f\n",
+                                   myid0, SCF_iter,
+                                   gpu_tasks, NUM, gpu_seconds);
+                            fflush(stdout);
+                        }
+                    }
                 }
                 else if (!use_gpu_task) {
                     DCLNO_Solve_Col_Local(NUM, NUM2,
@@ -2533,6 +2565,9 @@ static double DC_Col(char * mode, int MD_iter, int SCF_iter, int SucceedReadingD
     if (use_gpu_accel && DCLNO_GpuTurnRelease()) {
         DCLNO_GpuSolver_ReleaseDeviceMemory();
         openmx_gemmul8ReleaseWorkspaces();
+        /* Every direct-dispatch rank also owns MAGMA's separate GEMMul8
+           cache. Return it before the next SCF memory check and forces. */
+        magma_ozaki2_release_workspaces();
     }
 
     dtime(&TEtime);

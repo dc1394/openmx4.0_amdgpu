@@ -61,6 +61,127 @@ The Makefile variables above default to one specific machine; override them for 
 ## Benchmarks
 Benchmarks of the NVIDIA version this port derives from: https://journals.jps.jp/doi/10.7566/JPSJ.94.124003
 
+### Reproducing GPU tuning with -runtestL3
+
+The September 22–23, 2026 validation used a Radeon RX 9060 XT (16 GiB),
+eight MPI ranks and one thread per rank. All 20 original L3 inputs were attempted:
+19 completed, and Si1280-LNO stopped at the 16 GiB host-memory reserve after
+the MPI process tree reached about 230 GiB RSS. Seventeen completed cases met
+absolute tolerances of `1e-7` Ha for energy and `1e-7` Ha/bohr for every force
+component. Ni63-O64 and Fe1000 require the numerical caveats in the
+[full results and reproduction report](gpu_tuning_l3_20260922.txt).
+Five CPU regression cases had exactly identical printed energies and forces.
+Ni63-O64's reference-force discrepancy is also present in the untouched
+executable. Fe1000 exceeds the strict tolerance with both transform settings;
+two runs of the final binary also had a maximum force-component difference of
+`2.04e-7` Ha/bohr. Fe1000 is therefore not a strict numerical/repeatability pass.
+
+| L3 input | Original (s) | Tuned (s) | Speedup |
+|---|---:|---:|---:|
+| GGFF | 2255.05 | 593.10 | 3.80x |
+| Pt63 | 26.76 | 13.14 | 2.04x |
+| nsV4Bz5 | 35.68 | 17.77 | 2.01x |
+| Mn12_148_F | 35.42 | 19.29 | 1.84x |
+| CG15c | 238.76 | 189.11 | 1.26x |
+
+These are single-run timings comparing the original runtime defaults against
+the code changes plus the three launch settings below. Across the 12 cases
+that completed in both configurations, total time fell from 2969.61 to
+1136.20 seconds (2.61x). Interrupted cases are excluded from that ratio.
+With matched launch settings, C60 took 8.89 -> 5.88 seconds and Mn12_148_F
+took 34.51 -> 19.29 seconds; both retained force agreement within `1e-12`.
+
+The GPU construction kernels use team reductions for energy and force integrals,
+and reduce the Force3 grid on the device before returning the three force
+components per atom pair. The HIP Hamiltonian kernel stages orbital tiles in
+shared memory while preserving FP64 accumulation in grid order. Large collinear
+cluster transforms (n >= 2048) use the existing GEMMul8 bridge, including its
+workspace guard and `scf.gemmul8.enable` setting; density-matrix construction
+reuses the most recent device eigenvectors. The CPU calculation loops are unchanged.
+The collinear dense-solver memory check includes MAGMA scratch space and sums
+simultaneous spin roots sharing the same physical GPU; retained SCF buffers are
+credited toward that budget. If both spin roots cannot fit together but one
+fits, the GPU processes them in sequence and returns the dense matrices and
+library workspaces after each spin. Density-matrix construction uses the saved
+host eigenvectors in this case. `OPENMX_CLUSTER_GPU_SERIAL=0` disables this
+capacity fallback. A solve that cannot fit even one spin uses the existing ELPA
+fallback before allocating the dense GPU matrices.
+The collinear DC-LNO GPU path dispatches smaller local problems on every rank
+admitted by its shared-device memory check, using the same rank-to-device map
+as the other GPU paths. For matrices of dimension 2048 or larger on a shared
+GPU, it retains one GPU owner while other ranks use the existing CPU solver.
+The completed CG15c/MCCN measurements support concurrent dispatch for smaller
+matrices; the large-matrix trials did not establish an end-to-end improvement.
+`OPENMX_DCLNO_GPU_OWNER_THRESHOLD` changes that boundary; zero allows all ranks
+at every size for A/B measurements. MAGMA's original algorithm and its internal
+CPU/GPU crossover remain unchanged.
+Large EH0 integration batches run one MPI rank at a time on each physical GPU
+when any rank in that GPU group has at least 8192 pairs. This bounds simultaneous
+long kernels and target-data transfers; small batches remain concurrent.
+`OPENMX_EH0_GPU_CONCURRENCY=0` disables the admission control, and a positive
+value sets the maximum active ranks per GPU. The integral and force formulas
+are unchanged. In the measured C1000 case, this removed a long EH0 wait and
+completed total-energy evaluation in about 25 seconds with matching forces.
+The DC-LNO per-iteration release also returns MAGMA's separate GEMMul8 workspace,
+so it does not reduce the memory available to later SCF and force phases.
+The DS_VNA projector construction shrinks its pair batch from 256 when the
+shared GPU cannot hold all ranks' temporary arrays. The allocation estimate
+and target mappings use the same admitted batch size; if even one pair does
+not fit, the existing CPU fallback is retained.
+The subsequent HVNA contraction budgets its actual neighbour/output tables
+and processes only as many ranks together as the shared device can hold,
+returning the mapped arrays before admitting the next group of ranks.
+The noncollinear multi-k GPU band path can retain compact eigenvectors between
+the occupation and density-matrix passes, avoiding repeated eigensolves. This
+host cache lives for one SCF call, uses at most 1024 MiB per rank, and is further
+limited to 1/32 of the node's available RAM divided by its MPI ranks.
+`OPENMX_BAND_NONCOL_KCACHE_MB=0` disables it; a positive value changes the
+per-rank cap without bypassing the available-memory limit. GPU k-point groups
+interleave MPI owners so their existing concurrency limit can actually run
+independent solves together; `OPENMX_BAND_NONCOL_INTERLEAVE_K=0` restores the
+original consecutive ordering. The collinear multi-k GPU path uses the same
+owner interleaving, controlled by `OPENMX_BAND_COL_INTERLEAVE_K`.
+
+`tools/run_runtest_l3.py` runs each of the 20 original inputs with `-runtestL3`
+in a separate directory and MPI job. It preserves inputs and reference outputs,
+snapshots the executable, and records times, numerical differences and memory
+usage in `results.json`. It stops a job when Linux `MemAvailable` falls below
+16 GiB or the job exceeds 3600 seconds, then continues with the next case.
+These limits are configurable. Interrupted cases are not successful tests;
+the runner continues through the suite and then returns a nonzero status.
+
+```sh
+python3 tools/run_runtest_l3.py --binary source/openmx --ranks 8 \
+  --output work/codex_l3_after \
+  --env GPU_MAX_HW_QUEUES=1 --env LIBOMPTARGET_AMDGPU_NUM_HSA_QUEUES=1 \
+  --env HSA_ENABLE_SDMA=0
+python3 tools/compare_runtest_l3.py work/codex_l3_before work/codex_l3_after
+python3 tools/compare_runtest_l3.py --reference work/codex_l3_after
+```
+
+Use `--cases C60 GGFF` for selected L3 inputs, `--env OPENMX_GPU=0` for a CPU
+comparison, and a fresh output directory for each run. The comparison checks
+every force component as well as total energy, atom positions and grid dimensions;
+the built-in test's force difference is a signed sum and can hide cancellation.
+
+The runtime settings above were used for the final measurements with eight MPI
+ranks sharing one gfx1200 GPU. With the runtime defaults, Fe1000 completed its
+SCF and force phases but waited for many minutes in OpenMP GPU operations
+during total-energy evaluation. Limiting both queue pools to one let the same
+executable finish, with total-energy evaluation taking about 13 seconds.
+Disabling SDMA alone did not resolve that wait; limiting queues alone still
+left a HIP host-to-device copy waiting in Pt500. The final configuration combines
+both settings with the EH0 admission control described above. These are launch
+settings for this measured configuration; the executable does not override the
+runtime environment. HIP and OpenMP have separate queue pools, as discussed in this
+[ROCm issue](https://github.com/ROCm/legacy-rocm-build/issues/2705).
+
+For GPU A/B measurements, `OPENMX_SETHAM_HIP_KERNEL=scalar` selects the original
+Hamiltonian HIP kernel, and `OPENMX_CLUSTER_GPU_GEMM=0` restores native
+hipBLAS SYMM/GEMM for the cluster transforms. `OPENMX_SETHAM_TIMING=1`,
+`OPENMX_CLUSTER_PROFILE=1` and `OPENMX_FORCE_PROFILE=1` print stage timings;
+`OPENMX_DCLNO_GPU_PROFILE=1` reports local GPU solve counts and elapsed time.
+
 ### Built-in test suites (-runtest / -runtestL)
 Desktop PC: AMD Ryzen Threadripper 3970X (16 of 32 cores used), 256 GB RAM, one AMD Radeon RX 9060 XT (gfx1200, 16 GB); ROCm 7.2.0, Open MPI 5.0.9 built with the ROCm compilers, AOCL 5.2.0; 16 MPI ranks sharing the GPU, flat MPI, the same binary for every column. GPU columns use the input-file defaults, CPU columns `OPENMX_GPU=0`:
 

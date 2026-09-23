@@ -1,0 +1,256 @@
+OpenMX 4.0 AMD GPU tuning / -runtestL3 validation
+Validation: 2026-09-22 to 2026-09-23 (JST)
+
+Scope
+  CPU numerical paths and build flags are unchanged. GPU-only changes cover
+  energy/force reductions, device-side Force3 integration, HIP orbital tiling,
+  large collinear cluster transforms and device eigenvector reuse, multi-k
+  scheduling and noncollinear eigenvector reuse, and DC-LNO GPU dispatch.
+  Cluster VRAM preflight accounts for simultaneous roots and MAGMA scratch.
+  If only one spin fits, GPU spin solves run in sequence and release device
+  workspaces between spins, preserving compact host eigenvectors for DM;
+  DC-LNO returns MAGMA workspaces at its existing SCF release point.
+  On shared GPUs its all-rank dispatch applies below dimension 2048; larger
+  local matrices retain one GPU owner while other ranks use the existing CPU solver.
+  DS_VNA pair batches shrink to fit device memory. HVNA computes its full
+  mapped-array footprint and admits ranks in turns when necessary.
+  Large EH0 batches (maximum >=8192 pairs/rank) run one rank per physical
+  GPU at a time, including their mappings; small batches remain concurrent.
+  OPENMX_EH0_GPU_CONCURRENCY=0 disables this; positive values set concurrency.
+  No MAGMA algorithm/crossover change or new eigensolver backend was retained.
+
+Configuration
+  AMD Radeon RX 9060 XT (gfx1200), 16 GiB VRAM (16304 MiB reported).
+  AMD Ryzen Threadripper 3970X, 32 physical cores, about 251 GiB host RAM.
+  ROCm 7.2.0; Open MPI 5.0.9; AOCL 5.2.0; AOCC runtime 5.1.0.
+  8 MPI ranks bound to cores; -nt 1; OMP/BLIS/OPENBLAS_NUM_THREADS=1.
+  Original work/large3_example/*.dat and reference outputs were not edited.
+  Each input was run via -runtestL3 in a separate MPI process and directory.
+  Baseline commit: dccc11e315677a81511bec15b898b751e503c1bf.
+  Baseline and candidate runs were serialized on the GPU for timing comparisons.
+  Baseline uses the original runtime defaults. The final tuned configuration
+  additionally sets GPU_MAX_HW_QUEUES=1,
+  LIBOMPTARGET_AMDGPU_NUM_HSA_QUEUES=1 and HSA_ENABLE_SDMA=0.
+  Reported before/after ratios therefore
+  compare the original configuration with code plus runtime tuning. Earlier
+  v1 pilots and separate matched-environment runs isolate individual changes.
+  Timings are single-run elapsed times printed by runtestL3; small differences
+  are not statistical claims. Candidate stages can still fall back to the
+  existing CPU implementation when the shared 16 GiB GPU is too small.
+
+Reproduction
+  make -C source -j4 openmx \
+    MPI_HOME=/home/kawai/opt/openmpi-rocmclang \
+    AOCL_HOME=/opt/AMD/aocl/aocl-linux-aocc-5.2.0/aocc \
+    AOCC_LIB=/opt/AMD/aocc-compiler-5.1.0/lib
+  python3 tools/run_runtest_l3.py --binary source/openmx --ranks 8 \
+    --output work/codex_l3_after \
+    --env GPU_MAX_HW_QUEUES=1 --env LIBOMPTARGET_AMDGPU_NUM_HSA_QUEUES=1 \
+    --env HSA_ENABLE_SDMA=0
+  python3 tools/compare_runtest_l3.py --reference work/codex_l3_after
+  python3 tools/compare_runtest_l3.py work/codex_l3_before work/codex_l3_after
+  Use a fresh output directory for each run. The runner defaults to a 3600 s
+  per-input limit and 16 GiB MemAvailable reserve, records interruptions, and
+  continues through the suite. Its exit status is nonzero for incomplete runs.
+  This validation allows Si1280-LNO and N1C999 up to 7200 s while retaining
+  the memory guard; final/case_time_limits.json and any extended_monitor.json
+  record that extension. Use --timeout 7200 for those long DC-LNO inputs.
+
+Numerical checks
+  Compare Utot, every Cartesian force component, atom identity/coordinates and
+  integration grids. Absolute tolerances: 1e-7 Ha and 1e-7 Ha/bohr.
+  The built-in force difference is a signed sum; it can hide cancellation and
+  is not sufficient by itself. Bundled references round coordinates to five
+  decimals, so reference-only coordinate comparisons allow one printed unit.
+  Printed coordinates must agree exactly between baseline and candidate.
+  The input files use only three SCF iterations; these checks establish
+  regression agreement for those tests, not fully converged physical results.
+
+Artifacts
+  work/codex_gpu_tune/openmx.baseline : untouched original executable.
+  work/codex_gpu_tune/baseline/ : original-run outputs.
+  work/codex_gpu_tune/final/    : all 20 cases with the same final executable.
+  work/codex_gpu_tune/serial-small/ : forced serial-spin validation on Mn12.
+  work/codex_gpu_tune/cluster-native/ : native cluster GEMM A/B on C1000 and Fe1000.
+  work/codex_gpu_tune/cpu-final/ : five CPU regression cases, final executable.
+  work/codex_gpu_tune/fe-repeat/ : same-executable Fe1000 repeatability check.
+  work/codex_gpu_tune/batch-final/ : five L3 inputs in one MPI invocation.
+  work/codex_gpu_tune/final-default/ : interrupted default-queue run.
+  work/codex_gpu_tune/runtime-queue1/ : successful initial queue-limited retry.
+  Earlier v1/v3 and pilot outputs are retained for diagnostic provenance;
+  they are not substituted into the final 20-case candidate table.
+  Final/auxiliary command.json files record binary SHA256, command, environment
+  and limits. The original baseline SHA256 is recorded separately in metadata.json.
+  Large raw outputs are intentionally gitignored. Baseline peak RSS sampling
+  originally missed MPI rank process groups, so baseline RSS is omitted from
+  normalized results. Candidate RSS sums the process tree's RSS; shared
+  mappings can be counted more than once.
+
+Installation
+  source/openmx and work/openmx contain the validated final executable.
+  The previous work/openmx is preserved as
+  work/codex_gpu_tune/openmx.work-before-install.20260923.
+  installation.json records both SHA256 digests and the installation time.
+Executable SHA256
+  baseline: 97c6e8c4aa2b871d72807aa752a089dff8ec55caf57def7f59a5d18b0120fe26
+  final: 2a81ccda007effaa7dea418c279084b6dbdad8fbf2b0e1bd92524c283998a5a6
+
+All 20 L3 cases
+  Times: seconds printed by runtestL3; — means no completed measurement.
+  Ref errors: absolute energy (Ha), maximum absolute Cartesian force (Ha/bohr).
+  A completed process is not by itself a numerical pass.
+
+| Case | Before s/status | After s/status | Ratio | Ref | abs dE ref | max abs dF ref |
+|---|---:|---:|---:|---|---:|---:|
+| 5_5_13COb2 | 24.40 | 16.16 | 1.51x | PASS | 2.77e-09 | 5.4e-10 |
+| C1000 | timeout | 307.81 | — | PASS | 2.52e-09 | 9.35e-10 |
+| C60 | 9.23 | 5.88 | 1.57x | PASS | 3.6e-11 | 1.7e-11 |
+| CG15c | 238.76 | 189.11 | 1.26x | PASS | 1.5e-09 | 1.31e-09 |
+| Crys-MnO | 6.95 | 4.07 | 1.71x | PASS | 1.3e-11 | 3e-12 |
+| DIA512-1 | 73.77 | 68.95 | 1.07x | PASS | 9.97e-10 | 3.06e-09 |
+| Fe1000 | failed | 691.95 | — | DEVIATION | 1.16e-07 | 5.67e-07 |
+| GEL | timeout | 16.32 | — | PASS | 9.2e-11 | 1.54e-09 |
+| GFRAG | 17.41 | 9.66 | 1.80x | PASS | 3.17e-09 | 1.65e-09 |
+| GGFF | 2255.05 | 593.10 | 3.80x | PASS | 4.21e-11 | 9.3e-11 |
+| MCCN | 230.30 | 190.89 | 1.21x | PASS | 6.83e-09 | 1.37e-09 |
+| Mn12_148_F | 35.42 | 19.29 | 1.84x | PASS | 7.41e-11 | 3.4e-09 |
+| N1C999 | timeout | 6179.94 | — | PASS | 3e-09 | 7.1e-11 |
+| Ni63-O64 | diagnostic_cutoff | 23.59 | — | DEVIATION | 5.15e-10 | 1.14e-05 |
+| Pt500 | timeout | 972.98 | — | PASS | 3.27e-10 | 1.03e-09 |
+| Pt63 | 26.76 | 13.14 | 2.04x | PASS | 3.21e-09 | 5.01e-10 |
+| Si1280-LNO | timeout | host_memory_guard | — | incomplete | — | — |
+| SialicAcid | 15.88 | 8.18 | 1.94x | PASS | 3.63e-10 | 1.9e-10 |
+| ZrB2_2x2 | timeout | 82.08 | — | PASS | 2.02e-09 | 7.92e-10 |
+| nsV4Bz5 | 35.68 | 17.77 | 2.01x | PASS | 7.47e-10 | 3.3e-09 |
+
+Completion counts: {'host_memory_guard': 1, 'completed': 19}
+Reference checks: {'PASS': 17, 'DEVIATION': 2}
+Common completed cases (12): 2969.61 -> 1136.20 s, aggregate 2.614x.
+Max before/after energy error 8.4e-10 Ha; max force error 2.89e-09 Ha/bohr.
+Minimum sampled host MemAvailable across final suite: 15.98 GiB.
+Maximum summed process RSS across final suite: 230.26 GiB.
+
+Incomplete baseline details
+  C1000: timeout, 1236.0 s; 1200 s per-input limit (C1000: supervisor correction delayed termination; sampled waiting in HIP host-to-device transfer in Force_HNL, not host OOM)
+  Fe1000: failed, 200.9 s; see run.log
+  GEL: timeout, 681.1 s; GEL: no progress for over 600 s in force stage; sampled rank 0 waiting inside hipFree. Host RAM available; terminate to diagnose candidate.
+  N1C999: timeout, 1321.5 s; Profiling cutoff: first SCF still in CPU tridiagonalization inside GPU MAGMA after >1200 s; evaluate adjusted GPU crossover before repeating long run.
+  Ni63-O64: diagnostic_cutoff, 287.5 s; Force4B unchanged for several minutes; HIP/OpenMP queue waits sampled on two ranks. Stop to A/B runtime queue count.
+  Pt500: timeout, 1200.1 s; 1200 s per-input limit
+  Si1280-LNO: timeout, 1200.2 s; 1200 s per-input limit
+  ZrB2_2x2: timeout, 1200.3 s; 1200 s per-input limit
+
+Incomplete candidate details
+  Si1280-LNO: host_memory_guard, 2107.6 s; available >= 15.98 GiB, peak RSS 230.26 GiB.
+
+Final-executable controls
+
+  CPU parity (OPENMX_GPU=0)
+    C60: cpu-final 8.18 s, cpu-baseline 7.82 s; abs dE=0, max abs dF=0, PASS.
+    Crys-MnO: cpu-final 7.68 s, cpu-baseline 7.67 s; abs dE=0, max abs dF=0, PASS.
+    GEL: cpu-final 29.64 s, cpu-baseline 30.01 s; abs dE=0, max abs dF=0, PASS.
+    Mn12_148_F: cpu-final 34.51 s, cpu-baseline 34.85 s; abs dE=0, max abs dF=0, PASS.
+    nsV4Bz5: cpu-final 29.06 s, cpu-baseline 29.77 s; abs dE=0, max abs dF=0, PASS.
+
+  Native cluster transforms (OPENMX_CLUSTER_GPU_GEMM=0)
+    C1000: cluster-native 373.14 s, final 307.81 s; abs dE=1.364e-11, max abs dF=1e-12, PASS.
+      Native-transform reference errors: abs dE=2.537e-09, max abs dF=9.35e-10.
+    Fe1000: cluster-native 841.44 s, final 691.95 s; abs dE=1.586e-09, max abs dF=5.978e-07, DEVIATION.
+      Native-transform reference errors: abs dE=1.14e-07, max abs dF=1.776e-07.
+
+  Untouched binary with the same three runtime settings
+    C60: queue-baseline 8.89 s, final 5.88 s; abs dE=2.797e-11, max abs dF=1e-12, PASS.
+    GEL: queue-baseline=timeout, final=completed; no completed comparison.
+    Mn12_148_F: queue-baseline 34.51 s, final 19.29 s; abs dE=4.411e-11, max abs dF=1e-12, PASS.
+    Ni63-O64: queue-baseline=timeout, final=completed; no completed comparison.
+
+  Same-process final-executable L3 run
+    Status completed, wall 68.88 s, peak process RSS 18.24 GiB.
+    5_5_13COb2: abs dE=2.765e-09, max abs dF=5.4e-10, PASS.
+    C60: abs dE=3.598e-11, max abs dF=1.7e-11, PASS.
+    GFRAG: abs dE=3.172e-09, max abs dF=1.651e-09, PASS.
+    Mn12_148_F: abs dE=7.003e-11, max abs dF=3.4e-09, PASS.
+    nsV4Bz5: abs dE=7.48e-10, max abs dF=3.303e-09, PASS.
+
+Additional L3 validation (earlier implementation pilots)
+  Single-rank spin run (v1): Mn12_148_F, one MPI rank, 52.88 s;
+    reference energy error 2.52e-10 Ha, max force error 3.4e-9 Ha/bohr.
+    This exercises sequential spins with only the latest eigenvectors on device.
+  Hamiltonian tiled/scalar A/B (v1, original L3 inputs):
+    5_5_13COb2 HIP kernel time: 0.042170 / 0.067398 s (1.60x).
+    Mn12_148_F HIP kernel time: 0.383372 / 0.486384 s (1.27x).
+    Whole-input times were effectively unchanged in this kernel A/B;
+    these ratios are not whole-input speedups. Max force difference: 1e-12.
+  Forced serial-spin capacity fallback (v4, serial-small/Mn12_148_F):
+    OPENMX_CLUSTER_GPU_DIAG_RESERVE_MB=5500 forced sequential spin roots
+    on all three SCF iterations. 22.05 s; reference energy error 7e-11 Ha,
+    max force error 3.4e-9 Ha/bohr. Final Fe1000 covers the same capacity path.
+  Adaptive projector batch (v4, nsV4Bz5):
+    DS_VNA batch 256 -> 128, 0.982 GiB/rank, 1.270 GiB/rank budget.
+    Maximum Set_ProExpn_VNA time: 3.582 s (v1) -> 1.241 s (v4).
+    Whole input: 21.02 -> 18.69 s; reference checks passed.
+  Large EH0 admission (v6, C1000): 304.89 s; total-energy stage 24.619 s;
+    reference energy error 2.578e-9 Ha, max force error 9.35e-10 Ha/bohr.
+    This was a clean timing run without a debugger; the final table reruns v7.
+  CPU baseline parity uses the untouched executable. Its five original
+    measurements ran on cores 8-15 while a separate GPU diagnostic occupied
+    cores 0-7; CPU times are not isolated performance benchmarks.
+    An additional CPU GGFF attempt stopped after 738 s before SCF1 finished.
+    No completed CPU noncollinear comparison is claimed.
+
+Precision and runtime distinctions
+  Ni63-O64's untouched baseline also differs from bundled reference forces
+  by 1.1351082e-5 Ha/bohr (completed diagnostic with HSA_ENABLE_SDMA=0).
+  The signed sum reported by the built-in test is only about 3.5e-9 and hides
+  that component discrepancy. The separate matched-runtime comparison above
+  includes timeouts for Ni63-O64 and GEL, so those ratios are unavailable.
+  Comparing final Ni63-O64 with the completed untouched diagnostic gives
+  abs dE=7.09e-11 Ha and max abs dF=2.487e-9 Ha/bohr. This case is not
+  a 1e-7 reference-force pass.
+
+  Fe1000's initial queue-limited v5 run differed from the bundled reference
+  by 1.1707e-7 Ha and 1.66961e-7 Ha/bohr, just above the strict 1e-7 limits.
+  The final table and native-transform control above report the actual final
+  errors. The final/native force difference is 5.97849e-7 Ha/bohr. Native
+  transforms also miss the reference tolerance (1.77635e-7 Ha/bohr), so
+  OPENMX_CLUSTER_GPU_GEMM=0 does not by itself give a strict reference pass.
+  A completed run alone does not establish numerical agreement.
+
+  Fe1000 retains 8300 eigenstates after SCF1. The last up-spin state is at
+  -0.14429778434630 Ha, chemical potential -0.15739059622626 Ha, T=900 K;
+  its Fermi occupation is about 0.0100135. Final/native printed eigenvalues
+  at the cutoff agree, but sampled restart density-matrix entries differ by
+  up to 1.67e-5. Sensitivity to the eigenstate cutoff is a plausible explanation
+  for the force differences; these observations do not prove that cause.
+  The input, state-count rule and CPU numerical paths were preserved.
+  A second run of the same final binary and relevant settings (fe-repeat/)
+  completed in 690.44 s. It differs from the first final run by 2.18e-10 Ha
+  and 2.03576e-7 Ha/bohr (400 force components exceed 1e-7); its reference
+  errors are 1.15804e-7 Ha and 5.97364e-7 Ha/bohr. Thus Fe1000 does not
+  establish reproducibility at the strict 1e-7 force threshold, even without
+  changing the transform setting. No claim of a resolved numerical cause
+  or a strict Fe1000 pass is made.
+
+  With eight MPI ranks sharing this GPU, earlier default-runtime attempts
+  spent many minutes inside HIP/OpenMP copies or kernel waits. SDMA=0 alone
+  did not remove the Fe1000 EH0 wait; queues=1 alone completed Fe1000 but
+  left a Pt500 HNL host-to-device copy waiting. Combining both settings
+  removed those observed force-copy waits in subsequent C1000 testing;
+  physical-GPU EH0 admission then completed its total-energy calculation.
+  These observations do not establish a driver root cause. The executable
+  does not force ROCm environment variables; the final launch settings and
+  exact binary are recorded in command.json. Earlier diagnostic runs with
+  debugger attachment are excluded from the final timing table.
+
+  The original Fe1000 failed with MAGMA info=-113 (device allocation failure),
+  while host MemAvailable remained at least 169 GiB. The new serial-spin
+  capacity path completed Fe1000; that completion does not remove the
+  reference-precision caveat. N1C999 needed an extended limit and finished
+  at 6179.94 s with reference checks passing. Its original run was stopped
+  at 1321.54 s, so no speedup is claimed for it.
+
+Rejected optimization trials
+  Lowering the MAGMA DSYTRD GPU crossover from 3000 to 1536 did not improve
+  the observed N1C999 run. A separate DC-LNO hipSOLVER trial took 375.32 s
+  on CG15c versus 238.76 s for the original executable. Both experiments
+  were removed. The original MAGMA algorithm/crossover and source remain.

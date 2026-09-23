@@ -33,6 +33,7 @@ enum {
 const char *hipGetErrorString(hipError_t error);
 hipError_t hipGetDeviceCount(int *count);
 hipError_t hipGetDevice(int *device);
+hipError_t hipDeviceGetPCIBusId(char *pciBusId, int len, int device);
 hipError_t hipSetDevice(int device);
 hipError_t hipDeviceReset(void);
 hipError_t hipDeviceSynchronize(void);

@@ -1780,8 +1780,8 @@ static void Force3_GpuTrace(const double* dchi_all, const size_t* dchi_off,
                     const int npairs_c = npairs;
                     int max_n_olg = 0;
                     size_t task_count;
-                    double *task_f;
                     double *task_f_dev;
+                    double *pair_f_dev = (double*)(void*)(chunk_arena + o_pf);
 
                     for (int pp = 0; pp < npairs_c; pp++) {
                         if (max_n_olg < pm[pp].n_olg) max_n_olg = pm[pp].n_olg;
@@ -1789,8 +1789,6 @@ static void Force3_GpuTrace(const double* dchi_all, const size_t* dchi_off,
                     task_count = (size_t)npairs_c * (size_t)max_n_olg;
                     if (max_tf < task_count)
                         Force3_gpu_abort("Force3 GPU trace: task-force slot smaller than planned.");
-                    task_f = (double*)Force_checked_malloc(
-                        sizeof(double) * 3U * task_count, __FILE__, __LINE__);
                     /* lives in the planned arena; a separate allocation here
                        used to fail once the arena had claimed the free memory */
                     task_f_dev = (double*)(void*)(chunk_arena + o_tf);
@@ -1864,16 +1862,25 @@ static void Force3_GpuTrace(const double* dchi_all, const size_t* dchi_off,
                         }
                     }
 
-                    ForceHipMemcpyFromDevice(task_f, task_f_dev,
-                        sizeof(double) * 3U * task_count);
-                    memset(pair_f, 0, sizeof(double) * 3U * (size_t)npairs_c);
-                    for (size_t task = 0; task < task_count; task++) {
-                        const int pp = (int)(task / (size_t)max_n_olg);
-                        pair_f[3 * (size_t)pp + 0] += task_f[3 * task + 0];
-                        pair_f[3 * (size_t)pp + 1] += task_f[3 * task + 1];
-                        pair_f[3 * (size_t)pp + 2] += task_f[3 * task + 2];
+                    /* Reduce the grid on the device into the pair slot that
+                       is already part of the arena. Only three doubles per
+                       pair cross PCIe; the large task array stays on device. */
+#pragma omp target teams distribute thread_limit(128) is_device_ptr(task_f_dev, pair_f_dev)
+                    for (int pp = 0; pp < npairs_c; pp++) {
+                        double fx = 0.0, fy = 0.0, fz = 0.0;
+#pragma omp parallel for reduction(+:fx,fy,fz)
+                        for (int nog = 0; nog < max_n_olg; nog++) {
+                            const size_t task = (size_t)pp * max_n_olg + nog;
+                            fx += task_f_dev[3 * task + 0];
+                            fy += task_f_dev[3 * task + 1];
+                            fz += task_f_dev[3 * task + 2];
+                        }
+                        pair_f_dev[3 * (size_t)pp + 0] = fx;
+                        pair_f_dev[3 * (size_t)pp + 1] = fy;
+                        pair_f_dev[3 * (size_t)pp + 2] = fz;
                     }
-                    free(task_f);
+                    ForceHipMemcpyFromDevice(pair_f, pair_f_dev,
+                        sizeof(double) * 3U * (size_t)npairs_c);
 
                     {
                         int q = 0;
@@ -7706,7 +7713,7 @@ static void Force4B_GpuCase1Run(double***** CDM0)
             const double* cdm_pref = (const double*)(void*)(arena + o_cdm);
             double* item_f = (double*)(void*)(arena + o_itemf);
 
-#pragma omp target teams distribute parallel for      is_device_ptr(flat, halo, items, krowA, krowB, krow_halo, cdm_pref, item_f)
+#pragma omp target teams distribute thread_limit(128) is_device_ptr(flat, halo, items, krowA, krowB, krow_halo, cdm_pref, item_f)
             for (int pp = 0; pp < nitems_c; pp++) {
                 const int ian = items[pp].ian;
                 const int jan = items[pp].jan;
@@ -7716,6 +7723,7 @@ static void Force4B_GpuCase1Run(double***** CDM0)
                 const int mn = ian * jan;
                 double fx = 0.0, fy = 0.0, fz = 0.0;
 
+#pragma omp parallel for reduction(+:fx,fy,fz)
                 for (int idx = 0; idx < mn; idx++) {
                     const int m = idx / jan;
                     const int n = idx - m * jan;
@@ -7970,7 +7978,7 @@ static void Force4B_GpuCase2Run(double***** CDM0)
             const double* cdm_scale = (const double*)(void*)(arena + o_cdm);
             double* item_f = (double*)(void*)(arena + o_itemf);
 
-#pragma omp target teams distribute parallel for      is_device_ptr(c2, items, pair_h_off, pair_q_off, cdm_scale, item_f)
+#pragma omp target teams distribute thread_limit(128) is_device_ptr(c2, items, pair_h_off, pair_q_off, cdm_scale, item_f)
             for (int pp = 0; pp < nitems_c; pp++) {
                 const int ian = items[pp].ian;
                 const int jan = items[pp].jan;
@@ -7980,6 +7988,7 @@ static void Force4B_GpuCase2Run(double***** CDM0)
                 const int mn = ian * jan;
                 double fx = 0.0, fy = 0.0, fz = 0.0;
 
+#pragma omp parallel for reduction(+:fx,fy,fz)
                 for (int idx = 0; idx < mn; idx++) {
                     const int m = idx / jan;
                     const int n = idx - m * jan;
@@ -8507,7 +8516,7 @@ static void Force_HNL_GpuCase1Run(double***** CDM0)
             const double* ene = (const double*)(void*)(arena + o_ene);
             double* item_f = (double*)(void*)(arena + o_itemf);
 
-#pragma omp target teams distribute parallel for      is_device_ptr(items, krowA, krowB, krow_halo, krow_ene, krow_nlp, cdm_pref, halo, ene, item_f, flat)
+#pragma omp target teams distribute thread_limit(128) is_device_ptr(items, krowA, krowB, krow_halo, krow_ene, krow_nlp, cdm_pref, halo, ene, item_f, flat)
             for (int pp = 0; pp < nitems_c; pp++) {
                 const int ian = items[pp].ian;
                 const int jan = items[pp].jan;
@@ -8517,6 +8526,9 @@ static void Force_HNL_GpuCase1Run(double***** CDM0)
                 const int mn = ian * jan;
                 double fx = 0.0, fy = 0.0, fz = 0.0;
 
+                /* A team owns one atom pair; distribute orbital products
+                   across its lanes instead of serializing them in a lane. */
+#pragma omp parallel for reduction(+:fx,fy,fz)
                 for (int idx = 0; idx < mn; idx++) {
                     const int m = idx / jan;
                     const int n = idx - m * jan;
@@ -8801,7 +8813,7 @@ static void Force_HNL_GpuCase2Run(double***** CDM0)
             const double* ene = (const double*)(void*)(arena + o_ene);
             double* item_f = (double*)(void*)(arena + o_itemf);
 
-#pragma omp target teams distribute parallel for      is_device_ptr(items, item_h0, item_nlp, item_ene, item_a, item_b, cdm_pref, c2, ene, item_f, flat)
+#pragma omp target teams distribute thread_limit(128) is_device_ptr(items, item_h0, item_nlp, item_ene, item_a, item_b, cdm_pref, c2, ene, item_f, flat)
             for (int pp = 0; pp < nitems_c; pp++) {
                 const int ian = items[pp].ian;
                 const int jan = items[pp].jan;
@@ -8814,6 +8826,7 @@ static void Force_HNL_GpuCase2Run(double***** CDM0)
                 const int mn = ian * jan;
                 double fx = 0.0, fy = 0.0, fz = 0.0;
 
+#pragma omp parallel for reduction(+:fx,fy,fz)
                 for (int idx = 0; idx < mn; idx++) {
                     const int m = idx / jan;
                     const int n = idx - m * jan;

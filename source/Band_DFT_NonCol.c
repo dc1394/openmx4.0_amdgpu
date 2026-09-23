@@ -3127,6 +3127,34 @@ static void BandNonCol_RootDenseSolveOneK_HIP(int rebuild_overlap,
     }
 }
 
+/* The multi-k GPU path normally diagonalizes each H(k) twice: first for
+   occupations, then for density matrices. Keep compact backtransformed
+   eigenvectors within this SCF call when host memory permits. The node-wide
+   cache is limited to 1/32 of currently available RAM, additionally capped
+   at 1024 MiB per rank (OPENMX_BAND_NONCOL_KCACHE_MB=0 disables it). */
+static size_t BandNonCol_KCacheLimit(void)
+{
+    const char *env = getenv("OPENMX_BAND_NONCOL_KCACHE_MB");
+    double cap = env == NULL ? 1024.0 : atof(env);
+    FILE *file;
+    char line[256];
+    unsigned long long available_kib = 0;
+    int ranks = openmx_gpu_local_size_noncollective();
+    size_t limit;
+    if (!(cap > 0.0) || cap >= (double)SIZE_MAX / (1024.0 * 1024.0)) return 0;
+    limit = (size_t)(cap * 1024.0 * 1024.0);
+    file = fopen("/proc/meminfo", "r");
+    if (file == NULL) return 0;
+    while (fgets(line, sizeof(line), file) != NULL) {
+        if (sscanf(line, "MemAvailable: %llu kB", &available_kib) == 1) break;
+    }
+    fclose(file);
+    if (ranks < 1) ranks = 1;
+    if (available_kib / (unsigned)ranks * (1024ULL / 32ULL) < limit)
+        limit = (size_t)(available_kib / (unsigned)ranks * (1024ULL / 32ULL));
+    return limit;
+}
+
 static void BandNonCol_MakeEigenRange(int id, int numprocs, int MaxN, int *is, int *ie)
 {
     if (numprocs<=MaxN){
@@ -3518,6 +3546,10 @@ double Band_DFT_NonCol(
   int root_dense_serial_gpusolver_worlds = 0;
   int owns_dense_k_rank;
   int *dense_k_owner = NULL;
+  int *dense_k_order = NULL;
+  dcomplex **k_evec_cache = NULL;
+  size_t k_cache_bytes = 0, k_cache_used = 0, k_cache_limit = 0;
+  int k_cache_hits = 0;
   int numprocs0,myid0;
   int ID,ID0,ID1;
   int numprocs1,myid1;
@@ -4011,6 +4043,39 @@ double Band_DFT_NonCol(
 			      dense_k_owner[k] = dense_owner;
 			    }
 			  }
+  if (use_k_dense_gpusolver) {
+    const char *interleave = getenv("OPENMX_BAND_NONCOL_INTERLEAVE_K");
+    dense_k_order = (int*)malloc(sizeof(int)*(size_t)T_knum);
+    if (dense_k_order == NULL)
+      BandNonCol_AbortWithMessage("Cannot allocate GPU k-point turn order.");
+    for (int point=0; point<T_knum; ++point) dense_k_order[point] = point;
+    if (interleave == NULL || atoi(interleave) != 0) {
+      int *next = (int*)calloc((size_t)numprocs0, sizeof(int));
+      int turn = 0;
+      if (next == NULL)
+        BandNonCol_AbortWithMessage("Cannot allocate GPU k-point owner cursors.");
+      /* Consecutive k points normally belong to the same MPI rank. A
+         consecutive group therefore serialized all solves even when the
+         memory guard admitted four owners. Round-robin owner queues make
+         that existing concurrency limit effective, without changing the
+         k-point assignment or the global eigenvalue indices. */
+      while (turn < T_knum) {
+        for (int owner=0; owner<numprocs0; ++owner) {
+          while (next[owner] < T_knum && dense_k_owner[next[owner]] != owner)
+            ++next[owner];
+          if (next[owner] < T_knum) dense_k_order[turn++] = next[owner]++;
+        }
+      }
+      free(next);
+    }
+  }
+  if (use_k_dense_gpusolver && strcasecmp(mode,"scf")==0 &&
+      (size_t)n2 <= SIZE_MAX / (size_t)MaxN / sizeof(dcomplex)) {
+    k_cache_bytes = (size_t)n2 * (size_t)MaxN * sizeof(dcomplex);
+    k_cache_limit = BandNonCol_KCacheLimit();
+    if (k_cache_bytes <= k_cache_limit)
+      k_evec_cache = (dcomplex**)calloc((size_t)T_knum, sizeof(dcomplex*));
+  }
 				  if (use_root_dense_gpusolver || use_k_dense_gpusolver){
 				    BandNonCol_SetDenseGemmul8Defaults();
 				    MPI_Barrier(mpi_comm_level1);
@@ -4198,7 +4263,7 @@ double Band_DFT_NonCol(
 	      int owns_dense_k_group = 0;
 
 	      for (int gpu_turn=group_first; gpu_turn<group_last; gpu_turn++){
-	        if (dense_k_owner[gpu_turn]==myid0){
+	        if (dense_k_owner[dense_k_order[gpu_turn]]==myid0){
 	          owns_dense_k_group = 1;
 	          break;
 	        }
@@ -4249,7 +4314,7 @@ double Band_DFT_NonCol(
 
 	      for (int gpu_turn=group_first; gpu_turn<group_last; gpu_turn++){
 
-	        kloop = gpu_turn;
+	        kloop = dense_k_order[gpu_turn];
 	        if (dense_k_owner[kloop]!=myid0) continue;
 
 	        k1 = T_KGrids1[kloop];
@@ -4257,10 +4322,21 @@ double Band_DFT_NonCol(
         k3 = T_KGrids3[kloop];
 
         rdw = BandNonCol_RootDenseWorkspace_Ensure(1,n,n2,MaxN,1,SCF_iter);
-        BandNonCol_RootDenseSolveOneK_HIP(1,n,n2,MaxN,kloop,k1,k2,k3,
-                                          m_olp,m_h11,m_h22,m_h12,m_h12i,
-                                          m_i11,m_i22,m_i12,
-	                                          order_GA,MP,ko,EIGEN,0,0,0,rdw);
+        if (k_evec_cache != NULL && k_cache_bytes <= k_cache_limit - k_cache_used)
+          k_evec_cache[kloop] = (dcomplex*)malloc(k_cache_bytes);
+        {
+          int save_evec = k_evec_cache != NULL && k_evec_cache[kloop] != NULL;
+          BandNonCol_RootDenseSolveOneK_HIP(1,n,n2,MaxN,kloop,k1,k2,k3,
+                                            m_olp,m_h11,m_h22,m_h12,m_h12i,
+                                            m_i11,m_i22,m_i12,
+                                            order_GA,MP,ko,EIGEN,save_evec,save_evec,0,rdw);
+          if (save_evec) {
+            for (int basis=0; basis<n2; ++basis)
+              memcpy(k_evec_cache[kloop] + (size_t)basis*MaxN,
+                     rdw->cs2 + (size_t)basis*n2, sizeof(dcomplex)*(size_t)MaxN);
+            k_cache_used += k_cache_bytes;
+          }
+        }
 	      }
 
 	      if (owns_dense_k_group){
@@ -5364,7 +5440,7 @@ double Band_DFT_NonCol(
 		        int owns_dense_k_group = 0;
 
 		        for (int gpu_turn=group_first; gpu_turn<group_last; gpu_turn++){
-		          if (dense_k_owner[gpu_turn]==myid0){
+		          if (dense_k_owner[dense_k_order[gpu_turn]]==myid0){
 		            owns_dense_k_group = 1;
 		            break;
 		          }
@@ -5415,7 +5491,7 @@ double Band_DFT_NonCol(
 
 		        for (int gpu_turn=group_first; gpu_turn<group_last; gpu_turn++){
 
-		          kloop = gpu_turn;
+		          kloop = dense_k_order[gpu_turn];
 		          if (dense_k_owner[kloop]!=myid0) continue;
 
 		          k1 = T_KGrids1[kloop];
@@ -5423,10 +5499,22 @@ double Band_DFT_NonCol(
 	          k3 = T_KGrids3[kloop];
 
 	          rdw = BandNonCol_RootDenseWorkspace_Ensure(1,n,n2,MaxN,1,SCF_iter);
-	          BandNonCol_RootDenseSolveOneK_HIP(1,n,n2,MaxN,kloop,k1,k2,k3,
-	                                            m_olp,m_h11,m_h22,m_h12,m_h12i,
-	                                            m_i11,m_i22,m_i12,
-	                                            order_GA,MP,ko,EIGEN,1,1,0,rdw);
+              if (k_evec_cache != NULL && k_evec_cache[kloop] != NULL) {
+                for (int basis=0; basis<n2; ++basis)
+                  memcpy(rdw->cs2 + (size_t)basis*n2,
+                         k_evec_cache[kloop] + (size_t)basis*MaxN,
+                         sizeof(dcomplex)*(size_t)MaxN);
+                rdw->cs2_valid = 1;
+                free(k_evec_cache[kloop]);
+                k_evec_cache[kloop] = NULL;
+                ++k_cache_hits;
+              }
+              else {
+                BandNonCol_RootDenseSolveOneK_HIP(1,n,n2,MaxN,kloop,k1,k2,k3,
+                                                  m_olp,m_h11,m_h22,m_h12,m_h12i,
+                                                  m_i11,m_i22,m_i12,
+                                                  order_GA,MP,ko,EIGEN,1,1,0,rdw);
+              }
 	          BandNonCol_AccumulateDMRootDenseK_HIP(size_H1,MP,n,n2,MaxN,k1,k2,k3,
 	                                                EIGEN[0][kloop],rdw->cs2,NULL,0,
 		                                                rDM11,rDM22,rDM12,iDM12,iDM11,iDM22,
@@ -6098,6 +6186,15 @@ double Band_DFT_NonCol(
   free(index_Rcv_j);
   free(EVec_Rcv);
   free(dense_k_owner);
+  free(dense_k_order);
+  if (k_evec_cache != NULL) {
+    for (int point=0; point<T_knum; ++point) free(k_evec_cache[point]);
+    free(k_evec_cache);
+    if (BandNonCol_GpuVerbose())
+      printf("<Band> rank %d SCF %d: reused %d k-point eigensolves, host cache %.1f MiB (limit %.1f MiB).\n",
+             myid0, SCF_iter, k_cache_hits, k_cache_used/(1024.0*1024.0),
+             k_cache_limit/(1024.0*1024.0));
+  }
 
   /* for PrintMemory and allocation */
   firsttime=0;

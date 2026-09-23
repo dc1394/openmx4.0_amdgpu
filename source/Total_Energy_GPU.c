@@ -8,7 +8,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <math.h>
+#include <string.h>
 #include "openmx_common.h"
+#include "hip_runtime_compat.h"
 
 
 void TotalEnergy_EXC_EH1_Grid_OpenMP(int spinmax, double *My_Ena, double *My_Eef,
@@ -43,7 +45,7 @@ void TotalEnergy_EXC_EH1_Grid_OpenMP(int spinmax, double *My_Ena, double *My_Eef
                         RefVxc_Grid_B[0:grid_count], VNA_Grid_B[0:vna_grid_count], \
                         VEF_Grid_B[0:vef_grid_count])
   {
-#pragma omp target teams distribute parallel for map(tofrom:local_Ena,local_Eef,local_EH1,local_EXC0,local_EXC1)
+#pragma omp target teams distribute parallel for num_teams(128) thread_limit(256) reduction(+:local_Ena,local_Eef,local_EH1,local_EXC0,local_EXC1) map(tofrom:local_Ena,local_Eef,local_EH1,local_EXC0,local_EXC1)
     for (BN=0; BN<grid_count; BN++){
       double sden0,sden1,tden,aden,pden0,pden1,refvxc;
 
@@ -56,30 +58,23 @@ void TotalEnergy_EXC_EH1_Grid_OpenMP(int spinmax, double *My_Ena, double *My_Eef
       refvxc = RefVxc_Grid_B[BN];
 
       if (ProExpn_VNA==0){
-#pragma omp atomic update
         local_Ena += tden*VNA_Grid_B[BN];
       }
       if (E_Field_switch==1){
-#pragma omp atomic update
         local_Eef += tden*VEF_Grid_B[BN];
       }
 
-#pragma omp atomic update
       local_EH1 += (tden - 2.0*aden)*dVHart_Grid_B[BN];
 
       if (Exc0_correction_flag==1){
-#pragma omp atomic update
         local_EXC0 += (sden0+pden0)*Vxc_Grid_B0[BN] - (aden+pden0)*refvxc;
         if (0<spinmax){
-#pragma omp atomic update
           local_EXC1 += (sden1+pden1)*Vxc_Grid_B1[BN] - (aden+pden1)*refvxc;
         }
       }
       else{
-#pragma omp atomic update
         local_EXC0 += (sden0+pden0)*Vxc_Grid_B0[BN];
         if (0<spinmax){
-#pragma omp atomic update
           local_EXC1 += (sden1+pden1)*Vxc_Grid_B1[BN];
         }
       }
@@ -130,7 +125,7 @@ void TotalEnergy_Dipole_Grid_OpenMP(int GNs, double *My_E_dpx, double *My_E_dpy,
 
 #pragma omp target data map(to:Density_Grid_B0[0:grid_count], Density_Grid_B1[0:grid_count])
   {
-#pragma omp target teams distribute parallel for map(tofrom:local_E_dpx,local_E_dpy,local_E_dpz,local_E_dpx_BG,local_E_dpy_BG,local_E_dpz_BG)
+#pragma omp target teams distribute parallel for num_teams(128) thread_limit(256) reduction(+:local_E_dpx,local_E_dpy,local_E_dpz,local_E_dpx_BG,local_E_dpy_BG,local_E_dpz_BG) map(tofrom:local_E_dpx,local_E_dpy,local_E_dpz,local_E_dpx_BG,local_E_dpy_BG,local_E_dpz_BG)
     for (BN=0; BN<grid_count; BN++){
       int GN,n1,n2,n3;
       double x,y,z,den;
@@ -145,17 +140,11 @@ void TotalEnergy_Dipole_Grid_OpenMP(int GNs, double *My_E_dpx, double *My_E_dpy,
       z = (double)n1*gtv13 + (double)n2*gtv23 + (double)n3*gtv33 + grid_origin3;
       den = Density_Grid_B0[BN] + Density_Grid_B1[BN];
 
-#pragma omp atomic update
       local_E_dpx += den*x;
-#pragma omp atomic update
       local_E_dpy += den*y;
-#pragma omp atomic update
       local_E_dpz += den*z;
-#pragma omp atomic update
       local_E_dpx_BG += x;
-#pragma omp atomic update
       local_E_dpy_BG += y;
-#pragma omp atomic update
       local_E_dpz_BG += z;
     }
   }
@@ -191,7 +180,7 @@ void TotalEnergy_CWF_Dc_Grid_OpenMP(int spinmax, double My_dcEH1[2], double My_d
                         ADensity_Grid_B[0:grid_count], dVHart_Grid_B[0:grid_count], \
                         Vxc_Grid_B0[0:grid_count], Vxc_Grid_B1[0:grid_count])
   {
-#pragma omp target teams distribute parallel for map(tofrom:local_dcEH10,local_dcEH11,local_dcEXC0,local_dcEXC1)
+#pragma omp target teams distribute parallel for num_teams(128) thread_limit(256) reduction(+:local_dcEH10,local_dcEH11,local_dcEXC0,local_dcEXC1) map(tofrom:local_dcEH10,local_dcEH11,local_dcEXC0,local_dcEXC1)
     for (BN=0; BN<grid_count; BN++){
       double sden0,sden1,aden,dvhart;
 
@@ -200,15 +189,11 @@ void TotalEnergy_CWF_Dc_Grid_OpenMP(int spinmax, double My_dcEH1[2], double My_d
       aden = ADensity_Grid_B[BN];
       dvhart = dVHart_Grid_B[BN];
 
-#pragma omp atomic update
       local_dcEH10 += (sden0 + aden)*dvhart;
-#pragma omp atomic update
       local_dcEXC0 += sden0*Vxc_Grid_B0[BN];
 
       if (0<spinmax){
-#pragma omp atomic update
         local_dcEH11 += (sden1 + aden)*dvhart;
-#pragma omp atomic update
         local_dcEXC1 += sden1*Vxc_Grid_B1[BN];
       }
     }
@@ -373,7 +358,7 @@ static double TotalEnergy_EH0_Dr_VH_AtomF_flat(int spe, int N, double x, double 
 }
 
 
-void TotalEnergy_EH0_TwoCenter_Batch_OpenMP(int pair_count, int *pair_ban, int *pair_wan2,
+static void TotalEnergy_EH0_TwoCenter_Batch_Run(int pair_count, int *pair_ban, int *pair_wan2,
                                              int *pair_has_deriv, double *pair_dis,
                                              double *pair_dirx, double *pair_diry, double *pair_dirz,
                                              double *out0, double *out1, double *out2, double *out3)
@@ -462,7 +447,7 @@ void TotalEnergy_EH0_TwoCenter_Batch_OpenMP(int pair_count, int *pair_ban, int *
                         gridz_flat[0:grid_count], arho_flat[0:grid_count], wt_flat[0:grid_count], \
                         vps_xv_flat[0:vps_count], vps_rv_flat[0:vps_count], vh_atom_flat[0:vh_count]) map(from:out0[0:pair_count], out1[0:pair_count], out2[0:pair_count], out3[0:pair_count])
   {
-#pragma omp target teams distribute parallel for
+#pragma omp target teams distribute thread_limit(128)
     for (pair=0; pair<pair_count; pair++){
       int n1,ban,wan2,tgn,has_deriv;
       double dis,dirx,diry,dirz,dv,sum,sumr;
@@ -479,11 +464,10 @@ void TotalEnergy_EH0_TwoCenter_Batch_OpenMP(int pair_count, int *pair_ban, int *
       sum = 0.0;
       sumr = 0.0;
 
-      /* The pair loop already runs inside a target parallel region.  A nested
-         parallel region here is not supported consistently by AMD's device
-         runtime and can corrupt the EH0 force reduction.  Keep one pair per
-         GPU lane and use a lane-local SIMD reduction over its radial grid. */
-#pragma omp simd reduction(+:sum,sumr)
+      /* One team owns a pair; its lanes share the long radial integration.
+         The outer construct has no parallel region, so this is a single
+         level of parallelism, including for the derivative reduction. */
+#pragma omp parallel for reduction(+:sum,sumr)
       for (n1=0; n1<tgn; n1++){
         int idx;
         double x,y,z,z2,r2,r,xx,rho0,wt,va0,dr_va0;
@@ -545,6 +529,57 @@ void TotalEnergy_EH0_TwoCenter_Batch_OpenMP(int pair_count, int *pair_ban, int *
 }
 
 
+
+/* A large pair batch already fills a GPU. Limit concurrent long kernels
+   and target-data copies from separate MPI processes sharing that device.
+   Small batches and separate physical GPUs retain concurrent dispatch. */
+void TotalEnergy_EH0_TwoCenter_Batch_OpenMP(int pair_count, int *pair_ban, int *pair_wan2,
+                                             int *pair_has_deriv, double *pair_dis,
+                                             double *pair_dirx, double *pair_diry, double *pair_dirz,
+                                             double *out0, double *out1, double *out2, double *out3)
+{
+  MPI_Comm node,group;
+  int node_rank,node_size,rank,size,device,color,max_pairs,concurrency;
+  char bus[32] = {0}, *buses;
+  const char *env = getenv("OPENMX_EH0_GPU_CONCURRENCY");
+
+  if (env != NULL && atoi(env)==0) {
+    TotalEnergy_EH0_TwoCenter_Batch_Run(pair_count,pair_ban,pair_wan2,pair_has_deriv,
+                                     pair_dis,pair_dirx,pair_diry,pair_dirz,out0,out1,out2,out3);
+    return;
+  }
+  MPI_Comm_split_type(mpi_comm_level1,MPI_COMM_TYPE_SHARED,0,MPI_INFO_NULL,&node);
+  MPI_Comm_rank(node,&node_rank);
+  MPI_Comm_size(node,&node_size);
+  buses = (char*)calloc((size_t)node_size,sizeof(bus));
+  if (buses==NULL) MPI_Abort(mpi_comm_level1,1);
+  if (hipGetDevice(&device)==hipSuccess)
+    (void)hipDeviceGetPCIBusId(bus,sizeof(bus),device);
+  MPI_Allgather(bus,sizeof(bus),MPI_CHAR,buses,sizeof(bus),MPI_CHAR,node);
+  color = 0;
+  while (color<node_rank && strcmp(bus,buses+(size_t)color*sizeof(bus))!=0) ++color;
+  MPI_Comm_split(node,color,node_rank,&group);
+  free(buses);
+  MPI_Comm_free(&node);
+  MPI_Comm_rank(group,&rank);
+  MPI_Comm_size(group,&size);
+  MPI_Allreduce(&pair_count,&max_pairs,1,MPI_INT,MPI_MAX,group);
+  concurrency = max_pairs>=8192 ? 1 : size;
+  if (env != NULL && atoi(env)>0) concurrency = atoi(env);
+  if (concurrency>size) concurrency = size;
+  if (rank==0 && concurrency<size && getenv("OPENMX_GPU_VERBOSE")!=NULL) {
+    printf("EH0 GPU %s: %d ranks, %d active per turn, maximum %d pairs per rank.\n",
+           bus,size,concurrency,max_pairs);
+    fflush(stdout);
+  }
+  for (int first=0; first<size; first+=concurrency) {
+    if (first<=rank && rank<first+concurrency)
+      TotalEnergy_EH0_TwoCenter_Batch_Run(pair_count,pair_ban,pair_wan2,pair_has_deriv,
+                                       pair_dis,pair_dirx,pair_diry,pair_dirz,out0,out1,out2,out3);
+    if (concurrency<size) MPI_Barrier(group);
+  }
+  MPI_Comm_free(&group);
+}
 
 static double TotalEnergy_Exc0_XC_CA(double den, int P_switch)
 {
@@ -881,7 +916,7 @@ void TotalEnergy_Exc0_Batch_OpenMP(int Num_Leb, double **Leb_Grid_XYZW, double *
 
     /* pass 1: energy and per-point force prefactors */
 
-#pragma omp target teams distribute parallel for thread_limit(128) map(tofrom:energy_sum)
+#pragma omp target teams distribute parallel for thread_limit(128) reduction(+:energy_sum) map(tofrom:energy_sum)
     for (size_t pt=0; pt<npt_total; pt++){
       int mc,ir,ia,rem,k,koff,fnan;
       double r,x0,y0,z0,den,den0,exc0,dexc0,wpt,dr_atom;
@@ -932,7 +967,6 @@ void TotalEnergy_Exc0_Batch_OpenMP(int Num_Leb, double **Leb_Grid_XYZW, double *
       wpt = leb_w[ia]*r*r*CoarseGL_Weight[ir];
 
       pref[pt] = wpt*den0*dexc0;
-#pragma omp atomic update
       energy_sum += 2.0*PI*dr_atom*wpt*den0*exc0;
     }
   }
@@ -980,7 +1014,7 @@ void TotalEnergy_Exc0_Batch_OpenMP(int Num_Leb, double **Leb_Grid_XYZW, double *
             CoarseGL_Abscissae[0:nr], CoarseGL_Weight[0:nr], pref[0:npt_total]) \
         map(from:item_fx[0:nitems_alloc], item_fy[0:nitems_alloc], item_fz[0:nitems_alloc])
       {
-#pragma omp target teams distribute parallel for thread_limit(128)
+#pragma omp target teams distribute thread_limit(128)
         for (int pp=0; pp<nitems; pp++){
           const int mc = item_mc[pp];
           const int k = item_k[pp];
@@ -998,6 +1032,7 @@ void TotalEnergy_Exc0_Batch_OpenMP(int Num_Leb, double **Leb_Grid_XYZW, double *
           const size_t pt0 = (size_t)(mc-1)*(size_t)npt_atom;
           double sx = 0.0, sy = 0.0, sz = 0.0;
 
+#pragma omp parallel for reduction(+:sx,sy,sz)
           for (int pt2=0; pt2<npt_atom; pt2++){
             int ir,ia;
             double r,x0,y0,z0,dx,dy,dz,r2;

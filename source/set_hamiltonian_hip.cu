@@ -1,10 +1,77 @@
 #include <hip/hip_runtime.h>
 
 #include <cstddef>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
 
 namespace {
 
 constexpr int kThreads = 256;
+
+/* Each team forms a 16x16 orbital tile.  Cache 32 grid points in LDS and
+   apply the potential to the left orbital once, rather than once per
+   matrix element.  FP64 accumulation still follows the original grid order.
+   In particular, the float orbitals are converted before multiplication. */
+__global__ __launch_bounds__(kThreads) void matrix_elements_tiled_kernel(
+    int pair_count, std::size_t total_nolg,
+    const int *__restrict__ pair_NO0, const int *__restrict__ pair_NO1,
+    const int *__restrict__ pair_NOLG,
+    const std::size_t *__restrict__ pair_h_offset,
+    const std::size_t *__restrict__ pair_nolg_offset,
+    const std::size_t *__restrict__ pair_orbs0_offset,
+    const std::size_t *__restrict__ pair_orbs1_offset,
+    const double *__restrict__ vpotbuf, const float *__restrict__ orbs0buf,
+    const float *__restrict__ orbs1buf, double *__restrict__ hbuf)
+{
+    const int pair = blockIdx.x;
+    const int spin = blockIdx.y;
+    if (pair >= pair_count) return;
+    const int no0 = pair_NO0[pair], no1 = pair_NO1[pair];
+    const int nolg = pair_NOLG[pair];
+    const std::size_t hbase = pair_h_offset[pair] +
+                            static_cast<std::size_t>(spin) * no0 * no1;
+    const double *v = vpotbuf + static_cast<std::size_t>(spin) * total_nolg + pair_nolg_offset[pair];
+    const float *a = orbs0buf + pair_orbs0_offset[pair];
+    const float *b = orbs1buf + pair_orbs1_offset[pair];
+    const int lane = threadIdx.x;
+    const int row = lane / 16, col = lane % 16;
+    __shared__ double left[32][16];
+    __shared__ float right[32][16];
+
+    for (int i0 = 0; i0 < no0; i0 += 16) {
+        for (int j0 = 0; j0 < no1; j0 += 16) {
+            const bool active = i0 + row < no0 && j0 + col < no1;
+            const std::size_t hidx = hbase + static_cast<std::size_t>(i0 + row) * no1 + j0 + col;
+            double sum = active ? hbuf[hidx] : 0.0;
+            for (int g0 = 0; g0 < nolg; g0 += 32) {
+                const int count = nolg - g0 < 32 ? nolg - g0 : 32;
+                for (int t = lane; t < 32 * 16; t += kThreads) {
+                    const int g = t / 16, o = t % 16;
+                    left[g][o] = (g < count && i0 + o < no0)
+                        ? v[g0 + g] * static_cast<double>(a[static_cast<std::size_t>(g0 + g) * no0 + i0 + o]) : 0.0;
+                    right[g][o] = (g < count && j0 + o < no1)
+                        ? b[static_cast<std::size_t>(g0 + g) * no1 + j0 + o] : 0.0f;
+                }
+                __syncthreads();
+                if (active) {
+                    for (int g = 0; g < count; ++g)
+                        sum += left[g][row] * static_cast<double>(right[g][col]);
+                }
+                __syncthreads();
+            }
+            if (active) hbuf[hidx] = sum;
+        }
+    }
+}
+
+bool use_tiled_kernel()
+{
+    /* Keep the original kernel available for reproducible GPU A/B runs. */
+    const char *value = std::getenv("OPENMX_SETHAM_HIP_KERNEL");
+    return value == nullptr || std::strcmp(value, "scalar") != 0;
+}
 
 __global__ void matrix_elements_kernel(
     int pair_count, int spin_count, std::size_t total_nolg,
@@ -60,10 +127,28 @@ int launch_matrix_elements(int pair_count, int spin_count, int max_output_count,
     const dim3 block(kThreads);
     const dim3 grid(static_cast<unsigned>(pair_count),
                     static_cast<unsigned>((max_output_count + kThreads - 1) / kThreads));
-    hipLaunchKernelGGL(matrix_elements_kernel, grid, block, 0, 0,
-                       pair_count, spin_count, total_nolg, d_no0, d_no1, d_nolg,
-                       d_hoff, d_noff, d_o0off, d_o1off, d_vpot, d_o0, d_o1, d_h);
+    const bool tiled = use_tiled_kernel();
+    const char *trace = std::getenv("OPENMX_SETHAM_TIMING");
+    const bool profile = trace != nullptr && std::atoi(trace) != 0;
+    std::chrono::steady_clock::time_point start;
+    if (profile) start = std::chrono::steady_clock::now();
+    if (tiled) {
+        hipLaunchKernelGGL(matrix_elements_tiled_kernel,
+                           dim3(static_cast<unsigned>(pair_count), static_cast<unsigned>(spin_count)),
+                           block, 0, 0, pair_count, total_nolg, d_no0, d_no1, d_nolg,
+                           d_hoff, d_noff, d_o0off, d_o1off, d_vpot, d_o0, d_o1, d_h);
+    } else {
+        hipLaunchKernelGGL(matrix_elements_kernel, grid, block, 0, 0,
+                           pair_count, spin_count, total_nolg, d_no0, d_no1, d_nolg,
+                           d_hoff, d_noff, d_o0off, d_o1off, d_vpot, d_o0, d_o1, d_h);
+    }
     if (hipGetLastError() != hipSuccess || hipDeviceSynchronize() != hipSuccess) return 2;
+    if (profile) {
+        const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+        std::fprintf(stdout, "SETHAM_HIP kernel=%s pairs=%d spins=%d time=%.6f s\n",
+                     tiled ? "tiled" : "scalar", pair_count, spin_count, seconds);
+        std::fflush(stdout);
+    }
     return 0;
 }
 

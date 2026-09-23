@@ -1967,6 +1967,7 @@ double Band_DFT_Col(int SCF_iter, int knum_i, int knum_j, int knum_k, int SpinP_
     int     transformed_s_ready;
     int     use_gpusolver_dense;
     int     use_setham_packed_cache = 0;
+    int *   gpu_k_order = NULL;
     int *   setham_order_GA = NULL;
     double *setham_S1 = NULL;
     double *setham_H1 = NULL;
@@ -2451,6 +2452,45 @@ double Band_DFT_Col(int SCF_iter, int knum_i, int knum_j, int knum_k, int SpinP_
 
     owns_dense_k_rank = (use_gpusolver_dense && Set_Hamiltonian_OpenMP_Rank_Is_Selected());
     owns_global_dense_rank = (all_knum == 1 && owns_dense_k_rank);
+    if (use_gpusolver_dense && all_knum != 1) {
+        const int turns = Num_Comm_World1 * T_knum;
+        const char *interleave = getenv("OPENMX_BAND_COL_INTERLEAVE_K");
+        gpu_k_order = (int*)malloc(sizeof(int)*(size_t)turns);
+        if (gpu_k_order == NULL)
+            BandCol_AbortWithMessage("Cannot allocate GPU k-point turn order.");
+        for (int point=0; point<turns; ++point) gpu_k_order[point] = point;
+        if (interleave == NULL || atoi(interleave) != 0) {
+            int *owners = (int*)malloc(sizeof(int)*(size_t)turns);
+            int *next = (int*)calloc((size_t)numprocs0, sizeof(int));
+            int turn = 0;
+            if (owners == NULL || next == NULL)
+                BandCol_AbortWithMessage("Cannot allocate GPU k-point owner cursors.");
+            for (int point=0; point<turns; ++point) owners[point] = INT_MAX;
+            if (owns_dense_k_rank) {
+                for (int channel=0; channel<Num_Comm_World1; ++channel) {
+                    if (numprocs0 != 1 && channel != myworld1) continue;
+                    for (int point=S_knum; point<S_knum+num_kloop0; ++point)
+                        owners[channel*T_knum+point] = myid0;
+                }
+            }
+            MPI_Allreduce(MPI_IN_PLACE, owners, turns, MPI_INT, MPI_MIN, mpi_comm_level1);
+            for (int point=0; point<turns; ++point) {
+                if (owners[point] == INT_MAX)
+                    BandCol_AbortWithMessage("Missing GPU k-point owner.");
+            }
+            /* Adjacent k points belong to the same rank. Interleave owners
+               to use the concurrency admitted by the GPU memory guard. */
+            while (turn < turns) {
+                for (int owner=0; owner<numprocs0; ++owner) {
+                    while (next[owner] < turns && owners[next[owner]] != owner) ++next[owner];
+                    if (next[owner] < turns) gpu_k_order[turn++] = next[owner]++;
+                }
+            }
+            free(next);
+            free(owners);
+        }
+    }
+
     use_setham_packed_cache =
         (use_gpusolver_dense && all_knum == 1 && Set_Hamiltonian_GpuSolver_Packed_CacheReady() &&
          Set_Hamiltonian_GpuSolver_Packed_OrderMode() == 0);
@@ -2788,11 +2828,11 @@ diagonalize1:
                 dcomplex *evec_device;
                 int construct_on_device;
 
-                if (!owns_dense_k_rank || gpu_turn / T_knum != spin) {
+                if (!owns_dense_k_rank || gpu_k_order[gpu_turn] / T_knum != spin) {
                     continue;
                 }
 
-                kloop = gpu_turn % T_knum;
+                kloop = gpu_k_order[gpu_turn] % T_knum;
                 if (kloop < S_knum || S_knum + num_kloop0 <= kloop) {
                     continue;
                 }
@@ -4173,11 +4213,11 @@ diagonalize1:
                     double k2;
                     double k3;
 
-                    if (!owns_dense_k_rank || gpu_turn / T_knum != spin) {
+                    if (!owns_dense_k_rank || gpu_k_order[gpu_turn] / T_knum != spin) {
                         continue;
                     }
 
-                    kloop = gpu_turn % T_knum;
+                    kloop = gpu_k_order[gpu_turn] % T_knum;
                     if (kloop < S_knum || S_knum + num_kloop0 <= kloop) {
                         continue;
                     }
@@ -4840,6 +4880,7 @@ diagonalize1:
     }
 
     free(SP_Atoms);
+    free(gpu_k_order);
     free(SP_NZeros);
     free(My_NZeros);
 
