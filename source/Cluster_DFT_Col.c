@@ -40,6 +40,8 @@ extern void ClusterCol_HIPDetailTimer_Get(double *dense_build_kernel, double *dm
 extern int ClusterCol_SymmetrizeLower_HIP(int n, double *a, hipStream_t stream);
 extern int openmx_magma_dsyevdx_gpu(int n, int maxn, double *d_A, double *w, int *mout);
 extern int openmx_magma_release_z_workspace(void);
+extern int openmx_hipsolver_release_workspace(void);
+extern void Set_Density_Grid_GPU_Release_Device_Caches(void);
 
 typedef struct {
     int valid;
@@ -68,6 +70,20 @@ static int ClusterCol_CachedGpuSolverDenseMaxN = 0;
 /* d_tmp retains the most recently backtransformed spin until the next
    solve. The other spin of a single-rank run still uses its host copy. */
 static int ClusterCol_DeviceEvecSpin = -1;
+/* Serial spin roots cannot retain both overlaps on the device. Keep a
+   bounded host copy instead, valid only within the current SCF sequence. */
+static double *ClusterCol_SerialOverlap = NULL;
+static int ClusterCol_SerialOverlapN = 0;
+/* The root GPU path does not populate the distributed Ss matrix. Track
+   its initialization separately so a later ELPA fallback can build it. */
+static int ClusterCol_DistributedOverlapN = 0;
+
+static void ClusterCol_SerialOverlapReset(void)
+{
+    free(ClusterCol_SerialOverlap);
+    ClusterCol_SerialOverlap = NULL;
+    ClusterCol_SerialOverlapN = 0;
+}
 
 typedef struct {
     int active;
@@ -104,7 +120,6 @@ typedef struct {
 
 static ClusterColGpuSolverCtx ClusterCol_gpusolver_ctx = {0};
 
-static void Patch2Full_Cluster(double ****RH, double *H, int *MP);
 static void Patch2Full_Cluster_Owner(double ****RH, double *H, int *MP, int owns_dense);
 static void Patch2Device_Cluster_Owner(double ****RH, int *MP, int owns_dense, int n, double *d_H);
 static void ClusterCol_BuildDenseIndex(const int *order_GA, int *MP, int n, int tnum, int *dense_index);
@@ -500,6 +515,8 @@ void Cluster_DFT_Col_Release_GPU_Solver(void)
    the other ranks the pointers are NULL. */
 void Cluster_DFT_Col_Release_GPU_Caches(void)
 {
+    ClusterCol_DistributedOverlapN = 0;
+    ClusterCol_SerialOverlapReset();
     ClusterCol_DMEntryCache_Reset();
     ClusterCol_RootDMWorkspace_Reset();
     ClusterCol_ReleaseGpuSolverCachedEVec(0);
@@ -512,7 +529,7 @@ void Cluster_DFT_Col_Release_GPU_Caches(void)
    sequential spins do not get charged twice. Already resident OpenMX
    buffers count toward the budget on later SCF iterations. Return 2 when
    one spin at a time fits, so a shared GPU need not fall back to ELPA. */
-static int ClusterCol_GpuDiagFits(int n, int myworld1, int myid1)
+static int ClusterCol_GpuDiagFitsOnce(int n, int myworld1, int myid1, int *retryable)
 {
     const char *env = getenv("OPENMX_CLUSTER_GPU_DIAG");
     const char *reserve_env = getenv("OPENMX_CLUSTER_GPU_DIAG_RESERVE_MB");
@@ -521,9 +538,11 @@ static int ClusterCol_GpuDiagFits(int n, int myworld1, int myid1)
     double reserve = 256.0 * mib;
     int local_fit = 1, fit = 1;
     int local_serial_fit = 1, serial_fit = 1;
+    int local_retryable = 1;
     MPI_Comm node_comm, roots_comm;
 
-    if (env != NULL && atoi(env) == 0) local_fit = local_serial_fit = 0;
+    if (env != NULL && atoi(env) == 0)
+        local_fit = local_serial_fit = local_retryable = 0;
     if (serial_env != NULL && atoi(serial_env) == 0) local_serial_fit = 0;
     if (reserve_env != NULL && atof(reserve_env) >= 0.0)
         reserve = atof(reserve_env) * mib;
@@ -547,7 +566,7 @@ static int ClusterCol_GpuDiagFits(int n, int myworld1, int myid1)
         if (hipGetDevice(&device) != hipSuccess ||
             hipDeviceGetPCIBusId(bus, sizeof(bus), device) != hipSuccess ||
             hipMemGetInfo(&free_bytes, &total_bytes) != hipSuccess)
-            local_fit = local_serial_fit = 0;
+            local_fit = local_serial_fit = local_retryable = 0;
         if (local_fit) {
             int capacity = n;
             const char *ozaki = getenv("OPENMX_MAGMA_OZAKI2");
@@ -610,6 +629,7 @@ static int ClusterCol_GpuDiagFits(int n, int myworld1, int myid1)
     MPI_Comm_free(&node_comm);
     MPI_Allreduce(&local_fit, &fit, 1, MPI_INT, MPI_MIN, mpi_comm_level1);
     MPI_Allreduce(&local_serial_fit, &serial_fit, 1, MPI_INT, MPI_MIN, mpi_comm_level1);
+    MPI_Allreduce(&local_retryable, retryable, 1, MPI_INT, MPI_MIN, mpi_comm_level1);
     if (!fit && serial_fit && SpinP_switch == 1) {
         if (myid1 == 0 && myworld1 == 0) {
             printf("<Cluster_DFT_Col> Serializing spin roots to fit the shared GPU.\n");
@@ -617,7 +637,30 @@ static int ClusterCol_GpuDiagFits(int n, int myworld1, int myid1)
         }
         return 2;
     }
-    if (!fit && myid1 == 0 && myworld1 == 0) {
+    return fit;
+}
+
+static int ClusterCol_GpuDiagFits(int n, int myworld1, int myid1)
+{
+    int retryable = 0;
+    int fit = ClusterCol_GpuDiagFitsOnce(n, myworld1, myid1, &retryable);
+
+    if (fit == 0 && retryable) {
+        /* Completed SCF stages may leave library scratch behind. Reclaim
+           only reproducible device buffers, preserving the transformed
+           overlap and the original admission budget on every rank. */
+        if (myid1 == 0 && myworld1 == 0 && ClusterCol_GpuVerbose()) {
+            printf("<Cluster_DFT_Col> Reclaiming GPU workspaces before retrying the dense memory budget.\n");
+            fflush(stdout);
+        }
+        Set_Density_Grid_GPU_Release_Device_Caches();
+        openmx_gemmul8ReleaseWorkspaces();
+        (void)openmx_magma_release_z_workspace();
+        (void)openmx_hipsolver_release_workspace();
+        MPI_Barrier(mpi_comm_level1);
+        fit = ClusterCol_GpuDiagFitsOnce(n, myworld1, myid1, &retryable);
+    }
+    if (fit == 0 && myid1 == 0 && myworld1 == 0) {
         printf("<Cluster_DFT_Col> GPU dense buffers do not fit; using ELPA fallback.\n");
         fflush(stdout);
     }
@@ -1268,11 +1311,42 @@ static void ClusterCol_GpuSolverRootDensePath(int SCF_iter, int SpinP_switch, do
     (void)EVec1;
 }
 
+static void ClusterCol_SerialOverlapSave(int n)
+{
+    const char *env = getenv("OPENMX_CLUSTER_GPU_OVERLAP_CACHE_MB");
+    double cap_mib = env == NULL ? 2048.0 : atof(env);
+    size_t bytes = ClusterCol_CheckedMulCount((size_t)n, (size_t)n,
+                                               "serial overlap elements");
+    unsigned long long available_kib = 0;
+    char line[256];
+    FILE *file;
+
+    bytes = ClusterCol_CheckedMulCount(bytes, sizeof(double), "serial overlap bytes");
+    if (!(cap_mib > 0.0) || (double)bytes > cap_mib * 1048576.0) return;
+    /* There are at most two spin roots. Limit each to 1/32 of currently
+       available node RAM rather than relying on malloc's overcommit. */
+    file = fopen("/proc/meminfo", "r");
+    if (file == NULL) return;
+    while (fgets(line, sizeof(line), file) != NULL) {
+        if (sscanf(line, "MemAvailable: %llu kB", &available_kib) == 1) break;
+    }
+    fclose(file);
+    if ((unsigned long long)bytes > available_kib / 32ULL * 1024ULL) return;
+
+    ClusterCol_SerialOverlapReset();
+    ClusterCol_SerialOverlap = (double*)malloc(bytes);
+    if (ClusterCol_SerialOverlap == NULL) return;
+    wait_hipfunc(hipMemcpyAsync(ClusterCol_SerialOverlap, ClusterCol_gpusolver_ctx.d_S,
+                               bytes, hipMemcpyDeviceToHost, ClusterCol_gpusolver_ctx.stream));
+    wait_hipfunc(hipStreamSynchronize(ClusterCol_gpusolver_ctx.stream));
+    ClusterCol_SerialOverlapN = n;
+}
+
 /* Memory-limited spin case: all ranks assemble the same spin in the same
    order, but only its root allocates dense device matrices. Preserve the
    compact host eigenvectors for DM construction and release device/library
-   workspaces before admitting the next root. Rebuild S on each turn because
-   keeping both roots' transformed overlaps would defeat the memory bound. */
+   workspaces before admitting the next root. A bounded host overlap cache
+   avoids repeating the unchanged S eigensolve on every SCF iteration. */
 static void ClusterCol_GpuSolverRootDenseSerialPath(
     int SCF_iter, double **ko, double *****nh, double ****CntOLP,
     int numprocs0, int myworld1, int myid1, int *MP, int n, int MaxN)
@@ -1292,11 +1366,30 @@ static void ClusterCol_GpuSolverRootDenseSerialPath(
 
     for (int spin = 0; spin <= SpinP_switch; ++spin) {
         int owns_dense = myid1 == 0 && (numprocs0 == 1 || myworld1 == spin);
+        int local_cached = !owns_dense ||
+            (ClusterCol_SerialOverlap != NULL && ClusterCol_SerialOverlapN == n);
+        int cached = 0;
+        MPI_Allreduce(&local_cached, &cached, 1, MPI_INT, MPI_MIN, mpi_comm_level1);
         if (owns_dense) ClusterCol_GpuSolver_EnsureMatrixCapacity(n);
         for (int hamiltonian = 0; hamiltonian <= 1; ++hamiltonian) {
             double *device_matrix = owns_dense
                 ? (hamiltonian ? ClusterCol_gpusolver_ctx.d_H : ClusterCol_gpusolver_ctx.d_S)
                 : NULL;
+            if (!hamiltonian && cached) {
+                if (owns_dense) {
+                    size_t bytes = (size_t)n * (size_t)n * sizeof(double);
+                    wait_hipfunc(hipMemcpyAsync(device_matrix, ClusterCol_SerialOverlap,
+                                               bytes, hipMemcpyHostToDevice,
+                                               ClusterCol_gpusolver_ctx.stream));
+                    wait_hipfunc(hipStreamSynchronize(ClusterCol_gpusolver_ctx.stream));
+                    ClusterCol_gpusolver_ctx.transformed_s_valid = 1;
+                    ClusterCol_gpusolver_ctx.transformed_s_dim = n;
+                    if (ClusterCol_GpuVerbose())
+                        printf("CLUSTER_OVERLAP_CACHE SCF=%d spin=%d n=%d reused %.1f MiB\n",
+                               SCF_iter, spin, n, bytes / 1048576.0);
+                }
+                continue;
+            }
             if (packed) {
                 if (owns_dense) {
                     int tnum = Set_Hamiltonian_GpuSolver_Packed_Size();
@@ -1319,6 +1412,7 @@ static void ClusterCol_GpuSolverRootDenseSerialPath(
             if (owns_dense) {
                 if (!hamiltonian) {
                     ClusterCol_GpuSolver_PrepareTransformedSDevice(1, n, ko[spin]);
+                    ClusterCol_SerialOverlapSave(n);
                 }
                 else {
                     size_t count = ClusterCol_CheckedMulCount((size_t)n, (size_t)MaxN,
@@ -1339,126 +1433,12 @@ static void ClusterCol_GpuSolverRootDenseSerialPath(
     }
 }
 
-static void ClusterCol_GpuSolverDensePath(
-    int SCF_iter,
-    int SpinP_switch,
-    double **ko,
-    double *****nh,
-    double ****CntOLP,
-    int numprocs0,
-    int myworld1,
-    int myid1,
-    int *MP,
-    int *is2,
-    int *ie2,
-    int n,
-    int MaxN,
-    double **EVec1)
-{
-    int spin, spin_start, spin_end;
-    int i, l, state, basis;
-    int local_states;
-    double alpha = 1.0;
-    double beta = 0.0;
-    double *S;
-    double *H;
-    double *tmp;
-    double *A;
-    double *C;
-    size_t dense_count;
-
-    (void)SCF_iter;
-
-    if (n <= 0 || MaxN <= 0 || MaxN > n) {
-        ClusterCol_AbortWithMessage("Invalid hipSOLVER dense dimensions in Cluster_DFT_Col.c.");
-    }
-
-    if (Set_Hamiltonian_OpenMP_Rank_Is_Selected()) {
-        set_hip_default_device_from_local_rank_noncollective();
-    }
-
-    dense_count = ClusterCol_CheckedMulCount((size_t)n, (size_t)n, "GPU solver dense matrix");
-    S   = (double *)ClusterCol_MallocArray(dense_count, sizeof(double), "GPU solver overlap matrix");
-    H   = (double *)ClusterCol_MallocArray(dense_count, sizeof(double), "GPU solver Hamiltonian matrix");
-    tmp = (double *)ClusterCol_MallocArray(dense_count, sizeof(double), "GPU solver temporary matrix");
-    A   = (double *)ClusterCol_MallocArray(dense_count, sizeof(double), "GPU solver transformed Hamiltonian");
-    C   = (double *)ClusterCol_MallocArray(dense_count, sizeof(double), "GPU solver transformed eigenvectors");
-
-    Patch2Full_Cluster(CntOLP, S, MP);
-    ClusterCol_GpuSolver_CheckInfo("hipsolverDnDsyevdx(overlap)", gpusolver_Syevdx(S, ko[0], n, n));
-
-    for (l = n; 1 <= l; l--) {
-        ko[0][l] = ko[0][l - 1];
-        if (ko[0][l] < 0.0) {
-            ko[0][l] = 1.0e-10;
-        }
-        ko[0][l] = 1.0 / sqrt(ko[0][l]);
-    }
-
-    for (l = 1; l <= n; l++) {
-        double scale = ko[0][l];
-        for (i = 0; i < n; i++) {
-            S[(size_t)(l - 1) * (size_t)n + (size_t)i] *= scale;
-        }
-    }
-
-    spin_start = 0;
-    spin_end = SpinP_switch;
-    if (SpinP_switch == 1 && numprocs0 != 1) {
-        spin_start = myworld1;
-        spin_end = myworld1;
-    }
-
-    local_states = ie2[myid1] - is2[myid1] + 1;
-    if (local_states < 0) local_states = 0;
-
-    /*
-       Patch2Full_Cluster uses mpi_comm_level1 collectives, so all ranks must
-       assemble the same spin channel in the same order.  In spin-split runs
-       only the ranks belonging to the corresponding spin world diagonalize it.
-    */
-    for (spin = 0; spin <= SpinP_switch; spin++) {
-        Patch2Full_Cluster(nh[spin], H, MP);
-
-        if (spin < spin_start || spin_end < spin) {
-            continue;
-        }
-
-        F77_NAME(dgemm, DGEMM)("N", "N", &n, &n, &n, &alpha, H, &n, S, &n, &beta, tmp, &n);
-        F77_NAME(dgemm, DGEMM)("T", "N", &n, &n, &n, &alpha, S, &n, tmp, &n, &beta, A, &n);
-
-        ClusterCol_GpuSolver_CheckInfo("hipsolverDnDsyevdx(Hamiltonian)", gpusolver_Syevdx(A, ko[spin], n, MaxN));
-
-        for (l = MaxN; 1 <= l; l--) {
-            ko[spin][l] = ko[spin][l - 1];
-        }
-
-        F77_NAME(dgemm, DGEMM)("T", "T", &n, &n, &n, &alpha, A, &n, S, &n, &beta, C, &n);
-
-        if (0 < local_states) {
-            for (basis = 1; basis <= n; basis++) {
-                for (state = is2[myid1]; state <= ie2[myid1]; state++) {
-                    EVec1[spin][(basis - 1) * local_states + state - is2[myid1]] =
-                        C[(size_t)(basis - 1) * (size_t)n + (size_t)(state - 1)];
-                }
-            }
-        }
-    }
-
-    free(C);
-    free(A);
-    free(tmp);
-    free(H);
-    free(S);
-}
-
 void solve_evp_real_( int *n1, int *n2, double *Cs, int *na_rows1, double *a, double *Ss, int *na_rows2, int *nblk, 
                       int *mpi_comm_rows_int, int *mpi_comm_cols_int);
 
 void elpa_solve_evp_real_2stage_double_impl_( int *n1, int *n2, double *Cs, int *na_rows1, double *a, double *Ss, int *na_rows2, 
                                               int *nblk, int *na_cols1, int *mpi_comm_rows_int, int *mpi_comm_cols_int, int *mpiworld);
 
-static void Patch2Full_Cluster(double ****RH, double *H, int *MP);
 
 static double Lapack_LU_Dinverse(int n, double *A);
 static double Calc_Oscillator_Strength( int n, int UMOmax, int Nocc[2], int *MP,
@@ -1670,6 +1650,7 @@ double Cluster_DFT_Col(
   double time1,time2,time3,time4,time5,time6,time7,time8;
   int use_gpusolver_direct_cluster_dm = 0;
   int gpu_diag_mode = 0;
+  int rebuild_distributed_overlap = (SCF_iter == 1);
   int gpusolver_direct_evec_scattered = 0;
 
   /* for OpenMP */
@@ -1792,6 +1773,10 @@ double Cluster_DFT_Col(
     }
   }
 
+  if (scf_eigen_lib_flag==GPUSOLVER && SCF_iter==1) {
+    ClusterCol_SerialOverlapReset();
+    if (!gpusolver2_flag) ClusterCol_DistributedOverlapN = 0;
+  }
   if (scf_eigen_lib_flag==GPUSOLVER && gpusolver2_flag==0 && Cluster_DFT_Col_GpuSwitchNum()<=n)
     gpu_diag_mode = ClusterCol_GpuDiagFits(n,myworld1,myid1);
   if (gpu_diag_mode){
@@ -1813,9 +1798,26 @@ double Cluster_DFT_Col(
          2. search negative eigenvalues
   ****************************************************/
 
+  /* A previous root GPU solve has not initialized distributed Ss. Agree
+     before entering the overlap collectives on the first ELPA fallback.
+     CPU-selected solvers retain their original SCF_iter == 1 behavior. */
+  if (scf_eigen_lib_flag==GPUSOLVER && !gpusolver2_flag) {
+    int local_ready = (ClusterCol_DistributedOverlapN == n);
+    int all_ready = 0;
+    MPI_Allreduce(&local_ready, &all_ready, 1, MPI_INT, MPI_MIN, mpi_comm_level1);
+    if (!all_ready) {
+      rebuild_distributed_overlap = 1;
+      if (SCF_iter > 1 && myid0 == Host_ID && ClusterCol_GpuVerbose()) {
+        printf("<Cluster_DFT_Col> Rebuilding distributed overlap for ELPA fallback at SCF=%d (n=%d).\n",
+               SCF_iter, n);
+        fflush(stdout);
+      }
+    }
+  }
+
   MPI_Barrier(mpi_comm_level1);
 
-  if (SCF_iter==1){
+  if (rebuild_distributed_overlap){
     Overlap_Cluster_Ss(CntOLP,Cs,MP,myworld1);
   }
 
@@ -1828,7 +1830,7 @@ double Cluster_DFT_Col(
     } 
   }
 
-  if (SCF_iter==1){
+  if (rebuild_distributed_overlap){
 
     if (measure_time) dtime(&stime);
 
@@ -1896,6 +1898,9 @@ double Cluster_DFT_Col(
 	Ss[j*na_rows+i] = Ss[j*na_rows+i]*ko[0][jg];
       }
     }
+
+    if (scf_eigen_lib_flag==GPUSOLVER && !gpusolver2_flag)
+      ClusterCol_DistributedOverlapN = n;
 
     if (measure_time){
       dtime(&etime);
@@ -2033,14 +2038,6 @@ double Cluster_DFT_Col(
     PrintMemory("Cluster_DFT_Col: EVec_Rcv",sizeof(double)*Max_Num_Rcv_EV,NULL);
   }
   firsttime=0;
-
-  if (scf_eigen_lib_flag==GPUSOLVER && gpusolver2_flag==0 && Cluster_DFT_Col_GpuSwitchNum()<=n &&
-      !(SpinP_switch==1 && numprocs0!=1)){
-    ClusterCol_GpuSolverDensePath(SCF_iter,SpinP_switch,ko,nh,CntOLP,
-                                 numprocs0,myworld1,myid1,MP,is2,ie2,
-                                 n,MaxN,EVec1);
-    goto diagonalize_finished;
-  }
 
   /* spin=myworld1 */
 
@@ -6054,174 +6051,7 @@ double Calc_HF_Vx_single(
 
 
 
-void Patch2Full_Cluster(double ****RH, double *H, int *MP)
-{
-  int i,j,k;
-  int MA_AN,GA_AN,LB_AN,GB_AN,AN;
-  int wanA,wanB,tnoA,tnoB,Anum,Bnum,NUM;
-  int num,tnum,num_orbitals;
-  int ID,myid,numprocs,tag=999;
-  int *My_NZeros;
-  int *is1,*ie1,*is2;
-  int *My_Matomnum,*order_GA;
-  double *H1,sum;
 
-  MPI_Status stat;
-  MPI_Request request;
-
-  /* MPI */
-
-  MPI_Comm_size(mpi_comm_level1,&numprocs);
-  MPI_Comm_rank(mpi_comm_level1,&myid);
-  MPI_Barrier(mpi_comm_level1);
-
-  /* allocation of arrays */
-
-  My_NZeros = (int*)malloc(sizeof(int)*numprocs);
-  My_Matomnum = (int*)malloc(sizeof(int)*numprocs);
-  is1 = (int*)malloc(sizeof(int)*numprocs);
-  ie1 = (int*)malloc(sizeof(int)*numprocs);
-  is2 = (int*)malloc(sizeof(int)*numprocs);
-  order_GA = (int*)malloc(sizeof(int)*(atomnum+2));
-
-  /* find my total number of non-zero elements in myid */
-
-  My_NZeros[myid] = 0;
-  for (MA_AN=1; MA_AN<=Matomnum; MA_AN++){
-    GA_AN = M2G[MA_AN];
-    wanA = WhatSpecies[GA_AN];
-    tnoA = Spe_Total_CNO[wanA];
-
-    num = 0;      
-    for (LB_AN=0; LB_AN<=FNAN[GA_AN]; LB_AN++){
-      GB_AN = natn[GA_AN][LB_AN];
-      wanB = WhatSpecies[GB_AN];
-      tnoB = Spe_Total_CNO[wanB];
-      num += tnoB;
-    }
-
-    My_NZeros[myid] += tnoA*num;
-  }
-
-  for (ID=0; ID<numprocs; ID++){
-    MPI_Bcast(&My_NZeros[ID],1,MPI_INT,ID,mpi_comm_level1);
-  }
-
-  tnum = 0;
-  for (ID=0; ID<numprocs; ID++){
-    tnum += My_NZeros[ID];
-  }  
-
-  is1[0] = 0;
-  ie1[0] = My_NZeros[0] - 1;
-
-  for (ID=1; ID<numprocs; ID++){
-    is1[ID] = ie1[ID-1] + 1;
-    ie1[ID] = is1[ID] + My_NZeros[ID] - 1;
-  }  
-
-  /* set is2 and order_GA */
-
-  My_Matomnum[myid] = Matomnum;
-  for (ID=0; ID<numprocs; ID++){
-    MPI_Bcast(&My_Matomnum[ID],1,MPI_INT,ID,mpi_comm_level1);
-  }
-
-  is2[0] = 1;
-  for (ID=1; ID<numprocs; ID++){
-    is2[ID] = is2[ID-1] + My_Matomnum[ID-1];
-  }
-  
-  for (MA_AN=1; MA_AN<=Matomnum; MA_AN++){
-    order_GA[is2[myid]+MA_AN-1] = M2G[MA_AN];
-  }
-
-  for (ID=0; ID<numprocs; ID++){
-    MPI_Bcast(&order_GA[is2[ID]],My_Matomnum[ID],MPI_INT,ID,mpi_comm_level1);
-  }
-
-  /* set MP */
-
-  Anum = 1;
-  for (i=1; i<=atomnum; i++){
-    MP[i] = Anum;
-    wanA = WhatSpecies[i];
-    Anum += Spe_Total_CNO[wanA];
-  }
-  NUM = Anum - 1;
-
-  /* set H1 */
-
-  H1 = (double*)malloc(sizeof(double)*(tnum+1));
-
-  k = is1[myid];
-  for (MA_AN=1; MA_AN<=Matomnum; MA_AN++){
-    GA_AN = M2G[MA_AN];
-    wanA = WhatSpecies[GA_AN];
-    tnoA = Spe_Total_CNO[wanA];
-    for (i=0; i<tnoA; i++){
-      for (LB_AN=0; LB_AN<=FNAN[GA_AN]; LB_AN++){
-        GB_AN = natn[GA_AN][LB_AN];
-        wanB = WhatSpecies[GB_AN];
-        tnoB = Spe_Total_CNO[wanB];
-        for (j=0; j<tnoB; j++){
-          H1[k] = RH[MA_AN][LB_AN][i][j]; 
-          k++;
-	}
-      }
-    }
-  }
-
-  /* MPI H1 */
-    
-  for (ID=0; ID<numprocs; ID++){
-    k = is1[ID];
-    MPI_Bcast(&H1[k], My_NZeros[ID], MPI_DOUBLE, ID, mpi_comm_level1);
-  }
-
-  /* H1 -> H */
-
-  for (i=0; i<NUM*NUM; i++){
-    H[i] = 0.0;
-  }
-
-  k = 0;
-  for (AN=1; AN<=atomnum; AN++){
-    GA_AN = order_GA[AN];
-    wanA = WhatSpecies[GA_AN];
-    tnoA = Spe_Total_CNO[wanA];
-    Anum = MP[GA_AN];
-
-    for (i=0; i<tnoA; i++){
-
-      for (LB_AN=0; LB_AN<=FNAN[GA_AN]; LB_AN++){
-        GB_AN = natn[GA_AN][LB_AN];
-        wanB = WhatSpecies[GB_AN];
-        tnoB = Spe_Total_CNO[wanB];
-        Bnum = MP[GB_AN];
-
-        for (j=0; j<tnoB; j++){
-            
-          //H[Anum+i][Bnum+j] += H1[k];
-
-          H[NUM*(Bnum+j-1)+Anum+i-1] += H1[k];
-
-          k++;
-	}
-      }
-    }
-  }
-
-  /* freeing of arrays */
-
-  free(My_NZeros);
-  free(My_Matomnum);
-  free(is1);
-  free(ie1);
-  free(is2);
-  free(order_GA);
-  free(H1);
-}
 
 static void Patch2Full_Cluster_Owner(double ****RH, double *H, int *MP, int owns_dense)
 {

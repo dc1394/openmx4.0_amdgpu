@@ -3127,6 +3127,32 @@ static void BandNonCol_RootDenseSolveOneK_HIP(int rebuild_overlap,
     }
 }
 
+/* The SCF driver already gathers these eight sparse matrices in the same
+   rank/atom/orbital order as PackDenseM1. Borrow them on dense k owners
+   instead of repeating the gathers for every GPU turn in both passes.
+   Agree collectively before skipping any of the fallback collectives. */
+static int BandNonCol_PackedKCacheReady(int owns_dense, int size_H1)
+{
+    const char *env = getenv("OPENMX_BAND_NONCOL_PACKED_CACHE");
+    int ready = (env == NULL || atoi(env) != 0) &&
+        Set_Hamiltonian_GpuSolver_Packed_CacheReady() &&
+        Set_Hamiltonian_GpuSolver_Packed_OrderMode() == 1 &&
+        Set_Hamiltonian_GpuSolver_Packed_Size() == size_H1;
+    int all_ready = 0;
+
+    if (ready && owns_dense) {
+        ready = Set_Hamiltonian_GpuSolver_Packed_OwnsCache() &&
+                Set_Hamiltonian_GpuSolver_Packed_OrderGA() != NULL &&
+                Set_Hamiltonian_GpuSolver_Packed_Overlap() != NULL;
+        for (int spin = 0; spin < 4; ++spin)
+            ready = ready && Set_Hamiltonian_GpuSolver_Packed_H(spin) != NULL;
+        for (int comp = 0; comp < 3; ++comp)
+            ready = ready && Set_Hamiltonian_GpuSolver_Packed_ImNL(comp) != NULL;
+    }
+    MPI_Allreduce(&ready, &all_ready, 1, MPI_INT, MPI_MIN, mpi_comm_level1);
+    return all_ready;
+}
+
 /* The multi-k GPU path normally diagonalizes each H(k) twice: first for
    occupations, then for density matrices. Keep compact backtransformed
    eigenvectors within this SCF call when host memory permits. The node-wide
@@ -3541,6 +3567,8 @@ double Band_DFT_NonCol(
   int parallel_mode;
   int use_root_dense_gpusolver;
   int use_k_dense_gpusolver;
+  int use_k_packed_cache = 0;
+  int *packed_k_order = order_GA;
   int use_device_eigenvector_dm;
   int use_backtransform_barrier;
   int root_dense_serial_gpusolver_worlds = 0;
@@ -4044,6 +4072,14 @@ double Band_DFT_NonCol(
 			    }
 			  }
   if (use_k_dense_gpusolver) {
+    use_k_packed_cache = BandNonCol_PackedKCacheReady(owns_dense_k_rank, size_H1);
+    if (use_k_packed_cache) {
+      Set_Hamiltonian_GpuSolver_SetMP(MP);
+      if (owns_dense_k_rank)
+        packed_k_order = Set_Hamiltonian_GpuSolver_Packed_OrderGA();
+      if (myid0 == Host_ID && BandNonCol_GpuVerbose())
+        printf("<Band> SCF %d: reusing shared packed H/S for all non-collinear k points.\n", SCF_iter);
+    }
     const char *interleave = getenv("OPENMX_BAND_NONCOL_INTERLEAVE_K");
     dense_k_order = (int*)malloc(sizeof(int)*(size_t)T_knum);
     if (dense_k_order == NULL)
@@ -4271,7 +4307,19 @@ double Band_DFT_NonCol(
 
 	      MPI_Barrier(mpi_comm_level1);
 
-	      if (owns_dense_k_group){
+	      if (use_k_packed_cache){
+	        if (owns_dense_k_group){
+	          m_olp = Set_Hamiltonian_GpuSolver_Packed_Overlap();
+	          m_h11 = Set_Hamiltonian_GpuSolver_Packed_H(0);
+	          m_h22 = Set_Hamiltonian_GpuSolver_Packed_H(1);
+	          m_h12 = Set_Hamiltonian_GpuSolver_Packed_H(2);
+	          m_h12i = Set_Hamiltonian_GpuSolver_Packed_H(3);
+	          m_i11 = Set_Hamiltonian_GpuSolver_Packed_ImNL(0);
+	          m_i22 = Set_Hamiltonian_GpuSolver_Packed_ImNL(1);
+	          m_i12 = Set_Hamiltonian_GpuSolver_Packed_ImNL(2);
+	        }
+	      }
+	      else if (owns_dense_k_group){
 	        m_olp = (double*)malloc(sizeof(double)*(size_t)size_H1);
 	        m_h11 = (double*)malloc(sizeof(double)*(size_t)size_H1);
 	        m_h22 = (double*)malloc(sizeof(double)*(size_t)size_H1);
@@ -4301,16 +4349,18 @@ double Band_DFT_NonCol(
 	        }
 	      }
 
-	      BandNonCol_PackDenseM1(CntOLP, owns_dense_k_group ? m_olp : pack_buffer,MP,order_GA);
-	      BandNonCol_PackDenseM1(nh[0],  owns_dense_k_group ? m_h11 : pack_buffer,MP,order_GA);
-	      BandNonCol_PackDenseM1(nh[1],  owns_dense_k_group ? m_h22 : pack_buffer,MP,order_GA);
-	      BandNonCol_PackDenseM1(nh[2],  owns_dense_k_group ? m_h12 : pack_buffer,MP,order_GA);
-	      BandNonCol_PackDenseM1(nh[3],  owns_dense_k_group ? m_h12i : pack_buffer,MP,order_GA);
-	      BandNonCol_PackDenseM1(ImNL[0],owns_dense_k_group ? m_i11 : pack_buffer,MP,order_GA);
-	      BandNonCol_PackDenseM1(ImNL[1],owns_dense_k_group ? m_i22 : pack_buffer,MP,order_GA);
-	      BandNonCol_PackDenseM1(ImNL[2],owns_dense_k_group ? m_i12 : pack_buffer,MP,order_GA);
-	      free(pack_buffer);
-	      pack_buffer = NULL;
+	      if (!use_k_packed_cache){
+	        BandNonCol_PackDenseM1(CntOLP, owns_dense_k_group ? m_olp : pack_buffer,MP,order_GA);
+	        BandNonCol_PackDenseM1(nh[0],  owns_dense_k_group ? m_h11 : pack_buffer,MP,order_GA);
+	        BandNonCol_PackDenseM1(nh[1],  owns_dense_k_group ? m_h22 : pack_buffer,MP,order_GA);
+	        BandNonCol_PackDenseM1(nh[2],  owns_dense_k_group ? m_h12 : pack_buffer,MP,order_GA);
+	        BandNonCol_PackDenseM1(nh[3],  owns_dense_k_group ? m_h12i : pack_buffer,MP,order_GA);
+	        BandNonCol_PackDenseM1(ImNL[0],owns_dense_k_group ? m_i11 : pack_buffer,MP,order_GA);
+	        BandNonCol_PackDenseM1(ImNL[1],owns_dense_k_group ? m_i22 : pack_buffer,MP,order_GA);
+	        BandNonCol_PackDenseM1(ImNL[2],owns_dense_k_group ? m_i12 : pack_buffer,MP,order_GA);
+	        free(pack_buffer);
+	        pack_buffer = NULL;
+	      }
 
 	      for (int gpu_turn=group_first; gpu_turn<group_last; gpu_turn++){
 
@@ -4329,7 +4379,7 @@ double Band_DFT_NonCol(
           BandNonCol_RootDenseSolveOneK_HIP(1,n,n2,MaxN,kloop,k1,k2,k3,
                                             m_olp,m_h11,m_h22,m_h12,m_h12i,
                                             m_i11,m_i22,m_i12,
-                                            order_GA,MP,ko,EIGEN,save_evec,save_evec,0,rdw);
+                                            packed_k_order,MP,ko,EIGEN,save_evec,save_evec,0,rdw);
           if (save_evec) {
             for (int basis=0; basis<n2; ++basis)
               memcpy(k_evec_cache[kloop] + (size_t)basis*MaxN,
@@ -4340,22 +4390,25 @@ double Band_DFT_NonCol(
 	      }
 
 	      if (owns_dense_k_group){
-	        free(m_olp);
-	        free(m_h11);
-	        free(m_h22);
-	        free(m_h12);
-	        free(m_h12i);
-	        free(m_i11);
-	        free(m_i22);
-	        free(m_i12);
-	        m_olp = NULL;
-	        m_h11 = NULL;
-	        m_h22 = NULL;
-	        m_h12 = NULL;
-	        m_h12i = NULL;
-	        m_i11 = NULL;
-	        m_i22 = NULL;
-	        m_i12 = NULL;
+	        if (!use_k_packed_cache){
+	          free(m_olp);
+	          free(m_h11);
+	          free(m_h22);
+	          free(m_h12);
+	          free(m_h12i);
+	          free(m_i11);
+	          free(m_i22);
+	          free(m_i12);
+	          m_olp = NULL;
+	          m_h11 = NULL;
+	          m_h22 = NULL;
+	          m_h12 = NULL;
+	          m_h12i = NULL;
+	          m_i11 = NULL;
+	          m_i22 = NULL;
+	          m_i12 = NULL;
+	        }
+
 	        BandNonCol_ConstructCache_Reset();
 	        BandNonCol_RootDenseWorkspace_Reset();
 	      }
@@ -5448,7 +5501,19 @@ double Band_DFT_NonCol(
 
 		        MPI_Barrier(mpi_comm_level1);
 
-		        if (owns_dense_k_group){
+		        if (use_k_packed_cache){
+		          if (owns_dense_k_group){
+		            m_olp = Set_Hamiltonian_GpuSolver_Packed_Overlap();
+		            m_h11 = Set_Hamiltonian_GpuSolver_Packed_H(0);
+		            m_h22 = Set_Hamiltonian_GpuSolver_Packed_H(1);
+		            m_h12 = Set_Hamiltonian_GpuSolver_Packed_H(2);
+		            m_h12i = Set_Hamiltonian_GpuSolver_Packed_H(3);
+		            m_i11 = Set_Hamiltonian_GpuSolver_Packed_ImNL(0);
+		            m_i22 = Set_Hamiltonian_GpuSolver_Packed_ImNL(1);
+		            m_i12 = Set_Hamiltonian_GpuSolver_Packed_ImNL(2);
+		          }
+		        }
+		        else if (owns_dense_k_group){
 		          m_olp = (double*)malloc(sizeof(double)*(size_t)size_H1);
 		          m_h11 = (double*)malloc(sizeof(double)*(size_t)size_H1);
 		          m_h22 = (double*)malloc(sizeof(double)*(size_t)size_H1);
@@ -5478,16 +5543,18 @@ double Band_DFT_NonCol(
 		          }
 		        }
 
-		        BandNonCol_PackDenseM1(CntOLP, owns_dense_k_group ? m_olp : pack_buffer,MP,order_GA);
-		        BandNonCol_PackDenseM1(nh[0],  owns_dense_k_group ? m_h11 : pack_buffer,MP,order_GA);
-		        BandNonCol_PackDenseM1(nh[1],  owns_dense_k_group ? m_h22 : pack_buffer,MP,order_GA);
-		        BandNonCol_PackDenseM1(nh[2],  owns_dense_k_group ? m_h12 : pack_buffer,MP,order_GA);
-		        BandNonCol_PackDenseM1(nh[3],  owns_dense_k_group ? m_h12i : pack_buffer,MP,order_GA);
-		        BandNonCol_PackDenseM1(ImNL[0],owns_dense_k_group ? m_i11 : pack_buffer,MP,order_GA);
-		        BandNonCol_PackDenseM1(ImNL[1],owns_dense_k_group ? m_i22 : pack_buffer,MP,order_GA);
-		        BandNonCol_PackDenseM1(ImNL[2],owns_dense_k_group ? m_i12 : pack_buffer,MP,order_GA);
-		        free(pack_buffer);
-		        pack_buffer = NULL;
+		        if (!use_k_packed_cache){
+		          BandNonCol_PackDenseM1(CntOLP, owns_dense_k_group ? m_olp : pack_buffer,MP,order_GA);
+		          BandNonCol_PackDenseM1(nh[0],  owns_dense_k_group ? m_h11 : pack_buffer,MP,order_GA);
+		          BandNonCol_PackDenseM1(nh[1],  owns_dense_k_group ? m_h22 : pack_buffer,MP,order_GA);
+		          BandNonCol_PackDenseM1(nh[2],  owns_dense_k_group ? m_h12 : pack_buffer,MP,order_GA);
+		          BandNonCol_PackDenseM1(nh[3],  owns_dense_k_group ? m_h12i : pack_buffer,MP,order_GA);
+		          BandNonCol_PackDenseM1(ImNL[0],owns_dense_k_group ? m_i11 : pack_buffer,MP,order_GA);
+		          BandNonCol_PackDenseM1(ImNL[1],owns_dense_k_group ? m_i22 : pack_buffer,MP,order_GA);
+		          BandNonCol_PackDenseM1(ImNL[2],owns_dense_k_group ? m_i12 : pack_buffer,MP,order_GA);
+		          free(pack_buffer);
+		          pack_buffer = NULL;
+		        }
 
 		        for (int gpu_turn=group_first; gpu_turn<group_last; gpu_turn++){
 
@@ -5513,7 +5580,7 @@ double Band_DFT_NonCol(
                 BandNonCol_RootDenseSolveOneK_HIP(1,n,n2,MaxN,kloop,k1,k2,k3,
                                                   m_olp,m_h11,m_h22,m_h12,m_h12i,
                                                   m_i11,m_i22,m_i12,
-                                                  order_GA,MP,ko,EIGEN,1,1,0,rdw);
+                                                  packed_k_order,MP,ko,EIGEN,1,1,0,rdw);
               }
 	          BandNonCol_AccumulateDMRootDenseK_HIP(size_H1,MP,n,n2,MaxN,k1,k2,k3,
 	                                                EIGEN[0][kloop],rdw->cs2,NULL,0,
@@ -5522,22 +5589,25 @@ double Band_DFT_NonCol(
 		        }
 
 		        if (owns_dense_k_group){
-		          free(m_olp);
-		          free(m_h11);
-		          free(m_h22);
-		          free(m_h12);
-		          free(m_h12i);
-		          free(m_i11);
-		          free(m_i22);
-		          free(m_i12);
-		          m_olp = NULL;
-		          m_h11 = NULL;
-		          m_h22 = NULL;
-		          m_h12 = NULL;
-		          m_h12i = NULL;
-		          m_i11 = NULL;
-		          m_i22 = NULL;
-		          m_i12 = NULL;
+		          if (!use_k_packed_cache){
+		            free(m_olp);
+		            free(m_h11);
+		            free(m_h22);
+		            free(m_h12);
+		            free(m_h12i);
+		            free(m_i11);
+		            free(m_i22);
+		            free(m_i12);
+		            m_olp = NULL;
+		            m_h11 = NULL;
+		            m_h22 = NULL;
+		            m_h12 = NULL;
+		            m_h12i = NULL;
+		            m_i11 = NULL;
+		            m_i22 = NULL;
+		            m_i12 = NULL;
+		          }
+
 		          BandNonCol_ConstructCache_Reset();
 		          BandNonCol_RootDenseWorkspace_Reset();
 		        }

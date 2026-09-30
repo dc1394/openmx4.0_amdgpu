@@ -1,0 +1,473 @@
+OpenMX 4.0 AMD GPU tuning: -runtest / -runtestL / -runtestL2
+Updated 2026-09-30 21:15:10 JST
+STATUS: PAUSED BY USER; active tests and all queued validation stopped; not installed.
+Selected candidate: openmx.v12
+Selected SHA256: c55a088baddd9fb988bc55fd00da40bca39cdf25694b91b824933837ab359f82
+work/openmx SHA256: 2a81ccda007effaa7dea418c279084b6dbdad8fbf2b0e1bd92524c283998a5a6
+
+Changes
+  Collinear multi-k GPU solves retain transformed S(k) within a geometry
+  and compact eigenvectors between the occupation and density-matrix
+  passes within an SCF iteration. Caps: overlap 512 MiB/rank, eigenvectors
+  1024 MiB/rank; each also limited to 1/64 of available node RAM / local
+  ranks. Cache misses retain the original recomputation path.
+  The collinear band crossover changes from 800 to 400 basis functions.
+  Matrices n <= 512 use eight concurrent GPU turns; larger matrices keep
+  two. Existing environment overrides remain available.
+  Before a memory-based collinear band fallback, reclaim reproducible
+  device scratch and retry the ORIGINAL admission budget. Explicit
+  OPENMX_BAND_GPU_DIAG=0 skips this eviction. Geometry boundaries reset
+  the construction and overlap caches.
+  Noncollinear multi-k GPU solves borrow the current SCF packed H/S and
+  imaginary nonlocal matrices, avoiding repeated gathers in both passes.
+  All ranks agree before skipping collectives. No extra matrix copies;
+  OPENMX_BAND_NONCOL_PACKED_CACHE=0 restores the legacy gathering path.
+  Serial collinear cluster spin roots retain a host copy of transformed
+  overlap while releasing dense device matrices between spins. Cap:
+  2048 MiB/root, further limited to 1/32 of available node RAM/root.
+  Small density tables persist on device: owner cap 64 MiB, local cap
+  32 MiB/rank, additionally limited by shared free VRAM. Static joins are
+  validated once per geometry. Failed allocations/copies clean up.
+  In GPU BAND mode only, release density and shared orbital tables after
+  Force3, their last force-stage consumer, to admit the VNA GPU batches.
+  Other solvers preserve their original force admission behavior.
+  CPU numerical paths, numerical kernels, precision and compiler flags
+  are unchanged. README.md documents the cache caps and opt-out settings.
+  Test tools now select S/L/L2/L3, isolate original inputs, and retain
+  suite metadata. L3 remains the default; comparisons reject mixed suites.
+
+Configuration and interpretation
+  RX 9060 XT (gfx1200), 16304 MiB VRAM; Threadripper 3970X, 32 cores,
+  approximately 251 GiB RAM. ROCm 7.2.0, Open MPI 5.0.9, AOCL 5.2,
+  AOCC runtime 5.1. Baseline commit 0114e3ed97bf75ca54e0f91604b24026e9f9f27c.
+  Baseline binary SHA256:
+    2a81ccda007effaa7dea418c279084b6dbdad8fbf2b0e1bd92524c283998a5a6
+  Eight MPI ranks bound to cores, -nt 1; OMP/BLIS/OPENBLAS_NUM_THREADS=1.
+  GPU_MAX_HW_QUEUES=1; LIBOMPTARGET_AMDGPU_NUM_HSA_QUEUES=1;
+  HSA_ENABLE_SDMA=0; OPENMX_SETHAM_TIMING=1; OPENMX_FORCE_PROFILE=1;
+  OPENMX_CLUSTER_PROFILE=1; OPENMX_GPU_VERBOSE=1.
+  OpenMX's existing MAGMA wrapper sets MAGMA_OZAKI2_ALGO=1stage when unset;
+  this is the effective algorithm default in these measurements.
+  CPU controls additionally set OPENMX_GPU=0. One GPU job at a time.
+  Original inputs, references and SCF/MD limits remain unchanged.
+  Main cases: separate MPI launches through the built-in runtest options;
+  watchdog 3600 s/case for S/L. L2 limits are listed below, equally for
+  BOTH binaries. L2 has long original SCF sequences (Pt500/Fe1000 references
+  contain 199/366 SCFs); measured C1000 costs informed their larger limits;
+  stop if host MemAvailable falls below 16 GiB.
+  Archived v11 L2 baseline/candidate runs were consecutive per input.
+  New v12 cap384 L2 runs reuse earlier baselines for numerical checks,
+  except Pt500/Fe1000, which were scheduled for fresh consecutive
+  baseline/candidate runs. Reused baselines do not establish an equal-load timing comparison.
+  Same-process integration additionally checks cache lifecycle across inputs.
+  Times below are OpenMX elapsed_seconds, not watchdog wall time.
+  A single timing does not establish a small performance difference.
+  An unrelated 32-thread CPU job ran on 2026-09-23 from approximately 14:16
+  until 14:37:55 JST. It affected v11 CG diagnostic timing and final-S; it ended before
+  final-L began. See cpu-load.jsonl and per-run host-load-context.json.
+  No changes were made to that process. Shared-host timings are qualified
+  by these load observations; no equal-load final-S speed claim is made.
+  L2 watchdog limits (seconds/case, baseline and candidate):
+    Ih-Ice1200=3600, C1000=10800, GRA1024=10800, Si1000=10800, R-TiO2-1050=10800, Pt500=21600, Fe1000=86400
+  These are upper limits, not measured runtimes. See long-l2-timeout-review.json.
+
+Accuracy criteria
+  Absolute energy error <= 1e-7 Ha; maximum absolute Cartesian force
+  component error <= 1e-7 Ha/bohr; complete finite outputs and matching
+  atom identities/integration grids. Reference coordinates may differ by
+  one printed unit (1e-5); baseline/candidate coordinates must match exactly.
+  The built-in signed force sum alone is not the acceptance criterion.
+  Numerical PASS requires completed status, return code zero and the strict
+  comparison. Interrupted, timed-out or memory-guarded runs are not passes.
+
+Archived v11 runtest
+  Candidate recorded 14/14; completed 14/14; reference PASS 14; A/B PASS 14.
+  Case                 Base(s)    v11(s)    B/v11   SCF B/A   Reference A/B
+  Benzene                   4.66       4.92   0.947x     19/19     PASS PASS
+  C60                      12.39      13.72   0.903x     27/27     PASS PASS
+  CO                        8.24       8.73   0.944x     16/16     PASS PASS
+  Cr2                       7.65       7.78   0.983x     21/21     PASS PASS
+  Crys-MnO                  9.29       9.92   0.936x     37/37     PASS PASS
+  GaAs                     15.64      16.51   0.947x     13/13     PASS PASS
+  Glycine                   5.18       5.72   0.906x     20/20     PASS PASS
+  Graphite4                 3.30       3.95   0.835x     14/14     PASS PASS
+  H2O-EF                    4.79       5.39   0.889x     17/17     PASS PASS
+  H2O                       3.94       4.75   0.829x     31/31     PASS PASS
+  HMn                      14.56      14.15   1.029x     26/26     PASS PASS
+  Methane                   3.42       4.29   0.797x     14/15     PASS PASS
+  Mol_MnO                   8.66       8.51   1.018x     26/26     PASS PASS
+  Ndia2                     3.29       3.76   0.875x     13/13     PASS PASS
+  Total: 105.01 -> 112.10 s; ratio 0.937x.
+  Maximum reference errors: E 4.09841e-11 Ha, F 1.58e-10 Ha/bohr.
+  Maximum baseline errors: E 2.10001e-11 Ha, F 1.67e-10 Ha/bohr.
+
+Archived v11 runtestL
+  Candidate recorded 16/16; completed 16/16; reference PASS 16; A/B PASS 16.
+  Case                 Base(s)    v11(s)    B/v11   SCF B/A   Reference A/B
+  GEL                     108.77      59.00   1.844x     58/58     PASS PASS
+  GFRAG                    55.19      54.52   1.012x     60/60     PASS PASS
+  Mn12_148_F              109.05     109.43   0.997x     61/61     PASS PASS
+  nsV4Bz5                 138.69     137.85   1.006x     57/57     PASS PASS
+  SialicAcid               22.79      22.72   1.003x     29/29     PASS PASS
+  Pt63                     74.55      73.95   1.008x     68/67     PASS PASS
+  Ni63-O64                 95.46      95.58   0.999x     62/62     PASS PASS
+  FeBCC                   273.65     276.96   0.988x     62/62     PASS PASS
+  5_5_13COb2              102.07     101.29   1.008x     67/66     PASS PASS
+  B2C62_Band             1531.66     762.09   2.010x   204/203     PASS PASS
+  ZrB2_2x2                330.00     330.88   0.997x     49/49     PASS PASS
+  DIA512-1                205.42     207.64   0.989x     29/29     PASS PASS
+  MCCN                    617.10     612.35   1.008x     67/67     PASS PASS
+  CG15c-DC-LNO            193.35     193.84   0.997x     42/42     PASS PASS
+  GGFF                   1501.14    1382.44   1.086x   101/101     PASS PASS
+  N1C999                 2111.76    2124.30   0.994x     59/59     PASS PASS
+  Total: 7470.65 -> 6544.84 s; ratio 1.141x.
+  Maximum reference errors: E 2.81398e-09 Ha, F 3.2207e-08 Ha/bohr.
+  Maximum baseline errors: E 2.91038e-10 Ha, F 3.2744e-08 Ha/bohr.
+  GEL Eigen median per SCF: 0.578296 -> 0.315356 s.
+  GEL DM median per SCF: 0.817661 -> 0.191722 s.
+  GEL Force4 total: 2.191938 -> 2.199207 s; memory fallbacks 0 -> 0.
+  B2C62_Band Eigen median per SCF: 2.688099 -> 1.574181 s.
+  B2C62_Band DM median per SCF: 3.147016 -> 0.492364 s.
+  B2C62_Band Force4 total: 103.256941 -> 92.930755 s; memory fallbacks 11 -> 0.
+  GGFF Eigen median per SCF: 8.009218 -> 7.470136 s.
+  GGFF DM median per SCF: 3.494462 -> 2.866523 s.
+  GGFF Force4 total: 2.935412 -> 2.787383 s; memory fallbacks 0 -> 0.
+  MCCN Force4 total: 2.641830 -> 2.650969 s; memory fallbacks 1 -> 1.
+  CG15c-DC-LNO Force4 total: 2.239440 -> 2.245336 s; memory fallbacks 1 -> 1.
+
+Archived v11 runtestL2
+  Candidate recorded 5/7; completed 4/7; reference PASS 4; A/B PASS 3.
+  Case                 Base(s)    v11(s)    B/v11   SCF B/A   Reference A/B
+  Ih-Ice1200             1284.43    1280.55   1.003x     35/35     PASS PASS
+  C1000                  1628.45    2029.18   0.803x     32/41     PASS FAIL
+  GRA1024                2416.93    2459.28   0.983x     48/49     PASS PASS
+  Si1000                 2420.35    2409.05   1.005x     39/39     PASS PASS
+  R-TiO2-1050             failed     failed        -       2/2        - -
+  Pt500                 11896.86    pending        -     173/-        - -
+  Maximum reference errors: E 5.05515e-08 Ha, F 6.58e-10 Ha/bohr.
+  Maximum baseline errors: E 3.19809e-07 Ha, F 1e-12 Ha/bohr.
+  Ih-Ice1200 cluster overlap median/root after SCF1: 0.000000 -> 0.000000 s.
+  Ih-Ice1200 cluster eig median/root after SCF1: 9.755790 -> 9.766538 s.
+  Ih-Ice1200 serial-spin SCFs: 0 -> 0; candidate overlap cache hits 0.
+  C1000 cluster overlap median/root after SCF1: 0.000000 -> 0.000000 s.
+  C1000 cluster eig median/root after SCF1: 24.127391 -> 24.086707 s.
+  C1000 serial-spin SCFs: 0 -> 0; candidate overlap cache hits 0.
+  GRA1024 cluster overlap median/root after SCF1: 0.000000 -> 0.000000 s.
+  GRA1024 cluster eig median/root after SCF1: 26.282661 -> 26.322058 s.
+  GRA1024 serial-spin SCFs: 0 -> 0; candidate overlap cache hits 0.
+  Si1000 cluster overlap median/root after SCF1: 0.000000 -> 0.000000 s.
+  Si1000 cluster eig median/root after SCF1: 24.180642 -> 24.181291 s.
+  Si1000 serial-spin SCFs: 0 -> 0; candidate overlap cache hits 0.
+
+C1000 reference discrepancy investigation
+  Baseline reference errors: E 3.20179e-07 Ha, F 3.96e-10 Ha/bohr; strict PASS False.
+  Baseline stopped after 32 SCFs; final printed NormRD was 9.5248e-8,
+  versus 41 SCFs and 5e-12 in the reference. This is a pre-existing
+  baseline discrepancy; its cause is not established by timing alone.
+  The stopping test uses stored NormRD[0], while the log displays its
+  square root. The baseline satisfied the original combined energy/
+  residual test; its printed residual must not be compared directly
+  with the SCF criterion. See C1000-convergence-review.json.
+  Default v11: completed, 41 SCFs, 2029.18 s.
+    reference: E 3.70164e-10 Ha, F 3.96e-10 Ha/bohr, strict PASS True.
+    baseline: E 3.19809e-07 Ha, F 1e-12 Ha/bohr, strict PASS False.
+  Baseline/candidate energy disagreement must be interpreted with
+  the baseline reference error and different stopping counts above.
+  New band/serial-spin caches are inactive for C1000; existing memory
+  guards select CPU density quadrature. C1000-active-path-review.json
+  records the source/log evidence; it is not a proof of reproducibility.
+  Original-input same-algorithm GPU repeat: completed; 2030.52 s; 41 SCFs.
+    reference: E 4.32919e-10 Ha, F 3.96e-10 Ha/bohr, strict PASS True.
+    baseline: E 3.19747e-07 Ha, F 1e-12 Ha/bohr, strict PASS False.
+  Full diagnostic data: v11-C1000-1stage-L2-audit.json.
+  The explicit 1stage setting equals the OpenMX wrapper default in
+  source/magma_openmx.cu:65. This is a reproducibility repeat, not an
+  algorithm comparison. The earlier inference from the raw MAGMA auto
+  default was incorrect; l2-library-review.json records the correction.
+  Repeat vs default v11: E 6.27551e-11 Ha, F 1e-12 Ha/bohr; strict PASS True.
+  Review complete: both v11 runs pass reference and agree with each
+  other, with 41 SCFs each. Retain the original solver settings.
+  The baseline discrepancy remains recorded; its cause is not proven.
+  Full-run C1000 times include different stopping counts and do not
+  demonstrate a kernel speed change. See c1000-review-decision.json.
+  No energy/force tolerances, inputs or convergence thresholds were relaxed.
+
+Bounded MAGMA algorithm profiling
+  magma-profile-C1000-1stage: timeout; 10 complete stage profiles; profiling only, not a numerical pass.
+  magma-profile-C1000-auto: timeout; 9 complete stage profiles; profiling only, not a numerical pass.
+  Common completed steady SCFs: 2, 3, 4, 5, 6, 7, 8, 9
+  One-stage/auto eigen medians: 24.071320 / 32.427876 s; ratio 0.742x.
+  Review: Accept the corrected-affinity auto configuration as a measured optional C1000 GPU runtime setting. Keep the global one-stage default and normal suite settings unchanged. Full C1000 reference/default comparisons pass; remaining L2 validation continues.
+  Same v11 binary and original C1000 input; two sequential 600-second
+  diagnostics: explicit MAGMA_OZAKI2_ALGO=1stage versus auto, both with
+  MAGMA_NUM_THREADS=8 and MPI ranks mapped to CPUs 8..15. This leaves
+  CPUs 0..7 for MAGMA bulge-chasing workers, whose affinity is sampled.
+  Raw auto selects two-stage for the steady partial-spectrum problem;
+  OpenMX normally defaults to one-stage. Diagnostic timeouts do not
+  validate final energies/forces. Main suite settings remain unchanged.
+  Evidence: magma-profile.done, magma-affinity-review.json and per-run
+  *-threads.jsonl (worker affinity, device memory and GPU activity).
+  Follow-up: initial auto workers were sampled only on CPUs 0/8.
+  A tiny CPU-only runtime reproducer shows an OpenMP region resetting
+  a native worker to the parent CPU mask. KMP_AFFINITY=disabled
+  preserves its explicit mask; OMP_PROC_BIND=false alone does not.
+  See affinity-probe.c and affinity-probe-results.json. This is a
+  runtime diagnostic and does not alter OpenMX production sources.
+  magma-affinity-C1000-auto: timeout; 12 complete stage profiles; profiling only, not a numerical pass.
+
+Optional C1000 runtime setting: full accuracy validation
+  Same v11 binary: default 2029.18 -> optional 1820.90 s; 10.26% shorter, 1.114x.
+  Original input; SCFs 41/41.
+  reference: E 4.43833e-10 Ha, F 3.96e-10 Ha/bohr; strict PASS True.
+  baseline: E 3.19736e-07 Ha, F 1e-12 Ha/bohr; strict PASS False.
+  Comparison return codes: {"reference": 0, "baseline": 1, "v11-default": 0}
+  Optional vs default v11: E 7.37e-11 Ha, F 1e-12 Ha/bohr; PASS.
+  See v11-C1000-auto-affinity-L2-v11-default.md for this comparison.
+  Steady eigensolver median 24.086707 -> 18.946157 s; 1.271x.
+  Settings: MAGMA_OZAKI2_ALGO=auto, MAGMA_NUM_THREADS=8,
+  KMP_AFFINITY=disabled; MPI --bind-to core and
+  --map-by pe-list=8,9,10,11,12,13,14,15:ordered; eight ranks, -nt 1.
+  All other settings match the normal suite. Native MAGMA workers
+  use CPUs 0..7; MPI ranks use CPUs 8..15. Reserve all 16 CPUs.
+  This uses more CPU resources than the normal eight-core allocation.
+  Actual thread sampling verified workers spread across CPUs 0..7
+  with KMP_AFFINITY=disabled; the initial uncorrected auto run was slower.
+  Full corrected-runtime validation covers C1000 only. This is an
+  optional GPU runtime recipe; the global one-stage default, production
+  sources and normal suite settings are unchanged. The original baseline
+  C1000 discrepancy remains; it is not a failure against normal v11.
+  Recipe: README.md. Decision: magma-profile-review-decision.json.
+
+R-TiO2-1050 GPU memory recovery follow-up
+  baseline: failed, return code 1; host MemAvailable minimum 133.69 GiB.
+  v11: failed, return code 1; host MemAvailable minimum 134.15 GiB.
+  Both abort at SCF2: admission rejects the dense GPU budget, but an
+  older branch then tries replicated hipSOLVER allocations on all ranks.
+  This is GPU memory pressure, not host-memory exhaustion. The failed
+  runs are preserved and are not numerical passes or timings.
+  A subsequent GPU-only fix reclaims reproducible device workspaces and
+  retries the unchanged budget, removes the obsolete replicated solve,
+  and initializes distributed overlap before first GPU-to-ELPA fallback.
+  CPU-selected solvers retain their original numerical branches.
+  Follow-up validation state: v12 normal S14/CPU14 exact/explicit-off2/transitions6 and affected L7 passed. Five cap384 L2 cases passed reference. User stopped all tests and queues on 2026-09-30 at 21:10:33 JST; Pt500 candidate interrupted at SCF230 without final numerical validation. Fe1000, shared-process integration and paired S timing were not run. The earlier default-cap R diagnostic remains interrupted and is not a numerical pass. Not installed.
+    v12-S: completed 14, driver rc 0, comparisons {"reference": 0, "baseline": 0}
+    cpu-v12-S: completed 14, driver rc 0, comparisons {"reference": 0, "baseline": 0}
+      CPU printed E/F/atom/position/grid exact: True
+    v12-explicit-off-S: completed 2, driver rc 0, comparisons {"reference": 0}
+    v12-transition-fallback-S: completed 2, driver rc 0, comparisons {"reference": 0}
+      Artificial-pressure paths verified: True; not performance measurements.
+    v12-transition-recover-S: completed 2, driver rc 0, comparisons {"reference": 0}
+      Artificial-pressure paths verified: True; not performance measurements.
+    v12-transition-retry-S: completed 2, driver rc 0, comparisons {"reference": 0}
+      Artificial-pressure paths verified: True; not performance measurements.
+    v12-L2-case-R-TiO2-1050: completed 0, driver rc 1, comparisons {"reference": 1}
+  Evidence: rtio2-memory-review.json; v12-memory-validation.json.
+
+v12 follow-up numerical validation (distinct production binary)
+  Binary SHA256: c55a088baddd9fb988bc55fd00da40bca39cdf25694b91b824933837ab359f82
+  Only Cluster_DFT_Col.c changed from v11; other five production
+  source hashes match v11. Original inputs and normal settings retained.
+  State: v12 normal S14/CPU14 exact/explicit-off2/transitions6 and affected L7 passed. Five cap384 L2 cases passed reference. User stopped all tests and queues on 2026-09-30 at 21:10:33 JST; Pt500 candidate interrupted at SCF230 without final numerical validation. Fe1000, shared-process integration and paired S timing were not run. The earlier default-cap R diagnostic remains interrupted and is not a numerical pass. Not installed.
+  v12-S: recorded 14/14, completed 14/14, reference PASS 14.
+    Benzene: completed; 4.64 s; 19 SCFs; E/F errors 9.947598300641403e-13/0.0.
+    C60: completed; 12.47 s; 27 SCFs; E/F errors 4.001776687800884e-11/1.4000002546143975e-11.
+    CO: completed; 8.33 s; 16 SCFs; E/F errors 0.0/1.7000002100475697e-11.
+    Cr2: completed; 7.0 s; 21 SCFs; E/F errors 3.0127011996228248e-12/9.000000050773949e-11.
+    Crys-MnO: completed; 9.78 s; 40 SCFs; E/F errors 8.981260180007666e-12/1.7e-11.
+    GaAs: completed; 16.7 s; 13 SCFs; E/F errors 2.2993162929196842e-11/2.0000000000006135e-12.
+    Glycine: completed; 5.29 s; 20 SCFs; E/F errors 0.0/1.0000056338554941e-12.
+    Graphite4: completed; 3.31 s; 14 SCFs; E/F errors 2.000177801164682e-12/1.000000000001134e-12.
+    H2O-EF: completed; 4.81 s; 17 SCFs; E/F errors 9.983125437429408e-13/0.0.
+    H2O: completed; 4.04 s; 31 SCFs; E/F errors 0.0/9.999986949615902e-13.
+    HMn: completed; 14.36 s; 26 SCFs; E/F errors 0.0/0.0.
+    Methane: completed; 3.88 s; 16 SCFs; E/F errors 4.900080341485591e-11/5.000000413701855e-12.
+    Mol_MnO: completed; 8.24 s; 26 SCFs; E/F errors 0.0/0.0.
+    Ndia2: completed; 3.27 s; 13 SCFs; E/F errors 4.000355602329364e-12/0.0.
+  cpu-v12-S: recorded 14/14, completed 14/14, reference PASS 14.
+    Benzene: completed; 4.6 s; 19 SCFs; E/F errors 0.0/0.0.
+    C60: completed; 14.32 s; 27 SCFs; E/F errors 1.3017142919125035e-11/1.4000002546143975e-11.
+    CO: completed; 7.57 s; 16 SCFs; E/F errors 0.0/7.999999968033578e-12.
+    Cr2: completed; 6.98 s; 21 SCFs; E/F errors 0.0/7.799999535151869e-11.
+    Crys-MnO: completed; 13.54 s; 37 SCFs; E/F errors 3.0127011996228248e-12/2.2e-11.
+    GaAs: completed; 19.55 s; 13 SCFs; E/F errors 5.9969806898152456e-12/3.000000000000093e-12.
+    Glycine: completed; 5.31 s; 20 SCFs; E/F errors 0.0/1.0000056338554941e-12.
+    Graphite4: completed; 3.68 s; 14 SCFs; E/F errors 0.0/9.999999960041972e-13.
+    H2O-EF: completed; 5.08 s; 17 SCFs; E/F errors 0.0/0.0.
+    H2O: completed; 3.71 s; 31 SCFs; E/F errors 0.0/0.0.
+    HMn: completed; 13.25 s; 26 SCFs; E/F errors 0.0/0.0.
+    Methane: completed; 3.33 s; 14 SCFs; E/F errors 3.5999647707285476e-11/4.000008657634169e-12.
+    Mol_MnO: completed; 8.0 s; 26 SCFs; E/F errors 0.0/0.0.
+    Ndia2: completed; 5.45 s; 13 SCFs; E/F errors 0.0/0.0.
+  v12-L: recorded 7/7, completed 7/7, reference PASS 7.
+    GFRAG: completed; 54.35 s; 60 SCFs; E/F errors 4.189928404230159e-10/1.898000000222222e-09.
+    Mn12_148_F: completed; 109.28 s; 61 SCFs; E/F errors 2.2509993868879974e-10/2.8599999798983866e-10.
+    nsV4Bz5: completed; 138.99 s; 57 SCFs; E/F errors 1.0402345651527867e-10/7.96e-10.
+    SialicAcid: completed; 22.65 s; 29 SCFs; E/F errors 9.947598300641403e-13/1.7100000061776033e-10.
+    Pt63: completed; 76.48 s; 70 SCFs; E/F errors 2.2000676835887134e-09/2.269999999603145e-10.
+    Ni63-O64: completed; 95.42 s; 62 SCFs; E/F errors 8.258211892098188e-10/3.3900000000067557e-10.
+    5_5_13COb2: completed; 102.11 s; 67 SCFs; E/F errors 3.369677870068699e-10/1.770000005937855e-10.
+  v12-L2: recorded 1/7, completed 0/7, reference PASS 0.
+    R-TiO2-1050: failed; - s; 3 SCFs; E/F errors -/-.
+  L follow-up scope: seven cases including Gamma Band-to-Cluster
+  dispatch: GFRAG, Mn12_148_F, nsV4Bz5, SialicAcid, Pt63, Ni63-O64
+  and 5_5_13COb2. The complete L performance suite above used v11
+  and remains labeled as that evidence.
+  Earlier L2 baseline runs are retained for numerical comparisons;
+  only new Pt500/Fe1000 baseline-candidate runs are consecutive pairs.
+  Failed R-TiO2 baseline and C1000 discrepancy are not A/B passes.
+
+v13 follow-up numerical validation (distinct production binary)
+  Binary SHA256: 160f2e3735ae6dba2979ebae2bf906cdd7301f5cf04efb5d64353bba266b915c
+  Only Cluster_DFT_Col.c changed from v11; other five production
+  source hashes match v11. Original inputs and normal settings retained.
+  v13 additionally recreates the Cluster BLAS handle only under
+  memory pressure, retaining dense matrices and the original budget.
+  State: Rejected: BLAS handle recreation did not increase recovered memory on R. Full R intentionally interrupted at SCF2, not a numerical pass. Source restored exactly to v12.
+  v13-S: recorded 14/14, completed 14/14, reference PASS 14.
+    Benzene: completed; 4.64 s; 19 SCFs; E/F errors 9.947598300641403e-13/0.0.
+    C60: completed; 12.52 s; 27 SCFs; E/F errors 4.001776687800884e-11/1.4000002546143975e-11.
+    CO: completed; 8.44 s; 16 SCFs; E/F errors 0.0/8e-12.
+    Cr2: completed; 7.07 s; 21 SCFs; E/F errors 3.0127011996228248e-12/1.200000000000302e-10.
+    Crys-MnO: completed; 9.96 s; 38 SCFs; E/F errors 1.4978240869822912e-11/1.6e-11.
+    GaAs: completed; 15.84 s; 13 SCFs; E/F errors 2.1998403099132702e-11/2.0000000000006135e-12.
+    Glycine: completed; 5.12 s; 20 SCFs; E/F errors 0.0/1.0000056338554941e-12.
+    Graphite4: completed; 3.3 s; 14 SCFs; E/F errors 2.000177801164682e-12/1.000000000001134e-12.
+    H2O-EF: completed; 4.8 s; 17 SCFs; E/F errors 0.0/0.0.
+    H2O: completed; 4.02 s; 31 SCFs; E/F errors 0.0/0.0.
+    HMn: completed; 14.07 s; 26 SCFs; E/F errors 0.0/0.0.
+    Methane: completed; 3.48 s; 14 SCFs; E/F errors 4.5000447812526545e-11/5.000000413701855e-12.
+    Mol_MnO: completed; 8.37 s; 26 SCFs; E/F errors 9.947598300641403e-13/0.0.
+    Ndia2: completed; 3.22 s; 13 SCFs; E/F errors 4.000355602329364e-12/0.0.
+  cpu-v13-S: recorded 14/14, completed 14/14, reference PASS 14.
+    Benzene: completed; 4.76 s; 19 SCFs; E/F errors 0.0/0.0.
+    C60: completed; 14.45 s; 27 SCFs; E/F errors 1.3017142919125035e-11/1.4000002546143975e-11.
+    CO: completed; 8.79 s; 16 SCFs; E/F errors 0.0/7.999999968033578e-12.
+    Cr2: completed; 7.0 s; 21 SCFs; E/F errors 0.0/7.799999535151869e-11.
+    Crys-MnO: completed; 12.86 s; 37 SCFs; E/F errors 3.0127011996228248e-12/2.2e-11.
+    GaAs: completed; 19.72 s; 13 SCFs; E/F errors 5.9969806898152456e-12/3.000000000000093e-12.
+    Glycine: completed; 5.0 s; 20 SCFs; E/F errors 0.0/1.0000056338554941e-12.
+    Graphite4: completed; 3.69 s; 14 SCFs; E/F errors 0.0/9.999999960041972e-13.
+    H2O-EF: completed; 4.61 s; 17 SCFs; E/F errors 0.0/0.0.
+    H2O: completed; 3.72 s; 31 SCFs; E/F errors 0.0/0.0.
+    HMn: completed; 13.22 s; 26 SCFs; E/F errors 0.0/0.0.
+    Methane: completed; 3.34 s; 14 SCFs; E/F errors 3.5999647707285476e-11/4.000008657634169e-12.
+    Mol_MnO: completed; 7.77 s; 26 SCFs; E/F errors 0.0/0.0.
+    Ndia2: completed; 4.55 s; 13 SCFs; E/F errors 0.0/0.0.
+  v13-L: recorded 0/7, completed 0/7, reference PASS 0.
+  v13-L2: recorded 1/7, completed 0/7, reference PASS 0.
+    R-TiO2-1050: failed; - s; 2 SCFs; E/F errors -/-.
+  L follow-up scope: seven cases including Gamma Band-to-Cluster
+  dispatch: GFRAG, Mn12_148_F, nsV4Bz5, SialicAcid, Pt63, Ni63-O64
+  and 5_5_13COb2. The complete L performance suite above used v11
+  and remains labeled as that evidence.
+  Earlier L2 baseline runs are retained for numerical comparisons;
+  only new Pt500/Fe1000 baseline-candidate runs are consecutive pairs.
+  Failed R-TiO2 baseline and C1000 discrepancy are not A/B passes.
+
+L2 runtime workspace tuning on v12: actual MAGMA cap 384 MiB
+  State: PAUSED BY USER at 2026-09-30 21:10:33 JST. Candidate cap384 L2 reference PASS remains 5/7. Pt500 baseline passed; candidate interrupted at SCF 230 without final numerical validation. Fe1000, integration and paired S are unstarted. All test/queue/monitor processes stopped; no installation or automatic restart.
+  MAGMA_OZAKI2_MAX_WS_MB=384 lowers the actual device/stream adapter
+  allocation cap from 512 MiB. The admission budget reflects that actual
+  cap. One-stage algorithm, eight MPI ranks, numerical tolerances,
+  original inputs, Cluster reserve and MAGMA free-space guard are retained.
+  This is an explicit L2 runtime setting; global wrapper defaults stay
+  unchanged. Full R reference PASS and zero dense CPU fallbacks are
+  required before the remaining L/L2 jobs start.
+  Full R result: {"run": "v12-magma384-L2-case-R-TiO2-1050", "driver_returncode": 0, "comparisons": {"reference": 0}, "completed": 1, "reclaim_retries": 38, "dense_cpu_fallbacks": 0, "host_memory_guard": false, "start_timestamp": 1790730731.2296543, "end_timestamp": 1790734052.5391605, "sampling_log": "cpu-load.jsonl"}
+  Recorded 6/7; completed 5/7; reference PASS 5.
+    R-TiO2-1050: completed; 3318.75 s; 39 SCFs; E/F errors 5.918991519138217e-09/4.1499999999515015e-10; dense CPU fallbacks 0.
+    Ih-Ice1200: completed; 1283.81 s; 35 SCFs; E/F errors 2.6930138119496405e-09/1.0700000000612997e-10; dense CPU fallbacks 0.
+    C1000: completed; 2037.01 s; 41 SCFs; E/F errors 3.7198333302512765e-10/3.96e-10; dense CPU fallbacks 0.
+    GRA1024: completed; 2563.09 s; 51 SCFs; E/F errors 8.913048077374697e-10/6.570000000310529e-10; dense CPU fallbacks 0.
+    Si1000: completed; 2534.15 s; 41 SCFs; E/F errors 6.921254680491984e-10/1.0100000000299973e-10; dense CPU fallbacks 0.
+    Pt500: interrupted_by_user; - s; 230 SCFs; E/F errors -/-; dense CPU fallbacks 0.
+  Default-cap v12 and rejected v13 partial R diagnostics are not
+  full numerical passes. v13 BLAS-handle reset freed no additional
+  net memory and was removed; source and source/openmx match frozen v12.
+  Baseline R failed, so no baseline R speedup ratio is available.
+  GRA1024 elapsed 2416.93 s (baseline, 48 SCFs) / 2459.28 s (v11, 49 SCFs) / 2563.09 s (v12 cap384, 51 SCFs). Steady eigensolver medians 26.282661 / 26.322058 / 26.3423045 s are essentially unchanged. The longer total includes additional SCFs. Earlier baselines were not measured consecutively with cap384; no equal-load speedup is claimed.
+  Si1000 elapsed 2420.35 s (baseline, 39 SCFs) / 2409.05 s (v11, 39 SCFs) / 2534.15 s (v12 cap384, 41 SCFs). Steady eigensolver medians 24.180642 / 24.181291 / 24.1807885 s are unchanged. The longer total includes two additional SCFs. Current reference and baseline comparisons both pass; earlier baselines do not establish equal-load timing.
+  Current C1000 also compared against the earlier reference-passing
+  v11 default run: comparison rc 0, E/F differences 1.8189894035458565e-12/1.0000000095567244e-12.
+  Evidence: v12-magma384-L2-case-C1000-v11-default.md
+  Its difference from the original baseline remains about 3.20e-7 Ha;
+  that baseline itself failed reference and stopped at 32 rather than
+  41 SCFs. Current cap384 and earlier normal v11 both pass reference;
+  the baseline discrepancy is retained, with no tolerance changes.
+
+Pt500 convergence and host-load observation
+  Observation at 2026-09-30 21:08:41 JST: baseline Pt500 completed at 173 SCFs in 11896.86 s and passed reference (E 6.89033e-9 Ha, max F 5.6382e-8 Ha/bohr). Candidate was still running at SCF 229; this snapshot is not a candidate numerical pass.
+  Baseline host load was approximately 8.10 busy cores. Candidate host load rose at 20:27:37 JST on 2026-09-30, with a separate 32-thread CPU process observed; recent samples use approximately 31.6 busy cores. This whole-run Pt500 pair does not establish an equal-host-load timing comparison.
+  The candidate SCF count increase is a separate observation; its cause is not established by the CPU-load change. Steady eigensolver medians were approximately 24.18 s baseline and 24.30 s candidate at the snapshot. Final numerical comparison and convergence review remain required.
+  Snapshot evidence: Pt500-host-load-review.json; full sampling: cpu-load.jsonl.
+
+Archived v11 CPU S control
+  Run: cpu-final-S; recorded binary SHA256: d05f4221d1d11a2c3fc7a4c8c387414872be557e396e420651ade031e519d8b1
+  14 cases; exact E/F/position/grid match: True
+  Equality covers printed Utot, every force component, atom identities,
+  coordinates and integration grids for CPU S. It does not assert
+  full-log/internal-bit equality or CPU L/L2 validation.
+
+Consecutive S timing control after long suites and integration
+  Not run (paused by user): baseline 0/14, candidate 0/14.
+  Same per-input launches, input order and runtime settings as the main S
+  measurements. This addresses the shared CPU load during the first final-S.
+  Paired checks: timing-final-S-baseline.md; load: paired-small-cpu-load.jsonl.
+
+Same-process integration
+  integration-S: not run (paused by user).
+  integration-L: not run (paused by user).
+  S uses all 14 inputs in one launch. L uses GEL/Mn12_148_F/SialicAcid
+  in one launch with OPENMX_CLUSTER_GPU_DIAG_RESERVE_MB=5500, exercising
+  serial spin roots. OPENMX_BAND_CACHE_TRACE=1; 1800 s/process watchdog.
+
+Controls and rejected changes (historical pilots, not final v11 suite times)
+  v10 CG15c-DC-LNO passed numerics but slowed 193.35 -> 202.19 s:
+  early table release promoted small Force4B batches to GPU, increasing
+  force#4 from 2.239440 to 10.714681 s. v11 restricts release to band mode.
+  Under shared CPU load, v10 CG repeated at 213.25 s versus v11 202.39 s;
+  force#4 10.653812 -> 2.319702 s. Both pass strict reference/A-B checks.
+  v10 full GGFF: 1501.14 -> 1378.71 s, both 101 SCFs, reference/A-B PASS.
+  Eigen median 8.009218 -> 7.426329 s; DM median 3.494462 -> 2.862635 s.
+  Forced-GPU GaAs, eigenvector cache off, packed reuse on/off:
+  133.66/137.85 s, both 13 SCFs; all printed energies and forces exactly
+  identical; reference PASS. Normal small-matrix admission is unchanged.
+  These verify packed reuse; forced GaAs timing is not a default speed claim.
+  GEL cached K2/K4/K8 pilots: 91.32/70.70/62.32 s versus baseline 108.77 s.
+  Uncached crossover-only MAGMA/hipSOLVER variants took 220.59/202.30 s and
+  were rejected. No eigensolver-backend change was retained.
+  Forced-GPU FeBCC n=208/K8 was slower (Eigen+DM median 6.123 vs 3.998 s);
+  stopped at SCF 13 as a diagnostic, not a numerical pass. Crossover 400
+  retains the original CPU dense solver on that input.
+  GEL partial cache caps (S 4 MiB, eigenvectors 2 MiB): 108.90 s, strict
+  reference PASS. Forced serial Mn12 (v5), reserve 5500 MiB: 139.49 -> 120.50 s,
+  61 SCFs, 120 overlap hits, strict reference/A-B PASS. This is a serial-path
+  control, not a default Mn12 performance claim.
+  One-rank forced-GPU FeBCC: 983.47 s, 57 SCFs, reference PASS; both spins
+  and 224 k/spin slots share one rank. Explicit BAND_GPU_DIAG=0 GEL: 104.48 s,
+  reference PASS. Earlier v9/v10 CPU S controls also had exact E/F parity.
+  Superseded v2/v3 B2 pilots were interrupted during development. v10 L
+  completed 15 strict-passing cases; N1C999 was interrupted as superseded.
+  Partial runs are preserved and are not counted as numerical passes.
+  Final v11 L reruns all 16 inputs; no different-binary pilot times are reused.
+
+Artifacts and provenance
+  Local evidence: work/codex_gpu_sll2/ (ignored build/test artifacts).
+  Final review: final-readiness.json distinguishes failed and pending checks;
+  review-final-results.py rechecks outputs, binary/source hashes and original
+  inputs. final-review-queue.py runs it after paired S and refreshes this report;
+  it does not install a binary or treat queue completion as numerical PASS.
+  Per-run command.json records binary hash, input suite and environment;
+  results.json records status, return code, elapsed time and memory guard.
+  L2 aggregates link original per-case runs and identify source_run; they
+  do not pretend to be a single MPI launch. *-audit.json contains strict
+  errors, SCF/MD counts, stage profiles and fallback counts.
+  Archived v11 source: v11-source-manifest.json, v11.patch, v11-build.log.
+  Baseline GFRAG/FeBCC/B2 watchdogs were temporarily paused while their MPI
+  jobs continued; their OpenMX elapsed times remain valid. Their memory
+  monitoring coverage is partial, explicitly recorded in monitor-coverage.json;
+  separate guards remained active. MPI jobs were never paused.
+  Final v11 watchdogs remained active through controller handoffs.
+  v9/v10 archives and v10-final-archives.json retain superseded provenance.
+  This report preserves the user-requested stop and incomplete-validation evidence.
+  Selected source (openmx.v12): v12-source-manifest.json, v12.patch; build log: work/codex_gpu_sll2/v12-build.log.

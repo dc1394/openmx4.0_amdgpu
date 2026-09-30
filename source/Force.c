@@ -3655,6 +3655,23 @@ double Force(double***** H0,
         fflush(stdout);
     }
 
+    /* Force3 is the last force-stage consumer of the shared orbital tables.
+       In band runs their SCF copies can displace the VNA projector batches.
+       Keep other solvers' existing admission behavior: promoting small
+       DC-LNO force batches to the GPU can be slower than their CPU fallback.
+       Drop the density cache first so its borrowed table view cannot outlive
+       the matrix-elements cache. */
+    if (scf_eigen_lib_flag == GPUSOLVER && Solver == 3) {
+        dtime(&stime);
+        Set_Density_Grid_GPU_Invalidate();
+        Set_Hamiltonian_Invalidate_OpenMP_MatrixElements_Cache();
+        MPI_Barrier(mpi_comm_level1);
+        dtime(&etime);
+        if (force_profile)
+            Force_profile_report("release-scf-caches", etime - stime,
+                mpi_comm_level1, myid, numprocs);
+    }
+
     /****************************************************
                         #4 of Force
 

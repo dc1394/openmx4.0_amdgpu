@@ -990,7 +990,11 @@ int Set_Density_Grid_GPU_Service(int Cnt_kind, int Calc_CntOrbital_ON, double **
     return 0;
   }
 
-  persistent = SDG_env_bool("OPENMX_DENSITY_GRID_GPU_PERSISTENT", 0);
+  /* Small geometry tables are cheap to retain and otherwise get allocated
+     and uploaded on every SCF step. Keep the large epochs transient so
+     the following dense eigensolve can still claim the device. */
+  persistent = SDG_env_bool("OPENMX_DENSITY_GRID_GPU_PERSISTENT",
+      cache->device_bytes <= SDG_env_mib("OPENMX_DENSITY_GRID_GPU_CACHE_MB", 64));
   if (myid == owner && !persistent) SDG_delete_device(cache);
 
   for (int spin = 0; spin < spin_count; spin++) {
@@ -1037,15 +1041,54 @@ typedef struct {
   uint32_t *pt_pair;       /* overlap point -> pair */
   double *dm;
   double *tmpden;
+  int joins_validated;
+  int device_id;
+  uint32_t *d_out_ptr, *d_term_pt, *d_pt_pair;
+  double *d_dm, *d_tmpden;
   SetHamiltonianMETables t;
 } SDGLocalContext;
 
 static SDGLocalContext SDG_local = {0};
 
+static void SDG_local_delete_device(SDGLocalContext *c)
+{
+  if (c->d_out_ptr != NULL) hipFree(c->d_out_ptr);
+  if (c->d_term_pt != NULL) hipFree(c->d_term_pt);
+  if (c->d_pt_pair != NULL) hipFree(c->d_pt_pair);
+  if (c->d_dm != NULL) hipFree(c->d_dm);
+  if (c->d_tmpden != NULL) hipFree(c->d_tmpden);
+  c->d_out_ptr = c->d_term_pt = c->d_pt_pair = NULL;
+  c->d_dm = c->d_tmpden = NULL;
+}
+
+static int SDG_local_upload(SDGLocalContext *c)
+{
+  int device;
+  size_t terms = c->term_count ? c->term_count : 1;
+  size_t dm_count = c->dm_count ? c->dm_count : 1;
+  if (hipGetDevice(&device) != hipSuccess) return 0;
+  if (c->d_out_ptr != NULL && c->device_id != device) SDG_local_delete_device(c);
+  if (c->d_out_ptr != NULL) return 1;
+  c->device_id = device;
+  if (hipMalloc((void**)&c->d_out_ptr, sizeof(uint32_t)*(c->output_count+1)) != hipSuccess ||
+      hipMalloc((void**)&c->d_term_pt, sizeof(uint32_t)*terms) != hipSuccess ||
+      hipMalloc((void**)&c->d_pt_pair, sizeof(uint32_t)*terms) != hipSuccess ||
+      hipMalloc((void**)&c->d_dm, sizeof(double)*dm_count) != hipSuccess ||
+      hipMalloc((void**)&c->d_tmpden, sizeof(double)*c->spin_count*c->output_count) != hipSuccess ||
+      hipMemcpy(c->d_out_ptr, c->out_ptr, sizeof(uint32_t)*(c->output_count+1), hipMemcpyHostToDevice) != hipSuccess ||
+      hipMemcpy(c->d_term_pt, c->term_pt, sizeof(uint32_t)*c->term_count, hipMemcpyHostToDevice) != hipSuccess ||
+      hipMemcpy(c->d_pt_pair, c->pt_pair, sizeof(uint32_t)*c->term_count, hipMemcpyHostToDevice) != hipSuccess) {
+    SDG_local_delete_device(c);
+    return 0;
+  }
+  return 1;
+}
+
 static void SDG_local_free(void)
 {
   SDGLocalContext *c = &SDG_local;
 
+  SDG_local_delete_device(c);
   free(c->atom_out_base);
   free(c->out_ptr);
   free(c->term_pt);
@@ -1053,6 +1096,14 @@ static void SDG_local_free(void)
   free(c->dm);
   free(c->tmpden);
   memset(c, 0, sizeof(*c));
+}
+
+/* Yield only reproducible device buffers to a following dense eigensolve;
+   geometry tables and their validated host layout remain available. */
+void Set_Density_Grid_GPU_Release_Device_Caches(void)
+{
+  SDG_delete_device(&SDG_cache);
+  SDG_local_delete_device(&SDG_local);
 }
 
 static int SDG_local_build(int Cnt_kind, int spin_count)
@@ -1201,7 +1252,7 @@ static int SDG_local_build(int Cnt_kind, int spin_count)
 /* Device bytes this call would stage on top of what is already resident. */
 static size_t SDG_local_call_bytes(const SDGLocalContext *c)
 {
-  size_t bytes = c->extra_bytes;
+  size_t bytes = c->d_out_ptr != NULL ? 0 : c->extra_bytes;
 
   if (!c->t.orbs0_resident) (void)SDG_add_bytes(&bytes, c->t.total_orbs0, sizeof(Type_Orbs_Grid));
   if (!c->t.orbs1_resident) (void)SDG_add_bytes(&bytes, c->t.total_orbs1, sizeof(Type_Orbs_Grid));
@@ -1285,6 +1336,11 @@ int Set_Density_Grid_GPU_Local_Prepare(int Cnt_kind, int Calc_CntOrbital_ON)
   }
 
   reserve_bytes = SDG_env_mib("OPENMX_DENSITY_GRID_GPU_RESERVE_MB", 256);
+  if (c->d_out_ptr != NULL) {
+    int device;
+    if (hipGetDevice(&device) != hipSuccess) return 0;
+    if (device != c->device_id) SDG_local_delete_device(c);
+  }
   if (hipMemGetInfo(&free_bytes, &total_bytes) != hipSuccess) return 0;
   need = SDG_local_call_bytes(c);
   if (free_bytes < reserve_bytes) return 0;
@@ -1322,29 +1378,41 @@ int Set_Density_Grid_GPU_Local_Run(double *****CDM, double ***Tmp_Den_Grid)
   if (!c->ready || output_count == 0) return 0;
   if (!SDG_pack_local_cdm(CDM, dm, dm_count, spin_count)) return 0;
 
-  /* Validate the flattened joins before launching: malformed table sharing
-     must fall back instead of becoming an asynchronous GPU page fault. */
-  for (size_t out=0; out<output_count; out++) {
-    if (out_ptr[out]>out_ptr[out+1] || out_ptr[out+1]>term_count) return 0;
-    for (uint32_t q=out_ptr[out]; q<out_ptr[out+1]; q++) {
-      uint32_t pt=term_pt[q], pair;
-      size_t o0,o1,mat;
-      if (pt>=total_nolg) return 0;
-      pair=pt_pair[pt];
-      if (pair>=(uint32_t)pair_count) return 0;
-      mat=(size_t)pair_NO0[pair]*(size_t)pair_NO1[pair];
-      o0=pair_orbs0_offset[pair]+((size_t)pt-pair_nolg_offset[pair])*(size_t)pair_NO0[pair];
-      o1=pair_orbs1_offset[pair]+((size_t)pt-pair_nolg_offset[pair])*(size_t)pair_NO1[pair];
-      if (pair_h_offset[pair]+(size_t)spin_count*mat>dm_count ||
-          o0+(size_t)pair_NO0[pair]>total_orbs0 ||
-          o1+(size_t)pair_NO1[pair]>total_orbs1) return 0;
+  /* Validate once per geometry; the shared-table invalidation resets this
+     cache together with its CSR. Rewalking every join on the CPU in every
+     SCF step can cost more than the GPU contraction itself. */
+  if (!c->joins_validated) {
+    for (size_t out=0; out<output_count; out++) {
+      if (out_ptr[out]>out_ptr[out+1] || out_ptr[out+1]>term_count) return 0;
+      for (uint32_t q=out_ptr[out]; q<out_ptr[out+1]; q++) {
+        uint32_t pt=term_pt[q], pair;
+        size_t o0,o1,mat;
+        if (pt>=total_nolg) return 0;
+        pair=pt_pair[pt];
+        if (pair>=(uint32_t)pair_count) return 0;
+        mat=(size_t)pair_NO0[pair]*(size_t)pair_NO1[pair];
+        o0=pair_orbs0_offset[pair]+((size_t)pt-pair_nolg_offset[pair])*(size_t)pair_NO0[pair];
+        o1=pair_orbs1_offset[pair]+((size_t)pt-pair_nolg_offset[pair])*(size_t)pair_NO1[pair];
+        if (pair_h_offset[pair]+(size_t)spin_count*mat>dm_count ||
+            o0+(size_t)pair_NO0[pair]>total_orbs0 ||
+            o1+(size_t)pair_NO1[pair]>total_orbs1) return 0;
+      }
     }
+    c->joins_validated = 1;
   }
 
   {
-    uint32_t *out_ptr_host=out_ptr, *term_pt_host=term_pt, *pt_pair_host=pt_pair;
     double *dm_host=dm, *tmpden_host=tmpden;
     int dev=omp_get_default_device();
+    int keep_resident = 0;
+    size_t free_bytes = 0, total_bytes = 0;
+    size_t cap = SDG_env_mib("OPENMX_DENSITY_GRID_GPU_LOCAL_CACHE_MB", 32);
+
+    if (c->extra_bytes <= cap && cap != 0) {
+      if (c->d_out_ptr != NULL) keep_resident = 1;
+      else if (hipMemGetInfo(&free_bytes, &total_bytes) == hipSuccess)
+        keep_resident = c->extra_bytes <= free_bytes / 32U / (size_t)c->node_ranks;
+    }
 
     pair_NO0=(const int*)omp_get_mapped_ptr(pair_NO0,dev);
     pair_NO1=(const int*)omp_get_mapped_ptr(pair_NO1,dev);
@@ -1358,15 +1426,16 @@ int Set_Density_Grid_GPU_Local_Run(double *****CDM, double ***Tmp_Den_Grid)
     if (!pair_NO0 || !pair_NO1 || !pair_h_offset || !pair_nolg_offset ||
         !pair_orbs0_offset || !pair_orbs1_offset || !nolg_Nc || !orbs0buf || !orbs1buf) return 0;
 
-    if (hipMalloc((void**)&out_ptr,sizeof(uint32_t)*(output_count+1))!=hipSuccess ||
-        hipMalloc((void**)&term_pt,sizeof(uint32_t)*term_count)!=hipSuccess ||
-        hipMalloc((void**)&pt_pair,sizeof(uint32_t)*term_count)!=hipSuccess ||
-        hipMalloc((void**)&dm,sizeof(double)*dm_count)!=hipSuccess ||
-        hipMalloc((void**)&tmpden,sizeof(double)*(size_t)spin_count*output_count)!=hipSuccess) return 0;
-    hipMemcpy(out_ptr,out_ptr_host,sizeof(uint32_t)*(output_count+1),hipMemcpyHostToDevice);
-    hipMemcpy(term_pt,term_pt_host,sizeof(uint32_t)*term_count,hipMemcpyHostToDevice);
-    hipMemcpy(pt_pair,pt_pair_host,sizeof(uint32_t)*term_count,hipMemcpyHostToDevice);
-    hipMemcpy(dm,dm_host,sizeof(double)*dm_count,hipMemcpyHostToDevice);
+    if (!SDG_local_upload(c)) return 0;
+    out_ptr = c->d_out_ptr;
+    term_pt = c->d_term_pt;
+    pt_pair = c->d_pt_pair;
+    dm = c->d_dm;
+    tmpden = c->d_tmpden;
+    if (hipMemcpy(dm, dm_host, sizeof(double)*dm_count, hipMemcpyHostToDevice) != hipSuccess) {
+      SDG_local_delete_device(c);
+      return 0;
+    }
 
 #pragma omp target teams distribute parallel for is_device_ptr(pair_NO0,pair_NO1,pair_h_offset,pair_nolg_offset,pair_orbs0_offset,pair_orbs1_offset,nolg_Nc,orbs0buf,orbs1buf,out_ptr,term_pt,pt_pair,dm,tmpden)
     for (size_t out = 0; out < output_count; out++) {
@@ -1421,8 +1490,11 @@ int Set_Density_Grid_GPU_Local_Run(double *****CDM, double ***Tmp_Den_Grid)
       }
     }
 
-    hipMemcpy(tmpden_host,tmpden,sizeof(double)*(size_t)spin_count*output_count,hipMemcpyDeviceToHost);
-    hipFree(out_ptr); hipFree(term_pt); hipFree(pt_pair); hipFree(dm); hipFree(tmpden);
+    if (hipMemcpy(tmpden_host,tmpden,sizeof(double)*(size_t)spin_count*output_count,hipMemcpyDeviceToHost) != hipSuccess) {
+      SDG_local_delete_device(c);
+      return 0;
+    }
+    if (!keep_resident) SDG_local_delete_device(c);
     tmpden=tmpden_host;
   }
 

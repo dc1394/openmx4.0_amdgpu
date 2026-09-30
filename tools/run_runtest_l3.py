@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run unmodified L3 inputs through -runtestL3 in isolated directories.
+"""Run unmodified built-in test inputs in isolated directories.
 
 Each MPI job contains one input, so a host-memory limit does not discard
 the rest of the suite. Originals, references and existing work outputs stay
@@ -68,6 +68,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--binary', required=True, type=Path)
     parser.add_argument('--output', required=True, type=Path)
+    parser.add_argument('--suite', choices=('S', 'L', 'L2', 'L3'), default='L3',
+                        help='built-in suite (S means -runtest; default: L3)')
     parser.add_argument('--ranks', type=int, default=8)
     parser.add_argument('--map-by', help='optional Open MPI mapping policy')
     parser.add_argument('--cases', nargs='+')
@@ -78,12 +80,15 @@ def main():
     if args.ranks < 1 or args.timeout <= 0 or args.min_available_gib < 0:
         parser.error('ranks and timeout must be positive; memory reserve must be nonnegative')
     repo = Path(__file__).resolve().parents[1]
-    inputs = repo / 'work/large3_example'
+    input_directory = {'S': 'input_example', 'L': 'large_example',
+                       'L2': 'large2_example', 'L3': 'large3_example'}[args.suite]
+    test_option = '-runtest' + ('' if args.suite == 'S' else args.suite)
+    inputs = repo / 'work' / input_directory
     cases = sorted(inputs.glob('*.dat'))
     if args.cases:
         by_name = {p.stem: p for p in cases}
         if set(args.cases) - by_name.keys():
-            parser.error('Unknown L3 case')
+            parser.error('Unknown case in the selected suite')
         cases = [by_name[name] for name in dict.fromkeys(args.cases)]
     output = args.output.resolve()
     output.mkdir(parents=True, exist_ok=False)
@@ -100,16 +105,17 @@ def main():
     command = ['mpirun', '-np', str(args.ranks), '--bind-to', 'core']
     if args.map_by:
         command += ['--map-by', args.map_by]
-    command += [str(binary), '-runtestL3', '-nt', '1']
+    command += [str(binary), test_option, '-nt', '1']
     (output / 'command.json').write_text(json.dumps(dict(
-        command=command, env=args.env, binary_sha256=hashlib.sha256(binary.read_bytes()).hexdigest(),
+        command=command, suite=args.suite, input_directory=input_directory,
+        env=args.env, binary_sha256=hashlib.sha256(binary.read_bytes()).hexdigest(),
         environment={k: v for k, v in env.items() if k.startswith((
             'OPENMX_', 'OMP_', 'BLIS_', 'OPENBLAS_', 'MAGMA_', 'GEMMUL8_',
             'HSA_', 'HIP_', 'ROCR_', 'LIBOMPTARGET_', 'GPU_MAX_HW_QUEUES'))},
         min_available_gib=args.min_available_gib, timeout=args.timeout), indent=2))
     for inp in cases:
         case = output / inp.stem
-        testdir = case / 'large3_example'
+        testdir = case / input_directory
         testdir.mkdir(parents=True)
         (testdir / inp.name).symlink_to(inp)
         system = re.search(r'^System.Name\s+(\S+)', inp.read_text(), re.M | re.I)[1]
@@ -138,7 +144,7 @@ def main():
             finally:
                 if proc.poll() is None:
                     stop_job(proc)
-        result_file = case / 'runtestL3.result'
+        result_file = case / (test_option[1:] + '.result')
         row = result_file.read_text() if result_file.exists() else ''
         match = re.search(r'Elapsed time\(s\)=\s*([\d.]+)\s+diff Utot=\s*([\d.eE+-]+)\s+diff Force=\s*([\d.eE+-]+)', row)
         if proc.returncode == 0 and match:

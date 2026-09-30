@@ -440,6 +440,11 @@ static int BandCol_DMDeviceWorkspaceRelease(int report_errors)
     return release_failed;
 }
 
+extern "C" int BandCol_ReleaseDMDeviceWorkspace_HIP(void)
+{
+    return BandCol_DMDeviceWorkspaceRelease(1);
+}
+
 static void BandCol_DMDeviceWorkspaceProcessCleanup(void)
 {
     BandColDMDeviceWorkspace *w = &BandCol_dm_device_workspace;

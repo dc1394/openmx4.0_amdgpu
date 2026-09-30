@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compare L3 runs, including every force component (not a signed sum)."""
+"""Compare built-in test runs, including every force component (not a signed sum)."""
 import argparse
 import json
 import math
@@ -28,7 +28,7 @@ def main():
     parser.add_argument('baseline', type=Path)
     parser.add_argument('candidate', type=Path, nargs='?')
     parser.add_argument('--reference', action='store_true',
-                        help='check one run directory against the bundled L3 references')
+                        help='check one run directory against the bundled references')
     parser.add_argument('--energy-tolerance', type=float, default=1e-7)
     parser.add_argument('--force-tolerance', type=float, default=1e-7)
     args = parser.parse_args()
@@ -39,6 +39,13 @@ def main():
     baseline = {} if args.reference else {
         r['case']: r for r in json.loads((args.baseline / 'results.json').read_text())}
     candidate = {r['case']: r for r in json.loads((args.candidate / 'results.json').read_text())}
+    input_directories = {}
+    for folder in (args.baseline, args.candidate):
+        metadata = folder / 'command.json'
+        info = json.loads(metadata.read_text()) if metadata.exists() else {}
+        input_directories[folder] = info.get('input_directory', 'large3_example')
+    if input_directories[args.baseline] != input_directories[args.candidate]:
+        parser.error('Cannot compare different test suites')
     failed = False
     print('| Case | Before (s) | After (s) | Speedup | abs ΔE (Ha) | Max abs ΔF (Ha/bohr) | Status |')
     print('|---|---:|---:|---:|---:|---:|---|')
@@ -50,11 +57,12 @@ def main():
             failed = True
             continue
         def output(folder, reference=False):
-            inp = next((folder / name / 'large3_example').glob('*.dat'))
+            input_directory = input_directories[folder]
+            inp = next((folder / name / input_directory).glob('*.dat'))
             system = re.search(r'^System.Name\s+(\S+)', inp.read_text(), re.M | re.I)[1]
             parent = folder / name
             if reference:
-                parent /= 'large3_example'
+                parent /= input_directory
             return parent / (system + '.out')
         be, ba, bf, bg = read_output(output(args.baseline, args.reference))
         ce, ca, cf, cg = read_output(output(args.candidate))

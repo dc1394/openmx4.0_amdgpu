@@ -104,8 +104,13 @@ credited toward that budget. If both spin roots cannot fit together but one
 fits, the GPU processes them in sequence and returns the dense matrices and
 library workspaces after each spin. Density-matrix construction uses the saved
 host eigenvectors in this case. `OPENMX_CLUSTER_GPU_SERIAL=0` disables this
-capacity fallback. A solve that cannot fit even one spin uses the existing ELPA
-fallback before allocating the dense GPU matrices.
+capacity fallback. If neither mode fits, all ranks release reproducible density
+and library device workspaces, preserve the GPU overlap, and retry the same
+memory budget once. A solve that still does not fit uses the existing ELPA
+fallback. The first switch from GPU to ELPA within an SCF sequence initializes
+the distributed overlap before solving. `OPENMX_CLUSTER_GPU_DIAG=0` selects
+ELPA directly and skips workspace reclamation. CPU-selected solvers are
+unchanged.
 The collinear DC-LNO GPU path dispatches smaller local problems on every rank
 admitted by its shared-device memory check, using the same rank-to-device map
 as the other GPU paths. For matrices of dimension 2048 or larger on a shared
@@ -141,9 +146,54 @@ interleave MPI owners so their existing concurrency limit can actually run
 independent solves together; `OPENMX_BAND_NONCOL_INTERLEAVE_K=0` restores the
 original consecutive ordering. The collinear multi-k GPU path uses the same
 owner interleaving, controlled by `OPENMX_BAND_COL_INTERLEAVE_K`.
+The noncollinear multi-k GPU path also borrows the packed H/S and
+imaginary nonlocal matrices already assembled for the current SCF,
+avoiding repeated MPI gathers in both k-point passes. All ranks agree
+before skipping gathers; unavailable caches retain the original path.
+`OPENMX_BAND_NONCOL_PACKED_CACHE=0` restores the original gathers.
 
-`tools/run_runtest_l3.py` runs each of the 20 original inputs with `-runtestL3`
-in a separate directory and MPI job. It preserves inputs and reference outputs,
+The collinear multi-k GPU path also retains transformed overlaps for the current
+geometry and compact eigenvectors between the occupation and density-matrix
+passes of each SCF step. The host caps are 512 MiB and 1024 MiB per rank,
+respectively; each cache is additionally limited to 1/64 of available node RAM
+divided by local MPI ranks. `OPENMX_BAND_COL_OVERLAP_CACHE_MB` and
+`OPENMX_BAND_COL_KCACHE_MB` set these caps; zero disables the corresponding
+cache. Cache misses retain the original GPU solve. Overlaps are invalidated
+at the first SCF of each geometry and at run boundaries. The collinear band
+GPU crossover is now 400 basis functions, and multi-k matrices of dimension
+at most 512 use eight concurrent turns; larger matrices use two. Existing
+`OPENMX_BAND_GPU_SWITCH_NUM` and concurrency overrides remain available.
+`OPENMX_BAND_CACHE_TRACE=1` reports cache hits.
+
+Memory-limited collinear cluster spin roots retain transformed overlaps on the
+host while still releasing their dense device matrices between spins.
+`OPENMX_CLUSTER_GPU_OVERLAP_CACHE_MB` defaults to 2048 MiB per root, further
+limited to 1/32 of currently available node RAM; zero restores recomputation.
+This cache is also invalidated for each new SCF sequence and input.
+
+Density quadrature retains small device tables within a geometry: at most
+64 MiB for the single-owner service (`OPENMX_DENSITY_GRID_GPU_CACHE_MB`) and
+32 MiB per rank for the local mode (`OPENMX_DENSITY_GRID_GPU_LOCAL_CACHE_MB`).
+The local cache is further limited by shared device free memory; its static
+index joins are validated once per geometry. The existing explicit
+`OPENMX_DENSITY_GRID_GPU_PERSISTENT` setting overrides the owner's automatic
+retention policy. Before a collinear band solve falls back for insufficient
+device memory, it releases reproducible density, density-matrix, construction
+and library scratch buffers and retries the same admission budget. Transformed
+overlaps and density host caches remain available; CPU solver arithmetic is
+unchanged.
+
+In GPU band mode, the density and shared orbital-table caches are released after
+Force3, their last force-stage consumer. This makes their device memory
+available to the following VNA projector batches; they are rebuilt for the
+next geometry as usual. Other solvers retain their existing memory admission
+behavior: the small DC-LNO force batches can run faster in the CPU fallback.
+The force kernels and CPU mode are unchanged.
+
+`tools/run_runtest_l3.py` runs original built-in inputs in separate directories
+and MPI jobs. `--suite S`, `L`, `L2` and `L3` select `-runtest`, `-runtestL`,
+`-runtestL2` and `-runtestL3`; the default remains L3 (20 inputs).
+It preserves inputs and reference outputs,
 snapshots the executable, and records times, numerical differences and memory
 usage in `results.json`. It stops a job when Linux `MemAvailable` falls below
 16 GiB or the job exceeds 3600 seconds, then continues with the next case.
@@ -163,6 +213,13 @@ Use `--cases C60 GGFF` for selected L3 inputs, `--env OPENMX_GPU=0` for a CPU
 comparison, and a fresh output directory for each run. The comparison checks
 every force component as well as total energy, atom positions and grid dimensions;
 the built-in test's force difference is a signed sum and can hide cancellation.
+The comparison tool reads the suite from each run's metadata and rejects
+comparisons between different suites.
+
+For the smaller and longer SCF suites, use `--suite S`, `--suite L`, or
+`--suite L2` with the same runtime settings and comparison commands. Long
+SCF sequences in L2 can require a larger `--timeout`; an interrupted run has
+no final energy/force validation and must be reported separately.
 
 The runtime settings above were used for the final measurements with eight MPI
 ranks sharing one gfx1200 GPU. With the runtime defaults, Fe1000 completed its
@@ -181,6 +238,74 @@ Hamiltonian HIP kernel, and `OPENMX_CLUSTER_GPU_GEMM=0` restores native
 hipBLAS SYMM/GEMM for the cluster transforms. `OPENMX_SETHAM_TIMING=1`,
 `OPENMX_CLUSTER_PROFILE=1` and `OPENMX_FORCE_PROFILE=1` print stage timings;
 `OPENMX_DCLNO_GPU_PROFILE=1` reports local GPU solve counts and elapsed time.
+
+#### R-TiO2-1050 GPU memory setting
+
+On the measured 16 GiB RX 9060 XT, `MAGMA_OZAKI2_MAX_WS_MB=384` lets the
+collinear solver reclaim enough workspace to keep every R-TiO2-1050
+SCF eigensolve on the GPU. This limits the actual MAGMA adapter allocation
+as well as its admission estimate; memory reserves are unchanged. Set it
+before launching OpenMX. The normal algorithm remains `1stage`.
+
+The full original L2 input completed on v12 in 3318.75 s with 39 SCF steps,
+38 workspace reclaims and no dense-solver CPU fallback. Reference errors
+were 5.92e-9 Ha in energy and 4.15e-10 Ha/bohr in the maximum force component,
+both below the existing 1e-7 limits. Construction and force stages still
+use their existing memory-based CPU fallbacks. The baseline aborted at
+SCF2, so this is a completion/accuracy result, not a baseline speed ratio.
+Validation was stopped at the user's request on September 30, 2026. Five of
+seven L2 cases passed the reference comparison with this cap. The Pt500
+candidate was interrupted at SCF 230; Fe1000 and the remaining shared-process
+and timing checks were not run. The final candidate has not been installed
+to `work/openmx`; the report below preserves the incomplete validation state.
+
+```sh
+python3 tools/run_runtest_l3.py --binary source/openmx \
+  --output work/codex_R_TiO2_ws384 --suite L2 --cases R-TiO2-1050 \
+  --ranks 8 --timeout 10800 \
+  --env GPU_MAX_HW_QUEUES=1 --env LIBOMPTARGET_AMDGPU_NUM_HSA_QUEUES=1 \
+  --env HSA_ENABLE_SDMA=0 --env OPENMX_SETHAM_TIMING=1 \
+  --env OPENMX_FORCE_PROFILE=1 --env OPENMX_CLUSTER_PROFILE=1 \
+  --env OPENMX_GPU_VERBOSE=1 --env MAGMA_OZAKI2_MAX_WS_MB=384
+python3 tools/compare_runtest_l3.py --reference work/codex_R_TiO2_ws384
+```
+
+#### Optional C1000 MAGMA algorithm and CPU affinity experiment
+
+A separate L2 C1000 run with the same v11 binary used `MAGMA_OZAKI2_ALGO=auto`,
+`MAGMA_NUM_THREADS=8` and `KMP_AFFINITY=disabled`. On the RX 9060 XT / 3970X,
+elapsed time fell from 2029.18 s with the normal v11 settings to 1820.90 s
+(1.114×; 10.26% shorter), with 41 SCF steps in both runs. Final energy and
+every force component passed the original reference and normal-v11 comparisons
+at the existing 1e-7 Ha / Ha/bohr limits. Only C1000 has completed full numerical
+validation with these optional settings; the normal suites retain their settings.
+
+This experiment allocates additional CPU cores: native MAGMA workers use CPU IDs
+0–7, while the eight MPI ranks use IDs 8–15. `KMP_AFFINITY=disabled` preserves
+the workers' explicit affinity across OpenMP regions. The runner keeps
+OMP/BLIS/OpenBLAS threads at one. The measured gain includes this extra CPU
+allocation and affinity change. Source and defaults are unchanged; OpenMX's
+wrapper still selects `1stage` when `MAGMA_OZAKI2_ALGO` is unset.
+
+Reproduce from the repository root with the archived v11 binary and a fresh
+output directory; CPU IDs below are specific to the measured host:
+
+```sh
+python3 tools/run_runtest_l3.py --binary work/codex_gpu_sll2/openmx.v11 \
+  --output work/codex_C1000_auto_affinity --suite L2 --cases C1000 \
+  --ranks 8 --timeout 10800 --map-by pe-list=8,9,10,11,12,13,14,15:ordered \
+  --env GPU_MAX_HW_QUEUES=1 --env LIBOMPTARGET_AMDGPU_NUM_HSA_QUEUES=1 \
+  --env HSA_ENABLE_SDMA=0 --env OPENMX_SETHAM_TIMING=1 \
+  --env OPENMX_FORCE_PROFILE=1 --env OPENMX_CLUSTER_PROFILE=1 \
+  --env OPENMX_GPU_VERBOSE=1 --env MAGMA_NUM_THREADS=8 \
+  --env KMP_AFFINITY=disabled --env MAGMA_OZAKI2_ALGO=auto
+python3 tools/compare_runtest_l3.py --reference work/codex_C1000_auto_affinity
+python3 tools/compare_runtest_l3.py work/codex_gpu_sll2/final-L2-case-C1000 \
+  work/codex_C1000_auto_affinity
+```
+
+See the [S/L/L2 tuning report](gpu_tuning_s_l_l2_20260923.txt) for the separate
+suite results, C1000 baseline discrepancy and experiment provenance.
 
 ### Built-in test suites (-runtest / -runtestL)
 Desktop PC: AMD Ryzen Threadripper 3970X (16 of 32 cores used), 256 GB RAM, one AMD Radeon RX 9060 XT (gfx1200, 16 GB); ROCm 7.2.0, Open MPI 5.0.9 built with the ROCm compilers, AOCL 5.2.0; 16 MPI ranks sharing the GPU, flat MPI, the same binary for every column. GPU columns use the input-file defaults, CPU columns `OPENMX_GPU=0`:

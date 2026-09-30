@@ -19,6 +19,7 @@
 #include <math.h>
 #include <omp.h>
 #include <stdio.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
@@ -41,6 +42,10 @@ extern int openmx_magma_zheevdx_gpu(int n, int maxn, void *d_A, double *w, int *
 extern int openmx_hipsolver_zheevd_gpu(int n, int maxn, void *d_A, double *w, int *mout);
 extern int openmx_gpu_eigensolver_use_hipsolver(void);
 extern int openmx_gpu_is_apu(void);
+extern int openmx_magma_release_z_workspace(void);
+extern int openmx_hipsolver_release_workspace(void);
+extern int BandCol_ReleaseDMDeviceWorkspace_HIP(void);
+extern void Set_Density_Grid_GPU_Release_Device_Caches(void);
 
 static void Construct_Band_CsHs(int SCF_iter, int all_knum, int * order_GA, int * MP, double * S1, double * H1,
                                 double k1, double k2, double k3, dcomplex * Cs, dcomplex * Hs, int n,
@@ -49,6 +54,7 @@ static int  BandCol_LastConstructOnDevice(void);
 
 static double get_max_value(double localValue);
 static void   BandCol_GpuSolver_EnsureMatrixCapacity(int n);
+static void   BandCol_ConstructCache_Reset(void);
 
 typedef struct
 {
@@ -84,6 +90,97 @@ typedef struct
 } BandColGpuSolverCtx;
 
 static BandColGpuSolverCtx BandCol_gpusolver_ctx = {0};
+
+typedef struct {
+    dcomplex *matrix;
+    double k1, k2, k3;
+} BandColKOverlap;
+
+static BandColKOverlap *BandCol_k_overlap = NULL;
+static int BandCol_k_overlap_n = 0, BandCol_k_overlap_points = 0;
+static size_t BandCol_k_overlap_bytes = 0, BandCol_k_overlap_used = 0;
+
+static void BandCol_KOverlapReset(void)
+{
+    for (int k = 0; k < BandCol_k_overlap_points; ++k)
+        free(BandCol_k_overlap[k].matrix);
+    free(BandCol_k_overlap);
+    BandCol_k_overlap = NULL;
+    BandCol_k_overlap_n = BandCol_k_overlap_points = 0;
+    BandCol_k_overlap_bytes = BandCol_k_overlap_used = 0;
+}
+
+/* Overlap and eigenvector caches each receive at most 1/64 of available
+   node RAM, divided among local ranks. Allocation failure keeps the
+   original GPU recomputation path available. */
+static size_t BandCol_HostCacheLimit(const char *name, double default_mib)
+{
+    const char *env = getenv(name);
+    double cap = env == NULL ? default_mib : atof(env);
+    unsigned long long available_kib = 0;
+    int ranks = openmx_gpu_local_size_noncollective();
+    FILE *file;
+    char line[256];
+    size_t limit;
+
+    if (!(cap > 0.0) || cap >= (double)SIZE_MAX / 1048576.0) return 0;
+    limit = (size_t)(cap * 1048576.0);
+    file = fopen("/proc/meminfo", "r");
+    if (file == NULL) return 0;
+    while (fgets(line, sizeof(line), file) != NULL) {
+        if (sscanf(line, "MemAvailable: %llu kB", &available_kib) == 1) break;
+    }
+    fclose(file);
+    if (ranks < 1) ranks = 1;
+    if (available_kib / (unsigned)ranks * (1024ULL / 64ULL) < limit)
+        limit = (size_t)(available_kib / (unsigned)ranks * (1024ULL / 64ULL));
+    return limit;
+}
+
+static void BandCol_KOverlapPrepare(int n, int points)
+{
+    if (BandCol_k_overlap_n != n || BandCol_k_overlap_points != points)
+        BandCol_KOverlapReset();
+    if (BandCol_k_overlap != NULL || n <= 0 || points <= 0 ||
+        (size_t)n > SIZE_MAX / (size_t)n / sizeof(dcomplex)) return;
+    size_t bytes = (size_t)n * (size_t)n * sizeof(dcomplex);
+    if (bytes > BandCol_HostCacheLimit("OPENMX_BAND_COL_OVERLAP_CACHE_MB", 512.0)) return;
+    BandCol_k_overlap = (BandColKOverlap*)calloc((size_t)points, sizeof(BandColKOverlap));
+    if (BandCol_k_overlap == NULL) return;
+    BandCol_k_overlap_n = n;
+    BandCol_k_overlap_points = points;
+    BandCol_k_overlap_bytes = bytes;
+}
+
+static int BandCol_KOverlapRestore(int point, double k1, double k2, double k3)
+{
+    BandColGpuSolverCtx *ctx = &BandCol_gpusolver_ctx;
+    if (BandCol_k_overlap == NULL) return 0;
+    BandColKOverlap *entry = &BandCol_k_overlap[point];
+    if (entry->matrix == NULL || entry->k1 != k1 || entry->k2 != k2 || entry->k3 != k3) return 0;
+    wait_hipfunc(hipMemcpy(ctx->d_S, entry->matrix, BandCol_k_overlap_bytes, hipMemcpyHostToDevice));
+    ctx->transformed_s_valid = 1;
+    ctx->transformed_s_dim = BandCol_k_overlap_n;
+    return 1;
+}
+
+static void BandCol_KOverlapSave(int point, double k1, double k2, double k3)
+{
+    if (BandCol_k_overlap == NULL) return;
+    BandColKOverlap *entry = &BandCol_k_overlap[point];
+    if (entry->matrix == NULL) {
+        size_t limit = BandCol_HostCacheLimit("OPENMX_BAND_COL_OVERLAP_CACHE_MB", 512.0);
+        if (BandCol_k_overlap_used > limit || BandCol_k_overlap_bytes > limit - BandCol_k_overlap_used) return;
+        entry->matrix = (dcomplex*)malloc(BandCol_k_overlap_bytes);
+        if (entry->matrix == NULL) return;
+        BandCol_k_overlap_used += BandCol_k_overlap_bytes;
+    }
+    wait_hipfunc(hipMemcpy(entry->matrix, BandCol_gpusolver_ctx.d_S,
+                          BandCol_k_overlap_bytes, hipMemcpyDeviceToHost));
+    entry->k1 = k1;
+    entry->k2 = k2;
+    entry->k3 = k3;
+}
 
 typedef struct
 {
@@ -182,16 +279,11 @@ static void BandCol_AbortWithMessage(const char * msg)
     exit(1);
 }
 
-/* GPU/CPU crossover of the collinear band dense eigensolver path.  The CPU
-   fallback of this path solves every k point twice with a serial ELPA per
-   k-point world, so the GPU-dense path pays off well below the global
-   GPU_CPU_SWITCH_NUM: measured on one RTX 5080 shared by 8 ranks (14
-   irreducible k points), the GPU path is 2.0x at n=832 and 1.4x at n=416,
-   with the crossover near n=300-400.  800 matches the DC-LNO threshold
-   GPU_CPU_SWITCH_NUM2.  OPENMX_BAND_GPU_SWITCH_NUM=<dim> overrides the
-   default for this path only.  Also consulted by DFT.c so the startup
-   fallback notice reports the effective value. */
-#define BAND_GPU_CPU_SWITCH_NUM 800
+/* Reusing S(k) and the occupation-pass eigenvectors lowers the collinear
+   band crossover: GEL (n=456) improves with eight ranks on gfx1200.
+   OPENMX_BAND_GPU_SWITCH_NUM overrides this path only; DFT.c also uses
+   the value for its startup fallback notice. */
+#define BAND_GPU_CPU_SWITCH_NUM 400
 
 int Band_DFT_Col_GpuSwitchNum(void)
 {
@@ -389,7 +481,7 @@ static int BandCol_AbortAfterEigenScf(void)
     return (value != NULL && atoi(value) != 0) ? 1 : 0;
 }
 
-static int BandCol_MaxConcurrentKGpuTurns(void)
+static int BandCol_MaxConcurrentKGpuTurns(int n)
 {
     const char *value = getenv("OPENMX_BAND_GPU_MAX_CONCURRENT_K");
     long limit;
@@ -418,7 +510,9 @@ static int BandCol_MaxConcurrentKGpuTurns(void)
         return (int)limit;
     }
 
-    return BandCol_DefaultGpuTurnGroup();
+    /* With cached S/eigenvectors, eight small k-point solves overlap well
+       on gfx1200 (GEL, n=456). Larger matrices keep the two-turn budget. */
+    return n <= 512 ? 8 : BandCol_DefaultGpuTurnGroup();
 }
 
 /* Fixed per-rank device cost of the BLAS/eigensolver libraries beyond the
@@ -478,19 +572,17 @@ static int BandCol_GpuDenseFits(int n, int owns_dense)
     const char *env = getenv("OPENMX_BAND_GPU_DIAG");
     const char *reserve_env = getenv("OPENMX_BAND_GPU_DIAG_RESERVE_MB");
     size_t free_bytes=0,total_bytes=0,reserve=(size_t)1024*1024*1024;
-    size_t per_rank,required,fixed_all;
+    size_t per_rank,required=0,fixed_all;
     int device_ranks;
-    int turns=BandCol_MaxConcurrentKGpuTurns();
-    int local_fit=1,fit=1;
+    int turns=BandCol_MaxConcurrentKGpuTurns(n);
+    int local_fit=1,fit=1,has_budget=0;
 
-    if (env!=NULL && atoi(env)==0) local_fit=0;
     if (reserve_env!=NULL){
         long mib=atol(reserve_env);
         if (0<=mib) reserve=(size_t)mib*1024U*1024U;
     }
     if (turns<1) turns=1;
     if ((size_t)n>SIZE_MAX/(size_t)n/sizeof(dcomplex)/5U){
-        local_fit=0;
         per_rank=SIZE_MAX;
     }
     else per_rank=(size_t)5*(size_t)n*(size_t)n*sizeof(dcomplex)+(size_t)n*sizeof(double);
@@ -503,26 +595,43 @@ static int BandCol_GpuDenseFits(int n, int owns_dense)
         (size_t)turns<=(SIZE_MAX-reserve-fixed_all)/per_rank){
         required=per_rank*(size_t)turns+reserve+fixed_all;
         OpenMX_GpuPhaseNeed_Register("band_col",required);
-        if (local_fit && owns_dense &&
-            (hipMemGetInfo(&free_bytes,&total_bytes)!=hipSuccess || free_bytes<required)){
-            int myid;
+        has_budget=1;
+    }
+    /* A completed DM/density phase may still own hundreds of MiB. Reclaim
+       its reproducible device buffers before accepting a CPU fallback;
+       keep the original admission budget and transformed overlap intact. */
+    for (int attempt=0; attempt<2; ++attempt) {
+        /* -1 is an explicit/invalid-budget fallback, 0 is memory pressure,
+           and 1 fits. Only memory pressure should evict reusable caches. */
+        local_fit=(has_budget && (env==NULL || atoi(env)!=0)) ? 1 : -1;
+        if (local_fit==1 && owns_dense &&
+            (hipMemGetInfo(&free_bytes,&total_bytes)!=hipSuccess || free_bytes<required))
             local_fit=0;
-            MPI_Comm_rank(mpi_comm_level1,&myid);
-            if (myid==Host_ID){
-                const double MiB=1024.0*1024.0;
-                fprintf(stderr,
-                        "Band_DFT_Col: GPU device is shared by %d rank(s), has %.3f MiB free "
-                        "(%.3f MiB total), but %.3f MiB is required for the dense GPU diagonalization "
-                        "(%.3f MiB library reserve per rank); switching to CPU path.\n",
-                        device_ranks,(double)free_bytes/MiB,(double)total_bytes/MiB,
-                        (double)required/MiB,(double)BandCol_GpuLibraryReserveBytes()/MiB);
-                fflush(stderr);
-            }
+        MPI_Allreduce(&local_fit,&fit,1,MPI_INT,MPI_MIN,mpi_comm_level1);
+        if (fit!=0 || attempt==1) break;
+        (void)BandCol_ReleaseDMDeviceWorkspace_HIP();
+        BandCol_ConstructCache_Reset();
+        Set_Density_Grid_GPU_Release_Device_Caches();
+        openmx_gemmul8ReleaseWorkspaces();
+        (void)openmx_magma_release_z_workspace();
+        (void)openmx_hipsolver_release_workspace();
+        MPI_Barrier(mpi_comm_level1);
+    }
+    if (fit==0 && local_fit==0 && owns_dense) {
+        int myid;
+        MPI_Comm_rank(mpi_comm_level1,&myid);
+        if (myid==Host_ID) {
+            const double MiB=1024.0*1024.0;
+            fprintf(stderr,
+                    "Band_DFT_Col: GPU device is shared by %d rank(s), has %.3f MiB free "
+                    "(%.3f MiB total), but %.3f MiB is required for the dense GPU diagonalization "
+                    "(%.3f MiB library reserve per rank); switching to CPU path.\n",
+                    device_ranks,(double)free_bytes/MiB,(double)total_bytes/MiB,
+                    (double)required/MiB,(double)BandCol_GpuLibraryReserveBytes()/MiB);
+            fflush(stderr);
         }
     }
-    else local_fit=0;
-    MPI_Allreduce(&local_fit,&fit,1,MPI_INT,MPI_MIN,mpi_comm_level1);
-    return fit;
+    return fit==1;
 }
 
 static void BandCol_ConstructCache_Reset(void)
@@ -1263,6 +1372,8 @@ static void BandCol_GpuSolver_Destroy(void)
    a no-op when the corresponding path never ran. */
 void Band_DFT_Col_Release_GPU_Caches(void)
 {
+    BandCol_KOverlapReset();
+    (void)BandCol_ReleaseDMDeviceWorkspace_HIP();
     BandCol_ConstructCache_Reset();
     BandCol_DMWorkspace_Reset();
     BandCol_DMEntryCache_Reset();
@@ -1968,12 +2079,20 @@ double Band_DFT_Col(int SCF_iter, int knum_i, int knum_j, int knum_k, int SpinP_
     int     use_gpusolver_dense;
     int     use_setham_packed_cache = 0;
     int *   gpu_k_order = NULL;
+    dcomplex **k_evec_cache = NULL;
+    size_t k_cache_bytes = 0, k_cache_used = 0, k_cache_limit = 0;
+    int k_cache_hits = 0, k_overlap_hits = 0;
     int *   setham_order_GA = NULL;
     double *setham_S1 = NULL;
     double *setham_H1 = NULL;
 
     /* for time */
     dtime(&TStime);
+
+    if (scf_eigen_lib_flag == GPUSOLVER && SCF_iter == 1) {
+        BandCol_KOverlapReset();
+        BandCol_ConstructCache_Reset();
+    }
 
     time1  = 0.0;
     time2  = 0.0;
@@ -2491,6 +2610,16 @@ double Band_DFT_Col(int SCF_iter, int knum_i, int knum_j, int knum_k, int SpinP_
         }
     }
 
+    if (use_gpusolver_dense && all_knum != 1) {
+        BandCol_KOverlapPrepare(n, T_knum);
+        if (MaxN > 0 && (size_t)n <= SIZE_MAX / (size_t)MaxN / sizeof(dcomplex)) {
+            k_cache_bytes = (size_t)n * (size_t)MaxN * sizeof(dcomplex);
+            k_cache_limit = BandCol_HostCacheLimit("OPENMX_BAND_COL_KCACHE_MB", 1024.0);
+            if (k_cache_bytes <= k_cache_limit)
+                k_evec_cache = (dcomplex**)calloc((size_t)Num_Comm_World1 * T_knum, sizeof(dcomplex*));
+        }
+    }
+
     use_setham_packed_cache =
         (use_gpusolver_dense && all_knum == 1 && Set_Hamiltonian_GpuSolver_Packed_CacheReady() &&
          Set_Hamiltonian_GpuSolver_Packed_OrderMode() == 0);
@@ -2814,7 +2943,7 @@ diagonalize1:
     }
 
     if (all_knum != 1 && use_gpusolver_dense) {
-        const int max_concurrent_gpu_turns = BandCol_MaxConcurrentKGpuTurns();
+        const int max_concurrent_gpu_turns = BandCol_MaxConcurrentKGpuTurns(n);
         const int total_gpu_turns = Num_Comm_World1 * T_knum;
 
         for (int group_first = 0; group_first < total_gpu_turns; group_first += max_concurrent_gpu_turns) {
@@ -2856,7 +2985,12 @@ diagonalize1:
                 if (measure_time)
                     dtime(&Stime);
 
-                BandCol_GpuSolver_PrepareTransformedS(1, n, construct_on_device ? NULL : Ss, ko, koS);
+                if (BandCol_KOverlapRestore(kloop, k1, k2, k3)) {
+                    ++k_overlap_hits;
+                } else {
+                    BandCol_GpuSolver_PrepareTransformedS(1, n, construct_on_device ? NULL : Ss, ko, koS);
+                    BandCol_KOverlapSave(kloop, k1, k2, k3);
+                }
 
                 if (measure_time) {
                     dtime(&Etime);
@@ -2875,7 +3009,15 @@ diagonalize1:
                 } else {
                     evec_device = BandCol_GpuSolver_SolveHamiltonianDeviceOnly(n, MaxN, Hs, ko);
                 }
-                (void)evec_device;
+                if (k_evec_cache != NULL && k_cache_bytes <= k_cache_limit - k_cache_used) {
+                    size_t slot = (size_t)spin * T_knum + kloop;
+                    k_evec_cache[slot] = (dcomplex*)malloc(k_cache_bytes);
+                    if (k_evec_cache[slot] != NULL) {
+                        wait_hipfunc(hipMemcpy(k_evec_cache[slot], evec_device,
+                                              k_cache_bytes, hipMemcpyDeviceToHost));
+                        k_cache_used += k_cache_bytes;
+                    }
+                }
                 BandCol_GpuSolver_ReleaseDeviceMemory();
 
                 if (measure_time) {
@@ -4195,7 +4337,7 @@ diagonalize1:
         /* for kloop */
 
         if (use_gpusolver_dense) {
-            const int max_concurrent_gpu_turns = BandCol_MaxConcurrentKGpuTurns();
+            const int max_concurrent_gpu_turns = BandCol_MaxConcurrentKGpuTurns(n);
             const int total_gpu_turns = Num_Comm_World1 * T_knum;
 
             for (int group_first = 0; group_first < total_gpu_turns; group_first += max_concurrent_gpu_turns) {
@@ -4226,54 +4368,75 @@ diagonalize1:
                     k2 = T_KGrids2[kloop];
                     k3 = T_KGrids3[kloop];
 
-                    /* make S and H */
-
-                    Construct_Band_CsHs(SCF_iter, all_knum, use_setham_packed_cache ? setham_order_GA : order_GA, MP,
-                                        use_setham_packed_cache ? setham_S1 : S1,
-                                        use_setham_packed_cache ? setham_H1 : H1, k1, k2, k3, Ss, Hs, n,
-                                        use_gpusolver_dense, owns_global_dense_rank);
-                    construct_on_device = BandCol_LastConstructOnDevice();
-
-                    /* diagonalize S */
-
-                    if (measure_time)
-                        dtime(&Stime);
-
-                    BandCol_GpuSolver_PrepareTransformedS(1, n, construct_on_device ? NULL : Ss, ko, koS);
-
-                    if (measure_time) {
-                        dtime(&Etime);
-                        time9 += Etime - Stime;
-                    }
-
-                    if (3 <= level_stdout) {
-                        printf(" myid0=%2d kloop %2d  k1 k2 k3 %10.6f %10.6f %10.6f\n", myid0, kloop, T_KGrids1[kloop],
-                               T_KGrids2[kloop], T_KGrids3[kloop]);
-                        for (i1 = 1; i1 <= n; i1++) {
-                            printf("  Eigenvalues of OLP  %2d  %15.12f\n", i1, ko[i1]);
-                        }
-                    }
-
-                    /****************************************************
-                          1/sqrt(ko) * U^t * H * U * 1/sqrt(ko)
-                    ****************************************************/
-
-                    if (n != na_rows_max || n != na_cols_max) {
-                        BandCol_AbortWithMessage("GPUSOLVER DM path requires full dense matrices in Band_DFT_Col.c.");
-                    }
-
-                    if (measure_time)
-                        dtime(&Stime);
-
-                    if (construct_on_device) {
-                        evec_device = BandCol_GpuSolver_SolveHamiltonianDeviceInput(n, MaxN, ko);
+                    size_t cache_slot = (size_t)spin * T_knum + kloop;
+                    if (k_evec_cache != NULL && k_evec_cache[cache_slot] != NULL) {
+                        BandCol_GpuSolver_Init();
+                        evec_device = BandCol_GpuSolver_EnsureEigenvectorCapacity(n, MaxN);
+                        wait_hipfunc(hipMemcpy(evec_device, k_evec_cache[cache_slot],
+                                              k_cache_bytes, hipMemcpyHostToDevice));
+                        free(k_evec_cache[cache_slot]);
+                        k_evec_cache[cache_slot] = NULL;
+                        memcpy(ko + 1, EIGEN[spin][kloop] + 1, sizeof(double) * (size_t)MaxN);
+                        ++k_cache_hits;
                     } else {
-                        evec_device = BandCol_GpuSolver_SolveHamiltonianDeviceOnly(n, MaxN, Hs, ko);
-                    }
+                        /* make S and H */
 
-                    if (measure_time) {
-                        dtime(&Etime);
-                        time10 += Etime - Stime;
+                        Construct_Band_CsHs(SCF_iter, all_knum, use_setham_packed_cache ? setham_order_GA : order_GA, MP,
+                                            use_setham_packed_cache ? setham_S1 : S1,
+                                            use_setham_packed_cache ? setham_H1 : H1, k1, k2, k3, Ss, Hs, n,
+                                            use_gpusolver_dense, owns_global_dense_rank);
+                        construct_on_device = BandCol_LastConstructOnDevice();
+
+                        /* diagonalize S */
+
+                        if (measure_time)
+                            dtime(&Stime);
+
+                        const int overlap_cached = BandCol_KOverlapRestore(kloop, k1, k2, k3);
+                        if (overlap_cached) {
+                            ++k_overlap_hits;
+                        } else {
+                            BandCol_GpuSolver_PrepareTransformedS(1, n, construct_on_device ? NULL : Ss, ko, koS);
+                            BandCol_KOverlapSave(kloop, k1, k2, k3);
+                        }
+
+                        if (measure_time) {
+                            dtime(&Etime);
+                            time9 += Etime - Stime;
+                        }
+
+                        if (3 <= level_stdout) {
+                            printf(" myid0=%2d kloop %2d  k1 k2 k3 %10.6f %10.6f %10.6f\n", myid0, kloop, T_KGrids1[kloop],
+                                   T_KGrids2[kloop], T_KGrids3[kloop]);
+                            if (overlap_cached)
+                                printf("  Reusing cached overlap transformation.\n");
+                            else
+                                for (i1 = 1; i1 <= n; i1++)
+                                    printf("  Eigenvalues of OLP  %2d  %15.12f\n", i1, ko[i1]);
+                        }
+
+                        /****************************************************
+                              1/sqrt(ko) * U^t * H * U * 1/sqrt(ko)
+                        ****************************************************/
+
+                        if (n != na_rows_max || n != na_cols_max) {
+                            BandCol_AbortWithMessage("GPUSOLVER DM path requires full dense matrices in Band_DFT_Col.c.");
+                        }
+
+                        if (measure_time)
+                            dtime(&Stime);
+
+                        if (construct_on_device) {
+                            evec_device = BandCol_GpuSolver_SolveHamiltonianDeviceInput(n, MaxN, ko);
+                        } else {
+                            evec_device = BandCol_GpuSolver_SolveHamiltonianDeviceOnly(n, MaxN, Hs, ko);
+                        }
+
+                        if (measure_time) {
+                            dtime(&Etime);
+                            time10 += Etime - Stime;
+                        }
+
                     }
 
                     if (3 <= level_stdout && 0 <= kloop) {
@@ -4881,6 +5044,15 @@ diagonalize1:
 
     free(SP_Atoms);
     free(gpu_k_order);
+    if (k_evec_cache != NULL) {
+        for (size_t point = 0; point < (size_t)Num_Comm_World1 * T_knum; ++point)
+            free(k_evec_cache[point]);
+        free(k_evec_cache);
+    }
+    if (use_gpusolver_dense && all_knum != 1 && BandCol_CacheTraceEnabled())
+        printf("BAND_COL_CACHE rank=%d SCF=%d evec_hits=%d overlap_hits=%d evec=%.1f MiB overlap=%.1f MiB\n",
+               myid0, SCF_iter, k_cache_hits, k_overlap_hits,
+               k_cache_used / 1048576.0, BandCol_k_overlap_used / 1048576.0);
     free(SP_NZeros);
     free(My_NZeros);
 
