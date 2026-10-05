@@ -1,6 +1,7 @@
 OpenMX 4.0 AMD GPU tuning: -runtest / -runtestL / -runtestL2
-Updated 2026-09-30 21:15:10 JST
-STATUS: PAUSED BY USER; active tests and all queued validation stopped; not installed.
+Updated 2026-10-05 JST; final measurements and audit completed 2026-10-03.
+STATUS: SCHEDULED VALIDATION FINISHED; L2 strict reference PASS 6/7;
+Fe1000 baseline/candidate reference checks failed; not installed.
 Selected candidate: openmx.v12
 Selected SHA256: c55a088baddd9fb988bc55fd00da40bca39cdf25694b91b824933837ab359f82
 work/openmx SHA256: 2a81ccda007effaa7dea418c279084b6dbdad8fbf2b0e1bd92524c283998a5a6
@@ -249,7 +250,11 @@ R-TiO2-1050 GPU memory recovery follow-up
   retries the unchanged budget, removes the obsolete replicated solve,
   and initializes distributed overlap before first GPU-to-ELPA fallback.
   CPU-selected solvers retain their original numerical branches.
-  Follow-up validation state: v12 normal S14/CPU14 exact/explicit-off2/transitions6 and affected L7 passed. Five cap384 L2 cases passed reference. User stopped all tests and queues on 2026-09-30 at 21:10:33 JST; Pt500 candidate interrupted at SCF230 without final numerical validation. Fe1000, shared-process integration and paired S timing were not run. The earlier default-cap R diagnostic remains interrupted and is not a numerical pass. Not installed.
+  Follow-up validation state: All scheduled tests and the final audit finished
+  on 2026-10-03. Candidate cap384 L2 reference PASS 6/7; Fe1000 baseline and
+  candidate fail reference energy. Integration S (14 cases), L (3 cases),
+  and paired S (14 cases) checks pass. Interrupted Pt500 runs remain
+  archived; not installed.
     v12-S: completed 14, driver rc 0, comparisons {"reference": 0, "baseline": 0}
     cpu-v12-S: completed 14, driver rc 0, comparisons {"reference": 0, "baseline": 0}
       CPU printed E/F/atom/position/grid exact: True
@@ -267,7 +272,9 @@ v12 follow-up numerical validation (distinct production binary)
   Binary SHA256: c55a088baddd9fb988bc55fd00da40bca39cdf25694b91b824933837ab359f82
   Only Cluster_DFT_Col.c changed from v11; other five production
   source hashes match v11. Original inputs and normal settings retained.
-  State: v12 normal S14/CPU14 exact/explicit-off2/transitions6 and affected L7 passed. Five cap384 L2 cases passed reference. User stopped all tests and queues on 2026-09-30 at 21:10:33 JST; Pt500 candidate interrupted at SCF230 without final numerical validation. Fe1000, shared-process integration and paired S timing were not run. The earlier default-cap R diagnostic remains interrupted and is not a numerical pass. Not installed.
+  State: Scheduled tests and final audit completed on 2026-10-03.
+  Candidate cap384 L2 reference PASS 6/7; Fe1000 reference checks failed.
+  Integration and paired S checks pass; no pending tests; not installed.
   v12-S: recorded 14/14, completed 14/14, reference PASS 14.
     Benzene: completed; 4.64 s; 19 SCFs; E/F errors 9.947598300641403e-13/0.0.
     C60: completed; 12.47 s; 27 SCFs; E/F errors 4.001776687800884e-11/1.4000002546143975e-11.
@@ -365,7 +372,7 @@ v13 follow-up numerical validation (distinct production binary)
   Failed R-TiO2 baseline and C1000 discrepancy are not A/B passes.
 
 L2 runtime workspace tuning on v12: actual MAGMA cap 384 MiB
-  State: PAUSED BY USER at 2026-09-30 21:10:33 JST. Candidate cap384 L2 reference PASS remains 5/7. Pt500 baseline passed; candidate interrupted at SCF 230 without final numerical validation. Fe1000, integration and paired S are unstarted. All test/queue/monitor processes stopped; no installation or automatic restart.
+  State: Scheduled jobs attempted; cap384 L2 strict reference PASS 6/7. Final audit ready=False; 2 failed checks and 0 pending checks. Inspect final-readiness.json and timing/load evidence before installation; not installed.
   MAGMA_OZAKI2_MAX_WS_MB=384 lowers the actual device/stream adapter
   allocation cap from 512 MiB. The admission budget reflects that actual
   cap. One-stage algorithm, eight MPI ranks, numerical tolerances,
@@ -374,13 +381,14 @@ L2 runtime workspace tuning on v12: actual MAGMA cap 384 MiB
   unchanged. Full R reference PASS and zero dense CPU fallbacks are
   required before the remaining L/L2 jobs start.
   Full R result: {"run": "v12-magma384-L2-case-R-TiO2-1050", "driver_returncode": 0, "comparisons": {"reference": 0}, "completed": 1, "reclaim_retries": 38, "dense_cpu_fallbacks": 0, "host_memory_guard": false, "start_timestamp": 1790730731.2296543, "end_timestamp": 1790734052.5391605, "sampling_log": "cpu-load.jsonl"}
-  Recorded 6/7; completed 5/7; reference PASS 5.
+  Recorded 7/7; completed 7/7; reference PASS 6.
     R-TiO2-1050: completed; 3318.75 s; 39 SCFs; E/F errors 5.918991519138217e-09/4.1499999999515015e-10; dense CPU fallbacks 0.
     Ih-Ice1200: completed; 1283.81 s; 35 SCFs; E/F errors 2.6930138119496405e-09/1.0700000000612997e-10; dense CPU fallbacks 0.
     C1000: completed; 2037.01 s; 41 SCFs; E/F errors 3.7198333302512765e-10/3.96e-10; dense CPU fallbacks 0.
     GRA1024: completed; 2563.09 s; 51 SCFs; E/F errors 8.913048077374697e-10/6.570000000310529e-10; dense CPU fallbacks 0.
     Si1000: completed; 2534.15 s; 41 SCFs; E/F errors 6.921254680491984e-10/1.0100000000299973e-10; dense CPU fallbacks 0.
-    Pt500: interrupted_by_user; - s; 230 SCFs; E/F errors -/-; dense CPU fallbacks 0.
+    Pt500: completed; 12551.66 s; 182 SCFs; E/F errors 1.1816155165433884e-08/6.606399999999999e-08; dense CPU fallbacks 0.
+    Fe1000: completed; 36109.61 s; 380 SCFs; E/F errors 1.0136864148080349e-07/1.542200000000007e-08; dense CPU fallbacks 0.
   Default-cap v12 and rejected v13 partial R diagnostics are not
   full numerical passes. v13 BLAS-handle reset freed no additional
   net memory and was removed; source and source/openmx match frozen v12.
@@ -395,7 +403,43 @@ L2 runtime workspace tuning on v12: actual MAGMA cap 384 MiB
   41 SCFs. Current cap384 and earlier normal v11 both pass reference;
   the baseline discrepancy is retained, with no tolerance changes.
 
+Final Fe1000 result and audit
+  Baseline: 80662.89 s, 507 SCFs; reference E error 1.0959047358483076e-7 Ha,
+  max F error 7.251999999997741e-9 Ha/bohr; strict reference FAIL.
+  Candidate cap384: 36109.61 s, 380 SCFs; reference E error
+  1.0136864148080349e-7 Ha, max F error 1.542200000000007e-8 Ha/bohr;
+  strict reference FAIL. Atom identities, coordinates and grids match.
+  Candidate/baseline: E difference 8.221832104027271e-9 Ha,
+  max F difference 8.340000000000669e-9 Ha/bohr; strict comparison PASS.
+  Both completed normally using the original input and stopping criteria.
+  No dense-solver CPU fallback occurred in either run. The candidate
+  recorded 758 serial-spin overlap cache hits; the baseline recorded none.
+  Matrix construction and Force4B retain their existing CPU memory paths.
+  Total times include different SCF counts and are not a speedup at equal
+  iteration count. CPU-only Fe1000 was not measured in this validation.
+  The final audit at 2026-10-03 00:28:14 JST has zero pending checks and
+  exactly two failures: the baseline and candidate Fe1000 reference checks.
+  Thresholds remain 1e-7; neither completion nor the passing baseline
+  comparison makes Fe1000 a reference pass. All test/queue controllers
+  and the existing periodic reporter finished; no installation occurred.
+  Evidence: baseline-L2-case-Fe1000-audit.json,
+  v12-magma384-L2-case-Fe1000-audit.json and final-readiness.json.
+
+Validation resumed on 2026-10-01
+  User requested resumption after the external CPU workload finished.
+  Pt500 restarts from the unmodified original input with frozen v12 and
+  cap384. The Sep30 SCF230 interruption is archived separately and is
+  not a numerical pass. Completed baseline and five candidate L2 passes
+  are retained. Pt500 baseline/candidate are not consecutive timing runs;
+  interpret timings with SCF counts and cpu-load.jsonl.
+  Resume provenance: resume-20261001.json; archived interrupted run:
+  archives/pt500-user-stop-20260930/v12-magma384-L2-case-Pt500/.
+  Latest resumption: 2026-10-01 12:23:10 JST
+  The Oct1 morning SCF5 interruption is also preserved at:
+  /home/kawai/openmx4.0_amdgpu/work/codex_gpu_sll2/archives/pt500-user-stop-20261001-084208
+
 Pt500 convergence and host-load observation
+  The following Sep30 observation concerns the archived interrupted run, not the fresh Oct1 rerun. Archived run: archives/pt500-user-stop-20260930/v12-magma384-L2-case-Pt500.
   Observation at 2026-09-30 21:08:41 JST: baseline Pt500 completed at 173 SCFs in 11896.86 s and passed reference (E 6.89033e-9 Ha, max F 5.6382e-8 Ha/bohr). Candidate was still running at SCF 229; this snapshot is not a candidate numerical pass.
   Baseline host load was approximately 8.10 busy cores. Candidate host load rose at 20:27:37 JST on 2026-09-30, with a separate 32-thread CPU process observed; recent samples use approximately 31.6 busy cores. This whole-run Pt500 pair does not establish an equal-host-load timing comparison.
   The candidate SCF count increase is a separate observation; its cause is not established by the CPU-load change. Steady eigensolver medians were approximately 24.18 s baseline and 24.30 s candidate at the snapshot. Final numerical comparison and convergence review remain required.
@@ -408,15 +452,40 @@ Archived v11 CPU S control
   coordinates and integration grids for CPU S. It does not assert
   full-log/internal-bit equality or CPU L/L2 validation.
 
+CPU-only versus CPU/GPU elapsed-time comparison
+  Both configurations use eight MPI ranks and one thread per rank;
+  CPU-only controls add OPENMX_GPU=0. Values sum OpenMX elapsed_seconds,
+  excluding MPI launch/watchdog overhead. These are single-run timings.
+  Current v12 S14: CPU-only 114.37 s; CPU/GPU 106.12 s;
+  8.25 s (7.21%) shorter, CPU/GPU speed ratio 1.078x.
+  Evidence: cpu-v12-S/results.json and v12-S/results.json.
+  Earlier L3 five-case control, on the previous L3-final binary (SHA256
+  2a81ccda007effaa7dea418c279084b6dbdad8fbf2b0e1bd92524c283998a5a6):
+    C60          CPU  8.18 s; GPU  5.88 s
+    Crys-MnO     CPU  7.68 s; GPU  4.07 s
+    GEL          CPU 29.64 s; GPU 16.32 s
+    Mn12_148_F   CPU 34.51 s; GPU 19.29 s
+    nsV4Bz5      CPU 29.06 s; GPU 17.77 s
+  Total CPU 109.07 s; GPU 63.33 s; 41.94% shorter, ratio 1.722x.
+  Evidence: work/codex_gpu_tune/cpu-final/results.json and
+  work/codex_gpu_tune/final/results.json, restricted to these five cases.
+  L3 uses its own inputs and previous binary; this is not a current v12
+  L/L2 timing. No CPU-only L/L2 completion measurements were made in
+  the present eight-rank validation. Historical README sixteen-rank
+  CPU/GPU benchmarks have different conditions and are separate evidence.
+
 Consecutive S timing control after long suites and integration
-  Not run (paused by user): baseline 0/14, candidate 0/14.
+  Baseline 106.74 s; selected candidate 107.15 s; ratio 0.996x.
+  Both runs enable GPU acceleration; these compare two GPU revisions,
+  not CPU-only versus CPU/GPU. The 0.41 s difference is not a speed gain.
+  Comparison status: {"timing-baseline-S-reference": 0, "timing-final-S-reference": 0, "timing-final-S-baseline": 0}
   Same per-input launches, input order and runtime settings as the main S
   measurements. This addresses the shared CPU load during the first final-S.
   Paired checks: timing-final-S-baseline.md; load: paired-small-cpu-load.jsonl.
 
 Same-process integration
-  integration-S: not run (paused by user).
-  integration-L: not run (paused by user).
+  integration-S: recorded 14, completed 14, reference PASS 14.
+  integration-L: recorded 3, completed 3, reference PASS 3.
   S uses all 14 inputs in one launch. L uses GEL/Mn12_148_F/SialicAcid
   in one launch with OPENMX_CLUSTER_GPU_DIAG_RESERVE_MB=5500, exercising
   serial spin roots. OPENMX_BAND_CACHE_TRACE=1; 1800 s/process watchdog.

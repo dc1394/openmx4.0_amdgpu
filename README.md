@@ -253,11 +253,28 @@ were 5.92e-9 Ha in energy and 4.15e-10 Ha/bohr in the maximum force component,
 both below the existing 1e-7 limits. Construction and force stages still
 use their existing memory-based CPU fallbacks. The baseline aborted at
 SCF2, so this is a completion/accuracy result, not a baseline speed ratio.
-Validation was stopped at the user's request on September 30, 2026. Five of
-seven L2 cases passed the reference comparison with this cap. The Pt500
-candidate was interrupted at SCF 230; Fe1000 and the remaining shared-process
-and timing checks were not run. The final candidate has not been installed
-to `work/openmx`; the report below preserves the incomplete validation state.
+Validation resumed on October 1 and the scheduled tests and final audit
+finished on October 3, 2026. All seven L2 cases completed with this cap;
+six passed the strict reference comparison. Fe1000 completed at SCF 380,
+but its reference-energy difference of `1.01369e-7` Ha narrowly exceeds
+the unchanged `1e-7` limit. The baseline also fails that reference check
+(`1.09590e-7` Ha); the candidate/baseline energy and maximum-force differences
+are `8.22e-9` Ha and `8.34e-9` Ha/bohr, both passing. The final audit retains
+these two failed reference checks, with no pending tests.
+
+Same-process integration passed all 14 S inputs and the three selected L
+inputs. Fresh consecutive S timings were 106.74 s for the baseline and
+107.15 s for v12, with all reference and baseline comparisons passing.
+Both timings use the GPU; this is an optimization comparison. Separate
+v12 S controls took 114.37 s with `OPENMX_GPU=0` and 106.12 s with GPU
+acceleration enabled (7.2% shorter), using eight MPI ranks and one thread
+per rank. These single-run results are distinct from the historical
+16-rank benchmarks below; this validation did not measure CPU-only L/L2.
+
+The interrupted September 30 and October 1 Pt500 runs remain archived
+and are excluded from numerical passes. Test controllers and periodic
+notifications have finished. The candidate has not been installed to
+`work/openmx`; see the report below for the final results and limitations.
 
 ```sh
 python3 tools/run_runtest_l3.py --binary source/openmx \
