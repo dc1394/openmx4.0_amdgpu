@@ -20,7 +20,8 @@ A run that finds no usable GPU demotes itself to ELPA2, and `OPENMX_GPU=0` force
 With `gpusolver` a cluster calculation (one k-point) diagonalizes on a single GPU. `scf.eigen.lib gpusolver2` (cluster solver only) replaces that diagonalization with [ELPA](https://elpa.mpcdf.mpg.de/) 2026.02 (AMD GPU kernels) + [COSMA](https://github.com/eth-cscs/COSMA) (ROCm backend), engaging every rank and every GPU across nodes. A solve that does not fit in GPU memory falls back to the ELPA CPU kernels / ScaLAPACK; solves below n=256 stay on the CPU kernels. `OPENMX_GS2_ELPA_GPU` and `OPENMX_GS2_GEMM_GPU` (1 = GPU, 0 = CPU, unset = decide from free memory) override the two decisions; on a VRAM-limited card shared by many ranks use `OPENMX_GS2_GEMM_GPU=0`. ELPA, COSMA, COSTA and Tiled-MM are bundled as source archives under `source/third_party/dist/` and built by the first `make` (no network needed; autoconf, automake, libtool, m4 and python3 required). The `elpa1`/`elpa2` paths keep the ELPA 2018.05 embedded in OpenMX.
 
 ## GEMMul8
-The large dense matrix multiplications of the GPU eigensolver path run through [GEMMul8](https://github.com/RIKEN-RCCS/GEMMul8) v3.3.0, which emulates FP64 GEMM on the INT8 matrix cores (Ozaki scheme II) — effective on consumer GPUs with limited FP64 throughput, with total energies agreeing to ~1e-10 Hartree in our tests. `scf.gemmul8.enable off` switches to plain hipBLAS FP64. Its memory-saving mode is on by default with a 256 MiB per-rank workspace cap (`OPENMX_GEMMUL8_MAX_WORKSPACE_MB`; 0 = uncapped).
+The large dense matrix multiplications of the GPU eigensolver path run through [GEMMul8](https://github.com/RIKEN-RCCS/GEMMul8) [v3.5.2](https://github.com/RIKEN-RCCS/GEMMul8/releases/tag/v3.5.2), pinned to commit `603b52363715796a0af5e4aa1ed8d386349b4251`. It emulates FP64 GEMM on the INT8 matrix cores (Ozaki scheme II), supporting consumer GPUs with limited FP64 throughput. `scf.gemmul8.enable off` switches to plain hipBLAS FP64. Its memory-saving mode is on by default with a 256 MiB per-rank workspace cap (`OPENMX_GEMMUL8_MAX_WORKSPACE_MB`; 0 = uncapped).
+The v3.5.2 build and numerical checks are recorded in [gemmul8_upgrade_20261005.txt](gemmul8_upgrade_20261005.txt).
 
 ## Multi-GPU parallelization and MPI
 The ranks are split into one group per k-point and each group's eigenproblem is solved on one GPU, so the eigensolver keeps at most as many GPUs busy as there are k-points (`scf.Gpu.Num`, default 30, is only an upper bound). A cluster calculation therefore uses one GPU for the diagonalization however many the node has — give it one GPU and more ranks, or use `gpusolver2`. Hybrid MPI/OpenMP brings no speedup here: use flat MPI with one thread per rank,
@@ -56,7 +57,7 @@ make -j16 openmx \
   AOCC_LIB=/path/to/aocc/lib
 ```
 
-The Makefile variables above default to one specific machine; override them for yours. The first `make` also builds hipMAGMA 2.10.0 (bundled archive), GEMMul8 (submodule) and the gpusolver2 stack, which takes a while. Questions are welcome via GitHub issues or [my X account](https://x.com/dc1394) (Japanese is fine there).
+The Makefile variables above default to one specific machine; override them for yours. For an existing checkout, run `git submodule update --init --recursive` before rebuilding to select the bundled GEMMul8 version. The first `make` also builds hipMAGMA 2.10.0 (bundled archive), GEMMul8 (submodule) and the gpusolver2 stack, which takes a while. Questions are welcome via GitHub issues or [my X account](https://x.com/dc1394) (Japanese is fine there).
 
 ## Benchmarks
 Benchmarks of the NVIDIA version this port derives from: https://journals.jps.jp/doi/10.7566/JPSJ.94.124003
@@ -480,7 +481,7 @@ the AMD HIP backend) are also licensed under GPL-3.0-or-later.
 Each component retains its original license; the original license files are
 inside the respective source trees/archives.
 
-- **GEMMul8** — <https://github.com/RIKEN-RCCS/GEMMul8> (submodule at `source/third_party/GEMMul8`, v3.3.0) — Copyright (c) 2025- RIKEN R-CCS, responsible developer Yuki Uchino — MIT License. If you use this project in academic work, please also cite the GEMMul8 upstream references.
+- **GEMMul8** — <https://github.com/RIKEN-RCCS/GEMMul8> (submodule at `source/third_party/GEMMul8`, v3.5.2) — Copyright (c) 2025- RIKEN R-CCS, responsible developer Yuki Uchino — MIT License. If you use this project in academic work, please also cite the GEMMul8 upstream references.
 - **MAGMA** 2.10.0 — <https://icl.utk.edu/magma/> (archive at `source/third_party/magma/`, built as hipMAGMA) — Copyright (c) The University of Tennessee — BSD 3-Clause License.
 - **ELPA** 2026.02 — <https://elpa.mpcdf.mpg.de/> (archive under `source/third_party/dist/`, used by `gpusolver2`; the `elpa1`/`elpa2` paths use the ELPA 2018.05 embedded in upstream OpenMX) — Copyright (c) the ELPA consortium — GNU Lesser General Public License v3.0.
 - **COSMA** 2.8.4, **COSTA**, **Tiled-MM** — <https://github.com/eth-cscs/COSMA>, <https://github.com/eth-cscs/COSTA>, <https://github.com/eth-cscs/Tiled-MM> (archives under `source/third_party/dist/`, used by `gpusolver2`) — Copyright (c) ETH Zürich (parts: Advanced Micro Devices, Inc.) — BSD 3-Clause License.

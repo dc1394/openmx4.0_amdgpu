@@ -1,0 +1,144 @@
+GEMMul8 v3.5.2 integration, 2026-10-05
+====================================
+
+Versions and scope
+------------------
+Old submodule: v3.4.4, ce56e4228881df97782804d4d5dad9125d9a6416
+New submodule: v3.5.2, 603b52363715796a0af5e4aa1ed8d386349b4251
+Release: https://github.com/RIKEN-RCCS/GEMMul8/releases/tag/v3.5.2
+
+The submodule and GEMMUL8_COMMIT build pin select the same upstream release.
+The upstream checkout has no tracked local modifications. OpenMX's existing
+INT8 explicit instantiations remain compatible with the new public API and
+internal headers, including grouped CRT reconstruction. FP8 is not used by
+the existing OpenMX adapter. CPU computation sources are unchanged.
+
+The build now generates/includes dependency files for the embedded GEMMul8
+implementation and configuration objects. Changes to implementation headers
+therefore rebuild the kernels. gemmul8-clean also removes the configuration
+object and dependency files. A dry run with crt_tree.hpp treated as newer
+confirmed recompilation and re-archiving; an ordinary incremental dry run
+did not rebuild GEMMul8. Existing checkouts must select the recorded submodule
+with git submodule update --init --recursive before building.
+
+Build
+-----
+Successful ROCm 7.2.0 HIP build for Radeon RX 9060 XT, gfx1200.
+Open MPI: /home/kawai/opt/openmpi-rocmclang
+AOCL: /opt/AMD/aocl/aocl-linux-aocc-5.2.0/aocc
+AOCC runtime: /opt/AMD/aocc-compiler-5.1.0/lib
+
+make -C source -j2 openmx ROCM=/opt/rocm-7.2.0 \
+  MPI_HOME=/home/kawai/opt/openmpi-rocmclang \
+  AOCL_HOME=/opt/AMD/aocl/aocl-linux-aocc-5.2.0/aocc \
+  AOCC_LIB=/opt/AMD/aocc-compiler-5.1.0/lib ARCH=gfx1200
+
+New source/openmx SHA256:
+bd2f805d699e3f262ab05b841829354513df7d6e7acf85a494c21870979140c8
+New libgemmul8.a SHA256:
+afda01520c9b2d314cf458139435cdf5866215fa971303b436deaf8e6670fb68
+Old executable saved under work/codex_gemmul8_v352/backup/openmx:
+c55a088baddd9fb988bc55fd00da40bca39cdf25694b91b824933837ab359f82
+
+The build emitted upstream #pragma unroll compatibility warnings, no errors.
+The rebuilt executable is source/openmx; work/openmx was not installed over.
+Earlier GPU tuning reports retain their original binaries and measurements.
+
+Standalone numerical checks
+---------------------------
+tools/check_gemmul8_hip.cu tests all eight instantiated operations against
+native hipBLAS FP64: DGEMM, ZGEMM, DSYMM, ZHEMM, DSYR2K, ZHER2K, DTRMM, ZTRMM.
+It checks transpose/conjugate transpose, both sides/triangles, unit/non-unit
+diagonals, nonzero alpha/beta, padded leading dimensions, and untouched data.
+
+86/86 checks passed with INT8, num_moduli=15, accurate mode.
+Maximum absolute difference: 4.588e-11.
+Maximum max_abs_error/max(1,max_abs_reference): 5.242e-15.
+Acceptance limit for that ratio: 2e-12; all outputs must be finite.
+No workspace fallback was logged.
+
+Large DGEMM: 4097 x 2049 x 2049, unblocked work size 470915581 bytes.
+Large ZGEMM: 2049 x 2049 x 2049, unblocked work size 565259517 bytes.
+Both exceeded the 268435456-byte bridge cap and passed with blocking.
+Two additional checks disabled GEMMul8 through the OpenMX input-switch API
+and matched native hipBLAS exactly.
+
+Example after the OpenMX build:
+/opt/rocm-7.2.0/bin/hipcc -std=c++20 -O2 --offload-arch=gfx1200 \
+  -ffp-contract=off -Isource/third_party/GEMMul8/include \
+  tools/check_gemmul8_hip.cu source/gemmul8_bridge.o \
+  source/third_party/GEMMul8/lib/libgemmul8.a \
+  -L/opt/rocm-7.2.0/lib -lhipblas -lhipblaslt \
+  -Wl,-rpath,/opt/rocm-7.2.0/lib \
+  -o work/codex_gemmul8_v352/check_gemmul8_hip
+OPENMX_GEMMUL8_MAX_WORKSPACE_MB=256 \
+OPENMX_GEMMUL8_NUM_MOD_D=15 OPENMX_GEMMUL8_NUM_MOD_Z=15 \
+OPENMX_GEMMUL8_FASTMODE_D=0 OPENMX_GEMMUL8_FASTMODE_Z=0 \
+OPENMX_GEMMUL8_DISABLE_D=0 OPENMX_GEMMUL8_DISABLE_Z=0 \
+OPENMX_GEMMUL8_LOCAL_RANKS=1 OPENMX_GEMMUL8_VERBOSE=1 \
+GPU_MAX_HW_QUEUES=1 HSA_ENABLE_SDMA=0 \
+  work/codex_gemmul8_v352/check_gemmul8_hip
+
+CPU regression
+--------------
+Original L3 inputs C60 and Crys-MnO, OPENMX_GPU=0, 8 MPI ranks, -nt 1.
+Both versions completed; both candidate outputs passed the bundled references.
+New versus old energy and every Cartesian force component were exactly equal
+as printed in the output files. Atom identities, positions and grids matched.
+The comparison used zero energy/force tolerance.
+
+OpenMX L3 regression
+--------------------
+All seven original -runtestL3 inputs completed on both binaries, with 8 MPI
+ranks bound to cores and -nt 1. Each input retains its original 3-SCF limit.
+All seven candidate outputs passed the bundled references, checking energy,
+every Cartesian force component, atom identities/positions and grid dimensions.
+Reference energy/force tolerance: 1e-7 Ha / 1e-7 Ha/bohr.
+New versus old energy/force tolerance: 1e-10 Ha / 1e-10 Ha/bohr; 7/7 passed.
+
+Case           Old GPU (s)  New GPU (s)  abs E(new-ref)  max abs F(new-ref)
+C60                  5.97         5.81        3.60e-11            1.70e-11
+Crys-MnO             4.08         4.10        1.30e-11            4.00e-12
+GEL                 15.77        15.88        1.04e-10            9.83e-10
+Mn12_148_F          18.36        18.32        7.19e-11            3.40e-09
+nsV4Bz5             16.96        17.09        7.49e-10            3.30e-09
+SialicAcid           8.11         8.16        3.62e-10            1.90e-10
+GGFF               560.91       526.78        4.50e-11            9.30e-11
+
+Maximum new-versus-old differences: energy 2.05e-12 Ha, force 2e-12 Ha/bohr.
+These are regression timings, not a controlled performance benchmark: the
+old run overlapped compilation, CPU checks and the short BLAS check process.
+No conclusion about a release-wide speedup is drawn from these timings.
+
+Crys-MnO (dimension 52) and SialicAcid (311) intentionally retain the existing
+CPU dense-diagonalization fallback below dimension 400. GPU kernels remain
+enabled in those cases. Matrix-construction CPU work is a separate stage.
+The minimum available host RAM during the new GPU runs was 225.59 GiB;
+no memory-guard interruption or nonzero exit occurred. This upgrade validation
+does not rerun the full L/L2 suites or every L3 input.
+
+Recorded candidate command (choose a new output directory for a rerun):
+PATH=/home/kawai/opt/openmpi-rocmclang/bin:$PATH \
+  python3 tools/run_runtest_l3.py --binary source/openmx \
+  --output work/codex_gemmul8_v352/candidate-L3 --suite L3 --ranks 8 \
+  --cases C60 Crys-MnO GEL Mn12_148_F nsV4Bz5 SialicAcid GGFF \
+  --timeout 1200 --env OPENMX_GPU=1 --env GPU_MAX_HW_QUEUES=1 \
+  --env LIBOMPTARGET_AMDGPU_NUM_HSA_QUEUES=1 --env HSA_ENABLE_SDMA=0 \
+  --env OPENMX_GPU_VERBOSE=1 --env MAGMA_OZAKI2_VERBOSE=1
+python3 tools/compare_runtest_l3.py \
+  work/codex_gemmul8_v352/candidate-L3 --reference
+python3 tools/compare_runtest_l3.py \
+  work/codex_gemmul8_v352/baseline-L3 \
+  work/codex_gemmul8_v352/candidate-L3 \
+  --energy-tolerance 1e-10 --force-tolerance 1e-10
+
+Local evidence
+--------------
+Build: work/codex_gemmul8_v352/build.log
+Numerical checks: work/codex_gemmul8_v352/numerical-check.log
+CPU: work/codex_gemmul8_v352/{baseline,candidate}-cpu-L3/results.json
+CPU comparison/reference: cpu-comparison.txt, cpu-reference.txt in that folder.
+L3 GPU runs: work/codex_gemmul8_v352/{baseline,candidate}-L3/
+GPU comparison/reference: gpu-comparison.txt, candidate-reference.txt in that folder.
+Each run records the executable checksum, invocation and environment.
+These generated logs are local evidence and are not vendored into Git.

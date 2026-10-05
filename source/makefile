@@ -154,17 +154,18 @@ GEMMUL8_REPO_URL ?= https://github.com/RIKEN-RCCS/GEMMul8.git
 GEMMUL8_REPO_DIR ?= third_party/GEMMul8
 # gemmul8_openmx.cu instantiates GEMMul8 internals directly, so the
 # checkout must stay pinned to a commit whose internal layout it matches.
-# ce56e42 is the v3.4.4 release (2M method for complex GEMM, optimized
-# scaling/modular-arithmetic kernels, HIP compile fix of v3.4.2).
-GEMMUL8_COMMIT ?= ce56e4228881df97782804d4d5dad9125d9a6416
+# 603b523 is the v3.5.2 release (grouped CRT reconstruction and the
+# HIP host/device constexpr compilation fix).
+GEMMUL8_COMMIT ?= 603b52363715796a0af5e4aa1ed8d386349b4251
 GEMMUL8_DIR ?= $(GEMMUL8_REPO_DIR)
 GEMMUL8_LIB ?= $(GEMMUL8_DIR)/lib/libgemmul8.a
 GEMMUL8_OPENMX_OBJ ?= $(GEMMUL8_DIR)/src/gemmul8_openmx.o
-# v3.3.0 keeps the handle-local configuration (memory-saving mode) in a
+# GEMMul8 keeps the handle-local configuration (memory-saving mode) in a
 # registry defined in this host-only TU; the gemm path queries it via
 # gemmul8::config::get_config, so it must be part of the library.
 GEMMUL8_CONFIG_SRC ?= $(GEMMUL8_DIR)/src/worksize/cu_recipe/memory_saving.cu
 GEMMUL8_CONFIG_OBJ ?= $(GEMMUL8_DIR)/src/gemmul8_config.o
+GEMMUL8_DEPFILES = $(GEMMUL8_OPENMX_OBJ:.o=.d) $(GEMMUL8_CONFIG_OBJ:.o=.d)
 GEMMUL8_GPU_ARCH ?= $(ARCH)
 HIPCC_GEMMUL8_FLAGS = -std=c++20 -O3 -fPIC --offload-arch=$(GEMMUL8_GPU_ARCH) -I. -I$(GEMMUL8_DIR)/include -I$(GEMMUL8_DIR)/src -I$(ROCM)/include -D__HIP_PLATFORM_AMD__ -ffp-contract=off -Wno-unused-result -Wno-unused-command-line-argument -Wno-unused-value -DOCML_BASIC_ROUNDED_OPERATIONS -DGPU_ARCH=$(GEMMUL8_GPU_ARCH)
 MAGMA_VERSION ?= 2.10.0
@@ -366,7 +367,7 @@ fftw3-clean:
 	rm -rf "$(FFTW3_BUILD_ABS)" "$(FFTW3_PREFIX)"
 
 gemmul8-clean:
-	rm -f "$(GEMMUL8_OPENMX_OBJ)" "$(GEMMUL8_LIB)"
+	rm -f "$(GEMMUL8_OPENMX_OBJ)" "$(GEMMUL8_CONFIG_OBJ)" "$(GEMMUL8_LIB)" $(GEMMUL8_DEPFILES)
 
 magma-clean:
 	if [ -f "$(MAGMA_DIR)/Makefile" ]; then $(MAKE) -C "$(MAGMA_DIR)" clean; fi
@@ -806,10 +807,10 @@ $(GEMMUL8_DIR)/Makefile:
 	  git checkout -q $(GEMMUL8_COMMIT)
 $(GEMMUL8_DIR)/include/gemmul8.hpp: | $(GEMMUL8_DIR)/Makefile
 	@:
-$(GEMMUL8_OPENMX_OBJ): gemmul8_openmx.cu $(GEMMUL8_DIR)/Makefile
-	$(HIPCC) $(HIPCC_GEMMUL8_FLAGS) -c gemmul8_openmx.cu -o $(GEMMUL8_OPENMX_OBJ)
-$(GEMMUL8_CONFIG_OBJ): $(GEMMUL8_CONFIG_SRC) $(GEMMUL8_DIR)/Makefile
-	$(HIPCC) $(HIPCC_GEMMUL8_FLAGS) -c $(GEMMUL8_CONFIG_SRC) -o $(GEMMUL8_CONFIG_OBJ)
+$(GEMMUL8_OPENMX_OBJ): gemmul8_openmx.cu $(GEMMUL8_DIR)/Makefile makefile
+	$(HIPCC) $(HIPCC_GEMMUL8_FLAGS) -MMD -MP -MF $(@:.o=.d) -c gemmul8_openmx.cu -o $(GEMMUL8_OPENMX_OBJ)
+$(GEMMUL8_CONFIG_OBJ): $(GEMMUL8_CONFIG_SRC) $(GEMMUL8_DIR)/Makefile makefile
+	$(HIPCC) $(HIPCC_GEMMUL8_FLAGS) -MMD -MP -MF $(@:.o=.d) -c $(GEMMUL8_CONFIG_SRC) -o $(GEMMUL8_CONFIG_OBJ)
 $(GEMMUL8_LIB): $(GEMMUL8_OPENMX_OBJ) $(GEMMUL8_CONFIG_OBJ)
 	mkdir -p $(GEMMUL8_DIR)/lib
 	ar rcs $(GEMMUL8_LIB) $(GEMMUL8_OPENMX_OBJ) $(GEMMUL8_CONFIG_OBJ)
@@ -1487,3 +1488,7 @@ MO.o: MulPOnly.c Tools_BandCalc.h Inputtools.h read_scfout.h EigenValue_Problem.
 
 SigmaEK.o: SigmaEK.c
 	$(CC) -c $< -o $@
+
+# The local instantiation TU includes upstream implementation headers.
+# Track them so a submodule update also rebuilds the embedded kernels.
+-include $(GEMMUL8_DEPFILES)
