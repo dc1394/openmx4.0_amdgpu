@@ -50,6 +50,10 @@ hipError_t hipMemcpy(void *dst, const void *src, size_t sizeBytes, int kind);
 hipError_t hipMemcpyAsync(void *dst, const void *src, size_t sizeBytes, int kind, hipStream_t stream);
 hipError_t hipMemcpy2DAsync(void *dst, size_t dpitch, const void *src, size_t spitch,
                             size_t width, size_t height, int kind, hipStream_t stream);
+hipError_t hipMemcpy2D(void *dst, size_t dpitch, const void *src, size_t spitch,
+                       size_t width, size_t height, int kind);
+hipError_t hipGetLastError(void);
+hipError_t hipMemset(void *dst, int value, size_t sizeBytes);
 hipError_t hipMemGetInfo(size_t *free, size_t *total);
 
 typedef enum hipDataType {

@@ -23,6 +23,72 @@ With `gpusolver` a cluster calculation (one k-point) diagonalizes on a single GP
 The large dense matrix multiplications of the GPU eigensolver path run through [GEMMul8](https://github.com/RIKEN-RCCS/GEMMul8) [v3.5.2](https://github.com/RIKEN-RCCS/GEMMul8/releases/tag/v3.5.2), pinned to commit `603b52363715796a0af5e4aa1ed8d386349b4251`. It emulates FP64 GEMM on the INT8 matrix cores (Ozaki scheme II), supporting consumer GPUs with limited FP64 throughput. `scf.gemmul8.enable off` switches to plain hipBLAS FP64. Its memory-saving mode is on by default with a 256 MiB per-rank workspace cap (`OPENMX_GEMMUL8_MAX_WORKSPACE_MB`; 0 = uncapped).
 The v3.5.2 build and numerical checks are recorded in [gemmul8_upgrade_20261005.txt](gemmul8_upgrade_20261005.txt).
 
+## Refined FP32 eigensolver
+The dense eigensolves of the SCF loop (cluster and band, collinear and non-collinear) run in FP32 and are then refined to FP64 accuracy, as in the NVIDIA version: all eigenpairs come from rocSOLVER's FP32 divide and conquer (`hipsolverDnSsyevd`/`Cheevd`), then the wanted ones get two Ogita-Aishima Newton steps whose products go through GEMMul8, and a Rayleigh-Ritz step resolves the nearly degenerate, partially occupied clusters. From the second SCF step on, the previous step's vectors serve as a warm start, so most steps need no FP32 eigensolve at all. A Radeon RX 9060 XT (gfx1200) runs FP64 at about 1/13 of its FP32 rate, so this is on by default on consumer GPUs (RDNA and consumer GCN) and off on CDNA, whose FP64 is fast. `OPENMX_EIGEN_REFINE=K` sets the number of refinement steps, 0 turns it off. Problems with n < `OPENMX_EIGEN_REFINE_MIN_N` (default 1000) keep the FP64 eigensolver, whose fixed costs are lower there.
+
+The SCF ends in FP64. A run that stops on a refined step solves that step's Hamiltonian once more in FP64, so the energy density matrix and the forces come from FP64 vectors. The stop test on a refined step also requires the printed NormRD to be below `OPENMX_EIGEN_REFINE_STOP_GUARD` (default 100) times `scf.criterion`, and the last step `scf.maxIter` allows is always FP64. When a refinement cannot run (no room for its buffers, a failing solve), that step falls back to FP64 and says so. The one-k-point-per-rank band path solves its k-points twice when the GPU turns are serialized: pass 1 uses the previous step's chemical potential and parks each basis in host memory, and pass 2 finishes from it with the new one (`OPENMX_BAND_REFINE_BASIS_MB`, default 1024 MiB per rank). The k-dense band paths solve the same way.
+
+rocSOLVER's complex divide and conquer of ROCm 7.2 returns NaN eigenvectors with `info = 0` for any complex Hermitian matrix whose elements are all real (the non-collinear Hamiltonian without spin-orbit coupling), and for exactly block-diagonal ones. The FP32 solve therefore works on the unitary similarity D^H A D with random phases (same spectrum) and maps the vectors back. The existing FP64 `zheevd` path does the same in FP64 and now also checks its result for NaNs.
+
+Results on one RX 9060 XT (sidia333: 216 Si atoms; refined default against `OPENMX_EIGEN_REFINE=0`, same binary, 25 SCF steps and a force evaluation). Each pair agrees to within 4e-12 Ha in Utot and 1e-12 Ha/bohr in the forces, with the same number of SCF steps:
+
+| case | ranks | diagonalization (s) FP64 / refined | total (s) FP64 / refined |
+|---|---:|---:|---:|
+| cluster, non-collinear, n2 = 5616 | 16 | 231 / 111 | 391 / 270 |
+| cluster, collinear, n = 2808 | 16 | 46.9 / 12.4 | 143 / 108 |
+| band, non-collinear, 2 k-points | 8 | 394 / 232 | 733 / 569 |
+| band, collinear, 3 k-points (serialized turns) | 8 | 282 / 102 | 408 / 228 |
+
+The FP64 cluster column already includes a new device-resident non-collinear root solve: the back transform and the density matrix take the vectors on the device. That alone cut the 216-atom non-collinear cluster from 559 s to 391 s.
+
+| variable | default | meaning |
+|---|---:|---|
+| `OPENMX_EIGEN_REFINE` | device default | refinement steps; 0 = FP64 eigensolver |
+| `OPENMX_EIGEN_REFINE_MIN_N` | 1000 | smallest matrix the refinement takes |
+| `OPENMX_EIGEN_REFINE_UNTIL` | 0 | printed NormRD below which the rest of the cycle is FP64 (0 = never) |
+| `OPENMX_EIGEN_REFINE_STOP_GUARD` | 100 | a stop on a refined step also needs NormRD below this times `scf.criterion` |
+| `OPENMX_EIGEN_REFINE_WARM` / `_WARM_BAND` | 1 | warm starts from the previous step's vectors |
+| `OPENMX_EIGEN_REFINE_FIRST_ALL` | 0 | 1 refines all states at the first cluster SCF step (default: the occupied ones and the usual margin) |
+| `OPENMX_EIGEN_FP32_SOLVER` | rocsolver | `magma` takes MAGMA's FP32 solver first (each retries the other) |
+| `OPENMX_GPU_FP32_FP64_RATIO` | by architecture | the throughput ratio behind the default (on at 8 or more) |
+| `OPENMX_GEMMUL8_SOLVE_MIN_FREE_AFTER_MB` | 256 | free device memory the products of a dense solve must leave |
+| `OPENMX_BAND_REFINE_BASIS_MB` | 1024 | host memory per rank for the parked bases of the two-pass band solves |
+| `OPENMX_CLUSTER_NC_DEVICE_SOLVE` | 1 | 0 restores the host-staged non-collinear cluster solve |
+| `OPENMX_CLUSTER_NC_DEVICE_KEEP` | 0 | 1 keeps its device buffers between SCF steps instead of parking the basis on the host |
+
+## Double-float grid integrals and on-the-fly orbitals
+The grid integrals of each SCF step, the matrix elements of dVH + Vxc + VNA (`Set_Hamiltonian`) and the density on the grid (`Set_Density_Grid`), also run on the FP32 units, as in the NVIDIA version. Each product of an FP32 orbital with the FP64 potential or density matrix element (split into two floats) is formed exactly with an FMA, the partial sums are compensated (TwoSum), and they go into FP64 every 128 grid points. The result is FP64-grade: about 1e-15 of the sum of the magnitudes against a long-double reference, and the same SCF energies and forces as FP64 to within a few 1e-12. gfx1200 has no FP64 atomic add (a compare-and-swap loop), so the matrix-element kernel gives every output to one block. It splits the points of a pair, among them the pair of an atom with its own sphere, over up to 32 blocks and adds their partial sums in a fixed order. On the RX 9060 XT the double-float kernels run 3.6 to 6 times faster than the FP64 ones.
+
+The orbitals are evaluated on the device from the PAO tables, batch by batch of atoms, instead of being read from orbital tables of several GiB (`orbs_otf_hip.cu`, double-float evaluation that matches the tables to one float ulp). The batches are sized to `OPENMX_SETHAM_ONTHEFLY_MB` (256 MiB) of device memory, at least one atom each, and the memory is held only for the duration of the call. That lets every MPI rank use the GPU for these integrals; before, only one rank per k-point group did, and the others ran them on the CPU. The ranks of a node test the free memory and allocate their batch memory one at a time, and a rank that finds no room runs that call on the CPU.
+
+The GGA-PBE exchange-correlation potential on the grid (`Set_XC_Grid`: the gradient stencil, the functional, the divergence and the non-collinear rotation) also runs on the GPU, in FP64 and in the host's summation order, as in the NVIDIA version (`set_xc_grid_hip.cu`).
+
+The OpenMP offload runtime preallocates a device heap of `LIBOMPTARGET_HEAP_SIZE` bytes (512 MiB by default) in every process, which OpenMX's target regions do not need. With 16 ranks on a 16 GB GPU these heaps held 7 GiB. The runtime reads the variable before `main`, so unless it is set, `openmx` re-executes itself once at startup with 64 MiB, which brings a rank down from about 700 MiB to 240 MiB of device memory.
+
+All four cases of the previous section, 25 SCF steps and a force evaluation on one RX 9060 XT, now take (FP64 eigensolver and grid / refined eigensolver / refined eigensolver with the grid changes and the smaller OpenMP heap; Utot within 5e-12 Ha and forces within 2e-12 Ha/bohr of FP64 in every case, with the same number of SCF steps):
+
+| case | ranks | total (s) | Set_Hamiltonian (s) | Set_Density_Grid (s) |
+|---|---:|---:|---:|---:|
+| cluster, non-collinear, n2 = 5616 | 16 | 391 / 270 / 217 | 55.5 / 55.4 / 37.4 | 43.6 / 43.5 / 29.0 |
+| cluster, collinear, n = 2808 | 16 | 143 / 108 / 89 | 23.4 / 23.4 / 20.0 | 25.7 / 25.7 / 15.0 |
+| band, non-collinear, 2 k-points | 8 | 733 / 569 / 371 | 102.6 / 102.3 / 39.3 | 169.3 / 168.2 / 34.0 |
+| band, collinear, 3 k-points | 8 | 408 / 228 / 186 | 40.1 / 40.1 / 20.1 | 36.2 / 36.5 / 14.4 |
+
+The memory the smaller heaps return also lets larger band problems keep their eigensolver on the device. ZrB2 2x2 (76 atoms, collinear, 1x3x3 k-points, 8 ranks, 49 SCF steps to `scf.criterion` 1e-9) used to fall back to the CPU eigensolver at every step (2 GiB free against 5.3 GiB needed) and took 360 s; it now runs on the GPU in 178 s (Set_Hamiltonian 84 to 26 s, Set_Density_Grid 71 to 17 s, diagonalization 141 to 87 s).
+
+| variable | default | meaning |
+|---|---:|---|
+| `OPENMX_GRID_PRECISION` | device default | `df` or `fp64` grid kernels (double-float where the FP32 rate is at least 8 times the FP64 rate) |
+| `OPENMX_ORBS_EVAL_PRECISION` | device default | `df` or `fp64` evaluation of the on-the-fly orbitals |
+| `OPENMX_SETHAM_ONTHEFLY` | 1 | 0 turns the on-the-fly matrix elements off (tables or CPU) |
+| `OPENMX_DENSITY_GRID_ONTHEFLY` | 1 | 0 turns the on-the-fly density off |
+| `OPENMX_SETHAM_ONTHEFLY_MB` | 256 | device memory of one batch of atoms |
+| `OPENMX_SETHAM_GPU_KOWNER_ONLY` | 0 | 1 keeps the grid integrals on the GPU to one rank per k-point group, as before |
+| `OPENMX_XC_GRID_GPU` | 1 | 0 keeps the GGA-PBE exchange-correlation potential on the host |
+| `OPENMX_GPU_HEAP_REEXEC` | 1 | 0 keeps the OpenMP runtime's default device heap (no re-execution); setting `LIBOMPTARGET_HEAP_SIZE` also skips it |
+| `OPENMX_SETHAM_TIMING` | 0 | 1 prints the phase times of `Set_Hamiltonian` and of the on-the-fly batches |
+| `OPENMX_OTF_CHECK` | 0 | 1 compares the on-the-fly orbitals with the tables where both exist |
+
 ## Multi-GPU parallelization and MPI
 The ranks are split into one group per k-point and each group's eigenproblem is solved on one GPU, so the eigensolver keeps at most as many GPUs busy as there are k-points (`scf.Gpu.Num`, default 30, is only an upper bound). A cluster calculation therefore uses one GPU for the diagonalization however many the node has — give it one GPU and more ranks, or use `gpusolver2`. Hybrid MPI/OpenMP brings no speedup here: use flat MPI with one thread per rank,
 
@@ -31,7 +97,7 @@ mpirun -np 16 ./openmx input.dat -nt 1
 ```
 
 ## Sharing one GPU among many ranks
-ROCm needs no MPS-style daemon: the kernels of different processes run concurrently. What limits the rank count on a small card is memory — every rank's HIP/OpenMP context costs roughly 0.5–1 GB before any physics data. Each GPU stage checks the free device memory before it starts and falls back to the CPU for that stage and SCF iteration when the ranks sharing the device cannot all be accommodated (a ROCm BLAS allocation failing inside a kernel would otherwise terminate the process); the run says so on stderr and stays correct. The knobs:
+ROCm needs no MPS-style daemon: the kernels of different processes run concurrently. What limits the rank count on a small card is memory. A rank's HIP/OpenMP context costs about 240 MiB before any physics data (700 MiB with the OpenMP runtime's default device heap, see the previous section), and a hipBLAS handle about 200 MiB more on the ranks that solve. Each GPU stage checks the free device memory before it starts and falls back to the CPU for that stage and SCF iteration when the ranks sharing the device cannot all be accommodated (a ROCm BLAS allocation failing inside a kernel would otherwise terminate the process); the run says so on stderr and stays correct. The knobs:
 
 | variable | default | meaning |
 |---|---:|---|

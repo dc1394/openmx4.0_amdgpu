@@ -25,6 +25,7 @@
 #include "set_hip_default_device_from_local_rank.h"
 #include "set_openmp_device_from_local_rank.h"
 #include "elpa_cosma_bridge.h"
+#include "eigen_refine_hooks.h"
 #include <omp.h>
 #include <omp.h>
 
@@ -1348,6 +1349,161 @@ double DFT(int MD_iter, int Cnt_Now)
 	) po = 1;
 
     /*****************************************************
+      the refined FP32 eigensolver (eigen_refine_gpu.h):
+      a stop on a refined step also needs the printed NormRD
+      below OPENMX_EIGEN_REFINE_STOP_GUARD (default 100, 0 off)
+      times scf.criterion, since the test on dUele alone can
+      pass by chance on such a step; a stop that stands has
+      the step's Hamiltonian solved once more in FP64, so that
+      the post-SCF energy density matrix and the forces come
+      from FP64 vectors (the step's density matrix stands)
+    *****************************************************/
+
+    if (po==1 && Cnt_switch==0 && SCF_iter<SCF_MAX &&
+        ((Solver==2 && SpinP_switch==3 && Cluster_DFT_NonCol_RefineLastRefined()) ||
+         (Solver==2 && SpinP_switch<=1 && Cluster_DFT_Col_RefineLastRefined()) ||
+         (Solver==3 && SpinP_switch<=1 && Band_DFT_Col_RefineLastRefined()) ||
+         (Solver==3 && SpinP_switch==3 && GB_switch==0 && Band_DFT_NonCol_RefineLastRefined()))){
+
+      static double guard_factor = -1.0;
+      double bound, normrd;
+
+      if (guard_factor<0.0){
+        const char *value = getenv("OPENMX_EIGEN_REFINE_STOP_GUARD");
+        guard_factor = 100.0;
+        if (value!=NULL && value[0]!='\0'){
+          guard_factor = atof(value);
+          if (!isfinite(guard_factor)) guard_factor = 100.0;
+          if (guard_factor<0.0) guard_factor = 0.0;
+        }
+      }
+      bound = guard_factor*SCF_Criterion;
+      normrd = sqrt(fabs(NormRD[0]));
+      if (0.0<bound && bound<normrd){
+        if (myid0==Host_ID && 0<level_stdout){
+          printf("<DFT>  eigensolver: the stop test passed on a refined FP32 step with NormRD %.3e above %.3e; "
+                 "the SCF goes on\n", normrd, bound);
+          fflush(stdout);
+        }
+        po = 0;
+      }
+    }
+
+    if (po==1 && Cnt_switch==0 && Solver==2 && SpinP_switch<=1 && Cluster_DFT_Col_RefineLastRefined()){
+      if (myid0==Host_ID && 0<level_stdout){
+        printf("<DFT>  eigensolver: the SCF stops on a refined FP32 step; the Hamiltonian is solved once more in FP64\n");
+        fflush(stdout);
+      }
+      Cluster_DFT_Col_RefineForceFP64(1);
+      time5 += Cluster_DFT_Col("scf",LSCF_iter,SpinP_switch,
+                               ko_col,H,OLP[0],DM[0],EDM,
+                               Eele0,Eele1,
+                               myworld1,NPROCS_ID1,Comm_World1,NPROCS_WD1,
+                               Comm_World_StartID1,MPI_CommWD1,MP,is2,ie2,
+                               Ss_Re,Cs_Re,Hs_Re,
+                               CDM1,EDM1,PDM1,size_H1,SP_NZeros,SP_Atoms,EVec1_Re,Work1);
+      Cluster_DFT_Col_RefineForceFP64(0);
+      Uele_OS0 = Eele0[0];
+      Uele_OS1 = Eele0[1];
+      Uele_IS0 = Eele1[0];
+      Uele_IS1 = Eele1[1];
+      Uele = Uele_IS0 + Uele_IS1;
+    }
+
+    if (po==1 && Cnt_switch==0 && Solver==2 && SpinP_switch==3 && Cluster_DFT_NonCol_RefineLastRefined()){
+      if (myid0==Host_ID && 0<level_stdout){
+        printf("<DFT>  eigensolver: the SCF stops on a refined FP32 step; its Hamiltonian is solved once more in FP64\n");
+        fflush(stdout);
+      }
+          time5 += Cluster_DFT_NonCol("fp64",LSCF_iter,SpinP_switch,
+                                      ko_noncol,H,iHNL,OLP[0],DM[0],EDM,
+                                      Eele0,Eele1,
+                                      MP,is2,ie2,
+                                      Ss_Re,Cs_Re,
+                                      rHs11_Re,rHs12_Re,rHs22_Re,iHs11_Re,iHs12_Re,iHs22_Re,
+                                      Ss2_Cx,Hs2_Cx,Cs2_Cx,
+                                      CDM1,size_H1,EVec1_NonCol,Work1);
+    }
+
+    if (po==1 && Cnt_switch==0 && Solver==3 && SpinP_switch<=1 && Band_DFT_Col_RefineLastRefined()){
+      if (myid0==Host_ID && 0<level_stdout){
+        printf("<DFT>  eigensolver: the SCF stops on a refined FP32 step; the Hamiltonian is solved once more in FP64\n");
+        fflush(stdout);
+      }
+      Band_DFT_Col_RefineForceFP64(1);
+      time5 += Band_DFT_Col(LSCF_iter,
+                            Kspace_grid1,Kspace_grid2,Kspace_grid3,
+                            SpinP_switch,0,
+                            H,iHNL,OLP[0],DM[0],EDM,Eele0,Eele1,
+                            MP,order_GA,ko,koS,EIGEN_Band,
+                            H1,S1,
+                            CDM1,EDM1,
+                            EVec1_Cx,
+                            Ss_Cx,
+                            Cs_Cx,
+                            Hs_Cx,
+                            k_op,T_k_op,T_k_ID,
+                            T_KGrids1,T_KGrids2,T_KGrids3,
+                            myworld1,
+                            NPROCS_ID1,
+                            Comm_World1,
+                            NPROCS_WD1,
+                            Comm_World_StartID1,
+                            MPI_CommWD1,
+                            myworld2,
+                            NPROCS_ID2,
+                            NPROCS_WD2,
+                            Comm_World2,
+                            Comm_World_StartID2,
+                            MPI_CommWD2);
+      Band_DFT_Col_RefineForceFP64(0);
+      Uele_OS0 = Eele0[0];
+      Uele_OS1 = Eele0[1];
+      Uele_IS0 = Eele1[0];
+      Uele_IS1 = Eele1[1];
+      Uele = Uele_IS0 + Uele_IS1;
+    }
+
+    if (po==1 && Cnt_switch==0 && Solver==3 && SpinP_switch==3 && GB_switch==0 &&
+        Band_DFT_NonCol_RefineLastRefined()){
+      if (myid0==Host_ID && 0<level_stdout){
+        printf("<DFT>  eigensolver: the SCF stops on a refined FP32 step; the Hamiltonian is solved once more in FP64\n");
+        fflush(stdout);
+      }
+      Band_DFT_NonCol_RefineForceFP64(1);
+      time5 += Band_DFT_NonCol("scf",
+                               LSCF_iter,
+                               Kspace_grid1,Kspace_grid2,Kspace_grid3,
+                               SpinP_switch,H,iHNL,OLP[0],DM[0],EDM,Eele0,Eele1,
+                               MP,order_GA,ko_noncol,koS,EIGEN_Band,
+                               H1,
+                               Hs11_Cx,Hs22_Cx,Hs12_Cx,
+                               EVec1_Cx,
+                               Ss_Cx,Cs_Cx,Hs_Cx,
+                               Ss2_Cx,Cs2_Cx,Hs2_Cx,
+                               k_op,T_k_op,T_k_ID,
+                               T_KGrids1,T_KGrids2,T_KGrids3,
+                               myworld1,
+                               NPROCS_ID1,
+                               Comm_World1,
+                               NPROCS_WD1,
+                               Comm_World_StartID1,
+                               MPI_CommWD1,
+                               myworld2,
+                               NPROCS_ID2,
+                               NPROCS_WD2,
+                               Comm_World2,
+                               Comm_World_StartID2,
+                               MPI_CommWD2);
+      Band_DFT_NonCol_RefineForceFP64(0);
+      Uele_OS0 = Eele0[0];
+      Uele_OS1 = Eele0[1];
+      Uele_IS0 = Eele1[0];
+      Uele_IS1 = Eele1[1];
+      Uele = Uele_IS0 + Uele_IS1;
+    }
+
+    /*****************************************************
                      orbital optimization
     *****************************************************/
 
@@ -1664,6 +1820,19 @@ double DFT(int MD_iter, int Cnt_Now)
 
     outputfile1(1,MD_iter,orbitalOpt_iter,Cnt_Now,SCF_iter,file_DFTSCF,ChemP_e0); 
 
+    if (po==0 && Cnt_switch==0 && Solver==2 && SpinP_switch==3){
+      Cluster_DFT_NonCol_RefineAfterMixing(sqrt(fabs(NormRD[0])));
+    }
+    if (po==0 && Cnt_switch==0 && Solver==2 && SpinP_switch<=1){
+      Cluster_DFT_Col_RefineAfterMixing(sqrt(fabs(NormRD[0])));
+    }
+    if (po==0 && Cnt_switch==0 && Solver==3 && SpinP_switch<=1){
+      Band_DFT_Col_RefineAfterMixing(sqrt(fabs(NormRD[0])));
+    }
+    if (po==0 && Cnt_switch==0 && Solver==3 && SpinP_switch==3 && GB_switch==0){
+      Band_DFT_NonCol_RefineAfterMixing(sqrt(fabs(NormRD[0])));
+    }
+
     /*****************************************************
                          Uele -> pUele
     *****************************************************/
@@ -1694,6 +1863,128 @@ double DFT(int MD_iter, int Cnt_Now)
     ************************************************************************/
 
   } while (po==0 && SCF_iter<SCF_MAX);  if (po==0) scf_convergence_flag = 0; else scf_convergence_flag = 1;
+
+  /* an SCF cut on a refined FP32 step (scf.maxIter lowered through the
+     _SCF_keywords file below the step the solvers keep in FP64): the
+     step's Hamiltonian once more in FP64, as after a stop */
+
+  if (Cnt_switch==0 && Solver==2 && SpinP_switch<=1 && Cluster_DFT_Col_RefineLastRefined()){
+    if (myid0==Host_ID && 0<level_stdout){
+      printf("<DFT>  eigensolver: the SCF ended on a refined FP32 step; the Hamiltonian is solved once more in FP64\n");
+      fflush(stdout);
+    }
+    Cluster_DFT_Col_RefineForceFP64(1);
+    time5 += Cluster_DFT_Col("scf",LSCF_iter,SpinP_switch,
+                             ko_col,H,OLP[0],DM[0],EDM,
+                             Eele0,Eele1,
+                             myworld1,NPROCS_ID1,Comm_World1,NPROCS_WD1,
+                             Comm_World_StartID1,MPI_CommWD1,MP,is2,ie2,
+                             Ss_Re,Cs_Re,Hs_Re,
+                             CDM1,EDM1,PDM1,size_H1,SP_NZeros,SP_Atoms,EVec1_Re,Work1);
+    Cluster_DFT_Col_RefineForceFP64(0);
+    Uele_OS0 = Eele0[0];
+    Uele_OS1 = Eele0[1];
+    Uele_IS0 = Eele1[0];
+    Uele_IS1 = Eele1[1];
+    Uele = Uele_IS0 + Uele_IS1;
+  }
+
+  if (Cnt_switch==0 && Solver==2 && SpinP_switch==3 && Cluster_DFT_NonCol_RefineLastRefined()){
+    if (myid0==Host_ID && 0<level_stdout){
+      printf("<DFT>  eigensolver: the SCF ended on a refined FP32 step; its Hamiltonian is solved once more in FP64\n");
+      fflush(stdout);
+    }
+    time5 += Cluster_DFT_NonCol("fp64",LSCF_iter,SpinP_switch,
+                                      ko_noncol,H,iHNL,OLP[0],DM[0],EDM,
+                                      Eele0,Eele1,
+                                      MP,is2,ie2,
+                                      Ss_Re,Cs_Re,
+                                      rHs11_Re,rHs12_Re,rHs22_Re,iHs11_Re,iHs12_Re,iHs22_Re,
+                                      Ss2_Cx,Hs2_Cx,Cs2_Cx,
+                                      CDM1,size_H1,EVec1_NonCol,Work1);
+  }
+
+  if (Cnt_switch==0 && Solver==3 && SpinP_switch<=1 && Band_DFT_Col_RefineLastRefined()){
+    if (myid0==Host_ID && 0<level_stdout){
+      printf("<DFT>  eigensolver: the SCF ended on a refined FP32 step; the Hamiltonian is solved once more in FP64\n");
+      fflush(stdout);
+    }
+    Band_DFT_Col_RefineForceFP64(1);
+      time5 += Band_DFT_Col(LSCF_iter,
+                            Kspace_grid1,Kspace_grid2,Kspace_grid3,
+                            SpinP_switch,0,
+                            H,iHNL,OLP[0],DM[0],EDM,Eele0,Eele1,
+                            MP,order_GA,ko,koS,EIGEN_Band,
+                            H1,S1,
+                            CDM1,EDM1,
+                            EVec1_Cx,
+                            Ss_Cx,
+                            Cs_Cx,
+                            Hs_Cx,
+                            k_op,T_k_op,T_k_ID,
+                            T_KGrids1,T_KGrids2,T_KGrids3,
+                            myworld1,
+                            NPROCS_ID1,
+                            Comm_World1,
+                            NPROCS_WD1,
+                            Comm_World_StartID1,
+                            MPI_CommWD1,
+                            myworld2,
+                            NPROCS_ID2,
+                            NPROCS_WD2,
+                            Comm_World2,
+                            Comm_World_StartID2,
+                            MPI_CommWD2);
+    Band_DFT_Col_RefineForceFP64(0);
+    Uele_OS0 = Eele0[0];
+    Uele_OS1 = Eele0[1];
+    Uele_IS0 = Eele1[0];
+    Uele_IS1 = Eele1[1];
+    Uele = Uele_IS0 + Uele_IS1;
+  }
+
+  if (Cnt_switch==0 && Solver==3 && SpinP_switch==3 && GB_switch==0 && Band_DFT_NonCol_RefineLastRefined()){
+    if (myid0==Host_ID && 0<level_stdout){
+      printf("<DFT>  eigensolver: the SCF ended on a refined FP32 step; the Hamiltonian is solved once more in FP64\n");
+      fflush(stdout);
+    }
+    Band_DFT_NonCol_RefineForceFP64(1);
+      time5 += Band_DFT_NonCol("scf",
+                               LSCF_iter,
+                               Kspace_grid1,Kspace_grid2,Kspace_grid3,
+                               SpinP_switch,H,iHNL,OLP[0],DM[0],EDM,Eele0,Eele1,
+                               MP,order_GA,ko_noncol,koS,EIGEN_Band,
+                               H1,
+                               Hs11_Cx,Hs22_Cx,Hs12_Cx,
+                               EVec1_Cx,
+                               Ss_Cx,Cs_Cx,Hs_Cx,
+                               Ss2_Cx,Cs2_Cx,Hs2_Cx,
+                               k_op,T_k_op,T_k_ID,
+                               T_KGrids1,T_KGrids2,T_KGrids3,
+                               myworld1,
+                               NPROCS_ID1,
+                               Comm_World1,
+                               NPROCS_WD1,
+                               Comm_World_StartID1,
+                               MPI_CommWD1,
+                               myworld2,
+                               NPROCS_ID2,
+                               NPROCS_WD2,
+                               Comm_World2,
+                               Comm_World_StartID2,
+                               MPI_CommWD2);
+    Band_DFT_NonCol_RefineForceFP64(0);
+    Uele_OS0 = Eele0[0];
+    Uele_OS1 = Eele0[1];
+    Uele_IS0 = Eele1[0];
+    Uele_IS1 = Eele1[1];
+    Uele = Uele_IS0 + Uele_IS1;
+  }
+
+  /* the end of the SCF cycle: the band solvers' warm-start bases go, so the
+     forces and the next cycle start with the memory free */
+  if (Solver==3 && SpinP_switch<=1) Band_DFT_Col_RefineEndCycle();
+  if (Solver==3 && SpinP_switch==3 && GB_switch==0) Band_DFT_NonCol_RefineEndCycle();
 
   /*********************************************************************
    After achieving the SCF, the diagonalization with PAOs is performed

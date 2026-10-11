@@ -9,6 +9,102 @@
 
 void Inverse(int n, double **a, double **ia);
 
+/* ---------------------------------------------------------------------
+   GPU evaluation of the GGA-PBE branch (XC_switch 4, XC_P_switch 0, 1 or
+   2, without the LDA+U cFLL rotation; set_xc_grid_hip.cu, a port of the
+   NVIDIA version): the gradient stencil, the PBE functional, the
+   divergence stencil and the non-collinear rotation on the rank's D grid,
+   in FP64 and in the host's summation order.  A failure or an
+   unsupported case keeps the host loops; OPENMX_XC_GRID_GPU=0 turns it
+   off.
+   --------------------------------------------------------------------- */
+#include "set_hip_default_device_from_local_rank.h"
+
+int Set_XC_Grid_HIP(int n, int Ng1, int Ng2, int Ng3, int XC_P_switch, int pcc, int rotate,
+                    const double *inv27, const double *Den0, const double *Den1, const double *Den2,
+                    const double *Den3, const double *Pcc0, const double *Pcc1, double *Vxc0,
+                    double *Vxc1, double *Vxc2, double *Vxc3, double *const *dden_out,
+                    double *const *dexc_out);
+
+static int SXG_gpu_enabled(void)
+{
+  static int state = -1;
+
+  if (state < 0) {
+    const char *value = getenv("OPENMX_XC_GRID_GPU");
+    if (value != NULL && value[0] != '\0' && atoi(value) == 0) state = 0;
+    else state = gpu_rank_device_usable() ? 1 : 0;
+  }
+  return state;
+}
+
+/* 1 when the whole evaluation ran on the device (the outputs are in
+   Vxc0..3 and, where the caller passed them, dDen_Grid / dEXC_dGD) */
+static int Set_XC_Grid_GPU(int XC_P_switch,
+                           double *Den0, double *Den1, double *Den2, double *Den3,
+                           double *Vxc0, double *Vxc1, double *Vxc2, double *Vxc3,
+                           double ***dDen_Grid, double ***dEXC_dGD)
+{
+  const int n = My_NumGridD;
+  const int Ng1 = Max_Grid_Index_D[1] - Min_Grid_Index_D[1] + 1;
+  const int Ng2 = Max_Grid_Index_D[2] - Min_Grid_Index_D[2] + 1;
+  const int Ng3 = Max_Grid_Index_D[3] - Min_Grid_Index_D[3] + 1;
+  const int pcc = (PCC_switch == 1);
+  const int rotate = (SpinP_switch == 3 && (XC_P_switch == 1 || XC_P_switch == 2));
+  double mat_storage[30][30], inv_storage[30][30];
+  double *Mat[30], *InvMat[30], inv[27 * 27];
+  double *dden_out[6], *dexc_out[6];
+  int i, i1, j1, k1, i2, j2, k2, p, q;
+  double x, y, z, x1, y1, z1;
+
+  if (!(XC_P_switch == 0 || XC_P_switch == 1 || XC_P_switch == 2)) return 0;
+  if (dc_Type == 3 || dc_Type == 4) return 0;
+  if (!SXG_gpu_enabled()) return 0;
+  if (n <= 0) return 1;
+
+  /* the 27-point interpolation matrix of the host path */
+  for (i = 0; i < 30; i++) {
+    Mat[i] = mat_storage[i];
+    InvMat[i] = inv_storage[i];
+  }
+  p = 0;
+  for (i1 = -1; i1 <= 1; i1++) {
+    for (j1 = -1; j1 <= 1; j1++) {
+      for (k1 = -1; k1 <= 1; k1++) {
+        x = (double)i1 * gtv[1][1] + (double)j1 * gtv[2][1] + (double)k1 * gtv[3][1];
+        y = (double)i1 * gtv[1][2] + (double)j1 * gtv[2][2] + (double)k1 * gtv[3][2];
+        z = (double)i1 * gtv[1][3] + (double)j1 * gtv[2][3] + (double)k1 * gtv[3][3];
+        q = 0;
+        for (i2 = 0; i2 <= 2; i2++) {
+          x1 = pow(x, (double)i2);
+          for (j2 = 0; j2 <= 2; j2++) {
+            y1 = pow(y, (double)j2);
+            for (k2 = 0; k2 <= 2; k2++) {
+              z1 = pow(z, (double)k2);
+              Mat[p][q] = x1 * y1 * z1;
+              q++;
+            }
+          }
+        }
+        p++;
+      }
+    }
+  }
+  Inverse(26, Mat, InvMat);
+  for (p = 0; p < 27; p++)
+    for (q = 0; q < 27; q++) inv[p * 27 + q] = InvMat[p][q];
+
+  if (dDen_Grid != NULL)
+    for (i = 0; i < 6; i++) dden_out[i] = dDen_Grid[i / 3][i % 3];
+  if (dEXC_dGD != NULL)
+    for (i = 0; i < 6; i++) dexc_out[i] = dEXC_dGD[i / 3][i % 3];
+
+  return Set_XC_Grid_HIP(n, Ng1, Ng2, Ng3, XC_P_switch, pcc, rotate, inv, Den0, Den1, Den2, Den3,
+                         pcc ? PCCDensity_Grid_D[0] : NULL, pcc ? PCCDensity_Grid_D[1] : NULL,
+                         Vxc0, Vxc1, Vxc2, Vxc3,
+                         (dDen_Grid != NULL) ? dden_out : NULL, (dEXC_dGD != NULL) ? dexc_out : NULL);
+}
+
 /* input argument "SCF_iter" was added by S.Ryee for LDA+U. 
  * This was added so that spin-density XC energy is ignored
  * for SCF_iter>=2 when cFLL or cAMF LDA+U scheme is used. */
@@ -78,6 +174,9 @@ void Set_XC_Grid(int SCF_iter, int XC_P_switch, int XC_switch,
   /* MPI */
   MPI_Comm_size(mpi_comm_level1,&numprocs);
   MPI_Comm_rank(mpi_comm_level1,&myid);
+
+  if (XC_switch==4 && Set_XC_Grid_GPU(XC_P_switch, Den0, Den1, Den2, Den3, Vxc0, Vxc1, Vxc2, Vxc3,
+                                      dDen_Grid, dEXC_dGD)) return;
 
   /****************************************************
                  allocation of arrays

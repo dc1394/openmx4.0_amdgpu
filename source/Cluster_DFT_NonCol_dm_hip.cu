@@ -1,4 +1,5 @@
 #include <hip/hip_runtime.h>
+#include <hipblas/hipblas.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -9,6 +10,13 @@ typedef struct {
     double r;
     double i;
 } dcomplex;
+
+extern "C" hipblasStatus_t openmx_gemmul8Dgemm(hipblasHandle_t, hipblasOperation_t, hipblasOperation_t, int, int, int,
+                                               const double *, const double *, int, const double *, int,
+                                               const double *, double *, int);
+extern "C" hipblasStatus_t openmx_gemmul8DgemmUnblocked(hipblasHandle_t, hipblasOperation_t, hipblasOperation_t, int,
+                                                        int, int, const double *, const double *, int, const double *,
+                                                        int, const double *, double *, int);
 
 static int ClusterNonColDMReportHipError(const char *where, hipError_t err)
 {
@@ -45,7 +53,7 @@ __device__ static double ClusterNonColWarpReduceSum(double value)
 __global__ static void ClusterNonColDMKernel(int entry_count, int size_H1, int n, int n2, int nk_occ,
                                              int calc_edm, const int *basis0, const int *basis1,
                                              const double *occ, const double *occ_e,
-                                             const dcomplex *dense_evec, double *dm_buffer)
+                                             const dcomplex *dense_evec, int ld, double *dm_buffer)
 {
     const int warps_per_block = blockDim.x / warpSize;
     const int warp_in_block = threadIdx.x / warpSize;
@@ -71,10 +79,10 @@ __global__ static void ClusterNonColDMKernel(int entry_count, int size_H1, int n
 
     for (int k = lane; k < nk_occ; k += warpSize) {
         const double w = occ[k];
-        const dcomplex va_up = dense_evec[(size_t)ia * (size_t)nk_occ + (size_t)k];
-        const dcomplex vb_up = dense_evec[(size_t)ib * (size_t)nk_occ + (size_t)k];
-        const dcomplex va_dn = dense_evec[(size_t)(ia + n) * (size_t)nk_occ + (size_t)k];
-        const dcomplex vb_dn = dense_evec[(size_t)(ib + n) * (size_t)nk_occ + (size_t)k];
+        const dcomplex va_up = dense_evec[(size_t)ia * (size_t)ld + (size_t)k];
+        const dcomplex vb_up = dense_evec[(size_t)ib * (size_t)ld + (size_t)k];
+        const dcomplex va_dn = dense_evec[(size_t)(ia + n) * (size_t)ld + (size_t)k];
+        const dcomplex vb_dn = dense_evec[(size_t)(ib + n) * (size_t)ld + (size_t)k];
         const double re11 = va_up.r * vb_up.r + va_up.i * vb_up.i;
         const double im11 = va_up.r * vb_up.i - va_up.i * vb_up.r;
         const double re22 = va_dn.r * vb_dn.r + va_dn.i * vb_dn.i;
@@ -128,10 +136,15 @@ __global__ static void ClusterNonColDMKernel(int entry_count, int size_H1, int n
     }
 }
 
-extern "C" int ClusterNonCol_CalcDMRootDense_HIP(int entry_count, int size_H1, int n, int n2, int nk_occ,
-                                                 int calc_edm, const int *basis0, const int *basis1,
-                                                 const double *occ, const double *occ_e,
-                                                 const dcomplex *dense_evec, double *dm_buffer)
+/* dense_evec: the state-major eigenvectors (state k of basis i at
+   k + i n2) on the host, of which the first nk_occ states are copied to the
+   device; or, with d_evec_in, already on the device with leading dimension
+   ld_in */
+static int ClusterNonCol_CalcDMRootDense_Run(int entry_count, int size_H1, int n, int n2, int nk_occ,
+                                            int calc_edm, const int *basis0, const int *basis1,
+                                            const double *occ, const double *occ_e,
+                                            const dcomplex *dense_evec, const dcomplex *d_evec_in, int ld_in,
+                                            double *dm_buffer)
 {
     const int dm_components = calc_edm ? 10 : 6;
     const int block_size = 256;
@@ -181,8 +194,10 @@ extern "C" int ClusterNonCol_CalcDMRootDense_HIP(int entry_count, int size_H1, i
         err = hipMalloc((void **)&d_occ_e, occ_bytes);
         if (ClusterNonColDMReportHipError("hipMalloc(occ_e)", err)) goto cleanup_failed;
     }
-    err = hipMalloc((void **)&d_dense_evec, evec_bytes);
-    if (ClusterNonColDMReportHipError("hipMalloc(dense_evec)", err)) goto cleanup_failed;
+    if (d_evec_in == NULL) {
+        err = hipMalloc((void **)&d_dense_evec, evec_bytes);
+        if (ClusterNonColDMReportHipError("hipMalloc(dense_evec)", err)) goto cleanup_failed;
+    }
     err = hipMalloc((void **)&d_dm_buffer, dm_bytes);
     if (ClusterNonColDMReportHipError("hipMalloc(dm_buffer)", err)) goto cleanup_failed;
 
@@ -196,13 +211,17 @@ extern "C" int ClusterNonCol_CalcDMRootDense_HIP(int entry_count, int size_H1, i
         err = hipMemcpy(d_occ_e, occ_e, occ_bytes, hipMemcpyHostToDevice);
         if (ClusterNonColDMReportHipError("hipMemcpy(occ_e)", err)) goto cleanup_failed;
     }
-    err = hipMemcpy2D(d_dense_evec, evec_dst_pitch, dense_evec, evec_src_pitch,
-                      evec_width, evec_height, hipMemcpyHostToDevice);
-    if (ClusterNonColDMReportHipError("hipMemcpy2D(dense_evec)", err)) goto cleanup_failed;
+    if (d_evec_in == NULL) {
+        err = hipMemcpy2D(d_dense_evec, evec_dst_pitch, dense_evec, evec_src_pitch,
+                          evec_width, evec_height, hipMemcpyHostToDevice);
+        if (ClusterNonColDMReportHipError("hipMemcpy2D(dense_evec)", err)) goto cleanup_failed;
+    }
 
     hipLaunchKernelGGL(ClusterNonColDMKernel, grid, block, 0, 0,
                        entry_count, size_H1, n, n2, nk_occ, calc_edm,
-                       d_basis0, d_basis1, d_occ, d_occ_e, d_dense_evec, d_dm_buffer);
+                       d_basis0, d_basis1, d_occ, d_occ_e,
+                       (d_evec_in != NULL) ? d_evec_in : d_dense_evec, (d_evec_in != NULL) ? ld_in : nk_occ,
+                       d_dm_buffer);
     err = hipGetLastError();
     if (ClusterNonColDMReportHipError("ClusterNonColDMKernel launch", err)) goto cleanup_failed;
     err = hipDeviceSynchronize();
@@ -224,6 +243,86 @@ cleanup:
     if (d_basis1 != NULL) hipFree(d_basis1);
     if (d_basis0 != NULL) hipFree(d_basis0);
     return failed;
+}
+
+extern "C" int ClusterNonCol_CalcDMRootDense_HIP(int entry_count, int size_H1, int n, int n2, int nk_occ,
+                                                 int calc_edm, const int *basis0, const int *basis1,
+                                                 const double *occ, const double *occ_e,
+                                                 const dcomplex *dense_evec, double *dm_buffer)
+{
+    return ClusterNonCol_CalcDMRootDense_Run(entry_count, size_H1, n, n2, nk_occ, calc_edm, basis0, basis1, occ,
+                                             occ_e, dense_evec, NULL, 0, dm_buffer);
+}
+
+/* the same from eigenvectors that stay on the device (d_dense_evec, state
+   k of basis i at k + i ld) */
+extern "C" int ClusterNonCol_CalcDMRootDenseDevice_HIP(int entry_count, int size_H1, int n, int n2, int nk_occ,
+                                                       int calc_edm, const int *basis0, const int *basis1,
+                                                       const double *occ, const double *occ_e,
+                                                       const dcomplex *d_dense_evec, int ld, double *dm_buffer)
+{
+    return ClusterNonCol_CalcDMRootDense_Run(entry_count, size_H1, n, n2, nk_occ, calc_edm, basis0, basis1, occ,
+                                             occ_e, NULL, d_dense_evec, ld, dm_buffer);
+}
+
+/* T (cols x rows, leading dimension ldt) = A^T of the first cols columns of
+   A (rows x cols, leading dimension lda), without conjugation */
+__global__ static void ClusterNonColTransposeKernel(const dcomplex *__restrict__ A, int lda, dcomplex *__restrict__ T,
+                                                    int ldt, int rows, int cols)
+{
+    const size_t count = (size_t)rows * (size_t)cols;
+
+    for (size_t idx = blockIdx.x * (size_t)blockDim.x + threadIdx.x; idx < count;
+         idx += (size_t)gridDim.x * blockDim.x) {
+        const int r = (int)(idx % (size_t)cols);   /* row of T: column of A */
+        const int c = (int)(idx / (size_t)cols);   /* column of T: row of A */
+
+        T[(size_t)r + (size_t)c * (size_t)ldt] = A[(size_t)c + (size_t)r * (size_t)lda];
+    }
+}
+
+/* The back transform of the root dense path on the device: the first maxn
+   columns of d_A (n2 x n2, the eigenvectors V of the transformed problem)
+   become the state-major vectors (diag(S, S) V)^T (state l of basis i at
+   l + i n2, rows maxn.. untouched) in place.  V^T goes to d_vt (maxn x n2,
+   scratch), then each spin half of its real view (2 maxn x n: the real and
+   imaginary parts of a state on consecutive rows) is multiplied by S^T in
+   one real GEMM through the GEMMul8 bridge -- a quarter of the work of the
+   complex product with diag(S, S), and no n2 x n2 copy of it.  d_S is the
+   n x n transformed overlap.  Returns 0 on success. */
+extern "C" int ClusterNonCol_BackTransformDevice_HIP(hipblasHandle_t handle, int n, int n2, int maxn, void *d_A,
+                                                     void *d_vt, const double *d_S)
+{
+    hipStream_t     stream = NULL;
+    hipblasStatus_t status = hipblasGetStream(handle, &stream);
+    const double    one = 1.0, zero = 0.0;
+    const size_t    count = (size_t)n2 * (size_t)maxn;
+    size_t          blocks = (count + 255) / 256;
+    hipError_t      err;
+
+    if (status != HIPBLAS_STATUS_SUCCESS) return 1;
+    if (blocks > 65535u * 16u) blocks = 65535u * 16u;
+    hipLaunchKernelGGL(ClusterNonColTransposeKernel, dim3((unsigned)blocks), dim3(256), 0, stream,
+                       (const dcomplex *)d_A, n2, (dcomplex *)d_vt, maxn, n2, maxn);
+    err = hipGetLastError();
+    if (ClusterNonColDMReportHipError("ClusterNonColTransposeKernel launch", err)) return 1;
+    for (int half = 0; half < 2; half++) {
+        const int col = half * n;
+
+        /* a product of the dense solve, which the other ranks wait for: the
+           solve reserve of the GEMMul8 bridge */
+        status = openmx_gemmul8DgemmUnblocked(handle, HIPBLAS_OP_N, HIPBLAS_OP_T, 2 * maxn, n, n, &one,
+                                     (const double *)d_vt + (size_t)2 * (size_t)maxn * (size_t)col, 2 * maxn, d_S, n,
+                                     &zero, (double *)d_A + (size_t)2 * (size_t)n2 * (size_t)col, 2 * n2);
+        if (status != HIPBLAS_STATUS_SUCCESS) {
+            fprintf(stderr, "<Cluster> back transform GEMM failed (hipBLAS status %d)\n", (int)status);
+            fflush(stderr);
+            return 1;
+        }
+    }
+    err = hipStreamSynchronize(stream);
+    if (ClusterNonColDMReportHipError("back transform synchronize", err)) return 1;
+    return 0;
 }
 
 typedef struct

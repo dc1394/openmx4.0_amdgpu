@@ -530,6 +530,9 @@ static inline void SDG_accumulate_nc1(int no0, int no1,
 
 
 
+int Set_Density_Grid_GPU_Local_Prepare(int Cnt_kind, int Calc_CntOrbital_ON);
+int Set_Density_Grid_GPU_Local_Run(double *****CDM, double ***Tmp_Den_Grid);
+
 double Set_Density_Grid(int Cnt_kind, int Calc_CntOrbital_ON, double *****CDM, double **Density_Grid_B0)
 {
   static int firsttime=1;
@@ -570,6 +573,7 @@ double Set_Density_Grid(int Cnt_kind, int Calc_CntOrbital_ON, double *****CDM, d
   double Stime_atom, Etime_atom;
   double time0,time1,time2;
   int use_local_gpu = 0;
+  int use_otf_gpu = 0;
   int use_nc_simd;
   int nc_simd_mode;
   int nc_grid_batch;
@@ -625,7 +629,15 @@ double Set_Density_Grid(int Cnt_kind, int Calc_CntOrbital_ON, double *****CDM, d
     MPI_Allreduce(&local_ok,&use_local_gpu,1,MPI_INT,MPI_MIN,mpi_comm_level1);
   }
 
+  /* the orbitals evaluated on the device batch by batch on every rank
+     (Set_Hamiltonian.c) rather than the whole density on one owner */
   if (!use_local_gpu){
+    extern int Set_Density_Grid_OTF_Possible(int Cnt_kind);
+    int otf_ok=Set_Density_Grid_OTF_Possible(Cnt_kind);
+    MPI_Allreduce(&otf_ok,&use_otf_gpu,1,MPI_INT,MPI_MIN,mpi_comm_level1);
+  }
+
+  if (!use_local_gpu && !use_otf_gpu){
     if (Set_Density_Grid_GPU_Service(Cnt_kind,Calc_CntOrbital_ON,CDM,Density_Grid_B0,&time0)){
       return time0;
     }
@@ -895,6 +907,13 @@ double Set_Density_Grid(int Cnt_kind, int Calc_CntOrbital_ON, double *****CDM, d
   dtime(&time1);
 
   if (use_local_gpu && !Set_Density_Grid_GPU_Local_Run(CDM,Tmp_Den_Grid)) use_local_gpu=0;
+
+  /* the orbitals evaluated on the device batch by batch (Set_Hamiltonian.c),
+     rank by rank, before the CPU loop */
+  {
+    extern int Set_Density_Grid_OTF_Run(int Cnt_kind, double *****CDM, double ***Tmp_Den_Grid);
+    if (!use_local_gpu && use_otf_gpu && Set_Density_Grid_OTF_Run(Cnt_kind,CDM,Tmp_Den_Grid)) use_local_gpu=1;
+  }
 
   if (!use_local_gpu){
   

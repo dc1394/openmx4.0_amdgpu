@@ -242,7 +242,7 @@ OBJS    = openmx.o openmx_common.o Input_std.o Inputtools.o init.o LU_inverse.o 
           Get_Cnt_dOrbitals.o Gaunt.o Find_CGrids.o MD_pac.o \
           RestartFileDFT.o Output_CompTime.o Merge_LogFile.o Make_FracCoord.o \
           Make_InputFile_with_FinalCoord.o Output_Energy_Decomposition.o \
-          Divide_Conquer.o Divide_Conquer_LNO.o my_hipblasDgemm.o my_hipblasZgemm.o gemmul8_bridge.o elpa_cosma_bridge.o magma_openmx.o Krylov.o \
+          Divide_Conquer.o Divide_Conquer_LNO.o my_hipblasDgemm.o my_hipblasZgemm.o gemmul8_bridge.o eigen_refine_gpu.o orbs_otf_hip.o set_xc_grid_hip.o elpa_cosma_bridge.o magma_openmx.o Krylov.o \
           Divide_Conquer_Dosout.o EGAC_DFT.o LNO.o Calc_LNAO.o Calc_LNBO.o \
           Eigen_lapack.o gpusolver_Syevd.o gpusolver_Syevdx.o set_hip_default_device_from_local_rank.o set_openmp_device_from_local_rank.o Eigen_lapack2.o Eigen_lapack3.o EigenBand_lapack.o \
           Eigen_PReHH.o BroadCast_ReMatrix.o \
@@ -471,15 +471,15 @@ XC_EX.o: XC_EX.c openmx_common.h
 # SCF
 #
 
-DFT.o: DFT.c openmx_common.h tran_prototypes.h set_hip_default_device_from_local_rank.h
+DFT.o: DFT.c openmx_common.h tran_prototypes.h set_hip_default_device_from_local_rank.h eigen_refine_hooks.h
 	$(CC) -c DFT.c
-Cluster_DFT_Col.o: Cluster_DFT_Col.c openmx_common.h
+Cluster_DFT_Col.o: Cluster_DFT_Col.c openmx_common.h eigen_refine_gpu.h eigen_refine_hooks.h
 	$(CC) -c Cluster_DFT_Col.c
 Cluster_DFT_Col_dm_hip.o: Cluster_DFT_Col_dm_hip.cu
 	$(HIPCC) $(HIPCC_GEMMUL8_FLAGS) -c Cluster_DFT_Col_dm_hip.cu -o Cluster_DFT_Col_dm_hip.o
 magma_openmx.o: magma_openmx.cu openmx_common.h $(MAGMA_LIB)
 	$(HIPCC) $(HIPCC_MAGMA_FLAGS) -c magma_openmx.cu -o magma_openmx.o
-Cluster_DFT_NonCol.o: Cluster_DFT_NonCol.c openmx_common.h
+Cluster_DFT_NonCol.o: Cluster_DFT_NonCol.c openmx_common.h eigen_refine_gpu.h eigen_refine_hooks.h
 	$(CC) -c Cluster_DFT_NonCol.c
 Cluster_DFT_NonCol_dm_hip.o: Cluster_DFT_NonCol_dm_hip.cu
 	$(HIPCC) $(HIPCC_GEMMUL8_FLAGS) -c Cluster_DFT_NonCol_dm_hip.cu -o Cluster_DFT_NonCol_dm_hip.o
@@ -497,7 +497,7 @@ Cluster_DFT_Col_DMmu.o: Cluster_DFT_Col_DMmu.c openmx_common.h
 	$(CC) -c Cluster_DFT_Col_DMmu.c
 Cluster_DFT_NonCol_DMmu.o: Cluster_DFT_NonCol_DMmu.c openmx_common.h
 	$(CC) -c Cluster_DFT_NonCol_DMmu.c
-Band_DFT_Col.o: Band_DFT_Col.c openmx_common.h
+Band_DFT_Col.o: Band_DFT_Col.c openmx_common.h eigen_refine_gpu.h eigen_refine_hooks.h
 	$(CC) -c Band_DFT_Col.c
 Band_DFT_Col_CWF.o: Band_DFT_Col_CWF.c openmx_common.h
 	$(CC) -c Band_DFT_Col_CWF.c
@@ -527,7 +527,7 @@ Overlap_Cluster_LNO_Ss.o: Overlap_Cluster_LNO_Ss.c openmx_common.h
 	$(CC) -c Overlap_Cluster_LNO_Ss.c
 leakdetect.o: leakdetect.c leakdetect.h
 	$(CC) -c leakdetect.c
-Band_DFT_NonCol.o: Band_DFT_NonCol.c openmx_common.h
+Band_DFT_NonCol.o: Band_DFT_NonCol.c openmx_common.h eigen_refine_gpu.h eigen_refine_hooks.h
 	$(CC3) -c Band_DFT_NonCol.c
 Band_DFT_NonCol_GB.o: Band_DFT_NonCol_GB.c openmx_common.h
 	$(CC) -c Band_DFT_NonCol_GB.c
@@ -599,7 +599,7 @@ RF_BesselF.o: RF_BesselF.c openmx_common.h
 Nonlocal_RadialF.o: Nonlocal_RadialF.c openmx_common.h
 	$(CC) -c Nonlocal_RadialF.c
 
-Set_Orbitals_Grid.o: Set_Orbitals_Grid.c openmx_common.h set_hip_default_device_from_local_rank.h
+Set_Orbitals_Grid.o: Set_Orbitals_Grid.c openmx_common.h set_hip_default_device_from_local_rank.h orbs_otf_hip.h
 	$(CC) -c Set_Orbitals_Grid.c
 Set_Density_Grid.o: Set_Density_Grid.c openmx_common.h
 	$(CC_NOACC_O3) $(SDG_CPU_BASELINE_FLAGS) -c Set_Density_Grid.c
@@ -653,7 +653,7 @@ Initial_CntCoes2.o: Initial_CntCoes2.c openmx_common.h
 	$(CC) -c Initial_CntCoes2.c
 
 
-Set_XC_Grid.o: Set_XC_Grid.c openmx_common.h
+Set_XC_Grid.o: Set_XC_Grid.c openmx_common.h set_hip_default_device_from_local_rank.h
 	$(CC) -c Set_XC_Grid.c
 
 Get_Orbitals.o: Get_Orbitals.c openmx_common.h
@@ -776,6 +776,14 @@ my_hipblasZgemm.o: my_hipblasZgemm.c openmx_common.h
 	$(CC) -c my_hipblasZgemm.c
 gemmul8_bridge.o: gemmul8_bridge.cu openmx_common.h $(GEMMUL8_DIR)/include/gemmul8.hpp $(GEMMUL8_LIB)
 	$(HIPCC) $(HIPCC_GEMMUL8_FLAGS) -c gemmul8_bridge.cu -o gemmul8_bridge.o
+eigen_refine_gpu.o: eigen_refine_gpu.cu eigen_refine_gpu.h hip_runtime_compat.h hipblas_compat.h
+	$(HIPCC) $(HIPCC_GEMMUL8_FLAGS) $(MPI_CFLAGS) -c eigen_refine_gpu.cu -o eigen_refine_gpu.o
+# double-float arithmetic: no floating-point contraction (-ffp-contract=off in the flags)
+orbs_otf_hip.o: orbs_otf_hip.cu orbs_otf_hip.h
+	$(HIPCC) $(HIPCC_GEMMUL8_FLAGS) -c orbs_otf_hip.cu -o orbs_otf_hip.o
+
+set_xc_grid_hip.o: set_xc_grid_hip.cu
+	$(HIPCC) $(HIPCC_GEMMUL8_FLAGS) -c set_xc_grid_hip.cu -o set_xc_grid_hip.o
 
 gpusolver2-stack: $(GPUSOLVER2_STAMP)
 

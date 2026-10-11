@@ -54,6 +54,10 @@
 
 ***********************************************************************/
 
+/* readlink, setenv and unsetenv of the GPU heap re-exec under -std=c11 */
+#ifndef _DEFAULT_SOURCE
+#define _DEFAULT_SOURCE
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <math.h>
@@ -64,6 +68,7 @@
 #include <sys/stat.h>
 #include <sys/resource.h>
 #include <unistd.h>
+#include <sys/auxv.h>
 /*  end stat section */
 #include "openmx_common.h"
 #include "mpi.h"
@@ -94,6 +99,42 @@ int main(int argc, char *argv[])
   static char fileMemory[YOUSO10]; 
   double TStime,TEtime;
   MPI_Comm mpi_comm_parent;
+
+  /* The OpenMP offload runtime preallocates in every process a device heap
+     of LIBOMPTARGET_HEAP_SIZE bytes (512 MiB by default) for device-side
+     malloc, which the target regions of OpenMX do not rely on: with 16
+     ranks sharing one 16 GB GPU the heaps alone held 7 GiB (about 450 MiB
+     of the 700 MiB of each rank), starving the on-the-fly grid tiles and
+     the eigensolver.  The runtime reads the variable while the program is
+     loaded, before main, so unless the user has set it the process
+     re-executes itself once with 64 MiB (before MPI_Init; the PID, the
+     environment and the open files are kept).  OPENMX_GPU_HEAP_REEXEC=0
+     keeps the runtime's default. */
+  if (getenv("LIBOMPTARGET_HEAP_SIZE") == NULL) {
+    const char *reexec = getenv("OPENMX_GPU_HEAP_REEXEC");
+
+    /* Not when the dynamic loader was started directly (ld.so ./openmx
+       ...): /proc/self/exe is then the loader, and AT_BASE is 0 exactly
+       then (also for a static build, which only keeps the default heap).
+       The binary is executed by its own path, which keeps the process
+       name that pgrep, top and amd-smi show (/proc/self/exe would make it
+       "exe"); the stack limit is raised in the new image, as before. */
+    if ((reexec == NULL || reexec[0] == '\0' || atoi(reexec) != 0) && getauxval(AT_BASE) != 0) {
+      char self[4096];
+      const char *path = "/proc/self/exe";
+      ssize_t len = readlink("/proc/self/exe", self, sizeof(self) - 1);
+
+      if (0 < len && (size_t)len < sizeof(self) - 1) {
+        self[len] = '\0';
+        if (strstr(self, " (deleted)") == NULL && access(self, X_OK) == 0) path = self;
+      }
+      if (setenv("LIBOMPTARGET_HEAP_SIZE", "67108864", 1) == 0) {
+        execv(path, argv);
+        /* not re-executed: run with the default heap */
+        unsetenv("LIBOMPTARGET_HEAP_SIZE");
+      }
+    }
+  }
 
   /* MPI initialize */
 

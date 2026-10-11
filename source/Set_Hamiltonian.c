@@ -23,6 +23,10 @@
 #include <string.h>
 #include <strings.h>
 #include <time.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <sys/file.h>
+#include <unistd.h>
 
 
 #define measure_time 0
@@ -93,22 +97,186 @@ static void Set_Hamiltonian_Base_OpenMP(int SCF_iter, double *****H0, double ***
 static size_t Set_Hamiltonian_Base_OpenMP_DeviceBytes(int SCF_iter, int myid);
 static size_t Set_Hamiltonian_MatrixElements_OpenMP_DeviceBytes(int Cnt_kind, int myid);
 int Set_Hamiltonian_Hip_MatrixElements(
-    int pair_count, int spin_count, int max_output_count,
+    int pair_count, int spin_count, int max_output_count, int max_no, int max_nolg,
     size_t total_h, size_t total_nolg, size_t total_orbs0, size_t total_orbs1,
     const int *pair_NO0, const int *pair_NO1, const int *pair_NOLG,
     const size_t *pair_h_offset, const size_t *pair_nolg_offset,
-    const size_t *pair_orbs0_offset, const size_t *pair_orbs1_offset,
+    const size_t *pair_orbs0_offset, const size_t *pair_orbs1_offset, const int *nolg_Nc,
     const double *vpotbuf, const float *orbs0buf, const float *orbs1buf, double *hbuf);
 int Set_Hamiltonian_Hip_MatrixElements_Resident(
-    int pair_count, int spin_count, int max_output_count,
+    int pair_count, int spin_count, int max_output_count, int max_no, int max_nolg,
     size_t total_h, size_t total_nolg,
     const int *d_pair_NO0, const int *d_pair_NO1, const int *d_pair_NOLG,
     const size_t *d_pair_h_offset, const size_t *d_pair_nolg_offset,
-    const size_t *d_pair_orbs0_offset, const size_t *d_pair_orbs1_offset,
+    const size_t *d_pair_orbs0_offset, const size_t *d_pair_orbs1_offset, const int *d_nolg_Nc,
     const float *d_orbs0buf, const float *d_orbs1buf,
     const double *vpotbuf, double *hbuf);
 
 static int Set_Hamiltonian_OpenMP_Rank_Selected = 1;
+static size_t Set_Hamiltonian_ME_ResidentBytes(void);
+void Set_Hamiltonian_Invalidate_OpenMP_MatrixElements_Cache(void);
+
+#include "orbs_otf_hip.h"
+int Set_Orbitals_Grid_OTF_Prepare(void);
+void Set_Orbitals_Grid_OTF_Release(void);
+void Set_Hamiltonian_OTF_Release(void);
+static size_t Set_Hamiltonian_OTF_DeviceBytes(void);
+
+/* OPENMX_OTF_CHECK=1: the first table build of a geometry also evaluates
+   every table entry with the device orbital evaluator (orbs_otf_hip.cu)
+   and reports the largest difference on each rank */
+static void Set_Hamiltonian_OTF_Check(int pair_count, const int *pair_Mc_AN, const int *pair_h_AN,
+                                      const int *pair_NO0, const int *pair_NO1, const int *pair_NOLG,
+                                      const size_t *pair_nolg_offset, const size_t *pair_orbs1_offset,
+                                      const int *nolg_Nc, size_t total_nolg,
+                                      const Type_Orbs_Grid *orbs0buf, size_t total_orbs0,
+                                      const Type_Orbs_Grid *orbs1buf, size_t total_orbs1, int myid)
+{
+    OTF_Atom *atoms = NULL;
+    int *npts = NULL, *gla = NULL, *cla = NULL;
+    size_t *idx_off = NULL, *out_off = NULL, *sph_off = NULL, *atom_sph = NULL, *atom_o0 = NULL;
+    size_t sph_total = 0, o0 = 0;
+    float *h0 = NULL, *h1 = NULL;
+    void *d_atoms = NULL, *d_npts = NULL, *d_idx_off = NULL, *d_out_off = NULL, *d_sph_off = NULL;
+    void *d_gla = NULL, *d_cla = NULL, *d_nc = NULL, *d_o0 = NULL, *d_o1 = NULL;
+    int Mc_AN, pair, max_atom = 1, max_pair = 1, ok = 0;
+    double max0 = 0.0, max1 = 0.0, ref0 = 0.0, ref1 = 0.0;
+    size_t diff0 = 0, diff1 = 0, k;
+
+    if (!Set_Orbitals_Grid_OTF_Prepare()) {
+        printf("<OTF check> rank %d: no device orbital tables\n", myid);
+        fflush(stdout);
+        return;
+    }
+    atom_sph = (size_t *)malloc(sizeof(size_t) * (size_t)(Matomnum + 2));
+    atom_o0 = (size_t *)malloc(sizeof(size_t) * (size_t)(Matomnum + 2));
+    for (Mc_AN = 1; Mc_AN <= Matomnum; Mc_AN++) {
+        const int Gc_AN = M2G[Mc_AN];
+        atom_sph[Mc_AN] = sph_total;
+        atom_o0[Mc_AN] = o0;
+        sph_total += (size_t)GridN_Atom[Gc_AN];
+        o0 += (size_t)GridN_Atom[Gc_AN] * (size_t)Spe_Total_NO[WhatSpecies[Gc_AN]];
+        if (max_atom < GridN_Atom[Gc_AN]) max_atom = GridN_Atom[Gc_AN];
+    }
+    gla = (int *)malloc(sizeof(int) * (sph_total ? sph_total : 1));
+    cla = (int *)malloc(sizeof(int) * (sph_total ? sph_total : 1));
+    for (Mc_AN = 1; Mc_AN <= Matomnum; Mc_AN++) {
+        const int Gc_AN = M2G[Mc_AN];
+        int Nc;
+        for (Nc = 0; Nc < GridN_Atom[Gc_AN]; Nc++) {
+            gla[atom_sph[Mc_AN] + (size_t)Nc] = GridListAtom[Mc_AN][Nc];
+            cla[atom_sph[Mc_AN] + (size_t)Nc] = CellListAtom[Mc_AN][Nc];
+        }
+    }
+    {
+        const int items = (Matomnum > pair_count) ? Matomnum : pair_count;
+        atoms = (OTF_Atom *)calloc((size_t)(items ? items : 1), sizeof(OTF_Atom));
+        npts = (int *)malloc(sizeof(int) * (size_t)(items ? items : 1));
+        idx_off = (size_t *)malloc(sizeof(size_t) * (size_t)(items ? items : 1));
+        out_off = (size_t *)malloc(sizeof(size_t) * (size_t)(items ? items : 1));
+        sph_off = (size_t *)malloc(sizeof(size_t) * (size_t)(items ? items : 1));
+    }
+    h0 = (float *)malloc(sizeof(float) * (total_orbs0 ? total_orbs0 : 1));
+    h1 = (float *)malloc(sizeof(float) * (total_orbs1 ? total_orbs1 : 1));
+
+#define OTF_CK(call) do { if ((call) != hipSuccess) goto cleanup; } while (0)
+    OTF_CK(hipMalloc(&d_atoms, sizeof(OTF_Atom) * (size_t)((Matomnum > pair_count) ? Matomnum : pair_count) + 64));
+    OTF_CK(hipMalloc(&d_npts, sizeof(int) * (size_t)((Matomnum > pair_count) ? Matomnum : pair_count) + 64));
+    OTF_CK(hipMalloc(&d_idx_off, sizeof(size_t) * (size_t)((Matomnum > pair_count) ? Matomnum : pair_count) + 64));
+    OTF_CK(hipMalloc(&d_out_off, sizeof(size_t) * (size_t)((Matomnum > pair_count) ? Matomnum : pair_count) + 64));
+    OTF_CK(hipMalloc(&d_sph_off, sizeof(size_t) * (size_t)((Matomnum > pair_count) ? Matomnum : pair_count) + 64));
+    OTF_CK(hipMalloc(&d_gla, sizeof(int) * (sph_total ? sph_total : 1)));
+    OTF_CK(hipMalloc(&d_cla, sizeof(int) * (sph_total ? sph_total : 1)));
+    OTF_CK(hipMalloc(&d_nc, sizeof(int) * (total_nolg ? total_nolg : 1)));
+    OTF_CK(hipMalloc(&d_o0, sizeof(float) * (total_orbs0 ? total_orbs0 : 1)));
+    OTF_CK(hipMalloc(&d_o1, sizeof(float) * (total_orbs1 ? total_orbs1 : 1)));
+    OTF_CK(hipMemcpy(d_gla, gla, sizeof(int) * sph_total, hipMemcpyHostToDevice));
+    OTF_CK(hipMemcpy(d_cla, cla, sizeof(int) * sph_total, hipMemcpyHostToDevice));
+    OTF_CK(hipMemcpy(d_nc, nolg_Nc, sizeof(int) * total_nolg, hipMemcpyHostToDevice));
+
+    /* the central atoms over their spheres */
+    for (Mc_AN = 1; Mc_AN <= Matomnum; Mc_AN++) {
+        const int Gc_AN = M2G[Mc_AN];
+        const int Cwan = WhatSpecies[Gc_AN];
+        OTF_Atom *a = &atoms[Mc_AN - 1];
+        a->wan = Cwan;
+        a->no = Spe_Total_NO[Cwan];
+        a->gx = Gxyz[Gc_AN][1]; a->gy = Gxyz[Gc_AN][2]; a->gz = Gxyz[Gc_AN][3];
+        a->ax = a->ay = a->az = 0.0;
+        npts[Mc_AN - 1] = GridN_Atom[Gc_AN];
+        idx_off[Mc_AN - 1] = 0;
+        out_off[Mc_AN - 1] = atom_o0[Mc_AN];
+        sph_off[Mc_AN - 1] = atom_sph[Mc_AN];
+    }
+    OTF_CK(hipMemcpy(d_atoms, atoms, sizeof(OTF_Atom) * (size_t)Matomnum, hipMemcpyHostToDevice));
+    OTF_CK(hipMemcpy(d_npts, npts, sizeof(int) * (size_t)Matomnum, hipMemcpyHostToDevice));
+    OTF_CK(hipMemcpy(d_idx_off, idx_off, sizeof(size_t) * (size_t)Matomnum, hipMemcpyHostToDevice));
+    OTF_CK(hipMemcpy(d_out_off, out_off, sizeof(size_t) * (size_t)Matomnum, hipMemcpyHostToDevice));
+    OTF_CK(hipMemcpy(d_sph_off, sph_off, sizeof(size_t) * (size_t)Matomnum, hipMemcpyHostToDevice));
+    if (OTF_Orbitals_Eval(NULL, Matomnum, max_atom, (const OTF_Atom *)d_atoms, (const int *)d_npts,
+                          (const size_t *)d_idx_off, (const size_t *)d_out_off, (const size_t *)d_sph_off, NULL,
+                          (const int *)d_gla, (const int *)d_cla, (float *)d_o0) != 0) goto cleanup;
+    OTF_CK(hipDeviceSynchronize());
+
+    /* the neighbours at the pairs' overlap points */
+    for (pair = 0; pair < pair_count; pair++) {
+        const int Mc = pair_Mc_AN[pair], h_AN = pair_h_AN[pair];
+        const int Gc_AN = M2G[Mc];
+        const int Gh_AN = natn[Gc_AN][h_AN];
+        const int Rnh = ncn[Gc_AN][h_AN];
+        OTF_Atom *a = &atoms[pair];
+        a->wan = WhatSpecies[Gh_AN];
+        a->no = pair_NO1[pair];
+        a->gx = Gxyz[Gh_AN][1]; a->gy = Gxyz[Gh_AN][2]; a->gz = Gxyz[Gh_AN][3];
+        a->ax = atv[Rnh][1]; a->ay = atv[Rnh][2]; a->az = atv[Rnh][3];
+        npts[pair] = pair_NOLG[pair];
+        idx_off[pair] = pair_nolg_offset[pair];
+        out_off[pair] = pair_orbs1_offset[pair];
+        sph_off[pair] = atom_sph[Mc];
+        if (max_pair < pair_NOLG[pair]) max_pair = pair_NOLG[pair];
+    }
+    OTF_CK(hipMemcpy(d_atoms, atoms, sizeof(OTF_Atom) * (size_t)pair_count, hipMemcpyHostToDevice));
+    OTF_CK(hipMemcpy(d_npts, npts, sizeof(int) * (size_t)pair_count, hipMemcpyHostToDevice));
+    OTF_CK(hipMemcpy(d_idx_off, idx_off, sizeof(size_t) * (size_t)pair_count, hipMemcpyHostToDevice));
+    OTF_CK(hipMemcpy(d_out_off, out_off, sizeof(size_t) * (size_t)pair_count, hipMemcpyHostToDevice));
+    OTF_CK(hipMemcpy(d_sph_off, sph_off, sizeof(size_t) * (size_t)pair_count, hipMemcpyHostToDevice));
+    if (OTF_Orbitals_Eval(NULL, pair_count, max_pair, (const OTF_Atom *)d_atoms, (const int *)d_npts,
+                          (const size_t *)d_idx_off, (const size_t *)d_out_off, (const size_t *)d_sph_off,
+                          (const int *)d_nc, (const int *)d_gla, (const int *)d_cla, (float *)d_o1) != 0) goto cleanup;
+    OTF_CK(hipDeviceSynchronize());
+    OTF_CK(hipMemcpy(h0, d_o0, sizeof(float) * total_orbs0, hipMemcpyDeviceToHost));
+    OTF_CK(hipMemcpy(h1, d_o1, sizeof(float) * total_orbs1, hipMemcpyDeviceToHost));
+#undef OTF_CK
+    for (k = 0; k < total_orbs0; k++) {
+        const double d = fabs((double)h0[k] - (double)orbs0buf[k]);
+        if (d > 0.0) diff0++;
+        if (max0 < d) max0 = d;
+        if (ref0 < fabs((double)orbs0buf[k])) ref0 = fabs((double)orbs0buf[k]);
+    }
+    for (k = 0; k < total_orbs1; k++) {
+        const double d = fabs((double)h1[k] - (double)orbs1buf[k]);
+        if (d > 0.0) diff1++;
+        if (max1 < d) max1 = d;
+        if (ref1 < fabs((double)orbs1buf[k])) ref1 = fabs((double)orbs1buf[k]);
+    }
+    ok = 1;
+    printf("<OTF check> rank %d (%s): central atoms %zu values, %zu differ, max |diff| %.3e (max |value| %.3e); "
+           "neighbours %zu values, %zu differ, max |diff| %.3e (max |value| %.3e)\n",
+           myid, OTF_Orbitals_DoubleFloat() ? "double-float" : "FP64", total_orbs0, diff0, max0, ref0,
+           total_orbs1, diff1, max1, ref1);
+    fflush(stdout);
+
+cleanup:
+    if (!ok) {
+        printf("<OTF check> rank %d: device evaluation failed\n", myid);
+        fflush(stdout);
+    }
+    hipFree(d_atoms); hipFree(d_npts); hipFree(d_idx_off); hipFree(d_out_off); hipFree(d_sph_off);
+    hipFree(d_gla); hipFree(d_cla); hipFree(d_nc); hipFree(d_o0); hipFree(d_o1);
+    (void)hipGetLastError();
+    free(atoms); free(npts); free(idx_off); free(out_off); free(sph_off); free(atom_sph); free(atom_o0);
+    free(gla); free(cla); free(h0); free(h1);
+}
 
 typedef struct {
     int ready, cnt_kind;
@@ -165,13 +333,47 @@ static int Set_Hamiltonian_NonColGpuEigensolverActive(void)
     return Band_DFT_NonCol_GpuSwitchNum() <= 2*basis_count;
 }
 
+/* set when a dense eigensolver found the device too full while the
+   orbital tables were resident (Set_Hamiltonian_DemoteResidency): from then
+   on the tables are uploaded per call and freed after it, so that the
+   eigensolver keeps the room (OPENMX_SETHAM_DEMOTE_ON_PRESSURE=0 keeps
+   them resident) */
+static int Set_Hamiltonian_ME_residency_demoted = 0;
+
 static int Set_Hamiltonian_ME_KeepDeviceResident(void)
 {
+    if (Set_Hamiltonian_ME_residency_demoted) return 0;
     if (Set_Hamiltonian_NonColGpuEigensolverActive()) {
         const char *demote = getenv("OPENMX_NC_EIGEN_DEMOTE_SETHAM");
         if (demote == NULL || atoi(demote) != 0) return 0;
     }
     return 1;
+}
+
+/* every rank of a dense eigensolver whose memory test failed: the resident
+   orbital tables go now and stay off the device for the rest of the run;
+   rank-local, returns the device bytes released on this rank */
+size_t Set_Hamiltonian_DemoteResidency(void)
+{
+    static int checked = 0, enabled = 1;
+    size_t released;
+
+    if (!checked) {
+        const char *value = getenv("OPENMX_SETHAM_DEMOTE_ON_PRESSURE");
+        enabled = (value == NULL || value[0] == '\0' || atoi(value) != 0);
+        checked = 1;
+    }
+    if (!enabled) return 0;
+    released = Set_Hamiltonian_ME_ResidentBytes();
+    Set_Hamiltonian_ME_residency_demoted = 1;
+    if (0 < released) Set_Hamiltonian_Invalidate_OpenMP_MatrixElements_Cache();
+    /* the on-the-fly state too (the sphere indices of the local atoms and
+       the PAO tables): idle during the eigensolver, rebuilt lazily by the
+       next Set_Hamiltonian or Set_Density_Grid */
+    released += Set_Hamiltonian_OTF_DeviceBytes();
+    Set_Hamiltonian_OTF_Release();
+    Set_Orbitals_Grid_OTF_Release();
+    return released;
 }
 
 void Set_Hamiltonian_Invalidate_OpenMP_MatrixElements_Cache(void)
@@ -1142,13 +1344,868 @@ double Set_Hamiltonian(char * mode, int MD_iter, int SCF_iter, int SCF_iter0, in
     return time0;
 }
 
+/* ---------------------------------------------------------------------
+   On-the-fly matrix elements (port of the NVIDIA version's
+   Set_Hamiltonian_OnTheFly_MatrixElements): a rank whose orbital tables
+   are not resident on the device evaluates, batch by batch of its atoms,
+   the central atoms' orbitals over their spheres and the neighbours'
+   orbitals at the overlap points on the device (orbs_otf_hip.cu), gathers
+   the potential there from the grid uploaded once per call, and runs the
+   same matrix-element kernel; only the potential and the H blocks travel.
+   The device holds the atoms' sphere lists (a few MiB) and one batch
+   arena of OPENMX_SETHAM_ONTHEFLY_MB (default 256).
+   OPENMX_SETHAM_ONTHEFLY=0 turns it off.
+   --------------------------------------------------------------------- */
+int Set_Hamiltonian_Hip_OTF_VpotGather(int pair_count, int max_nolg, int spin_count, size_t batch_nolg,
+                                       const int *d_nolg, const size_t *d_noff, const size_t *d_sph,
+                                       const int *d_nc, const int *d_mgla, const double *d_vgrid,
+                                       size_t vgrid_len, double gridvol, double *d_vb);
+int Set_Hamiltonian_Hip_MatrixElements_Device(
+    int pair_count, int spin_count, int max_output_count, int max_no, int max_nolg, size_t total_h,
+    size_t total_nolg,
+    const int *d_no0, const int *d_no1, const int *d_nolg,
+    const size_t *d_hoff, const size_t *d_noff,
+    const size_t *d_o0off, const size_t *d_o1off, const int *d_nc,
+    const double *d_vpot, const float *d_o0, const float *d_o1, double *d_h);
+
+typedef struct {
+    int ready;
+    int *d_gla, *d_cla, *d_mgla;   /* every local atom's sphere: grid index, cell, grid-C index */
+    size_t *atom_sph;              /* host: first sphere entry of each local atom (Matomnum + 2) */
+    size_t sph_total;
+} SetHamOTFState;
+
+static SetHamOTFState Set_Hamiltonian_OTF_State;
+
+void Set_Hamiltonian_OTF_Release(void)
+{
+    SetHamOTFState *st = &Set_Hamiltonian_OTF_State;
+
+    if (st->d_gla != NULL) hipFree(st->d_gla);
+    if (st->d_cla != NULL) hipFree(st->d_cla);
+    if (st->d_mgla != NULL) hipFree(st->d_mgla);
+    (void)hipGetLastError();
+    free(st->atom_sph);
+    memset(st, 0, sizeof(*st));
+}
+
+/* the device bytes of the on-the-fly state of this rank */
+static size_t Set_Hamiltonian_OTF_DeviceBytes(void)
+{
+    const SetHamOTFState *st = &Set_Hamiltonian_OTF_State;
+    size_t bytes = OTF_Orbitals_Bytes();
+
+    if (st->d_gla != NULL) bytes += 3 * sizeof(int) * st->sph_total;
+    return bytes;
+}
+
+/* The on-the-fly tiles hold no tables (a few MiB of sphere indices and a
+   transient arena), so every rank may take them, as every rank enters the
+   NVIDIA version's GPU scheduler; OPENMX_SETHAM_GPU_KOWNER_ONLY=1 keeps
+   them to the ranks selected for the table path (one per k-point group). */
+static int Set_Hamiltonian_OTF_Rank_Selected(void)
+{
+    static int kowner_only = -1;
+
+    if (kowner_only < 0) {
+        const char *value = getenv("OPENMX_SETHAM_GPU_KOWNER_ONLY");
+        kowner_only = (value != NULL && value[0] != '\0' && atoi(value) != 0) ? 1 : 0;
+    }
+    return kowner_only ? Set_Hamiltonian_OpenMP_Rank_Selected : 1;
+}
+
+static int Set_Hamiltonian_OTF_Enabled(void)
+{
+    static int enabled = -1;
+
+    if (enabled < 0) {
+        const char *value = getenv("OPENMX_SETHAM_ONTHEFLY");
+        enabled = (value == NULL || value[0] == '\0' || atoi(value) != 0) ? 1 : 0;
+    }
+    return enabled;
+}
+
+static size_t Set_Hamiltonian_OTF_Budget(void)
+{
+    static size_t budget = 0;
+
+    if (budget == 0) {
+        const char *value = getenv("OPENMX_SETHAM_ONTHEFLY_MB");
+        long mib = (value != NULL && value[0] != '\0') ? atol(value) : 256;
+
+        if (mib < 32) mib = 32;
+        budget = (size_t)mib * 1024 * 1024;
+    }
+    return budget;
+}
+
+/* the spheres of the local atoms on the device, once per geometry */
+static int Set_Hamiltonian_OTF_Ensure(void)
+{
+    SetHamOTFState *st = &Set_Hamiltonian_OTF_State;
+    int *gla = NULL, *cla = NULL, *mgla = NULL;
+    int Mc_AN, ok = 0;
+
+    if (st->ready) return 1;
+    Set_Hamiltonian_OTF_Release();
+    st->atom_sph = (size_t *)malloc(sizeof(size_t) * (size_t)(Matomnum + 2));
+    if (st->atom_sph == NULL) return 0;
+    st->sph_total = 0;
+    for (Mc_AN = 1; Mc_AN <= Matomnum; Mc_AN++) {
+        st->atom_sph[Mc_AN] = st->sph_total;
+        st->sph_total += (size_t)GridN_Atom[M2G[Mc_AN]];
+    }
+    gla = (int *)malloc(sizeof(int) * (st->sph_total ? st->sph_total : 1));
+    cla = (int *)malloc(sizeof(int) * (st->sph_total ? st->sph_total : 1));
+    mgla = (int *)malloc(sizeof(int) * (st->sph_total ? st->sph_total : 1));
+    if (gla == NULL || cla == NULL || mgla == NULL) goto done;
+    for (Mc_AN = 1; Mc_AN <= Matomnum; Mc_AN++) {
+        const int Gc_AN = M2G[Mc_AN];
+        const size_t base = st->atom_sph[Mc_AN];
+        int Nc;
+
+        for (Nc = 0; Nc < GridN_Atom[Gc_AN]; Nc++) {
+            gla[base + (size_t)Nc] = GridListAtom[Mc_AN][Nc];
+            cla[base + (size_t)Nc] = CellListAtom[Mc_AN][Nc];
+            mgla[base + (size_t)Nc] = MGridListAtom[Mc_AN][Nc];
+        }
+    }
+    if (hipMalloc((void **)&st->d_gla, sizeof(int) * (st->sph_total ? st->sph_total : 1)) != hipSuccess ||
+        hipMalloc((void **)&st->d_cla, sizeof(int) * (st->sph_total ? st->sph_total : 1)) != hipSuccess ||
+        hipMalloc((void **)&st->d_mgla, sizeof(int) * (st->sph_total ? st->sph_total : 1)) != hipSuccess ||
+        hipMemcpy(st->d_gla, gla, sizeof(int) * st->sph_total, hipMemcpyHostToDevice) != hipSuccess ||
+        hipMemcpy(st->d_cla, cla, sizeof(int) * st->sph_total, hipMemcpyHostToDevice) != hipSuccess ||
+        hipMemcpy(st->d_mgla, mgla, sizeof(int) * st->sph_total, hipMemcpyHostToDevice) != hipSuccess)
+        goto done;
+    st->ready = 1;
+    ok = 1;
+
+done:
+    free(gla);
+    free(cla);
+    free(mgla);
+    if (!ok) Set_Hamiltonian_OTF_Release();
+    return ok;
+}
+
+#define SETH_OTF_ALIGN(x) (((x) + (size_t)255) & ~(size_t)255)
+
+/* The free-memory test and the allocation of an on-the-fly arena as one
+   step among the processes of the node (under the lock of the device
+   probe, set_hip_default_device_from_local_rank.c): ranks that allocate at
+   the same moment then each see the others' arenas and all keep the
+   reserve.  NULL when the device has no room (or the allocation fails). */
+static void *SetH_OTF_LockedAlloc(size_t bytes, size_t reserve, size_t *free_out)
+{
+    char path[64];
+    int fd;
+    void *p = NULL;
+    size_t free_bytes = 0, total_bytes = 0;
+
+    snprintf(path, sizeof(path), "/tmp/.openmx_gpu_probe.%ld", (long)getuid());
+    fd = open(path, O_CREAT | O_RDWR, 0600);   /* closed right after the lock */
+    if (0 <= fd) {
+        while (flock(fd, LOCK_EX) != 0 && errno == EINTR);
+    }
+    if (hipMemGetInfo(&free_bytes, &total_bytes) == hipSuccess && bytes + reserve <= free_bytes) {
+        if (hipMalloc(&p, bytes) != hipSuccess) p = NULL;
+    }
+    (void)hipGetLastError();
+    if (0 <= fd) {
+        (void)flock(fd, LOCK_UN);
+        (void)close(fd);
+    }
+    if (free_out != NULL) *free_out = free_bytes;
+    return p;
+}
+
+/* the device bytes of a batch of atoms [a0, a1): the meta image, the H
+   blocks, the potential at the overlap points and the two orbital tiles */
+static void Set_Hamiltonian_OTF_BatchSizes(int a0, int a1, int spin_count, size_t *image_bytes, size_t *h_count,
+                                           size_t *nolg_count, size_t *o0_count, size_t *o1_count, int *pair_count,
+                                           int *max_nolg, int *max_sphere, int *max_output)
+{
+    size_t na = 0, np = 0, bn = 0, bo0 = 0, bo1 = 0, bh = 0;
+    int Mc_AN;
+
+    *max_nolg = 0;
+    *max_sphere = 0;
+    *max_output = 0;
+    for (Mc_AN = a0; Mc_AN < a1; Mc_AN++) {
+        const int Gc_AN = M2G[Mc_AN];
+        const int NO0 = Spe_Total_NO[WhatSpecies[Gc_AN]];
+        int h_AN;
+
+        na++;
+        bo0 += (size_t)GridN_Atom[Gc_AN] * (size_t)NO0;
+        if (*max_sphere < GridN_Atom[Gc_AN]) *max_sphere = GridN_Atom[Gc_AN];
+        for (h_AN = 0; h_AN <= FNAN[Gc_AN]; h_AN++) {
+            const int NO1 = Spe_Total_NO[WhatSpecies[natn[Gc_AN][h_AN]]];
+            const int NOLG = NumOLG[Mc_AN][h_AN];
+
+            np++;
+            bn += (size_t)NOLG;
+            bo1 += (size_t)NOLG * (size_t)NO1;
+            bh += (size_t)spin_count * (size_t)NO0 * (size_t)NO1;
+            if (*max_nolg < NOLG) *max_nolg = NOLG;
+            if (*max_output < spin_count * NO0 * NO1) *max_output = spin_count * NO0 * NO1;
+        }
+    }
+    *image_bytes = SETH_OTF_ALIGN(na * sizeof(OTF_Atom)) + SETH_OTF_ALIGN(na * sizeof(int)) +
+                   3 * SETH_OTF_ALIGN(na * sizeof(size_t)) + SETH_OTF_ALIGN(np * sizeof(OTF_Atom)) +
+                   SETH_OTF_ALIGN(np * sizeof(int)) + 3 * SETH_OTF_ALIGN(np * sizeof(size_t)) +
+                   2 * SETH_OTF_ALIGN(np * sizeof(int)) + 2 * SETH_OTF_ALIGN(np * sizeof(size_t)) +
+                   SETH_OTF_ALIGN(bn * sizeof(int)) + SETH_OTF_ALIGN(bh * sizeof(double));
+    *h_count = bh;
+    *nolg_count = bn;
+    *o0_count = bo0;
+    *o1_count = bo1;
+    *pair_count = (int)np;
+}
+
+static size_t Set_Hamiltonian_OTF_BatchBytes(int a0, int a1, int spin_count)
+{
+    size_t image, bh, bn, bo0, bo1;
+    int np, mn, ms, mo;
+
+    Set_Hamiltonian_OTF_BatchSizes(a0, a1, spin_count, &image, &bh, &bn, &bo0, &bo1, &np, &mn, &ms, &mo);
+    return image + SETH_OTF_ALIGN((size_t)spin_count * bn * sizeof(double)) + SETH_OTF_ALIGN(bo0 * sizeof(float)) +
+           SETH_OTF_ALIGN(bo1 * sizeof(float));
+}
+
+/* 1 when this rank's matrix elements were computed on the device; 0 leaves
+   them untouched for the table or CPU path.  Rank-local. */
+static int Calc_MatrixElements_dVH_Vxc_VNA_OnTheFly(int Cnt_kind, int myid)
+{
+    const int spin_count = (SpinP_switch == 3) ? 4 : (SpinP_switch + 1);
+    const size_t vgrid_len = (size_t)My_NumGridC;
+    SetHamOTFState *st = &Set_Hamiltonian_OTF_State;
+    const size_t budget = Set_Hamiltonian_OTF_Budget();
+    int *batch_first = NULL;
+    int batch_count = 0, Mc_AN, b = 0;
+    size_t arena_bytes = 0, free_bytes = 0, total_bytes = 0, hall_count = 0, hall_at = 0;
+    unsigned char *arena = NULL, *image = NULL;
+    double *d_vgrid = NULL, *hall = NULL;
+    int ok = 0;
+    const char *timing_env = getenv("OPENMX_SETHAM_TIMING");
+    const int timing = (timing_env != NULL && atoi(timing_env) != 0);
+    double t_pack = 0.0, t_eval = 0.0, t_kernel = 0.0, t_unpack = 0.0, t_mark = 0.0, t_now = 0.0;
+#define SETH_OTF_TIME(acc) do { if (timing) { hipDeviceSynchronize(); dtime(&t_now); (acc) += t_now - t_mark; t_mark = t_now; } } while (0)
+
+    if (Cnt_kind != 0 || Matomnum <= 0 || !Set_Hamiltonian_OTF_Enabled() ||
+        !Set_Hamiltonian_MatrixElements_OpenMP_Enabled() || !Set_Hamiltonian_OTF_Rank_Selected()) return 0;
+    if (!Set_Orbitals_Grid_OTF_Prepare() || !Set_Hamiltonian_OTF_Ensure()) return 0;
+
+    /* the batches: consecutive atoms while their arena fits the budget */
+    batch_first = (int *)malloc(sizeof(int) * (size_t)(Matomnum + 2));
+    if (batch_first == NULL) return 0;
+    Mc_AN = 1;
+    while (Mc_AN <= Matomnum) {
+        int a1 = Mc_AN + 1;
+        size_t bytes = Set_Hamiltonian_OTF_BatchBytes(Mc_AN, a1, spin_count);
+
+        while (a1 <= Matomnum) {
+            const size_t more = Set_Hamiltonian_OTF_BatchBytes(Mc_AN, a1 + 1, spin_count);
+            if (budget < more) break;
+            bytes = more;
+            a1++;
+        }
+        batch_first[batch_count++] = Mc_AN;
+        if (arena_bytes < bytes) arena_bytes = bytes;
+        Mc_AN = a1;
+    }
+    batch_first[batch_count] = Matomnum + 1;
+    /* the results of every batch, written back to H only once all of them
+       have completed (a failure leaves H untouched for the caller's path) */
+    for (Mc_AN = 1; Mc_AN <= Matomnum; Mc_AN++) {
+        const int Gc_AN = M2G[Mc_AN];
+        const int NO0 = Spe_Total_NO[WhatSpecies[Gc_AN]];
+        int h_AN;
+
+        for (h_AN = 0; h_AN <= FNAN[Gc_AN]; h_AN++)
+            hall_count += (size_t)spin_count * (size_t)NO0 * (size_t)Spe_Total_NO[WhatSpecies[natn[Gc_AN][h_AN]]];
+    }
+    hall = (double *)malloc(sizeof(double) * (hall_count ? hall_count : 1));
+    if (hall == NULL) {
+        free(batch_first);
+        return 0;
+    }
+
+    /* room for the arena and the potential, beside a reserve */
+    /* the arena and the rank's potential grid behind it, one allocation */
+    arena = (unsigned char *)SetH_OTF_LockedAlloc(
+        arena_bytes + SETH_OTF_ALIGN(sizeof(double) * (size_t)spin_count * (vgrid_len ? vgrid_len : 1)),
+        (size_t)256 * 1024 * 1024, &free_bytes);
+    (void)total_bytes;
+    if (arena == NULL) {
+        free(batch_first);
+        free(hall);
+        return 0;
+    }
+    d_vgrid = (double *)(void *)(arena + arena_bytes);
+    {
+        int spin;
+        for (spin = 0; spin < spin_count; spin++) {
+            if (hipMemcpy(d_vgrid + (size_t)spin * vgrid_len, Vpot_Grid[spin], sizeof(double) * vgrid_len,
+                          hipMemcpyHostToDevice) != hipSuccess) goto done;
+        }
+    }
+
+    if (timing) dtime(&t_mark);
+    for (b = 0; b < batch_count; b++) {
+        const int a0 = batch_first[b], a1 = batch_first[b + 1];
+        size_t image_bytes, bh, bn, bo0, bo1, pos = 0;
+        int np, max_nolg, max_sphere, max_output, na = a1 - a0;
+        OTF_Atom *a_items, *p_items;
+        int *a_npts, *p_npts, *no0, *no1, *nc;
+        size_t *a_ioff, *a_ooff, *a_soff, *p_ioff, *p_ooff, *p_soff, *hoff, *o0off;
+        double *hbuf;
+        size_t o_a_items, o_a_npts, o_a_ioff, o_a_ooff, o_a_soff, o_p_items, o_p_npts, o_p_ioff, o_p_ooff, o_p_soff;
+        size_t o_no0, o_no1, o_hoff, o_o0off, o_nc, o_h, o_vb, o_o0, o_o1;
+        size_t h_at = 0, n_at = 0, o0_at = 0, o1_at = 0;
+        int ia = 0, ip = 0, max_no = 0;
+
+        Set_Hamiltonian_OTF_BatchSizes(a0, a1, spin_count, &image_bytes, &bh, &bn, &bo0, &bo1, &np, &max_nolg,
+                                       &max_sphere, &max_output);
+#define SETH_OTF_SEC(off, bytes) do { (off) = pos; pos += SETH_OTF_ALIGN(bytes); } while (0)
+        SETH_OTF_SEC(o_a_items, (size_t)na * sizeof(OTF_Atom));
+        SETH_OTF_SEC(o_a_npts, (size_t)na * sizeof(int));
+        SETH_OTF_SEC(o_a_ioff, (size_t)na * sizeof(size_t));
+        SETH_OTF_SEC(o_a_ooff, (size_t)na * sizeof(size_t));
+        SETH_OTF_SEC(o_a_soff, (size_t)na * sizeof(size_t));
+        SETH_OTF_SEC(o_p_items, (size_t)np * sizeof(OTF_Atom));
+        SETH_OTF_SEC(o_p_npts, (size_t)np * sizeof(int));
+        SETH_OTF_SEC(o_p_ioff, (size_t)np * sizeof(size_t));
+        SETH_OTF_SEC(o_p_ooff, (size_t)np * sizeof(size_t));
+        SETH_OTF_SEC(o_p_soff, (size_t)np * sizeof(size_t));
+        SETH_OTF_SEC(o_no0, (size_t)np * sizeof(int));
+        SETH_OTF_SEC(o_no1, (size_t)np * sizeof(int));
+        SETH_OTF_SEC(o_hoff, (size_t)np * sizeof(size_t));
+        SETH_OTF_SEC(o_o0off, (size_t)np * sizeof(size_t));
+        SETH_OTF_SEC(o_nc, bn * sizeof(int));
+        SETH_OTF_SEC(o_h, bh * sizeof(double));
+        /* device only */
+        SETH_OTF_SEC(o_vb, (size_t)spin_count * bn * sizeof(double));
+        SETH_OTF_SEC(o_o0, bo0 * sizeof(float));
+        SETH_OTF_SEC(o_o1, bo1 * sizeof(float));
+#undef SETH_OTF_SEC
+        if (arena_bytes < pos) goto done;   /* cannot happen: the plan sized the arena */
+        {
+            unsigned char *grown = (unsigned char *)realloc(image, o_vb);
+            if (grown == NULL) goto done;   /* image is still freed at done */
+            image = grown;
+        }
+        a_items = (OTF_Atom *)(void *)(image + o_a_items);
+        a_npts = (int *)(void *)(image + o_a_npts);
+        a_ioff = (size_t *)(void *)(image + o_a_ioff);
+        a_ooff = (size_t *)(void *)(image + o_a_ooff);
+        a_soff = (size_t *)(void *)(image + o_a_soff);
+        p_items = (OTF_Atom *)(void *)(image + o_p_items);
+        p_npts = (int *)(void *)(image + o_p_npts);
+        p_ioff = (size_t *)(void *)(image + o_p_ioff);
+        p_ooff = (size_t *)(void *)(image + o_p_ooff);
+        p_soff = (size_t *)(void *)(image + o_p_soff);
+        no0 = (int *)(void *)(image + o_no0);
+        no1 = (int *)(void *)(image + o_no1);
+        hoff = (size_t *)(void *)(image + o_hoff);
+        o0off = (size_t *)(void *)(image + o_o0off);
+        nc = (int *)(void *)(image + o_nc);
+        hbuf = (double *)(void *)(image + o_h);
+
+        for (Mc_AN = a0; Mc_AN < a1; Mc_AN++, ia++) {
+            const int Gc_AN = M2G[Mc_AN];
+            const int Cwan = WhatSpecies[Gc_AN];
+            const int NO0 = Spe_Total_NO[Cwan];
+            const size_t atom_o0 = o0_at;
+            int h_AN;
+
+            if (max_no < NO0) max_no = NO0;
+
+            memset(&a_items[ia], 0, sizeof(OTF_Atom));
+            a_items[ia].wan = Cwan;
+            a_items[ia].no = NO0;
+            a_items[ia].gx = Gxyz[Gc_AN][1];
+            a_items[ia].gy = Gxyz[Gc_AN][2];
+            a_items[ia].gz = Gxyz[Gc_AN][3];
+            a_npts[ia] = GridN_Atom[Gc_AN];
+            a_ioff[ia] = 0;
+            a_ooff[ia] = atom_o0;
+            a_soff[ia] = st->atom_sph[Mc_AN];
+            o0_at += (size_t)GridN_Atom[Gc_AN] * (size_t)NO0;
+
+            for (h_AN = 0; h_AN <= FNAN[Gc_AN]; h_AN++, ip++) {
+                const int Gh_AN = natn[Gc_AN][h_AN];
+                const int Rnh = ncn[Gc_AN][h_AN];
+                const int Hwan = WhatSpecies[Gh_AN];
+                const int NO1 = Spe_Total_NO[Hwan];
+                const int NOLG = NumOLG[Mc_AN][h_AN];
+                const size_t mat = (size_t)NO0 * (size_t)NO1;
+                int spin, i, j;
+
+                if (max_no < NO1) max_no = NO1;
+                memset(&p_items[ip], 0, sizeof(OTF_Atom));
+                p_items[ip].wan = Hwan;
+                p_items[ip].no = NO1;
+                p_items[ip].gx = Gxyz[Gh_AN][1];
+                p_items[ip].gy = Gxyz[Gh_AN][2];
+                p_items[ip].gz = Gxyz[Gh_AN][3];
+                p_items[ip].ax = atv[Rnh][1];
+                p_items[ip].ay = atv[Rnh][2];
+                p_items[ip].az = atv[Rnh][3];
+                p_npts[ip] = NOLG;
+                p_ioff[ip] = n_at;
+                p_ooff[ip] = o1_at;
+                p_soff[ip] = st->atom_sph[Mc_AN];
+                no0[ip] = NO0;
+                no1[ip] = NO1;
+                hoff[ip] = h_at;
+                o0off[ip] = atom_o0;
+                if (0 < NOLG) memcpy(nc + n_at, GListTAtoms1[Mc_AN][h_AN], sizeof(int) * (size_t)NOLG);
+                for (spin = 0; spin < spin_count; spin++) {
+                    for (i = 0; i < NO0; i++) {
+                        for (j = 0; j < NO1; j++) {
+                            hbuf[h_at + (size_t)spin * mat + (size_t)i * (size_t)NO1 + (size_t)j] =
+                                H[spin][Mc_AN][h_AN][i][j];
+                        }
+                    }
+                }
+                n_at += (size_t)NOLG;
+                o1_at += (size_t)NOLG * (size_t)NO1;
+                h_at += (size_t)spin_count * mat;
+            }
+        }
+
+        if (hipMemcpy(arena, image, o_vb, hipMemcpyHostToDevice) != hipSuccess) goto done;
+        SETH_OTF_TIME(t_pack);
+        if (OTF_Orbitals_Eval(NULL, na, max_sphere, (const OTF_Atom *)(void *)(arena + o_a_items),
+                              (const int *)(void *)(arena + o_a_npts), (const size_t *)(void *)(arena + o_a_ioff),
+                              (const size_t *)(void *)(arena + o_a_ooff), (const size_t *)(void *)(arena + o_a_soff),
+                              NULL, st->d_gla, st->d_cla, (float *)(void *)(arena + o_o0)) != 0) goto done;
+        if (OTF_Orbitals_Eval(NULL, np, max_nolg, (const OTF_Atom *)(void *)(arena + o_p_items),
+                              (const int *)(void *)(arena + o_p_npts), (const size_t *)(void *)(arena + o_p_ioff),
+                              (const size_t *)(void *)(arena + o_p_ooff), (const size_t *)(void *)(arena + o_p_soff),
+                              (const int *)(void *)(arena + o_nc), st->d_gla, st->d_cla,
+                              (float *)(void *)(arena + o_o1)) != 0) goto done;
+        SETH_OTF_TIME(t_eval);
+        if (Set_Hamiltonian_Hip_OTF_VpotGather(np, max_nolg, spin_count, bn, (const int *)(void *)(arena + o_p_npts),
+                                               (const size_t *)(void *)(arena + o_p_ioff),
+                                               (const size_t *)(void *)(arena + o_p_soff),
+                                               (const int *)(void *)(arena + o_nc), st->d_mgla, d_vgrid, vgrid_len,
+                                               GridVol, (double *)(void *)(arena + o_vb)) != 0) goto done;
+        if (Set_Hamiltonian_Hip_MatrixElements_Device(
+                np, spin_count, max_output, max_no, max_nolg, bh, bn, (const int *)(void *)(arena + o_no0),
+                (const int *)(void *)(arena + o_no1), (const int *)(void *)(arena + o_p_npts),
+                (const size_t *)(void *)(arena + o_hoff), (const size_t *)(void *)(arena + o_p_ioff),
+                (const size_t *)(void *)(arena + o_o0off), (const size_t *)(void *)(arena + o_p_ooff),
+                (const int *)(void *)(arena + o_nc), (const double *)(void *)(arena + o_vb),
+                (const float *)(void *)(arena + o_o0), (const float *)(void *)(arena + o_o1),
+                (double *)(void *)(arena + o_h)) != 0) goto done;
+        SETH_OTF_TIME(t_kernel);
+        (void)hbuf;
+        if (hall_count < hall_at + bh ||
+            hipMemcpy(hall + hall_at, arena + o_h, sizeof(double) * bh, hipMemcpyDeviceToHost) != hipSuccess)
+            goto done;
+        hall_at += bh;
+        SETH_OTF_TIME(t_unpack);
+    }
+
+    /* every batch completed: the H blocks back, in the order of the batches */
+    hall_at = 0;
+    for (Mc_AN = 1; Mc_AN <= Matomnum; Mc_AN++) {
+        const int Gc_AN = M2G[Mc_AN];
+        const int NO0 = Spe_Total_NO[WhatSpecies[Gc_AN]];
+        int h_AN;
+
+        for (h_AN = 0; h_AN <= FNAN[Gc_AN]; h_AN++) {
+            const int NO1 = Spe_Total_NO[WhatSpecies[natn[Gc_AN][h_AN]]];
+            const size_t mat = (size_t)NO0 * (size_t)NO1;
+            int spin, i, j;
+
+            for (spin = 0; spin < spin_count; spin++) {
+                for (i = 0; i < NO0; i++) {
+                    for (j = 0; j < NO1; j++) {
+                        H[spin][Mc_AN][h_AN][i][j] =
+                            hall[hall_at + (size_t)spin * mat + (size_t)i * (size_t)NO1 + (size_t)j];
+                    }
+                }
+            }
+            hall_at += (size_t)spin_count * mat;
+        }
+    }
+    ok = 1;
+    if (timing) {
+        printf("<Set_Hamiltonian> on-the-fly rank %d: pack %.3f eval %.3f kernel %.3f unpack %.3f s (%d batches)\n",
+               myid, t_pack, t_eval, t_kernel, t_unpack, batch_count);
+        fflush(stdout);
+    }
+#undef SETH_OTF_TIME
+    if (myid == Host_ID) {
+        static int announced = 0;
+        if (!announced) {
+            printf("<Set_Hamiltonian> GPU on-the-fly orbital tiles: %d batch(es) of %.1f MiB on rank %d, %s "
+                   "evaluation\n", batch_count, (double)arena_bytes / (1024.0 * 1024.0), myid,
+                   OTF_Orbitals_DoubleFloat() ? "double-float" : "FP64");
+            fflush(stdout);
+            announced = 1;
+        }
+    }
+
+done:
+    if (!ok && myid == Host_ID) {
+        fprintf(stderr, "Set_Hamiltonian: rank %d: the on-the-fly matrix elements failed in batch %d of %d; "
+                "the table or CPU path takes over\n", myid, b + 1, batch_count);
+        fflush(stderr);
+    }
+    free(image);
+    free(hall);
+    free(batch_first);
+    if (arena != NULL) hipFree(arena);   /* d_vgrid lies inside */
+    (void)hipGetLastError();
+    return ok;
+}
+
+int Set_Hamiltonian_Hip_OTF_Density(int pair_count, int max_nolg, int spin_count, int max_no, const int *d_no0,
+                                    const int *d_no1,
+                                    const int *d_nolg, const size_t *d_dmoff, const size_t *d_noff,
+                                    const size_t *d_o0off, const size_t *d_o1off, const size_t *d_denoff,
+                                    const int *d_nc, const double *d_dm, const float *d_o0, const float *d_o1,
+                                    size_t den_stride, double *d_den);
+
+/* The density of Set_Density_Grid on the fly: Tmp_Den_Grid[s][Mc_AN][Nc]
+   += sum over the atom's pairs and their overlap points of
+   CDM[s][Mc_AN][h_AN] phi0 phi1, with the orbitals evaluated on the device
+   batch by batch as for the matrix elements.  Returns 1 when this rank's
+   density was computed (Tmp_Den_Grid holds it), 0 when the caller's CPU
+   loop is to compute it (Tmp_Den_Grid untouched).  Rank-local.
+   OPENMX_DENSITY_GRID_ONTHEFLY=0 turns it off. */
+/* rank-local: whether this rank can take the on-the-fly density (the
+   caller agrees on it across the ranks before the single-owner service) */
+int Set_Density_Grid_OTF_Possible(int Cnt_kind)
+{
+    const char *enabled = getenv("OPENMX_DENSITY_GRID_ONTHEFLY");
+
+    /* without contraction (Cnt_switch 0) the contracted orbitals are the
+       primitive ones, so Cnt_kind 1 (the call before the forces) is the
+       same density */
+    if ((enabled != NULL && enabled[0] != '\0' && atoi(enabled) == 0) || (Cnt_kind != 0 && Cnt_kind != 1) ||
+        Cnt_switch != 0 || !Set_Hamiltonian_OTF_Enabled() || !Set_Hamiltonian_MatrixElements_OpenMP_Enabled() ||
+        !Set_Hamiltonian_OTF_Rank_Selected()) return 0;
+    /* a rank without atoms has nothing to compute and must not hold the
+       others back (the caller takes the minimum over the ranks) */
+    if (Matomnum <= 0) return 1;
+    return Set_Orbitals_Grid_OTF_Prepare() && Set_Hamiltonian_OTF_Ensure();
+}
+
+int Set_Density_Grid_OTF_Run(int Cnt_kind, double *****CDM, double ***Tmp_Den_Grid)
+{
+    const int spin_count = SpinP_switch + 1;
+    SetHamOTFState *st = &Set_Hamiltonian_OTF_State;
+    const size_t budget = Set_Hamiltonian_OTF_Budget();
+    const char *enabled = getenv("OPENMX_DENSITY_GRID_ONTHEFLY");
+    int *batch_first = NULL;
+    int batch_count = 0, Mc_AN, b = 0, myid, ok = 0;
+    size_t arena_bytes = 0, free_bytes = 0, total_bytes = 0;
+    unsigned char *arena = NULL, *image = NULL;
+    double **den_all = NULL;
+    const char *timing_env = getenv("OPENMX_SETHAM_TIMING");
+    const int timing = (timing_env != NULL && atoi(timing_env) != 0);
+    double t_pack = 0.0, t_eval = 0.0, t_kernel = 0.0, t_unpack = 0.0, t_mark = 0.0, t_now = 0.0, t_start = 0.0;
+#define SDG_OTF_TIME(acc) do { if (timing) { hipDeviceSynchronize(); dtime(&t_now); (acc) += t_now - t_mark; t_mark = t_now; } } while (0)
+
+    MPI_Comm_rank(mpi_comm_level1, &myid);
+    if (Matomnum <= 0) return 1;   /* nothing to add on this rank */
+    if ((enabled != NULL && enabled[0] != '\0' && atoi(enabled) == 0) || (Cnt_kind != 0 && Cnt_kind != 1) ||
+        Cnt_switch != 0 || !Set_Hamiltonian_OTF_Enabled() || !Set_Hamiltonian_MatrixElements_OpenMP_Enabled() ||
+        !Set_Hamiltonian_OTF_Rank_Selected()) {
+        static int noted = 0;
+        if (!noted && myid == Host_ID && getenv("OPENMX_GPU_VERBOSE") != NULL) {
+            printf("<Set_Density_Grid> on-the-fly density not enabled here (Cnt_kind %d, Cnt_switch %d, selected %d)\n",
+                   Cnt_kind, Cnt_switch, Set_Hamiltonian_OTF_Rank_Selected());
+            fflush(stdout);
+            noted = 1;
+        }
+        return 0;
+    }
+    if (!Set_Orbitals_Grid_OTF_Prepare() || !Set_Hamiltonian_OTF_Ensure()) return 0;
+
+    /* the batches: as for the matrix elements, the density of the atoms'
+       spheres in place of the potential at the overlap points */
+    batch_first = (int *)malloc(sizeof(int) * (size_t)(Matomnum + 2));
+    if (batch_first == NULL) return 0;
+    Mc_AN = 1;
+    while (Mc_AN <= Matomnum) {
+        int a1 = Mc_AN;
+        size_t bytes = 0;
+
+        while (a1 <= Matomnum) {
+            size_t image, bh, bn, bo0, bo1, sph = 0, more;
+            int np, mn, ms, mo, a;
+
+            Set_Hamiltonian_OTF_BatchSizes(Mc_AN, a1 + 1, spin_count, &image, &bh, &bn, &bo0, &bo1, &np, &mn, &ms,
+                                           &mo);
+            for (a = Mc_AN; a <= a1; a++) sph += (size_t)GridN_Atom[M2G[a]];
+            more = image + SETH_OTF_ALIGN((size_t)np * sizeof(size_t)) +
+                   SETH_OTF_ALIGN((size_t)spin_count * sph * sizeof(double)) + SETH_OTF_ALIGN(bo0 * sizeof(float)) +
+                   SETH_OTF_ALIGN(bo1 * sizeof(float));
+            if (a1 > Mc_AN && budget < more) break;
+            bytes = more;
+            a1++;
+        }
+        batch_first[batch_count++] = Mc_AN;
+        if (arena_bytes < bytes) arena_bytes = bytes;
+        Mc_AN = a1;
+    }
+    batch_first[batch_count] = Matomnum + 1;
+
+    arena = (unsigned char *)SetH_OTF_LockedAlloc(arena_bytes, (size_t)256 * 1024 * 1024, &free_bytes);
+    (void)total_bytes;
+    if (arena == NULL) {
+        static int warned = 0;
+
+        if (!warned) {
+            printf("<Set_Density_Grid> rank %d: no room for the on-the-fly density (%.1f MiB free, %.1f MiB "
+                   "needed with the reserve); CPU loop\n", myid, (double)free_bytes / 1048576.0,
+                   (double)(arena_bytes + (size_t)256 * 1024 * 1024) / 1048576.0);
+            fflush(stdout);
+            warned = 1;
+        }
+        free(batch_first);
+        return 0;
+    }
+    /* every atom's density on the host until all batches have completed */
+    den_all = (double **)calloc((size_t)spin_count, sizeof(double *));
+    if (den_all == NULL) goto done;
+    for (int sp = 0; sp < spin_count; sp++) {
+        den_all[sp] = (double *)malloc(sizeof(double) * (st->sph_total ? st->sph_total : 1));
+        if (den_all[sp] == NULL) goto done;
+    }
+
+    if (timing) { dtime(&t_mark); t_start = t_mark; }
+    for (b = 0; b < batch_count; b++) {
+        const int a0 = batch_first[b], a1 = batch_first[b + 1];
+        size_t image_bytes, bh, bn, bo0, bo1, pos = 0, sph = 0;
+        int np, max_nolg, max_sphere, max_output, na = a1 - a0;
+        OTF_Atom *a_items, *p_items;
+        int *a_npts, *p_npts, *no0, *no1, *nc;
+        size_t *a_ioff, *a_ooff, *a_soff, *p_ioff, *p_ooff, *p_soff, *dmoff, *o0off, *denoff;
+        double *dmbuf;
+        size_t o_a_items, o_a_npts, o_a_ioff, o_a_ooff, o_a_soff, o_p_items, o_p_npts, o_p_ioff, o_p_ooff, o_p_soff;
+        size_t o_no0, o_no1, o_dmoff, o_o0off, o_denoff, o_nc, o_dm, o_den, o_o0, o_o1;
+        size_t dm_at = 0, n_at = 0, o0_at = 0, o1_at = 0, s_at = 0;
+        int ia = 0, ip = 0, max_no = 0;
+
+        Set_Hamiltonian_OTF_BatchSizes(a0, a1, spin_count, &image_bytes, &bh, &bn, &bo0, &bo1, &np, &max_nolg,
+                                       &max_sphere, &max_output);
+        for (Mc_AN = a0; Mc_AN < a1; Mc_AN++) sph += (size_t)GridN_Atom[M2G[Mc_AN]];
+#define SETH_OTF_SEC(off, bytes) do { (off) = pos; pos += SETH_OTF_ALIGN(bytes); } while (0)
+        SETH_OTF_SEC(o_a_items, (size_t)na * sizeof(OTF_Atom));
+        SETH_OTF_SEC(o_a_npts, (size_t)na * sizeof(int));
+        SETH_OTF_SEC(o_a_ioff, (size_t)na * sizeof(size_t));
+        SETH_OTF_SEC(o_a_ooff, (size_t)na * sizeof(size_t));
+        SETH_OTF_SEC(o_a_soff, (size_t)na * sizeof(size_t));
+        SETH_OTF_SEC(o_p_items, (size_t)np * sizeof(OTF_Atom));
+        SETH_OTF_SEC(o_p_npts, (size_t)np * sizeof(int));
+        SETH_OTF_SEC(o_p_ioff, (size_t)np * sizeof(size_t));
+        SETH_OTF_SEC(o_p_ooff, (size_t)np * sizeof(size_t));
+        SETH_OTF_SEC(o_p_soff, (size_t)np * sizeof(size_t));
+        SETH_OTF_SEC(o_no0, (size_t)np * sizeof(int));
+        SETH_OTF_SEC(o_no1, (size_t)np * sizeof(int));
+        SETH_OTF_SEC(o_dmoff, (size_t)np * sizeof(size_t));
+        SETH_OTF_SEC(o_o0off, (size_t)np * sizeof(size_t));
+        SETH_OTF_SEC(o_denoff, (size_t)np * sizeof(size_t));
+        SETH_OTF_SEC(o_nc, bn * sizeof(int));
+        SETH_OTF_SEC(o_dm, bh * sizeof(double));
+        /* device only */
+        SETH_OTF_SEC(o_den, (size_t)spin_count * sph * sizeof(double));
+        SETH_OTF_SEC(o_o0, bo0 * sizeof(float));
+        SETH_OTF_SEC(o_o1, bo1 * sizeof(float));
+#undef SETH_OTF_SEC
+        if (arena_bytes < pos) goto done;
+        {
+            unsigned char *grown = (unsigned char *)realloc(image, o_den);
+            if (grown == NULL) goto done;   /* image is still freed at done */
+            image = grown;
+        }
+        a_items = (OTF_Atom *)(void *)(image + o_a_items);
+        a_npts = (int *)(void *)(image + o_a_npts);
+        a_ioff = (size_t *)(void *)(image + o_a_ioff);
+        a_ooff = (size_t *)(void *)(image + o_a_ooff);
+        a_soff = (size_t *)(void *)(image + o_a_soff);
+        p_items = (OTF_Atom *)(void *)(image + o_p_items);
+        p_npts = (int *)(void *)(image + o_p_npts);
+        p_ioff = (size_t *)(void *)(image + o_p_ioff);
+        p_ooff = (size_t *)(void *)(image + o_p_ooff);
+        p_soff = (size_t *)(void *)(image + o_p_soff);
+        no0 = (int *)(void *)(image + o_no0);
+        no1 = (int *)(void *)(image + o_no1);
+        dmoff = (size_t *)(void *)(image + o_dmoff);
+        o0off = (size_t *)(void *)(image + o_o0off);
+        denoff = (size_t *)(void *)(image + o_denoff);
+        nc = (int *)(void *)(image + o_nc);
+        dmbuf = (double *)(void *)(image + o_dm);
+
+        for (Mc_AN = a0; Mc_AN < a1; Mc_AN++, ia++) {
+            const int Gc_AN = M2G[Mc_AN];
+            const int Cwan = WhatSpecies[Gc_AN];
+            const int NO0 = Spe_Total_NO[Cwan];
+            const size_t atom_o0 = o0_at, atom_den = s_at;
+            int h_AN;
+
+            if (max_no < NO0) max_no = NO0;
+
+            memset(&a_items[ia], 0, sizeof(OTF_Atom));
+            a_items[ia].wan = Cwan;
+            a_items[ia].no = NO0;
+            a_items[ia].gx = Gxyz[Gc_AN][1];
+            a_items[ia].gy = Gxyz[Gc_AN][2];
+            a_items[ia].gz = Gxyz[Gc_AN][3];
+            a_npts[ia] = GridN_Atom[Gc_AN];
+            a_ioff[ia] = 0;
+            a_ooff[ia] = atom_o0;
+            a_soff[ia] = st->atom_sph[Mc_AN];
+            o0_at += (size_t)GridN_Atom[Gc_AN] * (size_t)NO0;
+            s_at += (size_t)GridN_Atom[Gc_AN];
+
+            for (h_AN = 0; h_AN <= FNAN[Gc_AN]; h_AN++, ip++) {
+                const int Gh_AN = natn[Gc_AN][h_AN];
+                const int Rnh = ncn[Gc_AN][h_AN];
+                const int Hwan = WhatSpecies[Gh_AN];
+                const int NO1 = Spe_Total_NO[Hwan];
+                const int NOLG = NumOLG[Mc_AN][h_AN];
+                const size_t mat = (size_t)NO0 * (size_t)NO1;
+                int spin, i, j;
+
+                if (max_no < NO1) max_no = NO1;
+                memset(&p_items[ip], 0, sizeof(OTF_Atom));
+                p_items[ip].wan = Hwan;
+                p_items[ip].no = NO1;
+                p_items[ip].gx = Gxyz[Gh_AN][1];
+                p_items[ip].gy = Gxyz[Gh_AN][2];
+                p_items[ip].gz = Gxyz[Gh_AN][3];
+                p_items[ip].ax = atv[Rnh][1];
+                p_items[ip].ay = atv[Rnh][2];
+                p_items[ip].az = atv[Rnh][3];
+                p_npts[ip] = NOLG;
+                p_ioff[ip] = n_at;
+                p_ooff[ip] = o1_at;
+                p_soff[ip] = st->atom_sph[Mc_AN];
+                no0[ip] = NO0;
+                no1[ip] = NO1;
+                dmoff[ip] = dm_at;
+                o0off[ip] = atom_o0;
+                denoff[ip] = atom_den;
+                if (0 < NOLG) memcpy(nc + n_at, GListTAtoms1[Mc_AN][h_AN], sizeof(int) * (size_t)NOLG);
+                for (spin = 0; spin < spin_count; spin++) {
+                    for (i = 0; i < NO0; i++) {
+                        for (j = 0; j < NO1; j++) {
+                            dmbuf[dm_at + (size_t)spin * mat + (size_t)i * (size_t)NO1 + (size_t)j] =
+                                CDM[spin][Mc_AN][h_AN][i][j];
+                        }
+                    }
+                }
+                n_at += (size_t)NOLG;
+                o1_at += (size_t)NOLG * (size_t)NO1;
+                dm_at += (size_t)spin_count * mat;
+            }
+        }
+
+        if (hipMemcpy(arena, image, o_den, hipMemcpyHostToDevice) != hipSuccess ||
+            hipMemset(arena + o_den, 0, (size_t)spin_count * sph * sizeof(double)) != hipSuccess) goto done;
+        SDG_OTF_TIME(t_pack);
+        if (OTF_Orbitals_Eval(NULL, na, max_sphere, (const OTF_Atom *)(void *)(arena + o_a_items),
+                              (const int *)(void *)(arena + o_a_npts), (const size_t *)(void *)(arena + o_a_ioff),
+                              (const size_t *)(void *)(arena + o_a_ooff), (const size_t *)(void *)(arena + o_a_soff),
+                              NULL, st->d_gla, st->d_cla, (float *)(void *)(arena + o_o0)) != 0) goto done;
+        if (OTF_Orbitals_Eval(NULL, np, max_nolg, (const OTF_Atom *)(void *)(arena + o_p_items),
+                              (const int *)(void *)(arena + o_p_npts), (const size_t *)(void *)(arena + o_p_ioff),
+                              (const size_t *)(void *)(arena + o_p_ooff), (const size_t *)(void *)(arena + o_p_soff),
+                              (const int *)(void *)(arena + o_nc), st->d_gla, st->d_cla,
+                              (float *)(void *)(arena + o_o1)) != 0) goto done;
+        SDG_OTF_TIME(t_eval);
+        if (Set_Hamiltonian_Hip_OTF_Density(np, max_nolg, spin_count, max_no, (const int *)(void *)(arena + o_no0),
+                                            (const int *)(void *)(arena + o_no1),
+                                            (const int *)(void *)(arena + o_p_npts),
+                                            (const size_t *)(void *)(arena + o_dmoff),
+                                            (const size_t *)(void *)(arena + o_p_ioff),
+                                            (const size_t *)(void *)(arena + o_o0off),
+                                            (const size_t *)(void *)(arena + o_p_ooff),
+                                            (const size_t *)(void *)(arena + o_denoff),
+                                            (const int *)(void *)(arena + o_nc),
+                                            (const double *)(void *)(arena + o_dm),
+                                            (const float *)(void *)(arena + o_o0),
+                                            (const float *)(void *)(arena + o_o1), sph,
+                                            (double *)(void *)(arena + o_den)) != 0) goto done;
+        SDG_OTF_TIME(t_kernel);
+        for (int sp = 0; sp < spin_count; sp++) {
+            if (hipMemcpy(den_all[sp] + st->atom_sph[a0], arena + o_den + (size_t)sp * sph * sizeof(double),
+                          sizeof(double) * sph, hipMemcpyDeviceToHost) != hipSuccess) goto done;
+        }
+        SDG_OTF_TIME(t_unpack);
+    }
+
+    /* every batch completed */
+    for (int sp = 0; sp < spin_count; sp++) {
+        for (Mc_AN = 1; Mc_AN <= Matomnum; Mc_AN++) {
+            const int n = GridN_Atom[M2G[Mc_AN]];
+            const double *src = den_all[sp] + st->atom_sph[Mc_AN];
+            double *dst = Tmp_Den_Grid[sp][Mc_AN];
+            int Nc;
+
+            for (Nc = 0; Nc < n; Nc++) dst[Nc] += src[Nc];
+        }
+    }
+    ok = 1;
+    if (timing) {
+        dtime(&t_now);
+        printf("<Set_Density_Grid> on-the-fly rank %d: pack %.3f eval %.3f kernel %.3f unpack %.3f total %.3f s "
+               "(%d batches)\n", myid, t_pack, t_eval, t_kernel, t_unpack, t_now - t_start, batch_count);
+        fflush(stdout);
+    }
+#undef SDG_OTF_TIME
+    if (myid == Host_ID) {
+        static int announced = 0;
+        if (!announced) {
+            printf("<Set_Density_Grid> GPU on-the-fly orbital tiles: %d batch(es) of %.1f MiB on rank %d\n",
+                   batch_count, (double)arena_bytes / (1024.0 * 1024.0), myid);
+            fflush(stdout);
+            announced = 1;
+        }
+    }
+
+done:
+    if (!ok && myid == Host_ID) {
+        fprintf(stderr, "Set_Density_Grid: rank %d: the on-the-fly density failed in batch %d of %d; CPU loop\n",
+                myid, b + 1, batch_count);
+        fflush(stderr);
+    }
+    if (den_all != NULL) {
+        for (int sp = 0; sp < spin_count; sp++) free(den_all[sp]);
+        free(den_all);
+    }
+    free(image);
+    free(batch_first);
+    if (arena != NULL) hipFree(arena);
+    (void)hipGetLastError();
+    return ok;
+}
+
 void Calc_MatrixElements_dVH_Vxc_VNA(int Cnt_kind)
 {
-    int myid;
+    int myid, use_tables;
 
     MPI_Comm_rank(mpi_comm_level1, &myid);
 
-    if (Set_Hamiltonian_MatrixElements_Use_OpenMP(Cnt_kind, myid)) {
+    /* collective: every rank takes part in the memory test */
+    use_tables = Set_Hamiltonian_MatrixElements_Use_OpenMP(Cnt_kind, myid);
+    /* the resident tables when they are (or are to stay) on the device;
+       else the on-the-fly tiles, which upload nothing but the potential;
+       else the tables uploaded for this call, else the CPU */
+    if (use_tables && (Set_Hamiltonian_ME_CacheReusable(Cnt_kind) || Set_Hamiltonian_ME_KeepDeviceResident())) {
+        Calc_MatrixElements_dVH_Vxc_VNA_OpenMP(Cnt_kind);
+        return;
+    }
+    if (Calc_MatrixElements_dVH_Vxc_VNA_OnTheFly(Cnt_kind, myid)) return;
+    if (use_tables) {
         Calc_MatrixElements_dVH_Vxc_VNA_OpenMP(Cnt_kind);
     } else {
         Calc_MatrixElements_dVH_Vxc_VNA_CPU(Cnt_kind);
@@ -1266,12 +2323,18 @@ static size_t Set_Hamiltonian_MatrixElements_OpenMP_DeviceBytes(int Cnt_kind, in
             total_h = Set_Hamiltonian_checked_add(total_h, h_size, "matrix-elements total Hamiltonian", myid);
             total_nolg = Set_Hamiltonian_checked_add(total_nolg, (size_t)NOLG,
                                                      "matrix-elements total NOLG", myid);
-            total_orbs0 = Set_Hamiltonian_checked_add(total_orbs0, orbs0_size,
-                                                      "matrix-elements total orbs0", myid);
             total_orbs1 = Set_Hamiltonian_checked_add(total_orbs1, orbs1_size,
                                                       "matrix-elements total orbs1", myid);
+            (void)orbs0_size;
             pair_count++;
         }
+        /* orbs0: the central atom's sphere once */
+        total_orbs0 = Set_Hamiltonian_checked_add(
+            total_orbs0,
+            Set_Hamiltonian_checked_mul((size_t)GridN_Atom[Gc_AN],
+                                        (size_t)((Cnt_kind == 0) ? Spe_Total_NO[Cwan] : Spe_Total_CNO[Cwan]),
+                                        "matrix-elements orbs0 size", myid),
+            "matrix-elements total orbs0", myid);
     }
 
     bytes = 0;
@@ -1291,6 +2354,7 @@ static size_t Set_Hamiltonian_MatrixElements_OpenMP_DeviceBytes(int Cnt_kind, in
                                     Set_Hamiltonian_checked_mul((size_t)spin_count, total_nolg,
                                                                 "matrix-elements vpotbuf", myid),
                                     sizeof(double), "matrix-elements vpotbuf", myid);
+    Set_Hamiltonian_add_array_bytes(&bytes, total_nolg, sizeof(int), "matrix-elements nolg_Nc", myid);
     Set_Hamiltonian_add_array_bytes(&bytes, total_orbs0, sizeof(Type_Orbs_Grid), "matrix-elements orbs0buf", myid);
     Set_Hamiltonian_add_array_bytes(&bytes, total_orbs1, sizeof(Type_Orbs_Grid), "matrix-elements orbs1buf", myid);
 
@@ -1517,7 +2581,7 @@ static void Calc_MatrixElements_dVH_Vxc_VNA_OpenMP_Resident(int Cnt_kind)
     const size_t *pair_orbs1_offset = c->pair_orbs1_offset;
     const Type_Orbs_Grid *orbs0buf = c->orbs0buf;
     const Type_Orbs_Grid *orbs1buf = c->orbs1buf;
-    int max_output_count = 0;
+    int max_output_count = 0, max_no = 0, max_nolg = 0;
     int myid, pair, spin;
     size_t k;
     double *hbuf, *vpotbuf;
@@ -1527,6 +2591,9 @@ static void Calc_MatrixElements_dVH_Vxc_VNA_OpenMP_Resident(int Cnt_kind)
     for (pair = 0; pair < pair_count; pair++) {
         int count = spin_count * pair_NO0[pair] * pair_NO1[pair];
         if (max_output_count < count) max_output_count = count;
+        if (max_no < pair_NO0[pair]) max_no = pair_NO0[pair];
+        if (max_no < pair_NO1[pair]) max_no = pair_NO1[pair];
+        if (max_nolg < pair_NOLG[pair]) max_nolg = pair_NOLG[pair];
     }
 
     hbuf = (double *)Set_Hamiltonian_malloc(sizeof(double) * total_h, "openmp hbuf", myid);
@@ -1562,7 +2629,7 @@ static void Calc_MatrixElements_dVH_Vxc_VNA_OpenMP_Resident(int Cnt_kind)
     }
 
     if (Set_Hamiltonian_Hip_MatrixElements_Resident(
-            pair_count, spin_count, max_output_count, total_h, total_nolg,
+            pair_count, spin_count, max_output_count, max_no, max_nolg, total_h, total_nolg,
             (const int *)omp_get_mapped_ptr((void *)pair_NO0, ompdev),
             (const int *)omp_get_mapped_ptr((void *)pair_NO1, ompdev),
             (const int *)omp_get_mapped_ptr((void *)pair_NOLG, ompdev),
@@ -1570,40 +2637,18 @@ static void Calc_MatrixElements_dVH_Vxc_VNA_OpenMP_Resident(int Cnt_kind)
             (const size_t *)omp_get_mapped_ptr((void *)pair_nolg_offset, ompdev),
             (const size_t *)omp_get_mapped_ptr((void *)pair_orbs0_offset, ompdev),
             (const size_t *)omp_get_mapped_ptr((void *)pair_orbs1_offset, ompdev),
+            (const int *)omp_get_mapped_ptr((void *)c->nolg_Nc, ompdev),
             (const float *)omp_get_mapped_ptr((void *)orbs0buf, ompdev),
             (const float *)omp_get_mapped_ptr((void *)orbs1buf, ompdev),
             vpotbuf, hbuf) != 0) {
-        /* the host fallback of the build path, on the cached tables */
-#pragma omp parallel for
-        for (pair = 0; pair < pair_count; pair++) {
-            int NO0 = pair_NO0[pair];
-            int NO1 = pair_NO1[pair];
-            int NOLG = pair_NOLG[pair];
-            size_t mat_size = (size_t)NO0 * (size_t)NO1;
-            size_t h_off = pair_h_offset[pair];
-            size_t nolg_off = pair_nolg_offset[pair];
-            size_t orbs0_off = pair_orbs0_offset[pair];
-            size_t orbs1_off = pair_orbs1_offset[pair];
-            size_t e;
-
-            for (e = 0; e < (size_t)spin_count * mat_size; e++) {
-                int sp = (int)(e / mat_size);
-                size_t ij = e - (size_t)sp * mat_size;
-                int i = (int)(ij / (size_t)NO1);
-                int j = (int)(ij - (size_t)i * (size_t)NO1);
-                size_t hidx = h_off + e;
-                double sum = hbuf[hidx];
-                int Nog;
-
-                for (Nog = 0; Nog < NOLG; Nog++) {
-                    sum += vpotbuf[(size_t)sp * total_nolg + nolg_off + (size_t)Nog] *
-                           orbs0buf[orbs0_off + (size_t)Nog * (size_t)NO0 + (size_t)i] *
-                           orbs1buf[orbs1_off + (size_t)Nog * (size_t)NO1 + (size_t)j];
-                }
-
-                hbuf[hidx] = sum;
-            }
-        }
+        /* the device call failed (no room while other ranks hold the
+           device): the host path, whose blocked loops are an order of
+           magnitude faster than a scan of the packed tables; it adds to H
+           itself, so the packed results are not written back */
+        Calc_MatrixElements_dVH_Vxc_VNA_CPU(Cnt_kind);
+        free(vpotbuf);
+        free(hbuf);
+        return;
     }
 
     for (pair = 0; pair < pair_count; pair++) {
@@ -1643,7 +2688,7 @@ static void Calc_MatrixElements_dVH_Vxc_VNA_OpenMP(int Cnt_kind)
     size_t *pair_h_offset, *pair_nolg_offset, *pair_orbs0_offset, *pair_orbs1_offset;
     size_t total_h, total_nolg, total_nolg_all, total_orbs0, total_orbs1;
     size_t packed_total_h, packed_total_orbs0, packed_total_orbs1;
-    int max_output_count = 0;
+    int max_output_count = 0, max_no = 0, max_nolg = 0, host_done = 0;
     double *hbuf, *vpotbuf;
     Type_Orbs_Grid *orbs0buf, *orbs1buf;
 
@@ -1693,11 +2738,17 @@ static void Calc_MatrixElements_dVH_Vxc_VNA_OpenMP(int Cnt_kind)
 
             total_h += (size_t)spin_count * (size_t)NO0 * (size_t)NO1;
             if (max_output_count < spin_count * NO0 * NO1) max_output_count = spin_count * NO0 * NO1;
+            if (max_no < NO0) max_no = NO0;
+            if (max_no < NO1) max_no = NO1;
+            if (max_nolg < NOLG) max_nolg = NOLG;
             total_nolg += (size_t)NOLG;
-            total_orbs0 += (size_t)NOLG * (size_t)NO0;
             total_orbs1 += (size_t)NOLG * (size_t)NO1;
             pair_count++;
         }
+        /* the central atom's orbitals once per point of its sphere (the
+           pairs select their overlap points through nolg_Nc) */
+        total_orbs0 += (size_t)GridN_Atom[Gc_AN] *
+                       (size_t)((Cnt_kind == 0) ? Spe_Total_NO[Cwan] : Spe_Total_CNO[Cwan]);
     }
 
     pair_Mc_AN = (int *)Set_Hamiltonian_malloc(sizeof(int) * (size_t)pair_count, "openmp pair_Mc_AN", myid);
@@ -1733,8 +2784,22 @@ static void Calc_MatrixElements_dVH_Vxc_VNA_OpenMP(int Cnt_kind)
     total_orbs0 = 0;
     total_orbs1 = 0;
     for (Mc_AN = 1; Mc_AN <= Matomnum; Mc_AN++) {
+        const size_t atom_orbs0_offset = total_orbs0;
+
         Gc_AN = M2G[Mc_AN];
         Cwan = WhatSpecies[Gc_AN];
+
+        {
+            const int NO0 = (Cnt_kind == 0) ? Spe_Total_NO[Cwan] : Spe_Total_CNO[Cwan];
+            int Nc, i;
+
+            for (Nc = 0; Nc < GridN_Atom[Gc_AN]; Nc++) {
+                for (i = 0; i < NO0; i++) {
+                    orbs0buf[atom_orbs0_offset + (size_t)Nc * (size_t)NO0 + (size_t)i] = Orbs_Grid[Mc_AN][Nc][i];
+                }
+            }
+            total_orbs0 += (size_t)GridN_Atom[Gc_AN] * (size_t)NO0;
+        }
 
         for (h_AN = 0; h_AN <= FNAN[Gc_AN]; h_AN++) {
             int NO0, NO1, NOLG;
@@ -1763,7 +2828,7 @@ static void Calc_MatrixElements_dVH_Vxc_VNA_OpenMP(int Cnt_kind)
             pair_NOLG[pair] = NOLG;
             pair_h_offset[pair] = total_h;
             pair_nolg_offset[pair] = total_nolg;
-            pair_orbs0_offset[pair] = total_orbs0;
+            pair_orbs0_offset[pair] = atom_orbs0_offset;
             pair_orbs1_offset[pair] = total_orbs1;
 
             for (spin = 0; spin < spin_count; spin++) {
@@ -1784,9 +2849,6 @@ static void Calc_MatrixElements_dVH_Vxc_VNA_OpenMP(int Cnt_kind)
                 nolg_MN[total_nolg + (size_t)Nog] = MN;
                 nolg_Nc[total_nolg + (size_t)Nog] = Nc;
 
-                for (i = 0; i < NO0; i++) {
-                    orbs0buf[total_orbs0 + (size_t)Nog * (size_t)NO0 + (size_t)i] = Orbs_Grid[Mc_AN][Nc][i];
-                }
                 for (j = 0; j < NO1; j++) {
                     orbs1buf[total_orbs1 + (size_t)Nog * (size_t)NO1 + (size_t)j] = orbs1[j];
                 }
@@ -1798,51 +2860,34 @@ static void Calc_MatrixElements_dVH_Vxc_VNA_OpenMP(int Cnt_kind)
 
             total_h += (size_t)spin_count * mat_size;
             total_nolg += (size_t)NOLG;
-            total_orbs0 += (size_t)NOLG * (size_t)NO0;
             total_orbs1 += (size_t)NOLG * (size_t)NO1;
             pair++;
         }
     }
 
-    if (Set_Hamiltonian_Hip_MatrixElements(
-            pair_count, spin_count, max_output_count,
-            packed_total_h, total_nolg_all, packed_total_orbs0, packed_total_orbs1,
-            pair_NO0, pair_NO1, pair_NOLG, pair_h_offset, pair_nolg_offset,
-            pair_orbs0_offset, pair_orbs1_offset, vpotbuf,
-            (const float *)orbs0buf, (const float *)orbs1buf, hbuf) != 0) {
-#pragma omp parallel for
-        for (pair = 0; pair < pair_count; pair++) {
-            int NO0 = pair_NO0[pair];
-            int NO1 = pair_NO1[pair];
-            int NOLG = pair_NOLG[pair];
-            size_t mat_size = (size_t)NO0 * (size_t)NO1;
-            size_t h_off = pair_h_offset[pair];
-            size_t nolg_off = pair_nolg_offset[pair];
-            size_t orbs0_off = pair_orbs0_offset[pair];
-            size_t orbs1_off = pair_orbs1_offset[pair];
-            size_t e;
-
-            for (e = 0; e < (size_t)spin_count * mat_size; e++) {
-                int spin = (int)(e / mat_size);
-                size_t ij = e - (size_t)spin * mat_size;
-                int i = (int)(ij / (size_t)NO1);
-                int j = (int)(ij - (size_t)i * (size_t)NO1);
-                size_t hidx = h_off + e;
-                double sum = hbuf[hidx];
-                int Nog;
-
-                for (Nog = 0; Nog < NOLG; Nog++) {
-                    sum += vpotbuf[(size_t)spin * total_nolg + nolg_off + (size_t)Nog] *
-                           orbs0buf[orbs0_off + (size_t)Nog * (size_t)NO0 + (size_t)i] *
-                           orbs1buf[orbs1_off + (size_t)Nog * (size_t)NO1 + (size_t)j];
-                }
-
-                hbuf[hidx] = sum;
-            }
+    {
+        const char *check = getenv("OPENMX_OTF_CHECK");
+        if (check != NULL && atoi(check) != 0 && Cnt_kind == 0) {
+            Set_Hamiltonian_OTF_Check(pair_count, pair_Mc_AN, pair_h_AN, pair_NO0, pair_NO1, pair_NOLG,
+                                      pair_nolg_offset, pair_orbs1_offset, nolg_Nc, total_nolg_all,
+                                      orbs0buf, packed_total_orbs0, orbs1buf, packed_total_orbs1, myid);
         }
     }
 
-    for (pair = 0; pair < pair_count; pair++) {
+    if (Set_Hamiltonian_Hip_MatrixElements(
+            pair_count, spin_count, max_output_count, max_no, max_nolg,
+            packed_total_h, total_nolg_all, packed_total_orbs0, packed_total_orbs1,
+            pair_NO0, pair_NO1, pair_NOLG, pair_h_offset, pair_nolg_offset,
+            pair_orbs0_offset, pair_orbs1_offset, nolg_Nc, vpotbuf,
+            (const float *)orbs0buf, (const float *)orbs1buf, hbuf) != 0) {
+        /* the device call failed: the host path (blocked loops, it adds to
+           H itself) instead of a scan of the packed tables; the tables
+           are still cached below */
+        Calc_MatrixElements_dVH_Vxc_VNA_CPU(Cnt_kind);
+        host_done = 1;
+    }
+
+    for (pair = 0; pair < pair_count && !host_done; pair++) {
         int NO0 = pair_NO0[pair];
         int NO1 = pair_NO1[pair];
         int spin, i, j;
@@ -1904,6 +2949,12 @@ static void Calc_MatrixElements_dVH_Vxc_VNA_OpenMP(int Cnt_kind)
         }
         c->t.meta_resident=resident_ok; c->t.nolg_resident=resident_ok;
         c->t.orbs0_resident=resident_ok; c->t.orbs1_resident=resident_ok;
+        if (keep_device_resident && !resident_ok) {
+            /* no room for the resident tables: from the next call on this
+               rank takes the on-the-fly tiles rather than building and
+               uploading the tables for every call */
+            Set_Hamiltonian_ME_residency_demoted = 1;
+        }
         if (!resident_ok) {
             /* An allocation or association may fail after earlier entries
                succeeded.  Do not leave those partial mappings live merely

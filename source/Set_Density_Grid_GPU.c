@@ -1391,7 +1391,7 @@ int Set_Density_Grid_GPU_Local_Run(double *****CDM, double ***Tmp_Den_Grid)
         pair=pt_pair[pt];
         if (pair>=(uint32_t)pair_count) return 0;
         mat=(size_t)pair_NO0[pair]*(size_t)pair_NO1[pair];
-        o0=pair_orbs0_offset[pair]+((size_t)pt-pair_nolg_offset[pair])*(size_t)pair_NO0[pair];
+        o0=pair_orbs0_offset[pair]+(size_t)c->t.nolg_Nc[pt]*(size_t)pair_NO0[pair];
         o1=pair_orbs1_offset[pair]+((size_t)pt-pair_nolg_offset[pair])*(size_t)pair_NO1[pair];
         if (pair_h_offset[pair]+(size_t)spin_count*mat>dm_count ||
             o0+(size_t)pair_NO0[pair]>total_orbs0 ||
@@ -1448,7 +1448,8 @@ int Set_Density_Grid_GPU_Local_Run(double *****CDM, double ***Tmp_Den_Grid)
         int NO1 = pair_NO1[pair];
         size_t mat = (size_t)NO0 * (size_t)NO1;
         size_t base = pair_h_offset[pair];
-        size_t o0 = pair_orbs0_offset[pair] + ((size_t)pt - pair_nolg_offset[pair]) * (size_t)NO0;
+        /* orbs0: the central atom's sphere, selected through nolg_Nc */
+        size_t o0 = pair_orbs0_offset[pair] + (size_t)nolg_Nc[pt] * (size_t)NO0;
         size_t o1 = pair_orbs1_offset[pair] + ((size_t)pt - pair_nolg_offset[pair]) * (size_t)NO1;
         double e0 = 0.0, e1 = 0.0, e2 = 0.0, e3 = 0.0;
 

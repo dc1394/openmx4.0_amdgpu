@@ -12,12 +12,14 @@
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <time.h>
 #include <math.h>
 #include "openmx_common.h"
 #include "mpi.h"
 #include <omp.h>
 #include "set_hip_default_device_from_local_rank.h"
+#include "orbs_otf_hip.h"
 
 
 /***********************************************************************
@@ -714,6 +716,123 @@ host_fallback:
 
 
 
+/***********************************************************************
+   The on-the-fly orbital tiles (orbs_otf_hip.h): the species' PAO tables,
+   the cell translations and the grid frame on the device, for the grid
+   integrals that evaluate the orbitals of each batch of atom pairs
+   instead of holding the multi-GiB tables.  Built on first use and
+   released with every new set of orbitals (a new geometry).
+   OPENMX_ORBS_EVAL_PRECISION=df|fp64 selects the evaluation; the default
+   is double-float on GPUs whose FP32 rate is at least 8 times their FP64
+   rate.
+***********************************************************************/
+
+extern int openmx_gpu_fp32_fp64_ratio(void);
+
+static int SOG_otf_unavailable = 0;
+
+static int SOG_otf_double_float(void)
+{
+  const char *value = getenv("OPENMX_ORBS_EVAL_PRECISION");
+
+  if (value != NULL && value[0] != '\0') {
+    if (strcmp(value, "fp64") == 0 || strcmp(value, "FP64") == 0 || strcmp(value, "double") == 0) return 0;
+    return 1;
+  }
+  return 8 <= openmx_gpu_fp32_fp64_ratio();
+}
+
+void Set_Orbitals_Grid_OTF_Release(void)
+{
+  OTF_Orbitals_Release();
+  SOG_otf_unavailable = 0;
+}
+
+/* 1 when the device tables are ready (built now if needed); rank-local */
+int Set_Orbitals_Grid_OTF_Prepare(void)
+{
+  OTF_HostTables t;
+  size_t *rv_off_h = NULL, *rwf_base_h = NULL;
+  int *sp_mesh_h = NULL, *sp_maxl_h = NULL, *sp_nb_h = NULL;
+  double *pao_rv = NULL, *pao_rwf = NULL, *atv_flat = NULL;
+  size_t rv_cnt = 0, rwf_cnt = 0, r;
+  int w, L0, Mul0, i, ok = 0;
+
+  if (OTF_Orbitals_Ready()) return 1;
+  if (SOG_otf_unavailable) return 0;
+  if (!SOG_gpu_eligible(0)) {
+    SOG_otf_unavailable = 1;
+    return 0;
+  }
+
+  rv_off_h = (size_t*)malloc(sizeof(size_t) * (size_t)(SpeciesNum + 1));
+  rwf_base_h = (size_t*)malloc(sizeof(size_t) * (size_t)(SpeciesNum + 1));
+  sp_mesh_h = (int*)malloc(sizeof(int) * (size_t)SpeciesNum);
+  sp_maxl_h = (int*)malloc(sizeof(int) * (size_t)SpeciesNum);
+  sp_nb_h = (int*)malloc(sizeof(int) * (size_t)SpeciesNum * (OTF_L0MAX + 1));
+  if (!rv_off_h || !rwf_base_h || !sp_mesh_h || !sp_maxl_h || !sp_nb_h) goto done;
+  for (w = 0; w < SpeciesNum; w++) {
+    rv_off_h[w] = rv_cnt;
+    rwf_base_h[w] = rwf_cnt;
+    sp_mesh_h[w] = Spe_Num_Mesh_PAO[w];
+    sp_maxl_h[w] = Spe_MaxL_Basis[w];
+    for (L0 = 0; L0 <= OTF_L0MAX; L0++) {
+      int nb = (L0 <= Spe_MaxL_Basis[w] ? Spe_Num_Basis[w][L0] : 0);
+      sp_nb_h[w * (OTF_L0MAX + 1) + L0] = nb;
+      rwf_cnt += (size_t)nb * (size_t)Spe_Num_Mesh_PAO[w];
+    }
+    rv_cnt += (size_t)Spe_Num_Mesh_PAO[w];
+  }
+  rv_off_h[SpeciesNum] = rv_cnt;
+  rwf_base_h[SpeciesNum] = rwf_cnt;
+  pao_rv = (double*)malloc(sizeof(double) * (rv_cnt == 0 ? 1 : rv_cnt));
+  pao_rwf = (double*)malloc(sizeof(double) * (rwf_cnt == 0 ? 1 : rwf_cnt));
+  atv_flat = (double*)malloc(sizeof(double) * ((size_t)TCpyCell + 1) * 3);
+  if (!pao_rv || !pao_rwf || !atv_flat) goto done;
+  for (w = 0; w < SpeciesNum; w++) {
+    size_t rpos = rwf_base_h[w];
+    for (i = 0; i < Spe_Num_Mesh_PAO[w]; i++) pao_rv[rv_off_h[w] + (size_t)i] = Spe_PAO_RV[w][i];
+    for (L0 = 0; L0 <= Spe_MaxL_Basis[w]; L0++)
+      for (Mul0 = 0; Mul0 < Spe_Num_Basis[w][L0]; Mul0++)
+        for (i = 0; i < Spe_Num_Mesh_PAO[w]; i++) pao_rwf[rpos++] = Spe_PAO_RWF[w][L0][Mul0][i];
+  }
+  for (r = 0; r <= (size_t)TCpyCell; r++) {
+    atv_flat[3 * r + 0] = atv[r][1];
+    atv_flat[3 * r + 1] = atv[r][2];
+    atv_flat[3 * r + 2] = atv[r][3];
+  }
+
+  memset(&t, 0, sizeof(t));
+  t.species = SpeciesNum;
+  t.rv_off = rv_off_h;
+  t.rwf_base = rwf_base_h;
+  t.mesh = sp_mesh_h;
+  t.maxl = sp_maxl_h;
+  t.nb = sp_nb_h;
+  t.rv = pao_rv;
+  t.rwf = pao_rwf;
+  t.rv_count = rv_cnt;
+  t.rwf_count = rwf_cnt;
+  t.atv = atv_flat;
+  t.atv_rows = (size_t)TCpyCell + 1;
+  t.ng23 = Ngrid2 * Ngrid3;
+  t.ng3 = Ngrid3;
+  for (i = 0; i < 3; i++) {
+    t.g[i][0] = gtv[i + 1][1];
+    t.g[i][1] = gtv[i + 1][2];
+    t.g[i][2] = gtv[i + 1][3];
+    t.org[i] = Grid_Origin[i + 1];
+  }
+  ok = OTF_Orbitals_Upload(&t, SOG_otf_double_float());
+  if (!ok) SOG_otf_unavailable = 1;
+
+done:
+  free(rv_off_h); free(rwf_base_h); free(sp_mesh_h); free(sp_maxl_h); free(sp_nb_h);
+  free(pao_rv); free(pao_rwf); free(atv_flat);
+  return ok;
+}
+
+
 double Set_Orbitals_Grid(int Cnt_kind)
 {
   int i,j,n,Mc_AN,Gc_AN,Cwan,NO0,GNc,GRc;
@@ -736,6 +855,11 @@ double Set_Orbitals_Grid(int Cnt_kind)
      cache.  Drop the previous epoch before any values are regenerated. */
   Set_Density_Grid_GPU_Invalidate();
   Set_Hamiltonian_Invalidate_OpenMP_MatrixElements_Cache();
+  Set_Orbitals_Grid_OTF_Release();
+  {
+    extern void Set_Hamiltonian_OTF_Release(void);
+    Set_Hamiltonian_OTF_Release();
+  }
 
   /* MPI */
   MPI_Comm_size(mpi_comm_level1,&numprocs);
