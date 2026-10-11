@@ -3355,6 +3355,13 @@ size_t OpenMX_GpuPhaseNeed_Max(void);
 size_t OpenMX_GpuPhaseNeed_MaxPrefixed(const char *prefix);
 void Set_Hamiltonian_Invalidate_OpenMP_MatrixElements_Cache(void);
 void Set_Density_Grid_GPU_Invalidate(void);
+/* the end of the SCF cycle (DFT.c): the on-the-fly state of the grid
+   integrals and the density's local-mode device buffers go before the
+   forces; Set_Hamiltonian_OTF_Release also at the run boundary */
+void Set_Hamiltonian_OTF_Release(void);
+void Set_Orbitals_Grid_OTF_Release(void);
+void Set_Hamiltonian_OnTheFly_EndCycle(void);
+void Set_Density_Grid_GPU_EndCycle(void);
 int Set_Density_Grid_GPU_Service(int Cnt_kind, int Calc_CntOrbital_ON,
                                  double *****CDM, double **Density_Grid_B0,
                                  double *elapsed);
@@ -4202,6 +4209,16 @@ hipblasStatus_t openmx_gemmul8Zgemm(hipblasHandle_t handle, hipblasOperation_t t
                                    const hipDoubleComplex *B, int ldb, const hipDoubleComplex *beta, hipDoubleComplex *C,
                                    int ldc);
 void openmx_gemmul8ReleaseWorkspaces(void);
+/* OPENMX_GEMMUL8_TIMING=1: prints (one line per rank that made calls) and
+   resets the totals of the bridge's general GEMMs; otherwise nothing */
+void openmx_gemmul8ReportTiming(void);
+/* bytes of the GEMMul8 workspaces this process holds */
+size_t openmx_gemmul8WorkspaceBytes(void);
+/* the dense eigensolver caches: the real MAGMA solver's host work arrays,
+   the FP32 solver workspaces, the calling thread's gpusolver context */
+int openmx_magma_release_d_workspace(void);
+void openmx_magma_release_fp32_workspace(void);
+void openmx_gpusolver_cache_release(void);
 /* scf.gemmul8.enable: 0 sends every openmx_gemmul8{D,Z}gemm call straight to
    plain hipBLAS FP64 GEMM (workspace queries then report 0).  Default on;
    set from Input_std.c on every rank. */

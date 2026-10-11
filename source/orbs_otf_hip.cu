@@ -8,6 +8,8 @@
   double-float arithmetic below relies on rounded products staying
   rounded (an error-free transformation fused into a later addition
   collapses to FP32 accuracy); the explicit fmaf() calls stay fused.
+  The pragma below keeps that when the flag is lost (hipcc's default,
+  fast-honor-pragmas, honors it).
 ***********************************************************************/
 #include <hip/hip_runtime.h>
 
@@ -15,9 +17,12 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <new>
 #include <vector>
 
 #include "orbs_otf_hip.h"
+
+#pragma clang fp contract(off)
 
 namespace {
 
@@ -56,10 +61,141 @@ struct TablesArg {
    FP64: a transcription of the inlined Get_Orbitals of the host loops of
    Set_Orbitals_Grid.c, without the angles (the real harmonics need only
    cos/sin of theta and phi: z/r, r1/r, x/r1, y/r1), and with the radial
-   mesh index estimated from the logarithmic mesh, then made exact.
+   mesh index estimated from the logarithmic mesh, then made exact.  The
+   tables Orbs_Grid / Orbs_Grid_FNAN are built with it too
+   (OTF_Orbitals_Eval_FP64), so the FP64 tiles equal them bit for bit.
+   The end intervals m = 1 and m = mesh - 1 take the substitutes of the
+   host loops (h1 = -(h2 + h3), f1 = f4; h3 = -(h1 + h2), f4 = f1) before
+   any load and in the spline weights dum1..dum4, as the double-float
+   tables do; the host loops read rv[-1] / rv[mesh] there and build the
+   weights from the uncorrected h1 / h3.  Each (L0, Mul0) is written as
+   it is computed: locally indexed arrays would live in scratch memory.
    --------------------------------------------------------------------- */
-__device__ void otf_point_eval(const TablesArg &t, int wan, int no, double gx, double gy, double gz, double ax,
-                               double ay, double az, int GNc, int GRc, float *out)
+
+/* the radial spline at R: the mesh interval m with its weights, or
+   (below) R inside the first mesh point, extrapolated from the interval
+   of rm = rv[4] */
+struct Spline64 {
+  int m, mesh, below;
+  double R, rm, h2, dum1, dum2, dum3, dum4, y1, y2, y12, y22;
+};
+
+/* the spline at R (rv[0] <= R <= rv[mesh - 1], or below) on the mesh rv
+   of mesh points */
+__device__ inline Spline64 spline64(const double *rv, int mesh, double R)
+{
+  Spline64 s;
+  double h1, h3, x1, x2, dum;
+
+  s.mesh = mesh;
+  s.R = R;
+  s.below = (R < rv[0]);
+  s.rm = 0.0;
+  if (s.below) {
+    s.m = 4;
+    s.rm = rv[4];
+    h1 = rv[3] - rv[2];
+    s.h2 = rv[4] - rv[3];
+    h3 = rv[5] - rv[4];
+    x1 = s.rm - rv[3];
+    x2 = s.rm - rv[4];
+  }
+  else {
+    /* the first mesh index with rv[m] >= R (what the host's bisection
+       finds): an estimate from the logarithmic mesh, then the exact
+       neighbours */
+    const double x0 = log(rv[0]);
+    const double dx = (log(rv[mesh - 1]) - x0) / (double)(mesh - 1);
+    int m = (int)((log(R) - x0) / dx) + 1;
+
+    if (m < 1) m = 1;
+    if (mesh - 1 < m) m = mesh - 1;
+    while (1 < m && R <= rv[m - 1]) m--;
+    while (m < mesh - 1 && rv[m] < R) m++;
+
+    s.m = m;
+    s.h2 = rv[m] - rv[m - 1];
+    if (m == 1) {
+      h3 = rv[m + 1] - rv[m];
+      h1 = -(s.h2 + h3);
+    }
+    else if (m == mesh - 1) {
+      h1 = rv[m - 1] - rv[m - 2];
+      h3 = -(h1 + s.h2);
+    }
+    else {
+      h1 = rv[m - 1] - rv[m - 2];
+      h3 = rv[m + 1] - rv[m];
+    }
+    x1 = R - rv[m - 1];
+    x2 = R - rv[m];
+  }
+
+  s.y1 = x1 / s.h2;
+  s.y2 = x2 / s.h2;
+  s.y12 = s.y1 * s.y1;
+  s.y22 = s.y2 * s.y2;
+
+  dum = h1 + s.h2;
+  s.dum1 = h1 / s.h2 / dum;
+  s.dum2 = s.h2 / h1 / dum;
+  dum = s.h2 + h3;
+  s.dum3 = s.h2 / h3 / dum;
+  s.dum4 = h3 / s.h2 / dum;
+  return s;
+}
+
+/* one radial function (rw: its table) of angular momentum L0 */
+__device__ inline double radial_fp64(const double *rw, int L0, const Spline64 &s)
+{
+  /* the boundary indices replaced before the loads */
+  const int m = s.m;
+  const int i1 = m == 1 ? m + 1 : m - 2;
+  const int i4 = m == s.mesh - 1 ? m - 2 : m + 1;
+  const double f1 = rw[i1];
+  const double f2 = rw[m - 1];
+  const double f3 = rw[m];
+  const double f4 = rw[i4];
+  const double h2 = s.h2, y1 = s.y1, y2 = s.y2, y12 = s.y12, y22 = s.y22;
+  const double dum = f3 - f2;
+  const double g1 = dum * s.dum1 + (f2 - f1) * s.dum2;
+  const double g2 = (f4 - f3) * s.dum3 + dum * s.dum4;
+  const double f = y22 * (3.0 * f2 + h2 * g1 + (2.0 * f2 + h2 * g1) * y2) +
+                   y12 * (3.0 * f3 - h2 * g2 - (2.0 * f3 - h2 * g2) * y1);
+
+  if (s.below) {
+    const double rm = s.rm, R = s.R;
+    const double df = 2.0 * y2 / h2 * (3.0 * f2 + h2 * g1 + (2.0 * f2 + h2 * g1) * y2) +
+                      y22 * (2.0 * f2 + h2 * g1) / h2 +
+                      2.0 * y1 / h2 * (3.0 * f3 - h2 * g2 - (2.0 * f3 - h2 * g2) * y1) -
+                      y12 * (2.0 * f3 - h2 * g2) / h2;
+    double a, b, c, d;
+
+    if (L0 == 0) {
+      a = 0.0;
+      b = 0.5 * df / rm;
+      c = 0.0;
+      d = f - b * rm * rm;
+    }
+    else if (L0 == 1) {
+      a = (rm * df - f) / (2.0 * rm * rm * rm);
+      b = 0.0;
+      c = df - 3.0 * a * rm * rm;
+      d = 0.0;
+    }
+    else {
+      b = (3.0 * f - rm * df) / (rm * rm);
+      a = (f - b * rm * rm) / (rm * rm * rm);
+      c = 0.0;
+      d = 0.0;
+    }
+    return a * R * R * R + b * R * R + c * R + d;
+  }
+  return f;
+}
+
+__device__ __forceinline__ void otf_point_eval(const TablesArg &t, int wan, int no, double gx, double gy, double gz,
+                                               double ax, double ay, double az, int GNc, int GRc, float *out)
 {
   const int n1 = GNc / t.ng23;
   const int n2 = (GNc - n1 * t.ng23) / t.ng3;
@@ -76,12 +212,11 @@ __device__ void otf_point_eval(const TablesArg &t, int wan, int no, double gx, d
   const int maxl = t.spx[wan];
   const double *rv = t.rv + t.rvo[wan];
 
-  double RF[OTF_L0MAX + 1][OTF_MULMAX];
-  double AF[OTF_L0MAX + 1][2 * OTF_L0MAX + 1];
   double R;
   double siQ, coQ, siP, coP;
-  int po = 0;
-  int L0, Mul0, M0, i1;
+  Spline64 s;
+  size_t rrow;
+  int L0, Mul0, i1;
 
   {
     const double Min_r = 10e-15;
@@ -123,167 +258,64 @@ __device__ void otf_point_eval(const TablesArg &t, int wan, int no, double gx, d
   }
 
   if (rv[mesh - 1] < R) {
-    po = 1;
+    /* outside the PAO mesh: every orbital is zero */
+    for (i1 = 0; i1 < no; i1++) out[i1] = 0.0f;
+    return;
   }
-  else {
-    const int below = (R < rv[0]);
-    double h1, h2, h3, x1, x2, y1, y2, y12, y22;
-    double dum, dum1, dum2, dum3, dum4;
-    double rm = 0.0;
-    size_t rrow = t.rwb[wan];
-    int m;
 
-    if (below) {
-      m = 4;
-      rm = rv[m];
-      h1 = rv[m - 1] - rv[m - 2];
-      h2 = rv[m] - rv[m - 1];
-      h3 = rv[m + 1] - rv[m];
-      x1 = rm - rv[m - 1];
-      x2 = rm - rv[m];
+  s = spline64(rv, mesh, R);
+  rrow = t.rwb[wan];
+  i1 = 0;
+  for (L0 = 0; L0 <= maxl; L0++) {
+    const int nb = t.spb[wan * (OTF_L0MAX + 1) + L0];
+    double A0, A1 = 0.0, A2 = 0.0, A3 = 0.0, A4 = 0.0, A5 = 0.0, A6 = 0.0;
+
+    if (L0 == 0) {
+      A0 = 0.282094791773878;
+    }
+    else if (L0 == 1) {
+      const double dum = 0.48860251190292 * siQ;
+      A0 = dum * coP;
+      A1 = dum * siP;
+      A2 = 0.48860251190292 * coQ;
+    }
+    else if (L0 == 2) {
+      const double dum1 = siQ * siQ;
+      const double dum2 = 1.09254843059208 * siQ * coQ;
+      A0 = 0.94617469575756 * coQ * coQ - 0.31539156525252;
+      A1 = 0.54627421529604 * dum1 * (1.0 - 2.0 * siP * siP);
+      A2 = 1.09254843059208 * dum1 * siP * coP;
+      A3 = dum2 * coP;
+      A4 = dum2 * siP;
     }
     else {
-      /* the first mesh index with rv[m] >= R (what the host's bisection
-         finds): an estimate from the logarithmic mesh, then the exact
-         neighbours */
-      const double x0 = log(rv[0]);
-      const double dx = (log(rv[mesh - 1]) - x0) / (double)(mesh - 1);
-
-      m = (int)((log(R) - x0) / dx) + 1;
-      if (m < 1) m = 1;
-      if (mesh - 1 < m) m = mesh - 1;
-      while (1 < m && R <= rv[m - 1]) m--;
-      while (m < mesh - 1 && rv[m] < R) m++;
-
-      h1 = rv[m - 1] - rv[m - 2];
-      h2 = rv[m] - rv[m - 1];
-      h3 = rv[m + 1] - rv[m];
-      x1 = R - rv[m - 1];
-      x2 = R - rv[m];
+      A0 = 0.373176332590116 * (5.0 * coQ * coQ * coQ - 3.0 * coQ);
+      A1 = 0.457045799464466 * coP * siQ * (5.0 * coQ * coQ - 1.0);
+      A2 = 0.457045799464466 * siP * siQ * (5.0 * coQ * coQ - 1.0);
+      A3 = 1.44530572132028 * siQ * siQ * coQ * (coP * coP - siP * siP);
+      A4 = 2.89061144264055 * siQ * siQ * coQ * siP * coP;
+      A5 = 0.590043589926644 * siQ * siQ * siQ * (4.0 * coP * coP * coP - 3.0 * coP);
+      A6 = 0.590043589926644 * siQ * siQ * siQ * (3.0 * siP - 4.0 * siP * siP * siP);
     }
+    for (Mul0 = 0; Mul0 < nb; Mul0++) {
+      const double RF = radial_fp64(t.rwf + rrow, L0, s);
 
-    y1 = x1 / h2;
-    y2 = x2 / h2;
-    y12 = y1 * y1;
-    y22 = y2 * y2;
-
-    dum = h1 + h2;
-    dum1 = h1 / h2 / dum;
-    dum2 = h2 / h1 / dum;
-    dum = h2 + h3;
-    dum3 = h2 / h3 / dum;
-    dum4 = h3 / h2 / dum;
-
-    for (L0 = 0; L0 <= maxl; L0++) {
-      const int nb = t.spb[wan * (OTF_L0MAX + 1) + L0];
-
-      for (Mul0 = 0; Mul0 < nb; Mul0++) {
-        const double *rw = t.rwf + rrow;
-        double f1 = rw[m - 2];
-        double f2 = rw[m - 1];
-        double f3 = rw[m];
-        double f4 = rw[m + 1];
-        double g1, g2, f;
-
-        rrow += (size_t)mesh;
-
-        if (m == 1) {
-          h1 = -(h2 + h3);
-          f1 = f4;
-        }
-        else if (m == (mesh - 1)) {
-          h3 = -(h1 + h2);
-          f4 = f1;
-        }
-
-        dum = f3 - f2;
-        g1 = dum * dum1 + (f2 - f1) * dum2;
-        g2 = (f4 - f3) * dum3 + dum * dum4;
-
-        f = y22 * (3.0 * f2 + h2 * g1 + (2.0 * f2 + h2 * g1) * y2) +
-            y12 * (3.0 * f3 - h2 * g2 - (2.0 * f3 - h2 * g2) * y1);
-
-        if (below) {
-          const double df = 2.0 * y2 / h2 * (3.0 * f2 + h2 * g1 + (2.0 * f2 + h2 * g1) * y2) +
-                            y22 * (2.0 * f2 + h2 * g1) / h2 +
-                            2.0 * y1 / h2 * (3.0 * f3 - h2 * g2 - (2.0 * f3 - h2 * g2) * y1) -
-                            y12 * (2.0 * f3 - h2 * g2) / h2;
-          double a, b, c, d;
-
-          if (L0 == 0) {
-            a = 0.0;
-            b = 0.5 * df / rm;
-            c = 0.0;
-            d = f - b * rm * rm;
-          }
-          else if (L0 == 1) {
-            a = (rm * df - f) / (2.0 * rm * rm * rm);
-            b = 0.0;
-            c = df - 3.0 * a * rm * rm;
-            d = 0.0;
-          }
-          else {
-            b = (3.0 * f - rm * df) / (rm * rm);
-            a = (f - b * rm * rm) / (rm * rm * rm);
-            c = 0.0;
-            d = 0.0;
-          }
-          RF[L0][Mul0] = a * R * R * R + b * R * R + c * R + d;
-        }
-        else {
-          RF[L0][Mul0] = f;
-        }
+      rrow += (size_t)mesh;
+      out[i1] = (float)(RF * A0);
+      if (1 <= L0) {
+        out[i1 + 1] = (float)(RF * A1);
+        out[i1 + 2] = (float)(RF * A2);
       }
+      if (2 <= L0) {
+        out[i1 + 3] = (float)(RF * A3);
+        out[i1 + 4] = (float)(RF * A4);
+      }
+      if (3 <= L0) {
+        out[i1 + 5] = (float)(RF * A5);
+        out[i1 + 6] = (float)(RF * A6);
+      }
+      i1 += 2 * L0 + 1;
     }
-  }
-
-  if (po == 0) {
-    double dum, dum1, dum2;
-
-    for (L0 = 0; L0 <= maxl; L0++) {
-      if (L0 == 0) {
-        AF[0][0] = 0.282094791773878;
-      }
-      else if (L0 == 1) {
-        dum = 0.48860251190292 * siQ;
-        AF[1][0] = dum * coP;
-        AF[1][1] = dum * siP;
-        AF[1][2] = 0.48860251190292 * coQ;
-      }
-      else if (L0 == 2) {
-        dum1 = siQ * siQ;
-        dum2 = 1.09254843059208 * siQ * coQ;
-        AF[2][0] = 0.94617469575756 * coQ * coQ - 0.31539156525252;
-        AF[2][1] = 0.54627421529604 * dum1 * (1.0 - 2.0 * siP * siP);
-        AF[2][2] = 1.09254843059208 * dum1 * siP * coP;
-        AF[2][3] = dum2 * coP;
-        AF[2][4] = dum2 * siP;
-      }
-      else if (L0 == 3) {
-        AF[3][0] = 0.373176332590116 * (5.0 * coQ * coQ * coQ - 3.0 * coQ);
-        AF[3][1] = 0.457045799464466 * coP * siQ * (5.0 * coQ * coQ - 1.0);
-        AF[3][2] = 0.457045799464466 * siP * siQ * (5.0 * coQ * coQ - 1.0);
-        AF[3][3] = 1.44530572132028 * siQ * siQ * coQ * (coP * coP - siP * siP);
-        AF[3][4] = 2.89061144264055 * siQ * siQ * coQ * siP * coP;
-        AF[3][5] = 0.590043589926644 * siQ * siQ * siQ * (4.0 * coP * coP * coP - 3.0 * coP);
-        AF[3][6] = 0.590043589926644 * siQ * siQ * siQ * (3.0 * siP - 4.0 * siP * siP * siP);
-      }
-    }
-
-    i1 = -1;
-    for (L0 = 0; L0 <= maxl; L0++) {
-      const int nb = t.spb[wan * (OTF_L0MAX + 1) + L0];
-
-      for (Mul0 = 0; Mul0 < nb; Mul0++) {
-        for (M0 = 0; M0 <= 2 * L0; M0++) {
-          i1++;
-          out[i1] = (float)(RF[L0][Mul0] * AF[L0][M0]);
-        }
-      }
-    }
-  }
-  else {
-    for (i1 = 0; i1 < no; i1++) out[i1] = 0.0f;
   }
 }
 
@@ -436,6 +468,10 @@ __device__ void otf_point_eval_df(const TablesArg &t, int wan, int no, double gx
     return;
   }
   if (R < rv[0]) {
+    /* inlined: without its local arrays the FP64 routine costs this kernel
+       no scratch (gfx1200: 116 VGPRs, 12 waves per SIMD), whereas a call
+       (__noinline__) takes 216 VGPRs and 208 B of scratch per lane for the
+       call frame (7 waves per SIMD) */
     otf_point_eval(t, wan, no, gx, gy, gz, ax, ay, az, GNc, GRc, out);
     return;
   }
@@ -629,6 +665,62 @@ size_t arena_off(size_t *pos, size_t bytes)
   return off;
 }
 
+/* the launch of OTF_Orbitals_Eval (double_float: the uploaded precision)
+   and of OTF_Orbitals_Eval_FP64 */
+int otf_launch(bool double_float, void *stream, int count, int max_npts, const OTF_Atom *atoms, const int *npts,
+               const size_t *idx_off, const size_t *out_off, const size_t *sph_off, const int *idx, const int *gla,
+               const int *cla, float *out)
+{
+  TablesArg t;
+  unsigned ychunks;
+
+  if (!g_dev.ready) return 1;
+  if (count <= 0 || max_npts <= 0) return 0;
+  t.rv = g_dev.rv;
+  t.rwf = g_dev.rwf;
+  t.atv = g_dev.atv;
+  t.rvo = g_dev.rvo;
+  t.rwb = g_dev.rwb;
+  t.spm = g_dev.spm;
+  t.spx = g_dev.spx;
+  t.spb = g_dev.spb;
+  t.rwd = g_dev.rwd;
+  t.mcd = g_dev.mcd;
+  t.spl = g_dev.spl;
+  t.ng23 = g_dev.ng23;
+  t.ng3 = g_dev.ng3;
+  t.g11 = g_dev.g[0][0];
+  t.g12 = g_dev.g[0][1];
+  t.g13 = g_dev.g[0][2];
+  t.g21 = g_dev.g[1][0];
+  t.g22 = g_dev.g[1][1];
+  t.g23 = g_dev.g[1][2];
+  t.g31 = g_dev.g[2][0];
+  t.g32 = g_dev.g[2][1];
+  t.g33 = g_dev.g[2][2];
+  t.org1 = g_dev.org[0];
+  t.org2 = g_dev.org[1];
+  t.org3 = g_dev.org[2];
+  /* enough blocks per item to fill the device when the items are few (an
+     atom's whole sphere), one when they are many (pairs) */
+  ychunks = (unsigned)((max_npts + kThreads - 1) / kThreads);
+  {
+    unsigned cap = (unsigned)(256 / (count < 256 ? count : 256));
+
+    if (cap < 1) cap = 1;
+    if (ychunks > cap) ychunks = cap;
+  }
+  /* a failure left behind by an earlier call is not this launch's */
+  (void)hipGetLastError();
+  if (double_float)
+    hipLaunchKernelGGL(otf_eval_kernel<true>, dim3((unsigned)count, ychunks), dim3(kThreads), 0,
+                       (hipStream_t)stream, t, count, atoms, npts, idx_off, out_off, sph_off, idx, gla, cla, out);
+  else
+    hipLaunchKernelGGL(otf_eval_kernel<false>, dim3((unsigned)count, ychunks), dim3(kThreads), 0,
+                       (hipStream_t)stream, t, count, atoms, npts, idx_off, out_off, sph_off, idx, gla, cla, out);
+  return hipGetLastError() == hipSuccess ? 0 : 2;
+}
+
 } // namespace
 
 extern "C" void OTF_Orbitals_Release(void)
@@ -665,20 +757,25 @@ extern "C" int OTF_Orbitals_Upload(const OTF_HostTables *t, int double_float)
   unsigned char *arena = nullptr;
 
   OTF_Orbitals_Release();
-  if (species <= 0) return 0;
+  if (species <= 0) return -1;
   for (int w = 0; w < species; w++) {
-    if (t->maxl[w] > OTF_L0MAX || t->mesh[w] < 6) return 0;
+    if (t->maxl[w] > OTF_L0MAX || t->mesh[w] < 6) return -1;
     for (int L0 = 0; L0 <= t->maxl[w]; L0++) {
-      if (t->nb[w * (OTF_L0MAX + 1) + L0] > OTF_MULMAX) return 0;
+      if (t->nb[w * (OTF_L0MAX + 1) + L0] > OTF_MULMAX) return -1;
     }
   }
   if (double_float) {
     /* every radial value as (hi, lo); per mesh point rv, h2 and the spline
        weights dum1..dum4 as (hi, lo) (the ends m = 1 and m = mesh - 1 take
        the host's corrected h1 / h3); per species the logarithmic mesh */
-    rwd.resize(2 * rwf_cnt, 0.0f);
-    mcd.resize(kMcdStride * rv_cnt, 0.0f);
-    spl.resize(2 * (size_t)species, 0.0f);
+    try {
+      rwd.resize(2 * rwf_cnt, 0.0f);
+      mcd.resize(kMcdStride * rv_cnt, 0.0f);
+      spl.resize(2 * (size_t)species, 0.0f);
+    }
+    catch (const std::bad_alloc &) {
+      return 0;
+    }
     for (size_t r = 0; r < t->rwf_count; r++) {
       const float hi = (float)t->rwf[r];
       rwd[2 * r] = hi;
@@ -791,50 +888,13 @@ extern "C" int OTF_Orbitals_Eval(void *stream, int count, int max_npts, const OT
                                  const size_t *idx_off, const size_t *out_off, const size_t *sph_off, const int *idx,
                                  const int *gla, const int *cla, float *out)
 {
-  TablesArg t;
-  unsigned ychunks;
+  return otf_launch(g_dev.double_float != 0, stream, count, max_npts, atoms, npts, idx_off, out_off, sph_off, idx,
+                    gla, cla, out);
+}
 
-  if (!g_dev.ready) return 1;
-  if (count <= 0 || max_npts <= 0) return 0;
-  t.rv = g_dev.rv;
-  t.rwf = g_dev.rwf;
-  t.atv = g_dev.atv;
-  t.rvo = g_dev.rvo;
-  t.rwb = g_dev.rwb;
-  t.spm = g_dev.spm;
-  t.spx = g_dev.spx;
-  t.spb = g_dev.spb;
-  t.rwd = g_dev.rwd;
-  t.mcd = g_dev.mcd;
-  t.spl = g_dev.spl;
-  t.ng23 = g_dev.ng23;
-  t.ng3 = g_dev.ng3;
-  t.g11 = g_dev.g[0][0];
-  t.g12 = g_dev.g[0][1];
-  t.g13 = g_dev.g[0][2];
-  t.g21 = g_dev.g[1][0];
-  t.g22 = g_dev.g[1][1];
-  t.g23 = g_dev.g[1][2];
-  t.g31 = g_dev.g[2][0];
-  t.g32 = g_dev.g[2][1];
-  t.g33 = g_dev.g[2][2];
-  t.org1 = g_dev.org[0];
-  t.org2 = g_dev.org[1];
-  t.org3 = g_dev.org[2];
-  /* enough blocks per item to fill the device when the items are few (an
-     atom's whole sphere), one when they are many (pairs) */
-  ychunks = (unsigned)((max_npts + kThreads - 1) / kThreads);
-  {
-    unsigned cap = (unsigned)(256 / (count < 256 ? count : 256));
-
-    if (cap < 1) cap = 1;
-    if (ychunks > cap) ychunks = cap;
-  }
-  if (g_dev.double_float)
-    hipLaunchKernelGGL(otf_eval_kernel<true>, dim3((unsigned)count, ychunks), dim3(kThreads), 0,
-                       (hipStream_t)stream, t, count, atoms, npts, idx_off, out_off, sph_off, idx, gla, cla, out);
-  else
-    hipLaunchKernelGGL(otf_eval_kernel<false>, dim3((unsigned)count, ychunks), dim3(kThreads), 0,
-                       (hipStream_t)stream, t, count, atoms, npts, idx_off, out_off, sph_off, idx, gla, cla, out);
-  return hipGetLastError() == hipSuccess ? 0 : 2;
+extern "C" int OTF_Orbitals_Eval_FP64(void *stream, int count, int max_npts, const OTF_Atom *atoms, const int *npts,
+                                      const size_t *idx_off, const size_t *out_off, const size_t *sph_off,
+                                      const int *idx, const int *gla, const int *cla, float *out)
+{
+  return otf_launch(false, stream, count, max_npts, atoms, npts, idx_off, out_off, sph_off, idx, gla, cla, out);
 }

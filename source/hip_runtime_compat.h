@@ -23,6 +23,7 @@ typedef int hipError_t;
 typedef struct ihipStream_t *hipStream_t;
 enum {
     hipSuccess = 0,
+    hipErrorNoDevice = 100,
     hipMemcpyHostToHost = 0,
     hipMemcpyHostToDevice = 1,
     hipMemcpyDeviceToHost = 2,
@@ -54,11 +55,16 @@ hipError_t hipMemcpy2D(void *dst, size_t dpitch, const void *src, size_t spitch,
                        size_t width, size_t height, int kind);
 hipError_t hipGetLastError(void);
 hipError_t hipMemset(void *dst, int value, size_t sizeBytes);
+hipError_t hipMemsetAsync(void *dst, int value, size_t sizeBytes, hipStream_t stream);
 hipError_t hipMemGetInfo(size_t *free, size_t *total);
 
+/* The values of ROCm's hip/library_types.h: a C translation unit may hand
+   these to C++ code compiled against the real header. */
 typedef enum hipDataType {
-    HIP_R_64F = 0,
-    HIP_C_64F = 1
+    HIP_R_32F = 0,
+    HIP_R_64F = 1,
+    HIP_C_32F = 4,
+    HIP_C_64F = 5
 } hipDataType;
 #endif
 

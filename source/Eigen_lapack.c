@@ -1575,6 +1575,16 @@ static void Eigen_gpusolver_x(double ** a, double * ko, int n0, int EVmax)
 
     int const info = gpusolver_Syevdx(A, ko, n, EVmax);
 
+    /* a positive info (no convergence) or a non-finite result is as fatal
+       as an error; nothing has been stored yet */
+    if (info != 0) {
+        free(A);
+        fprintf(stderr, "Eigen_gpusolver_x: GPU eigensolver failed, info=%d\n", info);
+        fflush(stderr);
+        MPI_Abort(mpi_comm_level1, 1);
+        return;
+    }
+
     /* store eigenvectors */
     for (int i = 0; i < EVmax; i++) {
         for (int j = 0; j < n; j++) {
@@ -1585,11 +1595,6 @@ static void Eigen_gpusolver_x(double ** a, double * ko, int n0, int EVmax)
     /* shift ko by 1 */
     for (int i = EVmax; i >= 1; i--) {
         ko[i] = ko[i - 1];
-    }
-
-    if (info < 0) {
-        printf("hipsolverDnDsyevdx: info=%d\n", info);
-        exit(10);
     }
 
     free(A);
@@ -1612,6 +1617,14 @@ void Eigen_gpusolver_x_openmp(double ** a, double * ko, int n0, int EVmax)
 
         info = gpusolver_Syevdx_openmp(A, ko, n, EVmax);
 
+        if (info != 0) {
+            free(A);
+            fprintf(stderr, "Eigen_gpusolver_x_openmp: GPU eigensolver failed, info=%d\n", info);
+            fflush(stderr);
+            MPI_Abort(mpi_comm_level1, 1);
+            return;
+        }
+
 #pragma omp parallel for collapse(2)
         for (int i = 0; i < EVmax; i++) {
             for (int j = 0; j < n; j++) {
@@ -1624,17 +1637,19 @@ void Eigen_gpusolver_x_openmp(double ** a, double * ko, int n0, int EVmax)
         }
     }
 
-    if (info < 0) {
-        printf("hipsolverDnDsyevdx: info=%d\n", info);
-        exit(10);
-    }
-
     free(A);
 }
 
 void Eigen_gpusolver_x_openmp2(double * a, double * ko, int n0, int EVmax)
 {
-    gpusolver_Syevdx_openmp(a, ko, n0, EVmax);
+    int const info = gpusolver_Syevdx_openmp(a, ko, n0, EVmax);
+
+    if (info != 0) {
+        fprintf(stderr, "Eigen_gpusolver_x_openmp2: GPU eigensolver failed, info=%d\n", info);
+        fflush(stderr);
+        MPI_Abort(mpi_comm_level1, 1);
+        return;
+    }
 
     {
         for (int i = n0; i >= 1; i--) {
@@ -1655,6 +1670,14 @@ void Eigen_gpusolver_d(double ** a, double * ko, int n, int EVmax)
 
     int const info = gpusolver_Syevdx(A, ko, n, EVmax);
 
+    if (info != 0) {
+        free(A);
+        fprintf(stderr, "Eigen_gpusolver_d: GPU eigensolver failed, info=%d\n", info);
+        fflush(stderr);
+        MPI_Abort(mpi_comm_level1, 1);
+        return;
+    }
+
     /* store eigenvectors */
     for (int i = 0; i < EVmax; i++) {
         for (int j = 0; j < n; j++) {
@@ -1665,11 +1688,6 @@ void Eigen_gpusolver_d(double ** a, double * ko, int n, int EVmax)
     /* shift ko by 1 */
     for (int i = EVmax; i >= 1; i--) {
         ko[i] = ko[i - 1];
-    }
-
-    if (info < 0) {
-        printf("hipsolverDnDsyevd: info=%d\n", info);
-        exit(10);
     }
 
     free(A);

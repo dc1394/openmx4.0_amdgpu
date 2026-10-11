@@ -26,7 +26,7 @@ The v3.5.2 build and numerical checks are recorded in [gemmul8_upgrade_20261005.
 ## Refined FP32 eigensolver
 The dense eigensolves of the SCF loop (cluster and band, collinear and non-collinear) run in FP32 and are then refined to FP64 accuracy, as in the NVIDIA version: all eigenpairs come from rocSOLVER's FP32 divide and conquer (`hipsolverDnSsyevd`/`Cheevd`), then the wanted ones get two Ogita-Aishima Newton steps whose products go through GEMMul8, and a Rayleigh-Ritz step resolves the nearly degenerate, partially occupied clusters. From the second SCF step on, the previous step's vectors serve as a warm start, so most steps need no FP32 eigensolve at all. A Radeon RX 9060 XT (gfx1200) runs FP64 at about 1/13 of its FP32 rate, so this is on by default on consumer GPUs (RDNA and consumer GCN) and off on CDNA, whose FP64 is fast. `OPENMX_EIGEN_REFINE=K` sets the number of refinement steps, 0 turns it off. Problems with n < `OPENMX_EIGEN_REFINE_MIN_N` (default 1000) keep the FP64 eigensolver, whose fixed costs are lower there.
 
-The SCF ends in FP64. A run that stops on a refined step solves that step's Hamiltonian once more in FP64, so the energy density matrix and the forces come from FP64 vectors. The stop test on a refined step also requires the printed NormRD to be below `OPENMX_EIGEN_REFINE_STOP_GUARD` (default 100) times `scf.criterion`, and the last step `scf.maxIter` allows is always FP64. When a refinement cannot run (no room for its buffers, a failing solve), that step falls back to FP64 and says so. The one-k-point-per-rank band path solves its k-points twice when the GPU turns are serialized: pass 1 uses the previous step's chemical potential and parks each basis in host memory, and pass 2 finishes from it with the new one (`OPENMX_BAND_REFINE_BASIS_MB`, default 1024 MiB per rank). The k-dense band paths solve the same way.
+The SCF ends in FP64. A run that stops on a refined step solves that step's Hamiltonian once more in FP64, so the energy density matrix and the forces come from FP64 vectors. The stop test on a refined step also requires the printed NormRD to be below `OPENMX_EIGEN_REFINE_STOP_GUARD` (default 100) times `scf.criterion`, and the last step `scf.maxIter` allows is always FP64. When a refinement cannot run (no room for its buffers, a failing solve), that step falls back to FP64 and says so. When every k-point owner of the one-k-point-per-rank band path fits one GPU turn group and the device has room for all of their refined solves at once, each owner solves its k-point once, in two halves: the FP32 estimates of all k-points give the chemical potential, then every owner finishes its refinement, from the first SCF step on. In serialized turn groups the path solves its k-points twice: pass 1 uses the previous step's chemical potential and parks each basis in host memory, and pass 2 finishes from it with the new one (`OPENMX_BAND_REFINE_BASIS_MB`, default 1024 MiB per rank). The k-dense band paths solve in two passes too.
 
 rocSOLVER's complex divide and conquer of ROCm 7.2 returns NaN eigenvectors with `info = 0` for any complex Hermitian matrix whose elements are all real (the non-collinear Hamiltonian without spin-orbit coupling), and for exactly block-diagonal ones. The FP32 solve therefore works on the unitary similarity D^H A D with random phases (same spectrum) and maps the vectors back. The existing FP64 `zheevd` path does the same in FP64 and now also checks its result for NaNs.
 
@@ -88,6 +88,66 @@ The memory the smaller heaps return also lets larger band problems keep their ei
 | `OPENMX_GPU_HEAP_REEXEC` | 1 | 0 keeps the OpenMP runtime's default device heap (no re-execution); setting `LIBOMPTARGET_HEAP_SIZE` also skips it |
 | `OPENMX_SETHAM_TIMING` | 0 | 1 prints the phase times of `Set_Hamiltonian` and of the on-the-fly batches |
 | `OPENMX_OTF_CHECK` | 0 | 1 compares the on-the-fly orbitals with the tables where both exist |
+| `OPENMX_SETHAM_ONTHEFLY_PLAN_CACHE` | 1 | 0 rebuilds the batch plans of the on-the-fly paths at every call |
+| `OPENMX_SETHAM_ONTHEFLY_PINNED_MB` | 1024 | page-locked host memory per rank for the plans and transfers (pageable beyond it) |
+| `OPENMX_SETDEN_ONTHEFLY_MB` | `OPENMX_SETHAM_ONTHEFLY_MB` | device memory of one batch of the on-the-fly density |
+| `OPENMX_DENSITY_GRID_GPU_LOCAL` | 1 | 1: ranks with resident tables integrate the density from them (double-float CSR kernel), the others with on-the-fly tiles; 0: on-the-fly on every rank |
+
+## More from the NVIDIA version: O(N) solvers, forces and robustness
+The remaining GPU work of the NVIDIA version is ported as well. Unless stated otherwise the defaults are the NVIDIA ones; where this RX 9060 XT measured otherwise, the AMD default and the reason are given.
+
+**Divide and conquer (DC).** The collinear GPU path stages its matrices with row copies and a device transpose (`hipblasDgeam`, bit-identical), reads the cached overlap in place in its device arena, and refills the host overlap only for a CPU fallback. The non-collinear GPU path is rewritten: it passed host arrays to rocSOLVER, which faults on a discrete GPU without XNACK, and it diagonalized the complex conjugate of the Hamiltonian (as did the NVIDIA OpenACC path), which flips the sign of the imaginary density-matrix parts of magnetic and spin-orbit clusters. The transforms now run on the device and the eigensolve uses MAGMA (or rocSOLVER with the phase similarity), with a CPU fallback per atom. On a 32-atom non-collinear diamond (8 ranks) the diagonalization takes 47 s instead of 475 s on the CPU, with Uele equal to 6e-12 Ha; on a 16-atom bcc Fe with non-collinear moments, 176 s instead of 1664 s.
+
+**DC-LNO.** `OPENMX_DCLNO_PROFILE=1` prints MPI-aggregated stage times and a histogram of the local problem sizes. A local GPU eigensolve that does not converge or runs out of memory is solved again on the CPU, collinear and non-collinear (the non-collinear retry is an AMD addition), and `OPENMX_DCLNO_RETRY_TEST=1` forces that retry for testing. The residue rows of an atom take one allocation. The non-collinear local problems use rocSOLVER `zheevd` with the phase similarity. CG15c-DC-LNO with every local problem forced onto the GPU, and with every one retried on the CPU, gives Utot within 5e-12 Ha of the CPU run.
+
+**Krylov.** The projected-solve GEMMs go through GEMMul8 (`OPENMX_KRYLOV_GEMMUL8=0`: hipBLAS), their workspace counts in the memory preflight, and projected problems below `OPENMX_KRYLOV_GPU_EIGEN_MIN` (300) go to LAPACK; `OPENMX_KRYLOV_GPU_PROFILE=1` prints the stage times. At 16 ranks per GPU the Krylov GPU path stays off by default (`OPENMX_KRYLOV_GPU=1` turns it on).
+
+**Dense eigensolvers.** A failed FP64 solve is retried from a copy of its input: MAGMA Ozaki-II with `info > 0` with stock MAGMA, and a rocSOLVER solve that fails or returns non-finite vectors with MAGMA (`OPENMX_MAGMA_OZAKI2_RETRY=0` turns it off, `OPENMX_GPUSOLVER_RETRY_TEST=1` solves everything twice for testing). The generic `gpusolver` wrappers keep a per-thread context, return errors instead of aborting, accept host or device arrays, and solve full spectra by divide and conquer; their callers check `info` before using the result. ROCm 7.2's rocSOLVER has further defects that the retry covers: `zheevd` still returns NaN vectors for exactly diagonal complex matrices and needed a larger dither (1e-100) for two-block matrices, `cheevd` needed 1e-25 instead of 1e-30 in the refined FP32 solve, and `dsyevdx`/`zheevdx` with an index range return no eigenpairs for degenerate diagonal matrices.
+
+**Cluster and band solvers.** The non-collinear cluster root solve does its forward transform and the assembly of the 2n x 2n Hamiltonian on the device, keeps its host staging page-locked, and builds the density matrix with three GEMMul8 products (`OPENMX_CLUSTER_GPU_DM_GEMM`, about 10 s less on the 216-atom example). The collinear forward transform takes the full GEMMul8 workspace and returns it right after (`OPENMX_GEMMUL8_FORWARD_UNBLOCKED`), and the cluster solvers return their GEMMul8 workspaces after each dense solve (`OPENMX_CLUSTER_GEMMUL8_TURN_RELEASE`). In the band solvers, the non-collinear one-k-point-per-rank path solves once in two halves when all owners fit (see the refined eigensolver above), the non-collinear k-dense path keeps the transformed overlaps of the geometry (`OPENMX_BAND_NONCOL_OVERLAP_CACHE_MB`, 512) and skips the density-matrix gathers when every owner kept its vectors, and the collinear back transform goes through GEMMul8 (`OPENMX_BAND_GEMMUL8_BACKTRANSFORM`, 6 to 8 s less on the collinear band example). The refinement settings are reset at every input of a `-runtest` suite, and the variables that steer collective paths are read on the root rank.
+
+**Grid integrals.** The on-the-fly paths cache their batch plans (the batches, their descriptors and the overlap-point lists) for the geometry and move every transfer through page-locked memory. The ranks whose Set_Hamiltonian tables are resident integrate the density from them with a double-float CSR kernel while the others use on-the-fly tiles, also for the DC, Krylov and DC-LNO solvers. The on-the-fly state and the density's device buffers are released before the forces. The orbital tables are built by the same trig-free FP64 evaluator as the tiles. `OPENMX_GRID_PRECISION` is parsed as in the NVIDIA version (`df` or `fp64`; any other value selects FP64).
+
+**Forces and VNA projectors.** Force4B admits a rank by the exact sizes of its two workspaces, and has the NVIDIA case-1 streaming (`OPENMX_FORCE4B_CASE1_STREAM`, `_CASE1_STREAM_MB`), the cached-halo rank turns per physical GPU (`OPENMX_FORCE4B_CASE1_TURNS`, `_CASE1_TURN_MAX_RANKS`) and the case-2 streaming (`OPENMX_FORCE4B_CASE2_STREAM`); each is `auto`, 0 or 1. On a GPU whose FP64 rate is at most 1/8 of its FP32 rate, auto leaves the turns and streams off: on the RX 9060 XT with 16 ranks they ran force #4 in 15.9 s (turns) and 34 s (streaming) against 11.5 s on the CPU. The DC, Krylov and DC-LNO forces stay on the CPU there (CG15c-DC-LNO force #4: 4.9 s on the GPU against 1.7 s). The resident batch stays on: the 8-rank collinear band example spends 17.6 s in the forces instead of 22.8 s. `OPENMX_FORCE4B_WEAK_FP64_AUTO=1` gives such a GPU the NVIDIA policy. The HVNA2/HVNA3 projector batches are admitted by their real footprint with a halving pair batch, and the HVNA turns can be switched off (`OPENMX_SETPRO_HVNA_TURNS=0`). `OPENMX_FORCE_RELEASE_SCF_CACHES=0` keeps the SCF grid caches through the forces of a band run.
+
+**Profiles and tests.** `OPENMX_BAND_PROFILE=1` prints the NVIDIA-format stage lines SETHPROF, SETHOTFPROF, SETHOTFDENPROF, SETVPOTPROF and SETDENPROF; `OPENMX_CLUSTER_PROFILE=1` adds CLUSTERPROF / NCCLUSTERPROF lines; `OPENMX_GEMMUL8_TIMING=1` reports every bridge GEMM per rank; `OPENMX_SETPRO_VERBOSE=1` explains the VNA projector admission. `tests/` holds the CPU harnesses (`python3 tests/run_*.py --cc gcc`, which cut the production functions out of the sources and run them against stubs) and short single-process GPU checks (`tests/run_gpusolver_smoke.sh`, `tests/run_force4b_gpu_smoke.py`, `tests/run_band_noncol_wavefunctions_gpu.py`, `tools/run_check_gemmul8_hip.sh`).
+
+The four sidia333 cases of the sections above, ZrB2 2x2 and CG15c-DC-LNO, against the build of the previous section (refined defaults on both; Utot within 4e-11 Ha and forces within 6e-12 Ha/bohr, with the same number of SCF steps except ZrB2, 48 instead of 49):
+
+| case | ranks | total (s) before / now | diagonalization (s) | forces (s) |
+|---|---:|---:|---:|---:|
+| cluster, non-collinear, n2 = 5616 | 16 | 217 / 183 | 94.4 / 62.8 | 18.5 / 17.9 |
+| cluster, collinear, n = 2808 | 16 | 89.1 / 85.7 | 12.6 / 12.4 | 14.3 / 14.5 |
+| band, non-collinear, 2 k-points | 8 | 371 / 283 | 227 / 155 | 26.2 / 21.2 |
+| band, collinear, 3 k-points | 8 | 186 / 173 | 103 / 94.9 | 22.6 / 17.6 |
+| ZrB2 2x2, band, collinear | 8 | 178 / 177 | 87.7 / 87.6 | 19.0 / 19.0 |
+| CG15c-DC-LNO | 16 | 115 / 112 | 26.7 / 26.5 | 2.7 / 2.8 |
+
+| variable | default | meaning |
+|---|---:|---|
+| `OPENMX_DCLNO_PROFILE` | 0 | 1 prints the DC-LNO stage profile |
+| `OPENMX_DCLNO_RETRY_TEST` | 0 | 1 redoes every GPU local solve on the CPU (testing) |
+| `OPENMX_DCLNO_NONCOL_GPU_THRESHOLD` | 400 | smallest non-collinear local problem solved on the GPU |
+| `OPENMX_DC_NONCOL_GPU_THRESHOLD` | 300 | the same for the non-collinear DC clusters (2 NUM) |
+| `OPENMX_GPUSOLVER_MIN_FREE_AFTER_MB` | 1536 | device memory the non-collinear DC admission keeps free |
+| `OPENMX_KRYLOV_GEMMUL8` | 1 | 0 runs the Krylov GEMMs in plain hipBLAS FP64 |
+| `OPENMX_MAGMA_OZAKI2_RETRY` | 1 | 0 turns off the copy and retry of failed dense solves |
+| `OPENMX_GPUSOLVER_RETRY_TEST` | 0 | 1 solves every dense eigenproblem again with the next backend (testing) |
+| `OPENMX_GPUSOLVER_CACHE_MB` | 64 | per-thread scratch kept by the generic wrappers and the kept retry copy |
+| `OPENMX_GPU_EIGENSOLVER_MAGMA_MIN_N` | 0 | MAGMA entry points send problems below this size to rocSOLVER (measurement knob) |
+| `OPENMX_CLUSTER_GPU_DM_GEMM` | 1 with GEMMul8 | non-collinear cluster density matrix by GEMMul8 products |
+| `OPENMX_GEMMUL8_FORWARD_UNBLOCKED` | 1 | collinear cluster forward transform with the full GEMMul8 workspace |
+| `OPENMX_CLUSTER_GEMMUL8_TURN_RELEASE` | 1 (0 on an APU) | GEMMul8 workspaces go back after each cluster dense solve |
+| `OPENMX_CLUSTER_GPU_RETAIN_SCRATCH` | keep | 0 returns the collinear owner's scratch after every SCF step |
+| `OPENMX_BAND_NONCOL_OVERLAP_CACHE_MB` | 512 | host cache of the transformed overlaps (non-collinear k-dense band) |
+| `OPENMX_BAND_NONCOL_CACHE_TRACE` | 0 | 1 reports the non-collinear band caches per rank |
+| `OPENMX_BAND_GEMMUL8_BACKTRANSFORM` | 1 | 0 runs the collinear band back transform in plain hipBLAS ZGEMM |
+| `OPENMX_FORCE4B_CASE1_STREAM` / `_CASE1_TURNS` / `_CASE2_STREAM` | auto | Force4B streaming and rank turns (0 off, 1 forced) |
+| `OPENMX_FORCE4B_WEAK_FP64_AUTO` | 0 | 1 lets auto use the turns and streams on an FP64-weak GPU |
+| `OPENMX_FORCE4B_ORDERN_AUTO` | 0 | 1 gives the DC, Krylov and DC-LNO forces the general auto policy |
+| `OPENMX_SETPRO_HVNA_TURNS` | 1 | 0 admits the HVNA batches only when every rank of the node fits at once |
+| `OPENMX_FORCE_RELEASE_SCF_CACHES` | 1 | 0 keeps the SCF grid caches through the forces of a band run |
+| `OPENMX_GEMMUL8_TIMING` | 0 | 1 reports the bridge GEMMs per rank at the end of the SCF |
 
 ## Multi-GPU parallelization and MPI
 The ranks are split into one group per k-point and each group's eigenproblem is solved on one GPU, so the eigensolver keeps at most as many GPUs busy as there are k-points (`scf.Gpu.Num`, default 30, is only an upper bound). A cluster calculation therefore uses one GPU for the diagonalization however many the node has — give it one GPU and more ranks, or use `gpusolver2`. Hybrid MPI/OpenMP brings no speedup here: use flat MPI with one thread per rank,
@@ -392,7 +452,7 @@ See the [S/L/L2 tuning report](gpu_tuning_s_l_l2_20260923.txt) for the separate
 suite results, C1000 baseline discrepancy and experiment provenance.
 
 ### Built-in test suites (-runtest / -runtestL)
-Desktop PC: AMD Ryzen Threadripper 3970X (16 of 32 cores used), 256 GB RAM, one AMD Radeon RX 9060 XT (gfx1200, 16 GB); ROCm 7.2.0, Open MPI 5.0.9 built with the ROCm compilers, AOCL 5.2.0; 16 MPI ranks sharing the GPU, flat MPI, the same binary for every column. GPU columns use the input-file defaults, CPU columns `OPENMX_GPU=0`:
+Desktop PC: AMD Ryzen Threadripper 3970X (16 of 32 cores used), 256 GB RAM, one AMD Radeon RX 9060 XT (gfx1200, 16 GB); ROCm 7.2.0, Open MPI 5.0.9 built with the ROCm compilers, AOCL 5.2.0; 16 MPI ranks sharing the GPU, flat MPI. GPU columns use the input-file defaults, CPU columns `OPENMX_GPU=0`. The GPU columns were measured again on 2026-10-12 after the ports of the previous sections, with `tools/run_runtest_l3.py` (one MPI job per input); the CPU columns are the earlier runs of the same CPU code:
 
 ```sh
 mpirun -np 16 ./openmx -runtest  -nt 1                  # GPU (defaults)
@@ -403,47 +463,47 @@ OPENMX_GPU=0 mpirun -np 16 ./openmx -runtestL -nt 1     # CPU reference, same bi
 
 | input | CPU (s) | GPU (s) |
 |---|---:|---:|
-| Benzene | 4.25 | 7.38 |
-| C60 | 9.59 | 18.09 |
-| CO | 6.92 | 10.59 |
-| Cr2 | 6.93 | 8.21 |
-| Crys-MnO | 11.66 | 13.14 |
-| GaAs | 16.83 | 17.59 |
-| Glycine | 5.29 | 6.64 |
-| Graphite4 | 3.93 | 5.15 |
-| H2O-EF | 4.42 | 5.80 |
-| H2O | 3.82 | 6.02 |
-| HMn | 10.73 | 11.72 |
-| Methane | 3.30 | 4.46 |
-| Mol_MnO | 7.40 | 8.40 |
-| Ndia2 | 4.68 | 5.12 |
-| **Total** | **99.76** | **128.31** |
+| Benzene | 4.25 | 6.42 |
+| C60 | 9.59 | 11.07 |
+| CO | 6.92 | 11.50 |
+| Cr2 | 6.93 | 7.35 |
+| Crys-MnO | 11.66 | 9.70 |
+| GaAs | 16.83 | 12.84 |
+| Glycine | 5.29 | 6.45 |
+| Graphite4 | 3.93 | 4.68 |
+| H2O-EF | 4.42 | 5.48 |
+| H2O | 3.82 | 5.45 |
+| HMn | 10.73 | 9.69 |
+| Methane | 3.30 | 4.75 |
+| Mol_MnO | 7.40 | 7.31 |
+| Ndia2 | 4.68 | 4.29 |
+| **Total** | **99.76** | **106.98** |
 
-These systems are below the GPU/CPU switching thresholds of the eigensolvers, so only the construction stages differ, and on runs of a few seconds the per-input GPU setup costs more than they save. The point is correctness: all 14 pass with max diff Utot 3.8e-11 Hartree (CPU: 4.7e-11).
+These systems are below the GPU/CPU switching thresholds of the eigensolvers, so only the construction stages differ, and on runs of a few seconds the per-input GPU setup costs more than they save. The point is correctness: all 14 pass with max diff Utot 6.5e-11 Hartree (CPU: 4.7e-11).
 
 `-runtestL` (16 medium/large systems; ratio = CPU / GPU):
 
 | input | atoms | solver | CPU (s) | GPU (s) | ratio |
 |---|---:|---|---:|---:|---:|
-| 5_5_13COb2 | 155 | band | 93.21 | 87.88 | 1.06 |
-| B2C62_Band | 64 | band | 588.52 | 709.30 | 0.83 |
-| CG15c-DC-LNO | 650 | dc-lno | 139.69 | 145.27 | 0.96 |
-| DIA512-1 | 512 | krylov | 153.99 | 149.03 | 1.03 |
-| FeBCC | 16 | band (sp) | 152.16 | 173.49 | 0.88 |
-| GEL | 40 | band | 44.82 | 63.56 | 0.71 |
-| GFRAG | 54 | cluster | 44.18 | 52.58 | 0.84 |
-| GGFF | 40 | band (NC) | 1315.59 | 1675.38 | 0.79 |
-| MCCN | 564 | krylov | 274.16 | 266.85 | 1.03 |
-| Mn12_148_F | 148 | cluster (sp) | 101.00 | 107.36 | 0.94 |
-| N1C999 | 1000 | dc-lno (sp) | 1204.12 | 1190.41 | 1.01 |
-| Ni63-O64 | 127 | band (sp) | 91.22 | 100.52 | 0.91 |
-| Pt63 | 63 | cluster | 66.48 | 75.47 | 0.88 |
-| SialicAcid | 40 | cluster | 20.54 | 28.00 | 0.73 |
-| ZrB2_2x2 | 76 | band | 284.33 | 315.05 | 0.90 |
-| nsV4Bz5 | 64 | cluster | 123.11 | 130.38 | 0.94 |
-| **Total** | | | **4697.12** | **5270.54** | **0.89** |
+| 5_5_13COb2 | 155 | band | 93.21 | 65.52 | 1.42 |
+| B2C62_Band | 64 | band | 588.52 | 715.16 | 0.82 |
+| CG15c-DC-LNO | 650 | dc-lno | 139.69 | 112.27 | 1.24 |
+| DIA512-1 | 512 | krylov | 153.99 | 121.70 | 1.27 |
+| FeBCC | 16 | band (sp) | 152.16 | 150.20 | 1.01 |
+| GEL | 40 | band | 44.82 | 101.96 | 0.44 |
+| GFRAG | 54 | cluster | 44.18 | 37.24 | 1.19 |
+| GGFF | 40 | band (NC) | 1315.59 | 1445.69 | 0.91 |
+| MCCN | 564 | krylov | 274.16 | 264.01 | 1.04 |
+| Mn12_148_F | 148 | cluster (sp) | 101.00 | 65.77 | 1.54 |
+| N1C999 | 1000 | dc-lno (sp) | 1204.12 | 1079.73 | 1.12 |
+| Ni63-O64 | 127 | band (sp) | 91.22 | 63.87 | 1.43 |
+| Pt63 | 63 | cluster | 66.48 | 51.14 | 1.30 |
+| SialicAcid | 40 | cluster | 20.54 | 17.94 | 1.14 |
+| ZrB2_2x2 | 76 | band | 284.33 | 182.19 | 1.56 |
+| nsV4Bz5 | 64 | cluster | 123.11 | 68.37 | 1.80 |
+| **Total** | | | **4697.12** | **4542.76** | **1.03** |
 
-All 16 pass on the GPU (max diff Utot 2.6e-9 Hartree; CPU 2.3e-9; the official CPU references in `work/large_example/runtestL.result_*` are of the same order, largest on Pt63 in every case). Read the GPU column for what it is: 16 ranks on one 16 GB desktop card leave each rank a few hundred MB, so the dense band diagonalizations, the Krylov solves and several construction stages are refused by their memory preflights and run on the CPU, and the suite ends up 12% slower on the GPU build; the O(N) inputs come out even or slightly ahead. These suites are correctness tests. The GPU gains come from dense diagonalizations that stay on the device — fewer ranks per GPU on a 16 GB card (below), or the default configuration on a data-center GPU with full-rate FP64 and large memory.
+All 16 pass on the GPU (max diff Utot 2.2e-9 Hartree, on Pt63; CPU 2.3e-9; the official CPU references in `work/large_example/runtestL.result_*` are of the same order, largest on Pt63 in every case). With 16 ranks on one 16 GB desktop card each rank has a few hundred MB, so several dense band diagonalizations and the Krylov solves still run on the CPU; the suite is nonetheless 3% faster than the CPU build now (it was 12% slower before the refined eigensolver, the grid changes and the ports above). GEL (n = 456) loses because the collinear band crossover of 400 was tuned with 8 ranks per GPU; B2C62_Band and GGFF stay slower as well. These suites are correctness tests. The larger GPU gains come from dense diagonalizations that stay on the device: fewer ranks per GPU on a 16 GB card (below), or a data-center GPU with full-rate FP64 and large memory.
 
 ### 216-atom non-collinear cluster on the same card
 Si, `scf.EigenvalueSolver cluster`, `scf.SpinPolarization NC`, n2 = 5616; 6 SCF iterations + one force evaluation; "CPU version" is standard OpenMX 4.0 built with the same compilers and AOCL:

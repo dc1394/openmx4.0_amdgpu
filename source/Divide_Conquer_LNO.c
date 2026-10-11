@@ -26,11 +26,80 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
+#include <limits.h>
 #include <string.h>
 #include <time.h>
 
 #define measure_time 0
 #define GPU_CPU_SWITCH_NUM2 800
+
+/* OPENMX_DCLNO_PROFILE: per-SCF accounting of the collinear local solves
+   (counts and sizes of the CPU and GPU tasks, stage times as the maximum
+   and the mean over the ranks).  Host_ID reads the variable and broadcasts
+   it, so that every rank enters the same reporting collectives even when
+   the launch environments differ. */
+static int DCLNO_ProfileEnabled(void)
+{
+    static int enabled = -1;
+    if (enabled < 0) {
+        int rank;
+        MPI_Comm_rank(mpi_comm_level1, &rank);
+        if (rank == Host_ID) {
+            const char *value = getenv("OPENMX_DCLNO_PROFILE");
+            enabled = value != NULL && atoi(value) != 0;
+        }
+        MPI_Bcast(&enabled, 1, MPI_INT, Host_ID, mpi_comm_level1);
+    }
+    return enabled;
+}
+
+#define DCLNO_PROFILE_BINS 8
+static int DCLNO_ProfileBin(int n)
+{
+    const int limit[DCLNO_PROFILE_BINS - 1] = {256, 512, 800, 1024, 1536, 2048, 4096};
+    int bin = 0;
+    while (bin < DCLNO_PROFILE_BINS - 1 && n >= limit[bin]) bin++;
+    return bin;
+}
+
+static void DCLNO_ProfileReport(int md, int scf, int rank, int ranks,
+                                const unsigned long long *hist,
+                                const int *nmin, const int *nmax,
+                                const double *seconds)
+{
+    unsigned long long all_hist[2 * DCLNO_PROFILE_BINS];
+    int all_min[2], all_max[2];
+    double sum_seconds[10], max_seconds[10];
+    const char *labels[10] = {"LNO", "matrix", "solve", "residues", "PDOS",
+                              "ChemP", "eigenenergy", "DM", "CPU-solve", "GPU-solve"};
+    int path, bin;
+
+    MPI_Reduce(hist, all_hist, 2 * DCLNO_PROFILE_BINS, MPI_UNSIGNED_LONG_LONG,
+               MPI_SUM, Host_ID, mpi_comm_level1);
+    MPI_Reduce(nmin, all_min, 2, MPI_INT, MPI_MIN, Host_ID, mpi_comm_level1);
+    MPI_Reduce(nmax, all_max, 2, MPI_INT, MPI_MAX, Host_ID, mpi_comm_level1);
+    MPI_Reduce(seconds, sum_seconds, 10, MPI_DOUBLE, MPI_SUM, Host_ID, mpi_comm_level1);
+    MPI_Reduce(seconds, max_seconds, 10, MPI_DOUBLE, MPI_MAX, Host_ID, mpi_comm_level1);
+    if (rank != Host_ID) return;
+
+    for (path = 0; path < 2; path++) {
+        unsigned long long count = 0;
+        for (bin = 0; bin < DCLNO_PROFILE_BINS; bin++)
+            count += all_hist[path * DCLNO_PROFILE_BINS + bin];
+        printf("<DC-LNO profile> MD=%d SCF=%d %s tasks=%llu n=%d..%d "
+               "hist[1:255,256:511,512:799,800:1023,1024:1535,1536:2047,2048:4095,4096:]=",
+               md, scf, path ? "GPU" : "CPU", count,
+               count ? all_min[path] : 0, all_max[path]);
+        for (bin = 0; bin < DCLNO_PROFILE_BINS; bin++)
+            printf("%s%llu", bin ? "," : "", all_hist[path * DCLNO_PROFILE_BINS + bin]);
+        printf("\n");
+    }
+    printf("<DC-LNO profile> MD=%d SCF=%d seconds[max,rank-mean]", md, scf);
+    for (bin = 0; bin < 10; bin++)
+        printf(" %s=%.6f,%.6f", labels[bin], max_seconds[bin], sum_seconds[bin] / ranks);
+    printf("\n");
+    fflush(stdout);
+}
 
 /* task-level threshold for proxy-to-GPU */
 #define DCLNO_GPU_PROXY_EIGEN_THRESHOLD_COL  (GPU_CPU_SWITCH_NUM2)
@@ -92,9 +161,32 @@ static int DCLNO_NonColGpuEigenThreshold(void)
 #define DCLNO_PROXY_TAG_COL_H      41002
 #define DCLNO_PROXY_TAG_COL_EVAL   41003
 #define DCLNO_PROXY_TAG_COL_CVEC   41004
+#define DCLNO_PROXY_TAG_COL_STATUS 41005
+
+/* MAGMA's allocation failures (magma_types.h).  The device is shared by
+   many ranks, so a local solve that finds no room retries on the CPU like a
+   nonconvergent one; DCLNO_RETRY_NO_MEMORY is its positive status (no
+   LAPACK INFO reaches it).  DCLNO_RETRY_GPU_ERROR is the status of a
+   noncollinear GPU solve that returned non-finite values or whose device
+   call failed. */
+#define DCLNO_MAGMA_ERR_HOST_ALLOC   (-112)
+#define DCLNO_MAGMA_ERR_DEVICE_ALLOC (-113)
+#define DCLNO_RETRY_NO_MEMORY        INT_MAX
+#define DCLNO_RETRY_GPU_ERROR        (INT_MAX - 1)
+/* LAPACK argument errors lie in (MAGMA_ERR, 0); MAGMA's own codes, a
+   failed magma_init among them (MAGMA_ERR_UNKNOWN), lie below MAGMA_ERR.
+   MAGMA_ERR_ILLEGAL_VALUE is the wrappers' own argument check. */
+#define DCLNO_MAGMA_ERR               (-100)
+#define DCLNO_MAGMA_ERR_ILLEGAL_VALUE (-104)
+#define DCLNO_MAGMA_ERR_UNKNOWN       (-116)
 
 extern int openmx_magma_dsyevdx_gpu(int n, int maxn, double *d_A, double *w, int *mout);
 extern void magma_ozaki2_release_workspaces(void);
+/* magma_openmx.cu: rocSOLVER's full-spectrum zheevd behind a unitary phase
+   similarity, with a finiteness check of the vectors (see
+   DCLNO_GpuSolverZ_Eigen) */
+extern int openmx_hipsolver_zheevd_gpu(int n, int maxn, void *d_A, double *w, int *mout);
+extern int openmx_hipsolver_release_workspace(void);
 
 /* ------------------------------------------------------------------ */
 /* forward declarations                                               */
@@ -207,6 +299,41 @@ static void *DCLNO_CallocArray(size_t count, size_t elem_size, const char *label
     return ptr;
 }
 
+/* Every residue row of one atom/spin has the same energy-window length.
+   Retain the existing pointer view but allocate its values in one block;
+   a large DC-LNO system otherwise makes millions of small allocations per
+   SCF step.  The self pair [0][0][0] owns the block (freed by the caller). */
+static void DCLNO_AllocateResidueValues(double ****rows, int Gc_AN, int states)
+{
+    const int no0 = Spe_Total_CNO[WhatSpecies[Gc_AN]];
+    size_t row_count = 0, offset = 0;
+    double *values;
+
+    /* two leading entries hold the occupied-state density and energy sums */
+    if (no0 <= 0 || FNAN[Gc_AN] < 0 || states < 2)
+        DCLNO_AbortWithMessage("Invalid residue dimensions in DC-LNO.");
+    for (int h = 0; h <= FNAN[Gc_AN]; h++) {
+        const int no1 = Spe_Total_CNO[WhatSpecies[natn[Gc_AN][h]]];
+        const size_t pair_rows = DCLNO_CheckedMulCount((size_t)no0, (size_t)no1,
+                                                       "residue pair rows");
+        if (no1 <= 0 || SIZE_MAX - row_count < pair_rows)
+            DCLNO_AbortWithMessage("Residue row count overflow in DC-LNO.");
+        row_count += pair_rows;
+    }
+    values = (double*)DCLNO_MallocArray(
+        DCLNO_CheckedMulCount(row_count, (size_t)states, "residue value block"),
+        sizeof(double), "residue value block");
+    for (int h = 0; h <= FNAN[Gc_AN]; h++) {
+        const int no1 = Spe_Total_CNO[WhatSpecies[natn[Gc_AN][h]]];
+        for (int i = 0; i < no0; i++) {
+            for (int j = 0; j < no1; j++) {
+                rows[h][i][j] = values + offset;
+                offset += (size_t)states;
+            }
+        }
+    }
+}
+
 static void DCLNO_GPUProxy_Init(void)
 {
     MPI_Comm base_comm;
@@ -303,7 +430,9 @@ static void DCLNO_CopyPackedEigvecsToC(const double *buf, int num, int num2, dou
     }
 }
 
-static void DCLNO_Eigen_lapack_d_reuse(double **a,
+/* a: the packed column-major matrix; the eigenvectors stay in A (the
+   column layout of BLAS), a is not written */
+static void DCLNO_Eigen_lapack_d_reuse(const double *a,
                                        double *ko,
                                        int n0,
                                        int EVmax,
@@ -322,14 +451,17 @@ static void DCLNO_Eigen_lapack_d_reuse(double **a,
 
     for (i=0; i<n0; i++) {
         for (j=0; j<n0; j++) {
-            A[i*n0 + j] = a[i+1][j+1];
+            /* Preserve the original triangle: the former C[row][column]
+               staging followed by its row-major flattening transposed a.
+               Do not switch UPLO; H can be slightly asymmetric after GEMM. */
+            A[i*n0 + j] = a[j*n0 + i];
         }
     }
 
     F77_NAME(dsyevd,DSYEVD)(JOBZ, UPLO, &n, A, &LDA, ko,
                             WORK, &LWORK, IWORK, &LIWORK, &INFO);
 
-    if (INFO < 0) {
+    if (INFO != 0) {
         char msg[256];
         snprintf(msg, sizeof(msg),
                  "Eigen_lapack_d workspace solve failed in Divide_Conquer_LNO.c: info=%d",
@@ -337,12 +469,7 @@ static void DCLNO_Eigen_lapack_d_reuse(double **a,
         DCLNO_AbortWithMessage(msg);
     }
 
-    for (i=0; i<EVmax; i++) {
-        for (j=0; j<n0; j++) {
-            a[j+1][i+1] = A[i*n0 + j];
-        }
-    }
-
+    (void)EVmax;
     for (i=EVmax; i>=1; i--) {
         ko[i] = ko[i-1];
     }
@@ -458,7 +585,12 @@ static void DCLNO_GpuSolver_EnsureMatrixCapacity(int num)
     ctx->max_num = num;
 }
 
-static void DCLNO_GpuSolver_Eigen(double *d_A, int m, int maxn, double *W)
+/* Return a positive value only when the caller is to solve the host
+   inputs again on the CPU: a positive INFO (no convergence) or
+   DCLNO_RETRY_NO_MEMORY (MAGMA could not allocate its workspace).  Other
+   negative values (rejected arguments) and a successful call with a wrong
+   eigenpair count are fatal. */
+static int DCLNO_GpuSolver_Eigen(double *d_A, int m, int maxn, double *W)
 {
     DCLNO_GpuSolverCtx *ctx = &DCLNO_gpusolver_ctx;
     int                info = 0;
@@ -473,24 +605,78 @@ static void DCLNO_GpuSolver_Eigen(double *d_A, int m, int maxn, double *W)
     wait_hipfunc(hipStreamSynchronize(ctx->stream));
 
     info = openmx_magma_dsyevdx_gpu(m, maxn, d_A, W, &mout);
-    if (info != 0) {
-        snprintf(msg, sizeof(msg), "magma_dsyevdx_gpu failed in DC-LNO: info=%d", info);
+    if (info == DCLNO_MAGMA_ERR_HOST_ALLOC || info == DCLNO_MAGMA_ERR_DEVICE_ALLOC) {
+        fprintf(stderr, "<DC-LNO> MAGMA could not allocate its workspace: info=%d n=%d requested=%d\n",
+                info, m, maxn);
+        fflush(stderr);
+        return DCLNO_RETRY_NO_MEMORY;
+    }
+    if (info < 0) {
+        if (DCLNO_MAGMA_ERR < info || info == DCLNO_MAGMA_ERR_ILLEGAL_VALUE)
+            snprintf(msg, sizeof(msg),
+                     "magma_dsyevdx_gpu rejected an argument in DC-LNO: info=%d n=%d requested=%d",
+                     info, m, maxn);
+        else
+            snprintf(msg, sizeof(msg),
+                     "magma_dsyevdx_gpu failed in DC-LNO with MAGMA error %d (from magma_init or "
+                     "the solver) n=%d requested=%d", info, m, maxn);
         DCLNO_AbortWithMessage(msg);
     }
+    if (info > 0) return info;
     if (mout != maxn) {
         snprintf(msg, sizeof(msg), "magma_dsyevdx_gpu returned %d eigenpairs in DC-LNO, expected %d.", mout, maxn);
         DCLNO_AbortWithMessage(msg);
     }
+    return 0;
 }
 
-static void DCLNO_Solve_Col_GpuSolver(int NUM, int NUM2, double *Smat, double *Hmat, double *ko)
+/* OPENMX_DCLNO_RETRY_TEST=1: every collinear and noncollinear GPU task
+   reports a nonconvergent overlap solve after the device has solved it, so
+   the CPU retry runs on the host inputs the GPU path left (a production-
+   input test of that path, like the NVIDIA version's
+   OPENMX_CUSOLVER_RETRY_TEST) */
+static int DCLNO_RetryTest(void)
+{
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char *value = getenv("OPENMX_DCLNO_RETRY_TEST");
+        enabled = (value != NULL && value[0] != '\0' && atoi(value) != 0) ? 1 : 0;
+    }
+    return enabled;
+}
+
+static void DCLNO_ReportGpuRetry(const char *what, int info, int n, int requested)
+{
+    static int quiet = 0;
+    if (DCLNO_RetryTest()) {
+        /* one line per rank is enough for the test */
+        if (quiet) return;
+        quiet = 1;
+    }
+    if (info == DCLNO_RETRY_NO_MEMORY)
+        fprintf(stderr, "<DC-LNO> GPU %s eigensolve had no device memory: n=%d requested=%d; "
+                "retrying on CPU.\n", what, n, requested);
+    else if (info == DCLNO_RETRY_GPU_ERROR)
+        fprintf(stderr, "<DC-LNO> GPU %s eigensolve returned non-finite values or failed on the device: "
+                "n=%d requested=%d; retrying on CPU.\n", what, n, requested);
+    else
+        fprintf(stderr, "<DC-LNO> GPU %s eigensolve did not converge: info=%d n=%d requested=%d; "
+                "retrying on CPU.\n", what, info, n, requested);
+    fflush(stderr);
+}
+
+/* On a positive return Smat/Hmat still hold the original host matrices
+   (the device works on copies and writes back only at the end); the caller
+   must solve the complete generalized problem again on its CPU scratch.
+   ko is scratch until success and may hold unconverged device values. */
+static int DCLNO_Solve_Col_GpuSolver(int NUM, int NUM2, double *Smat, double *Hmat, double *ko)
 {
     DCLNO_GpuSolverCtx *ctx = &DCLNO_gpusolver_ctx;
     double             alpha = 1.0;
     double             beta = 0.0;
     size_t             full_bytes;
     size_t             partial_bytes;
-    int                l;
+    int                l, info;
 
     if (NUM <= 0 || NUM2 <= 0 || NUM2 > NUM) {
         DCLNO_AbortWithMessage("Invalid matrix dimensions in DCLNO_Solve_Col_GpuSolver.");
@@ -510,7 +696,12 @@ static void DCLNO_Solve_Col_GpuSolver(int NUM, int NUM2, double *Smat, double *H
     wait_hipfunc(hipMemcpyAsync(ctx->d_S, Smat, full_bytes, hipMemcpyHostToDevice, ctx->stream));
     wait_hipfunc(hipMemcpyAsync(ctx->d_H, Hmat, full_bytes, hipMemcpyHostToDevice, ctx->stream));
 
-    DCLNO_GpuSolver_Eigen(ctx->d_S, NUM, NUM, ko + 1);
+    info = DCLNO_GpuSolver_Eigen(ctx->d_S, NUM, NUM, ko + 1);
+    if (info == 0 && DCLNO_RetryTest()) info = 1;
+    if (info > 0) {
+        DCLNO_ReportGpuRetry("overlap", info, NUM, NUM);
+        return info;
+    }
 
     for (l = 1; l <= NUM; l++) {
         ko[l] = 1.0 / sqrt(fabs(ko[l]));
@@ -530,7 +721,11 @@ static void DCLNO_Solve_Col_GpuSolver(int NUM, int NUM2, double *Smat, double *H
     wait_hipfunc(openmx_gemmul8Dgemm(ctx->hipblas, HIPBLAS_OP_C, HIPBLAS_OP_N, NUM, NUM, NUM, &alpha, ctx->d_tmp, NUM,
                                      ctx->d_S, NUM, &beta, ctx->d_H, NUM));
 
-    DCLNO_GpuSolver_Eigen(ctx->d_H, NUM, NUM2, ko + 1);
+    info = DCLNO_GpuSolver_Eigen(ctx->d_H, NUM, NUM2, ko + 1);
+    if (info > 0) {
+        DCLNO_ReportGpuRetry("Hamiltonian", info, NUM, NUM2);
+        return info;
+    }
 
     wait_hipfunc(openmx_gemmul8Dgemm(ctx->hipblas, HIPBLAS_OP_N, HIPBLAS_OP_N, NUM, NUM2, NUM, &alpha, ctx->d_tmp,
                                      NUM, ctx->d_H, NUM, &beta, ctx->d_S, NUM));
@@ -538,6 +733,7 @@ static void DCLNO_Solve_Col_GpuSolver(int NUM, int NUM2, double *Smat, double *H
     wait_hipfunc(hipMemcpyAsync(Hmat, ctx->d_S, partial_bytes,
                                   hipMemcpyDeviceToHost, ctx->stream));
     wait_hipfunc(hipStreamSynchronize(ctx->stream));
+    return 0;
 }
 
 /* ------------------------------------------------------------------ */
@@ -567,21 +763,16 @@ static void DCLNO_Solve_Col_Local(int NUM,
         owns_tmp = 1;
     }
 
-    /* diagonalize S */
-    for (i1=1; i1<=NUM; i1++) {
-        for (j1=1; j1<=NUM; j1++) {
-            C[i1][j1] = Smat[(j1-1)*NUM + (i1-1)];
-        }
-    }
-
-    DCLNO_Eigen_lapack_d_reuse(C, ko, NUM, NUM, Eig_A, Eig_Work, Eig_IWork);
+    /* Keep the LAPACK eigenvectors packed: the former C staging copied
+       each dense matrix twice on both sides of each solve. */
+    DCLNO_Eigen_lapack_d_reuse(Smat, ko, NUM, NUM, Eig_A, Eig_Work, Eig_IWork);
 
     for (l=1; l<=NUM; l++) ko[l] = 1.0/sqrt(fabs(ko[l]));
 
     /* Smat <- U * s^{-1/2} */
-    for (i1=1; i1<=NUM; i1++) {
-        for (j1=1; j1<=NUM; j1++) {
-            Smat[(j1-1)*NUM + (i1-1)] = C[i1][j1]*ko[j1];
+    for (j1=1; j1<=NUM; j1++) {
+        for (i1=1; i1<=NUM; i1++) {
+            Smat[(j1-1)*NUM + (i1-1)] = Eig_A[(j1-1)*NUM + (i1-1)]*ko[j1];
         }
     }
 
@@ -598,34 +789,19 @@ static void DCLNO_Solve_Col_Local(int NUM,
     ("C","N",&BM,&BN,&BK,&alpha,
      Smat,&BM,Tmp,&BK,&beta,Hmat,&BM);
 
-    /* diagonalize transformed H */
-    for (i1=1; i1<=NUM; i1++) {
-        for (j1=1; j1<=NUM; j1++) {
-            C[i1][j1] = Hmat[(j1-1)*NUM + (i1-1)];
-        }
-    }
+    /* diagonalize transformed H; Eig_A already has the BLAS column layout */
+    DCLNO_Eigen_lapack_d_reuse(Hmat, ko, NUM, NUM2, Eig_A, Eig_Work, Eig_IWork);
 
-    DCLNO_Eigen_lapack_d_reuse(C, ko, NUM, NUM2, Eig_A, Eig_Work, Eig_IWork);
-
-    /* Hmat (first NUM2 cols) <- transformed eigenvectors */
-    for (i1=1; i1<=NUM; i1++) {
-        for (j1=1; j1<=NUM2; j1++) {
-            Hmat[(j1-1)*NUM + (i1-1)] = C[i1][j1];
-        }
-    }
-
-    /* Tmp(:,1:NUM2) = Smat * Hmat(:,1:NUM2) */
+    /* Tmp(:,1:NUM2) = Smat * Eig_A(:,1:NUM2) */
     BM = NUM; BN = NUM2; BK = NUM;
     alpha = 1.0; beta = 0.0;
     F77_NAME(dgemm,DGEMM)
     ("N","N",&BM,&BN,&BK,&alpha,
-     Smat,&BM,Hmat,&BK,&beta,Tmp,&BM);
+     Smat,&BM,Eig_A,&BK,&beta,Tmp,&BM);
 
     /* return C[eig_index][basis_index] */
     for (j1=1; j1<=NUM2; j1++) {
-        for (i1=1; i1<=NUM; i1++) {
-            C[j1][i1] = Tmp[(j1-1)*NUM + (i1-1)];
-        }
+        memcpy(C[j1] + 1, Tmp + (size_t)(j1-1)*NUM, sizeof(double)*(size_t)NUM);
     }
 
     if (owns_tmp) free(Tmp);
@@ -638,23 +814,35 @@ static void DCLNO_Solve_Col_Local(int NUM,
 typedef struct {
     int                initialized;
     int                max_num;
-    size_t             d_work_bytes;
-    size_t             h_work_bytes;
     hipStream_t       stream;
     hipblasHandle_t     hipblas;
-    hipsolverDnHandle_t gpusolver;
     dcomplex *         d_S;
     dcomplex *         d_H;
     dcomplex *         d_tmp;
     dcomplex *         d_scale;
     dcomplex *         h_scale;
-    double *           d_W;
-    int32_t *          d_info;
-    void *             d_work;
-    void *             h_work;
 } DCLNO_GpuSolverZCtx;
 
 static DCLNO_GpuSolverZCtx DCLNO_gpusolverz_ctx = {0};
+
+/* the solve buffers; the stream and the handle stay */
+static void DCLNO_GpuSolverZ_FreeBuffers(DCLNO_GpuSolverZCtx *ctx)
+{
+    if (ctx->stream != NULL)  wait_hipfunc(hipStreamSynchronize(ctx->stream));
+
+    if (ctx->d_S != NULL)     wait_hipfunc(hipFree(ctx->d_S));
+    if (ctx->d_H != NULL)     wait_hipfunc(hipFree(ctx->d_H));
+    if (ctx->d_tmp != NULL)   wait_hipfunc(hipFree(ctx->d_tmp));
+    if (ctx->d_scale != NULL) wait_hipfunc(hipFree(ctx->d_scale));
+    free(ctx->h_scale);
+
+    ctx->d_S = NULL;
+    ctx->d_H = NULL;
+    ctx->d_tmp = NULL;
+    ctx->d_scale = NULL;
+    ctx->h_scale = NULL;
+    ctx->max_num = 0;
+}
 
 static void DCLNO_GpuSolverZ_Destroy(void)
 {
@@ -662,151 +850,164 @@ static void DCLNO_GpuSolverZ_Destroy(void)
 
     if (!ctx->initialized) return;
 
-    if (ctx->stream != NULL) wait_hipfunc(hipStreamSynchronize(ctx->stream));
-
-    if (ctx->d_S != NULL)     wait_hipfunc(hipFree(ctx->d_S));
-    if (ctx->d_H != NULL)     wait_hipfunc(hipFree(ctx->d_H));
-    if (ctx->d_tmp != NULL)   wait_hipfunc(hipFree(ctx->d_tmp));
-    if (ctx->d_scale != NULL) wait_hipfunc(hipFree(ctx->d_scale));
-    if (ctx->d_W != NULL)     wait_hipfunc(hipFree(ctx->d_W));
-    if (ctx->d_info != NULL)  wait_hipfunc(hipFree(ctx->d_info));
-    if (ctx->d_work != NULL)  wait_hipfunc(hipFree(ctx->d_work));
-    free(ctx->h_work);
-    free(ctx->h_scale);
-    if (ctx->gpusolver != NULL) wait_hipfunc(hipsolverDnDestroy(ctx->gpusolver));
+    DCLNO_GpuSolverZ_FreeBuffers(ctx);
     if (ctx->hipblas != NULL)    wait_hipfunc(hipblasDestroy(ctx->hipblas));
     if (ctx->stream != NULL)    wait_hipfunc(hipStreamDestroy(ctx->stream));
 
     memset(ctx, 0, sizeof(*ctx));
 }
 
-static void DCLNO_GpuSolverZ_Init(void)
+/* 0 when the hipBLAS handle cannot be created (a full device shows up
+   there first); nothing is kept then */
+static int DCLNO_GpuSolverZ_Init(void)
 {
     DCLNO_GpuSolverZCtx *ctx = &DCLNO_gpusolverz_ctx;
 
-    if (ctx->initialized) return;
+    if (ctx->initialized) return 1;
 
     wait_hipfunc(hipStreamCreateWithFlags(&ctx->stream, hipStreamNonBlocking));
-    wait_hipfunc(hipblasCreate(&ctx->hipblas));
-    wait_hipfunc(hipsolverDnCreate(&ctx->gpusolver));
+    if (hipblasCreate(&ctx->hipblas) != HIPBLAS_STATUS_SUCCESS) {
+        (void)hipGetLastError();
+        ctx->hipblas = NULL;
+        wait_hipfunc(hipStreamDestroy(ctx->stream));
+        ctx->stream = NULL;
+        return 0;
+    }
     wait_hipfunc(hipblasSetStream(ctx->hipblas, ctx->stream));
-    wait_hipfunc(hipsolverDnSetStream(ctx->gpusolver, ctx->stream));
 
     ctx->initialized = 1;
+    return 1;
 }
 
-static void DCLNO_GpuSolverZ_EnsureMatrixCapacity(int num)
+/* 0 when the device has no room for the buffers (none are kept then) */
+static int DCLNO_GpuSolverZ_EnsureMatrixCapacity(int num)
 {
     DCLNO_GpuSolverZCtx *ctx = &DCLNO_gpusolverz_ctx;
-    size_t matrix_bytes;
+    dcomplex **buffers[4];
+    size_t bytes[4];
+    int b;
 
     if (num <= 0) {
         DCLNO_AbortWithMessage("Invalid matrix size in DCLNO_GpuSolverZ_EnsureMatrixCapacity.");
     }
 
-    DCLNO_GpuSolverZ_Init();
+    if (!DCLNO_GpuSolverZ_Init()) return 0;
 
-    if (num <= ctx->max_num) return;
+    if (num <= ctx->max_num) return 1;
 
-    if (ctx->d_S != NULL)     wait_hipfunc(hipFree(ctx->d_S));
-    if (ctx->d_H != NULL)     wait_hipfunc(hipFree(ctx->d_H));
-    if (ctx->d_tmp != NULL)   wait_hipfunc(hipFree(ctx->d_tmp));
-    if (ctx->d_scale != NULL) wait_hipfunc(hipFree(ctx->d_scale));
-    if (ctx->d_W != NULL)     wait_hipfunc(hipFree(ctx->d_W));
-    if (ctx->d_info != NULL)  wait_hipfunc(hipFree(ctx->d_info));
-    free(ctx->h_scale);
+    DCLNO_GpuSolverZ_FreeBuffers(ctx);
 
-    matrix_bytes = DCLNO_CheckedArrayBytes(DCLNO_CheckedMulCount((size_t)num, (size_t)num,
-                                                                 "GPUSOLVER NC dense matrix dimensions"),
-                                           sizeof(dcomplex),
-                                           "GPUSOLVER NC dense matrix buffer");
+    buffers[0] = &ctx->d_S;
+    buffers[1] = &ctx->d_H;
+    buffers[2] = &ctx->d_tmp;
+    buffers[3] = &ctx->d_scale;
+    bytes[0] = DCLNO_CheckedArrayBytes(DCLNO_CheckedMulCount((size_t)num, (size_t)num,
+                                                             "GPUSOLVER NC dense matrix dimensions"),
+                                       sizeof(dcomplex),
+                                       "GPUSOLVER NC dense matrix buffer");
+    bytes[1] = bytes[0];
+    bytes[2] = bytes[0];
+    bytes[3] = DCLNO_CheckedArrayBytes((size_t)num, sizeof(dcomplex), "GPUSOLVER NC scale buffer");
 
-    wait_hipfunc(hipMalloc((void**)&ctx->d_S, matrix_bytes));
-    wait_hipfunc(hipMalloc((void**)&ctx->d_H, matrix_bytes));
-    wait_hipfunc(hipMalloc((void**)&ctx->d_tmp, matrix_bytes));
-    wait_hipfunc(hipMalloc((void**)&ctx->d_scale,
-                             DCLNO_CheckedArrayBytes((size_t)num, sizeof(dcomplex),
-                                                     "GPUSOLVER NC scale buffer")));
-    wait_hipfunc(hipMalloc((void**)&ctx->d_W,
-                             DCLNO_CheckedArrayBytes((size_t)num, sizeof(double),
-                                                     "GPUSOLVER NC eigenvalue buffer")));
-    wait_hipfunc(hipMalloc((void**)&ctx->d_info, sizeof(int32_t)));
+    for (b = 0; b < 4; b++) {
+        if (hipMalloc((void**)buffers[b], bytes[b]) != hipSuccess) {
+            *buffers[b] = NULL;
+            (void)hipGetLastError();
+            DCLNO_GpuSolverZ_FreeBuffers(ctx);
+            return 0;
+        }
+    }
     ctx->h_scale = (dcomplex*)DCLNO_MallocArray((size_t)num, sizeof(dcomplex),
                                                 "GPUSOLVER NC host scale buffer");
 
     ctx->max_num = num;
+    return 1;
 }
 
-static void DCLNO_GpuSolverZ_EnsureWorkspace(int m, int maxn)
+/*
+   Eigenpairs of the m x m Hermitian matrix d_A (lower triangle): all m
+   vectors replace d_A, the lowest maxn eigenvalues go to W.  The solve is
+   openmx_hipsolver_zheevd_gpu, rocSOLVER's full-spectrum zheevd behind the
+   unitary phase similarity D^H A D (vectors D V) that sidesteps the ROCm
+   7.2 divide-and-conquer defect: INFO 0 with NaN vectors for a matrix whose
+   elements are all real (the overlap here, always; the Hamiltonian of a
+   non-collinear system without spin-orbit coupling) or that is block
+   diagonal (a non-magnetic one).  The zheevdx used before had no such
+   check; on gfx1200 (n=400-1200) it took 1.1-2x the time of the full
+   zheevd for all eigenpairs and 2.4-3.3x for 60 % of them, and with that
+   range it returned wrong eigenvalues (errors of 0.9) for a matrix of
+   exactly degenerate pairs at n=300 and 500.
+
+   0 on success; a positive value when the caller is to solve the local
+   problem again on the CPU: INFO or a hipSOLVER status (positive codes),
+   DCLNO_RETRY_NO_MEMORY (no memory for the solver) or DCLNO_RETRY_GPU_ERROR
+   (non-finite eigenpairs, MAGMA_ERR_UNKNOWN for non-finite vectors or a
+   failed device call, or another MAGMA error of the wrapper's MAGMA
+   retry).  A rejected argument and a wrong eigenpair count are fatal.
+*/
+static int DCLNO_GpuSolverZ_Eigen(dcomplex *d_A, int m, int maxn, double *W)
 {
     DCLNO_GpuSolverZCtx *ctx = &DCLNO_gpusolverz_ctx;
-    hipsolverEigMode_t  jobz = HIPSOLVER_EIG_MODE_VECTOR;
-    hipblasFillMode_t   uplo = HIPBLAS_FILL_MODE_LOWER;
-    hipsolverEigRange_t range;
-    double vl = 0.0, vu = 0.0;
-    int64_t h_meig = 0;
-    size_t d_bytes = 0, h_bytes = 0;
+    int                info, mout = 0, k;
+    char               msg[256];
 
-    if (m <= 0 || maxn <= 0 || maxn > m) {
-        DCLNO_AbortWithMessage("Invalid eigensolver dimensions in DCLNO_GpuSolverZ_EnsureWorkspace.");
+    if (m <= 0 || maxn <= 0 || maxn > m || d_A == NULL || W == NULL) {
+        DCLNO_AbortWithMessage("Invalid eigensolver arguments in DCLNO_GpuSolverZ_Eigen.");
     }
 
-    range = (m == maxn) ? HIPSOLVER_EIG_RANGE_ALL : HIPSOLVER_EIG_RANGE_I;
-
-    wait_hipfunc(hipsolverDnXsyevdx_bufferSize(ctx->gpusolver, NULL, jobz, range, uplo, m,
-                                               HIP_C_64F, ctx->d_tmp, m, &vl, &vu, 1L, maxn, &h_meig,
-                                               HIP_R_64F, ctx->d_W, HIP_C_64F, &d_bytes, &h_bytes));
-
-    if (ctx->d_work_bytes < d_bytes) {
-        if (ctx->d_work != NULL) wait_hipfunc(hipFree(ctx->d_work));
-        ctx->d_work = NULL;
-        if (0 < d_bytes) {
-            wait_hipfunc(hipMalloc((void**)&ctx->d_work, d_bytes));
-        }
-        ctx->d_work_bytes = d_bytes;
-    }
-
-    if (h_bytes == 0) {
-        free(ctx->h_work);
-        ctx->h_work = NULL;
-        ctx->h_work_bytes = 0;
-    }
-    else if (ctx->h_work_bytes < h_bytes) {
-        free(ctx->h_work);
-        ctx->h_work = DCLNO_MallocArray(h_bytes, 1, "GPUSOLVER NC host workspace");
-        ctx->h_work_bytes = h_bytes;
-    }
-}
-
-static void DCLNO_GpuSolverZ_Eigen(dcomplex *d_A, int m, int maxn, double *W)
-{
-    DCLNO_GpuSolverZCtx *ctx = &DCLNO_gpusolverz_ctx;
-    hipsolverEigMode_t  jobz = HIPSOLVER_EIG_MODE_VECTOR;
-    hipblasFillMode_t   uplo = HIPBLAS_FILL_MODE_LOWER;
-    hipsolverEigRange_t range;
-    double vl = 0.0, vu = 0.0;
-    int64_t h_meig = 0;
-    int32_t info = 0;
-
-    DCLNO_GpuSolverZ_EnsureWorkspace(m, maxn);
-
-    range = (m == maxn) ? HIPSOLVER_EIG_RANGE_ALL : HIPSOLVER_EIG_RANGE_I;
-
-    wait_hipfunc(hipsolverDnXsyevdx(ctx->gpusolver, NULL, jobz, range, uplo, m, HIP_C_64F,
-                                    d_A, m, &vl, &vu, 1L, maxn, &h_meig, HIP_R_64F, ctx->d_W,
-                                    HIP_C_64F, ctx->d_work, ctx->d_work_bytes,
-                                    ctx->h_work, ctx->h_work_bytes, ctx->d_info));
-    wait_hipfunc(hipMemcpyAsync(&info, ctx->d_info, sizeof(int32_t), hipMemcpyDeviceToHost, ctx->stream));
-    wait_hipfunc(hipMemcpyAsync(W, ctx->d_W,
-                                  DCLNO_CheckedArrayBytes((size_t)maxn, sizeof(double),
-                                                          "GPUSOLVER NC eigenvalue copy"),
-                                  hipMemcpyDeviceToHost, ctx->stream));
+    /* the solver runs on the null stream: d_A must be complete */
     wait_hipfunc(hipStreamSynchronize(ctx->stream));
 
-    if (info != 0) {
-        fprintf(stderr, "hipsolverDnXsyevdx failed in DC-LNO (NC): info=%d\n", (int)info);
-        DCLNO_AbortWithMessage("hipsolverDnXsyevdx (complex) failed in Divide_Conquer_LNO.c.");
+    info = openmx_hipsolver_zheevd_gpu(m, maxn, (void*)d_A, W, &mout);
+    if (info == 0) {
+        for (k = 0; k < maxn; k++) {
+            if (!isfinite(W[k])) return DCLNO_RETRY_GPU_ERROR;
+        }
+        if (mout != maxn) {
+            snprintf(msg, sizeof(msg),
+                     "openmx_hipsolver_zheevd_gpu returned %d eigenpairs in DC-LNO (NC), expected %d.",
+                     mout, maxn);
+            DCLNO_AbortWithMessage(msg);
+        }
+        return 0;
     }
+
+    /* a failure returns before the solver's closing device synchronization */
+    (void)hipDeviceSynchronize();
+    (void)hipGetLastError();
+    if (info == DCLNO_MAGMA_ERR_HOST_ALLOC || info == DCLNO_MAGMA_ERR_DEVICE_ALLOC) return DCLNO_RETRY_NO_MEMORY;
+    if ((DCLNO_MAGMA_ERR < info && info < 0) || info == DCLNO_MAGMA_ERR_ILLEGAL_VALUE) {
+        snprintf(msg, sizeof(msg),
+                 "openmx_hipsolver_zheevd_gpu rejected an argument in DC-LNO (NC): info=%d n=%d requested=%d",
+                 info, m, maxn);
+        DCLNO_AbortWithMessage(msg);
+    }
+    if (info < 0) {
+        if (info != DCLNO_MAGMA_ERR_UNKNOWN) {
+            fprintf(stderr, "<DC-LNO> openmx_hipsolver_zheevd_gpu failed with MAGMA error %d: n=%d requested=%d\n",
+                    info, m, maxn);
+            fflush(stderr);
+        }
+        return DCLNO_RETRY_GPU_ERROR;
+    }
+    return info;
+}
+
+/* A hipBLAS/GEMMul8 call of the noncollinear GPU solve that returned an
+   error: the local problem goes back to the CPU like after a failed
+   eigensolve, and an allocation failure keeps the remaining tasks of the
+   call there. */
+static int DCLNO_NonColGpuCallFailed(const char *what, int status, int n, int requested)
+{
+    const int retry = (status == HIPBLAS_STATUS_ALLOC_FAILED) ? DCLNO_RETRY_NO_MEMORY
+                                                              : DCLNO_RETRY_GPU_ERROR;
+
+    (void)hipStreamSynchronize(DCLNO_gpusolverz_ctx.stream);
+    (void)hipGetLastError();
+    fprintf(stderr, "<DC-LNO> %s failed in the noncollinear GPU solve: status=%d n=%d requested=%d; "
+            "retrying on CPU.\n", what, status, n, requested);
+    fflush(stderr);
+    return retry;
 }
 
 /*
@@ -815,15 +1016,29 @@ static void DCLNO_GpuSolverZ_Eigen(dcomplex *d_A, int m, int maxn, double *W)
    TRANSPOSE (= conjugate for a Hermitian matrix) of the transformed
    Hamiltonian and stores the back-transformed eigenvectors transposed
    (state-major rows with leading dimension NUM) into Hmat.
+
+   The CPU flow transforms with T = diag(U s^{-1/2}, U s^{-1/2}) built from
+   the real vectors U its solver finds for the real overlap, and the vectors
+   of conj(H') = T^H conj(H) T then belong to conj(H) and S through T.  The
+   phase similarity of the GPU solver returns U with complex phases (and a
+   degenerate overlap eigenvalue may mix its vectors), so the back
+   transformation uses conj(T), which is T for a real U: conj(T)^H S conj(T)
+   = 1 because S is real, and conj(H') = conj(T)^H conj(H) conj(T).
+
+   On a positive return (DCLNO_GpuSolverZ_Eigen's codes, also
+   DCLNO_RETRY_NO_MEMORY and DCLNO_RETRY_GPU_ERROR for the buffers and the
+   products) Smat and Hmat still hold the original host matrices: the device
+   works on copies and writes Hmat back only at the end.  The caller then
+   solves the local problem again on the CPU; ko is scratch until success.
 */
-static void DCLNO_Solve_NonCol_GpuSolver(int NUM, int NUMH, int NUM2, int rebuild_s,
-                                         const dcomplex *Smat, dcomplex *Hmat, double *ko)
+static int DCLNO_Solve_NonCol_GpuSolver(int NUM, int NUMH, int NUM2, int rebuild_s,
+                                        const dcomplex *Smat, dcomplex *Hmat, double *ko)
 {
     DCLNO_GpuSolverZCtx *ctx = &DCLNO_gpusolverz_ctx;
     hipDoubleComplex zone  = make_hipDoubleComplex(1.0, 0.0);
     hipDoubleComplex zzero = make_hipDoubleComplex(0.0, 0.0);
     size_t full_bytes;
-    int l;
+    int l, info, status;
 
     if (NUM <= 0 || NUM2 <= 0 || NUM2 > NUM || 2*NUMH != NUM) {
         DCLNO_AbortWithMessage("Invalid matrix dimensions in DCLNO_Solve_NonCol_GpuSolver.");
@@ -837,7 +1052,10 @@ static void DCLNO_Solve_NonCol_GpuSolver(int NUM, int NUMH, int NUM2, int rebuil
                                          sizeof(dcomplex),
                                          "GPUSOLVER NC full matrix copy");
 
-    DCLNO_GpuSolverZ_EnsureMatrixCapacity(NUM);
+    if (!DCLNO_GpuSolverZ_EnsureMatrixCapacity(NUM)) {
+        DCLNO_ReportGpuRetry("noncollinear", DCLNO_RETRY_NO_MEMORY, NUM, NUM2);
+        return DCLNO_RETRY_NO_MEMORY;
+    }
 
     wait_hipfunc(hipMemcpyAsync(ctx->d_H, Hmat, full_bytes, hipMemcpyHostToDevice, ctx->stream));
 
@@ -851,7 +1069,12 @@ static void DCLNO_Solve_NonCol_GpuSolver(int NUM, int NUMH, int NUM2, int rebuil
                                                           "GPUSOLVER NC overlap copy"),
                                   hipMemcpyHostToDevice, ctx->stream));
 
-    DCLNO_GpuSolverZ_Eigen(ctx->d_tmp, NUMH, NUMH, ko + 1);
+    info = DCLNO_GpuSolverZ_Eigen(ctx->d_tmp, NUMH, NUMH, ko + 1);
+    if (info == 0 && DCLNO_RetryTest()) info = 1;
+    if (info > 0) {
+        DCLNO_ReportGpuRetry("noncollinear overlap", info, NUMH, NUMH);
+        return info;
+    }
 
     for (l = 1; l <= NUMH; l++) {
         ko[l] = 1.0 / sqrt(fabs(ko[l]));
@@ -867,10 +1090,11 @@ static void DCLNO_Solve_NonCol_GpuSolver(int NUM, int NUMH, int NUM2, int rebuil
     wait_hipfunc(hipMemsetAsync(ctx->d_S, 0, full_bytes, ctx->stream));
 
     /* top-left block: U * s^{-1/2}, written with leading dimension NUM */
-    wait_hipfunc(hipblasZdgmm(ctx->hipblas, HIPBLAS_SIDE_RIGHT, NUMH, NUMH,
-                              (hipDoubleComplex*)ctx->d_tmp, NUMH,
-                              (hipDoubleComplex*)ctx->d_scale, 1,
-                              (hipDoubleComplex*)ctx->d_S, NUM));
+    status = hipblasZdgmm(ctx->hipblas, HIPBLAS_SIDE_RIGHT, NUMH, NUMH,
+                          (hipDoubleComplex*)ctx->d_tmp, NUMH,
+                          (hipDoubleComplex*)ctx->d_scale, 1,
+                          (hipDoubleComplex*)ctx->d_S, NUM);
+    if (status != HIPBLAS_STATUS_SUCCESS) return DCLNO_NonColGpuCallFailed("hipblasZdgmm", status, NUM, NUM2);
 
     /* bottom-right block: copy of the top-left block */
     wait_hipfunc(hipMemcpy2DAsync(ctx->d_S + (size_t)NUMH * (size_t)NUM + (size_t)NUMH,
@@ -883,32 +1107,41 @@ static void DCLNO_Solve_NonCol_GpuSolver(int NUM, int NUMH, int NUM2, int rebuil
 
     /* H' = T^H * H * T */
 
-    wait_hipfunc(openmx_gemmul8Zgemm(ctx->hipblas, HIPBLAS_OP_N, HIPBLAS_OP_N, NUM, NUM, NUM, &zone,
-                                      (hipDoubleComplex*)ctx->d_H, NUM,
-                                      (hipDoubleComplex*)ctx->d_S, NUM, &zzero,
-                                      (hipDoubleComplex*)ctx->d_tmp, NUM));
+    status = openmx_gemmul8Zgemm(ctx->hipblas, HIPBLAS_OP_N, HIPBLAS_OP_N, NUM, NUM, NUM, &zone,
+                                 (hipDoubleComplex*)ctx->d_H, NUM,
+                                 (hipDoubleComplex*)ctx->d_S, NUM, &zzero,
+                                 (hipDoubleComplex*)ctx->d_tmp, NUM);
+    if (status != HIPBLAS_STATUS_SUCCESS) return DCLNO_NonColGpuCallFailed("ZGEMM H*T", status, NUM, NUM2);
 
-    wait_hipfunc(openmx_gemmul8Zgemm(ctx->hipblas, HIPBLAS_OP_C, HIPBLAS_OP_N, NUM, NUM, NUM, &zone,
-                                      (hipDoubleComplex*)ctx->d_S, NUM,
-                                      (hipDoubleComplex*)ctx->d_tmp, NUM, &zzero,
-                                      (hipDoubleComplex*)ctx->d_H, NUM));
+    status = openmx_gemmul8Zgemm(ctx->hipblas, HIPBLAS_OP_C, HIPBLAS_OP_N, NUM, NUM, NUM, &zone,
+                                 (hipDoubleComplex*)ctx->d_S, NUM,
+                                 (hipDoubleComplex*)ctx->d_tmp, NUM, &zzero,
+                                 (hipDoubleComplex*)ctx->d_H, NUM);
+    if (status != HIPBLAS_STATUS_SUCCESS) return DCLNO_NonColGpuCallFailed("ZGEMM T^H*(H*T)", status, NUM, NUM2);
 
     /* d_tmp = (H')^T = conj(H'), matching the CPU packing into C */
-    wait_hipfunc(hipblasZgeam(ctx->hipblas, HIPBLAS_OP_T, HIPBLAS_OP_N, NUM, NUM,
-                              &zone, (hipDoubleComplex*)ctx->d_H, NUM,
-                              &zzero, (hipDoubleComplex*)ctx->d_H, NUM,
-                              (hipDoubleComplex*)ctx->d_tmp, NUM));
+    status = hipblasZgeam(ctx->hipblas, HIPBLAS_OP_T, HIPBLAS_OP_N, NUM, NUM,
+                          &zone, (hipDoubleComplex*)ctx->d_H, NUM,
+                          &zzero, (hipDoubleComplex*)ctx->d_H, NUM,
+                          (hipDoubleComplex*)ctx->d_tmp, NUM);
+    if (status != HIPBLAS_STATUS_SUCCESS) return DCLNO_NonColGpuCallFailed("hipblasZgeam", status, NUM, NUM2);
 
-    DCLNO_GpuSolverZ_Eigen(ctx->d_tmp, NUM, NUM2, ko + 1);
+    info = DCLNO_GpuSolverZ_Eigen(ctx->d_tmp, NUM, NUM2, ko + 1);
+    if (info > 0) {
+        DCLNO_ReportGpuRetry("noncollinear Hamiltonian", info, NUM, NUM2);
+        return info;
+    }
 
-    /* Hmat(state, basis) = (T * V)^T = V^T * T^T, stored with ld NUM */
-    wait_hipfunc(openmx_gemmul8Zgemm(ctx->hipblas, HIPBLAS_OP_T, HIPBLAS_OP_T, NUM2, NUM, NUM, &zone,
-                                      (hipDoubleComplex*)ctx->d_tmp, NUM,
-                                      (hipDoubleComplex*)ctx->d_S, NUM, &zzero,
-                                      (hipDoubleComplex*)ctx->d_H, NUM));
+    /* Hmat(state, basis) = (conj(T) * V)^T = V^T * T^H, stored with ld NUM */
+    status = openmx_gemmul8Zgemm(ctx->hipblas, HIPBLAS_OP_T, HIPBLAS_OP_C, NUM2, NUM, NUM, &zone,
+                                 (hipDoubleComplex*)ctx->d_tmp, NUM,
+                                 (hipDoubleComplex*)ctx->d_S, NUM, &zzero,
+                                 (hipDoubleComplex*)ctx->d_H, NUM);
+    if (status != HIPBLAS_STATUS_SUCCESS) return DCLNO_NonColGpuCallFailed("ZGEMM V^T*T^H", status, NUM, NUM2);
 
     wait_hipfunc(hipMemcpyAsync(Hmat, ctx->d_H, full_bytes, hipMemcpyDeviceToHost, ctx->stream));
     wait_hipfunc(hipStreamSynchronize(ctx->stream));
+    return 0;
 }
 
 /* ------------------------------------------------------------------ */
@@ -958,27 +1191,7 @@ static void DCLNO_GpuSolverZ_ReleaseDeviceMemory(void)
 
     if (!ctx->initialized) return;
 
-    if (ctx->stream != NULL) wait_hipfunc(hipStreamSynchronize(ctx->stream));
-
-    if (ctx->d_S != NULL)     wait_hipfunc(hipFree(ctx->d_S));
-    if (ctx->d_H != NULL)     wait_hipfunc(hipFree(ctx->d_H));
-    if (ctx->d_tmp != NULL)   wait_hipfunc(hipFree(ctx->d_tmp));
-    if (ctx->d_scale != NULL) wait_hipfunc(hipFree(ctx->d_scale));
-    if (ctx->d_W != NULL)     wait_hipfunc(hipFree(ctx->d_W));
-    if (ctx->d_info != NULL)  wait_hipfunc(hipFree(ctx->d_info));
-    if (ctx->d_work != NULL)  wait_hipfunc(hipFree(ctx->d_work));
-    free(ctx->h_scale);
-
-    ctx->d_S = NULL;
-    ctx->d_H = NULL;
-    ctx->d_tmp = NULL;
-    ctx->d_scale = NULL;
-    ctx->h_scale = NULL;
-    ctx->d_W = NULL;
-    ctx->d_info = NULL;
-    ctx->d_work = NULL;
-    ctx->d_work_bytes = 0;
-    ctx->max_num = 0;
+    DCLNO_GpuSolverZ_FreeBuffers(ctx);
 }
 
 /*
@@ -1009,7 +1222,7 @@ static int DCLNO_GpuGroupMemoryFits(int max_msize, int is_complex)
                        : openmx_gemmul8DWorkspaceSize(max_msize, max_msize, max_msize);
     need += overhead;
 
-    if (hipMemGetInfo(&free_bytes, &total_bytes) != hipSuccess) {
+    if (OpenMX_GpuMemGetInfo(&free_bytes, &total_bytes) != hipSuccess) {
         free_bytes = 0;
     }
 
@@ -1040,7 +1253,9 @@ static int DCLNO_GpuGroupMemoryFits(int max_msize, int is_complex)
 /* node-local proxy service                                           */
 /* ------------------------------------------------------------------ */
 
-static void DCLNO_GPUProxy_Col_Service(int active,
+/* Return this rank's retry status.  A remote task retries at its origin,
+   whose CPU scratch is sized for that task rather than for the GPU owner. */
+static int DCLNO_GPUProxy_Col_Service(int active,
                                        int NUM,
                                        int NUM2,
                                        double *Smat,
@@ -1051,12 +1266,13 @@ static void DCLNO_GPUProxy_Col_Service(int active,
     int rank, size, src;
     int myinfo[3], *allinfo;
     int any_active = 0;
+    int retry_info = 0;
     double **recv_Sbuf = NULL;
     double **recv_Hbuf = NULL;
     MPI_Request *recv_Sreq = NULL;
     MPI_Request *recv_Hreq = NULL;
 
-    if (DCLNO_gpu_group_comm == MPI_COMM_NULL) return;
+    if (DCLNO_gpu_group_comm == MPI_COMM_NULL) return 0;
 
     MPI_Comm_rank(DCLNO_gpu_group_comm, &rank);
     MPI_Comm_size(DCLNO_gpu_group_comm, &size);
@@ -1078,7 +1294,7 @@ static void DCLNO_GPUProxy_Col_Service(int active,
 
     if (!any_active) {
         free(allinfo);
-        return;
+        return 0;
     }
 
     if (rank == 0) {
@@ -1120,8 +1336,8 @@ static void DCLNO_GPUProxy_Col_Service(int active,
 
         /* owner handles its own task first */
         if (active) {
-            DCLNO_Solve_Col_GpuSolver(NUM, NUM2, Smat, Hmat, ko);
-            DCLNO_CopyPackedEigvecsToC(Hmat, NUM, NUM2, C);
+            retry_info = DCLNO_Solve_Col_GpuSolver(NUM, NUM2, Smat, Hmat, ko);
+            if (retry_info == 0) DCLNO_CopyPackedEigvecsToC(Hmat, NUM, NUM2, C);
         }
 
         /* then serve other ranks in the group */
@@ -1135,6 +1351,7 @@ static void DCLNO_GPUProxy_Col_Service(int active,
             {
                 double *Sbuf, *Hbuf;
                 double *kbuf;
+                int solve_info;
 
                 MPI_Wait(&recv_Sreq[src], MPI_STATUS_IGNORE);
                 MPI_Wait(&recv_Hreq[src], MPI_STATUS_IGNORE);
@@ -1144,12 +1361,16 @@ static void DCLNO_GPUProxy_Col_Service(int active,
                 kbuf = (double*)DCLNO_MallocArray((size_t)(s_num + 2), sizeof(double),
                                                  "GPU proxy eigenvalue buffer");
 
-                DCLNO_Solve_Col_GpuSolver(s_num, s_num2, Sbuf, Hbuf, kbuf);
+                solve_info = DCLNO_Solve_Col_GpuSolver(s_num, s_num2, Sbuf, Hbuf, kbuf);
 
-                MPI_Send(&kbuf[1], s_num2, MPI_DOUBLE, src,
-                         DCLNO_PROXY_TAG_COL_EVAL, DCLNO_gpu_group_comm);
-                MPI_Send(Hbuf, s_num*s_num2, MPI_DOUBLE, src,
-                         DCLNO_PROXY_TAG_COL_CVEC, DCLNO_gpu_group_comm);
+                MPI_Send(&solve_info, 1, MPI_INT, src,
+                         DCLNO_PROXY_TAG_COL_STATUS, DCLNO_gpu_group_comm);
+                if (solve_info == 0) {
+                    MPI_Send(&kbuf[1], s_num2, MPI_DOUBLE, src,
+                             DCLNO_PROXY_TAG_COL_EVAL, DCLNO_gpu_group_comm);
+                    MPI_Send(Hbuf, s_num*s_num2, MPI_DOUBLE, src,
+                             DCLNO_PROXY_TAG_COL_CVEC, DCLNO_gpu_group_comm);
+                }
 
                 free(Sbuf);
                 free(Hbuf);
@@ -1173,17 +1394,22 @@ static void DCLNO_GPUProxy_Col_Service(int active,
         MPI_Send(Hmat, NUM*NUM, MPI_DOUBLE, 0,
                  DCLNO_PROXY_TAG_COL_H, DCLNO_gpu_group_comm);
 
-        MPI_Recv(&ko[1], NUM2, MPI_DOUBLE, 0,
-                 DCLNO_PROXY_TAG_COL_EVAL, DCLNO_gpu_group_comm, MPI_STATUS_IGNORE);
-        MPI_Recv(Cbuf, NUM*NUM2, MPI_DOUBLE, 0,
-                 DCLNO_PROXY_TAG_COL_CVEC, DCLNO_gpu_group_comm, MPI_STATUS_IGNORE);
+        MPI_Recv(&retry_info, 1, MPI_INT, 0,
+                 DCLNO_PROXY_TAG_COL_STATUS, DCLNO_gpu_group_comm, MPI_STATUS_IGNORE);
+        if (retry_info == 0) {
+            MPI_Recv(&ko[1], NUM2, MPI_DOUBLE, 0,
+                     DCLNO_PROXY_TAG_COL_EVAL, DCLNO_gpu_group_comm, MPI_STATUS_IGNORE);
+            MPI_Recv(Cbuf, NUM*NUM2, MPI_DOUBLE, 0,
+                     DCLNO_PROXY_TAG_COL_CVEC, DCLNO_gpu_group_comm, MPI_STATUS_IGNORE);
 
-        DCLNO_CopyPackedEigvecsToC(Cbuf, NUM, NUM2, C);
+            DCLNO_CopyPackedEigvecsToC(Cbuf, NUM, NUM2, C);
+        }
 
         free(Cbuf);
     }
 
     free(allinfo);
+    return retry_info;
 }
 
 /* ------------------------------------------------------------------ */
@@ -1264,11 +1490,16 @@ static double DC_Col(char * mode, int MD_iter, int SCF_iter, int SucceedReadingD
     int             use_gpu_accel, use_gpu_proxy;
     int             gpu_group_max_msize;
     int             group_max_atoms, atom_slot;
-    int             have_local_atom, use_gpu_task;
+    int             have_local_atom, use_gpu_task, gpu_retry_info;
+    int             gpu_no_memory = 0;
     int             gpu_tasks = 0;
     double          gpu_seconds = 0.0;
     int             gpu_profile = 0;
     size_t          eig_matrix_count, eig_work_count, eig_iwork_count;
+    int             profile_enabled, timed;
+    unsigned long long profile_hist[2 * DCLNO_PROFILE_BINS] = {0};
+    int             profile_min[2] = {INT_MAX, INT_MAX}, profile_max[2] = {0, 0};
+    double          profile_solve[2] = {0.0, 0.0};
 
     MPI_Comm_size(mpi_comm_level1, &numprocs0);
     MPI_Comm_rank(mpi_comm_level1, &myid0);
@@ -1302,6 +1533,9 @@ static double DC_Col(char * mode, int MD_iter, int SCF_iter, int SucceedReadingD
 
         return 0.0;
     }
+
+    profile_enabled = DCLNO_ProfileEnabled();
+    timed = measure_time || profile_enabled;
 
     time0 = 0.0;
     time1 = 0.0;
@@ -1827,7 +2061,7 @@ static double DC_Col(char * mode, int MD_iter, int SCF_iter, int SucceedReadingD
 
         if (have_local_atom) {
             dtime(&Stime_atom);
-            if (measure_time) dtime(&stime);
+            if (timed) dtime(&stime);
 
             Mc_AN = atom_slot;
             Gc_AN = M2G[Mc_AN];
@@ -2058,7 +2292,7 @@ static double DC_Col(char * mode, int MD_iter, int SCF_iter, int SucceedReadingD
                 }
             }
 
-            if (measure_time) {
+            if (timed) {
                 dtime(&etime);
                 time1 += etime - stime;
             }
@@ -2070,6 +2304,7 @@ static double DC_Col(char * mode, int MD_iter, int SCF_iter, int SucceedReadingD
 
         for (spin = 0; spin <= SpinP_switch; spin++) {
 
+            gpu_retry_info = 0;
             if (have_local_atom) {
                 Mc_AN = atom_slot;
                 Gc_AN = M2G[Mc_AN];
@@ -2084,21 +2319,34 @@ static double DC_Col(char * mode, int MD_iter, int SCF_iter, int SucceedReadingD
                     if (NUM2 < 1)   NUM2 = NUM;
                 }
 
+                /* a direct-dispatch rank whose MAGMA solve found no device
+                   memory keeps its remaining tasks of this call on the CPU */
                 use_gpu_task = (use_gpu_accel && NUM >= DCLNO_GpuEigenThreshold() &&
+                                (use_gpu_proxy || !gpu_no_memory) &&
                                 (use_gpu_proxy || DCLNO_is_gpu_owner ||
                                  DCLNO_gpu_group_size == 1 || DCLNO_GpuOwnerThreshold() == 0 ||
                                  NUM < DCLNO_GpuOwnerThreshold()));
 
-                if (measure_time) dtime(&stime);
+                if (profile_enabled) {
+                    const int path = use_gpu_task ? 1 : 0;
+                    profile_hist[path * DCLNO_PROFILE_BINS + DCLNO_ProfileBin(NUM)]++;
+                    if (NUM < profile_min[path]) profile_min[path] = NUM;
+                    if (NUM > profile_max[path]) profile_max[path] = NUM;
+                }
+
+                if (timed) dtime(&stime);
 
                 if (use_gpu_task && !use_gpu_proxy) {
                     double gpu_start = 0.0, gpu_stop;
                     if (gpu_profile) dtime(&gpu_start);
-                    DCLNO_Solve_Col_GpuSolver(NUM, NUM2,
-                                             &BLAS_OLP[spin * NUM * NUM],
-                                             &BLAS_H[spin * NUM * NUM],
-                                             ko);
-                    DCLNO_CopyPackedEigvecsToC(&BLAS_H[spin * NUM * NUM], NUM, NUM2, C);
+                    gpu_retry_info = DCLNO_Solve_Col_GpuSolver(NUM, NUM2,
+                                                               &BLAS_OLP[spin * NUM * NUM],
+                                                               &BLAS_H[spin * NUM * NUM],
+                                                               ko);
+                    if (gpu_retry_info == 0)
+                        DCLNO_CopyPackedEigvecsToC(&BLAS_H[spin * NUM * NUM], NUM, NUM2, C);
+                    else if (gpu_retry_info == DCLNO_RETRY_NO_MEMORY)
+                        gpu_no_memory = 1;
                     if (gpu_profile) {
                         dtime(&gpu_stop);
                         gpu_seconds += gpu_stop - gpu_start;
@@ -2126,7 +2374,7 @@ static double DC_Col(char * mode, int MD_iter, int SCF_iter, int SucceedReadingD
             }
 
             if (use_gpu_proxy && DCLNO_gpu_group_size > 1) {
-                DCLNO_GPUProxy_Col_Service(use_gpu_task,
+                gpu_retry_info = DCLNO_GPUProxy_Col_Service(use_gpu_task,
                                            NUM,
                                            NUM2,
                                            (have_local_atom ? &BLAS_OLP[spin * NUM * NUM] : NULL),
@@ -2136,12 +2384,30 @@ static double DC_Col(char * mode, int MD_iter, int SCF_iter, int SucceedReadingD
 
             if (!have_local_atom) continue;
 
-            if (measure_time) {
-                dtime(&etime);
-                time2 += etime - stime;
+            if (gpu_retry_info > 0) {
+                /* Both direct and proxy failures retain these host inputs.
+                   Retry here so remote tasks use their origin's scratch. */
+                DCLNO_Solve_Col_Local(NUM, NUM2,
+                                      &BLAS_OLP[spin * NUM * NUM],
+                                      &BLAS_H[spin * NUM * NUM],
+                                      C, ko, BLAS_Tmp,
+                                      BLAS_Eig_A, BLAS_Eig_Work, BLAS_Eig_IWork);
             }
 
-            if (measure_time) dtime(&stime);
+            if (timed) {
+                dtime(&etime);
+                time2 += etime - stime;
+                if (profile_enabled) profile_solve[use_gpu_task ? 1 : 0] += etime - stime;
+                if (profile_enabled && myid0 == Host_ID &&
+                    (atom_slot == 1 || atom_slot % 32 == 0)) {
+                    printf("<DC-LNO sample> MD=%d SCF=%d atom=%d/%d spin=%d %s n=%d requested=%d solve=%.6f s\n",
+                           MD_iter, SCF_iter, atom_slot, Matomnum, spin,
+                           use_gpu_task ? "GPU" : "CPU", NUM, NUM2, etime - stime);
+                    fflush(stdout);
+                }
+            }
+
+            if (timed) dtime(&stime);
 
             Mc_AN = atom_slot;
             Gc_AN = M2G[Mc_AN];
@@ -2203,6 +2469,8 @@ static double DC_Col(char * mode, int MD_iter, int SCF_iter, int SucceedReadingD
               store residues
             ******************************************************/
 
+            DCLNO_AllocateResidueValues(Residues[spin][Mc_AN - 1], Gc_AN, n2);
+
             wanA = WhatSpecies[Gc_AN];
             tno1 = Spe_Total_CNO[wanA];
 
@@ -2217,8 +2485,6 @@ static double DC_Col(char * mode, int MD_iter, int SCF_iter, int SucceedReadingD
                     for (j = 0; j < tno2; j++) {
 
                         size_Residues += n2;
-                        Residues[spin][Mc_AN - 1][h_AN][i][j] =
-                            (double*)DCLNO_MallocArray((size_t)n2, sizeof(double), "residue value row");
                         Residues[spin][Mc_AN - 1][h_AN][i][j][0] = 0.0;
                         Residues[spin][Mc_AN - 1][h_AN][i][j][1] = 0.0;
 
@@ -2237,7 +2503,7 @@ static double DC_Col(char * mode, int MD_iter, int SCF_iter, int SucceedReadingD
                 }
             }
 
-            if (measure_time) {
+            if (timed) {
                 dtime(&etime);
                 time3 += etime - stime;
             }
@@ -2255,7 +2521,7 @@ static double DC_Col(char * mode, int MD_iter, int SCF_iter, int SucceedReadingD
 
     if (strcasecmp(mode, "scf") == 0 || strcasecmp(mode, "full") == 0) {
 
-        if (measure_time) dtime(&stime);
+        if (timed) dtime(&stime);
 
         for (spin = 0; spin <= SpinP_switch; spin++) {
             for (Mc_AN = 1; Mc_AN <= Matomnum; Mc_AN++) {
@@ -2290,7 +2556,7 @@ static double DC_Col(char * mode, int MD_iter, int SCF_iter, int SucceedReadingD
             }
         }
 
-        if (measure_time) {
+        if (timed) {
             dtime(&etime);
             time6 += etime - stime;
         }
@@ -2300,7 +2566,7 @@ static double DC_Col(char * mode, int MD_iter, int SCF_iter, int SucceedReadingD
         ****************************************************/
 
         MPI_Barrier(mpi_comm_level1);
-        if (measure_time) dtime(&stime);
+        if (timed) dtime(&stime);
 
         po    = 0;
         loopN = 0;
@@ -2354,7 +2620,7 @@ static double DC_Col(char * mode, int MD_iter, int SCF_iter, int SucceedReadingD
             loopN++;
         } while (po == 0 && loopN < 1000);
 
-        if (measure_time) {
+        if (timed) {
             dtime(&etime);
             time7 += etime - stime;
         }
@@ -2363,7 +2629,7 @@ static double DC_Col(char * mode, int MD_iter, int SCF_iter, int SucceedReadingD
           eigenenergy
         ****************************************************/
 
-        if (measure_time) dtime(&stime);
+        if (timed) dtime(&stime);
 
         My_Eele0[0] = 0.0;
         My_Eele0[1] = 0.0;
@@ -2392,7 +2658,7 @@ static double DC_Col(char * mode, int MD_iter, int SCF_iter, int SucceedReadingD
 
         if (SpinP_switch == 0) Eele0[1] = Eele0[0];
 
-        if (measure_time) {
+        if (timed) {
             dtime(&etime);
             time8 += etime - stime;
         }
@@ -2401,7 +2667,7 @@ static double DC_Col(char * mode, int MD_iter, int SCF_iter, int SucceedReadingD
           CDM / EDM
         ****************************************************/
 
-        if (measure_time) dtime(&stime);
+        if (timed) dtime(&stime);
 
         for (spin = 0; spin <= SpinP_switch; spin++) {
             for (Mc_AN = 1; Mc_AN <= Matomnum; Mc_AN++) {
@@ -2478,7 +2744,7 @@ static double DC_Col(char * mode, int MD_iter, int SCF_iter, int SucceedReadingD
 
         if (SpinP_switch == 0) Eele1[1] = Eele1[0];
 
-        if (measure_time) {
+        if (timed) {
             dtime(&etime);
             time9 += etime - stime;
         }
@@ -2486,6 +2752,13 @@ static double DC_Col(char * mode, int MD_iter, int SCF_iter, int SucceedReadingD
 
     else if (strcasecmp(mode, "dos") == 0) {
         Save_DOS_Col(Residues, OLP0, EVal, LO_TC, HO_TC);
+    }
+
+    if (profile_enabled) {
+        const double seconds[10] = {time0, time1, time2, time3, time6, time7,
+                                    time8, time9, profile_solve[0], profile_solve[1]};
+        DCLNO_ProfileReport(MD_iter, SCF_iter, myid0, numprocs0,
+                            profile_hist, profile_min, profile_max, seconds);
     }
 
     if (measure_time) {
@@ -2533,15 +2806,15 @@ static double DC_Col(char * mode, int MD_iter, int SCF_iter, int SucceedReadingD
             wanA  = WhatSpecies[Gc_AN];
             tno1  = Spe_Total_CNO[wanA];
 
+            /* the self pair's first row owns the atom's value block */
+            free(Residues[spin][Mc_AN][0][0][0]);
+
             for (h_AN = 0; h_AN <= FNAN[Gc_AN]; h_AN++) {
                 Gh_AN = natn[Gc_AN][h_AN];
                 wanB  = WhatSpecies[Gh_AN];
                 tno2  = Spe_Total_CNO[wanB];
 
                 for (i = 0; i < tno1; i++) {
-                    for (j = 0; j < tno2; j++) {
-                        free(Residues[spin][Mc_AN][h_AN][i][j]);
-                    }
                     free(Residues[spin][Mc_AN][h_AN][i]);
                 }
                 free(Residues[spin][Mc_AN][h_AN]);
@@ -2640,6 +2913,7 @@ static double DC_NonCol(char *mode,
   double time5,time6,time7,time8;
   int Eigen_MPI_flag,bcast_flag;
   int use_gpu_accel_nc,use_gpu_task_nc;
+  int gpu_retry_info_nc = 0, gpu_no_memory_nc = 0;
   double sum1,sum2,sum4;
   int i1s, j1s;
 
@@ -4104,8 +4378,11 @@ static double DC_NonCol(char *mode,
 
     if (measure_time) dtime(&stime);
 
-    use_gpu_task_nc = (use_gpu_accel_nc && Eigen_MPI_flag==0 &&
+    /* a rank whose GPU solve found no device memory keeps its remaining
+       tasks of this call on the CPU */
+    use_gpu_task_nc = (use_gpu_accel_nc && !gpu_no_memory_nc && Eigen_MPI_flag==0 &&
                        DCLNO_NonColGpuEigenThreshold() <= NUM);
+    gpu_retry_info_nc = 0;
 
     if (use_gpu_task_nc){
 
@@ -4118,15 +4395,20 @@ static double DC_NonCol(char *mode,
         if (NUM<NUM2) NUM2 = NUM;
       }
 
-      DCLNO_Solve_NonCol_GpuSolver(NUM, NUMH, NUM2, LNO_recalc_flag,
-                                   BLAS_OLP, BLAS_H, ko);
+      gpu_retry_info_nc = DCLNO_Solve_NonCol_GpuSolver(NUM, NUMH, NUM2, LNO_recalc_flag,
+                                                       BLAS_OLP, BLAS_H, ko);
+      if (gpu_retry_info_nc == DCLNO_RETRY_NO_MEMORY) gpu_no_memory_nc = 1;
 
       if (measure_time){
         dtime(&etime);
         time3 += etime - stime;
       }
     }
-    else{
+
+    /* the CPU flow, also the retry of a failed GPU solve: that one left
+       BLAS_OLP and BLAS_H as they were, and since the GPU path requires
+       Eigen_MPI_flag==0 the eigensolver communicator holds this rank alone */
+    if (!use_gpu_task_nc || 0 < gpu_retry_info_nc){
 
     /* if (LNO_recalc_flag==1) */
 
@@ -4443,7 +4725,7 @@ static double DC_NonCol(char *mode,
       time3 += etime - stime;
     }
 
-    } /* else: CPU eigensolver fallback */
+    } /* CPU eigensolver: fallback and retry */
 
     /***********************************************
         store eigenvalues and residues of poles
@@ -5147,11 +5429,15 @@ static double DC_NonCol(char *mode,
   if (SCF_iter==2) firsttime=0;
 
   /* for time */
-  /* free the GEMMul8 workspace and solver buffers so the grid/force phases
-     of this SCF step see the memory; handles stay alive. */
+  /* free the GEMMul8 workspace, the zheevd scratch and the solver buffers
+     so the grid/force phases of this SCF step see the memory; handles stay
+     alive.  MAGMA's own GEMMul8 cache is filled when a failed rocSOLVER
+     solve was solved again with MAGMA Ozaki-II (openmx_hipsolver_zheevd_gpu). */
   if (use_gpu_accel_nc && DCLNO_GpuTurnRelease()) {
     DCLNO_GpuSolverZ_ReleaseDeviceMemory();
     openmx_gemmul8ReleaseWorkspaces();
+    (void)openmx_hipsolver_release_workspace();
+    magma_ozaki2_release_workspaces();
   }
 
   dtime(&TEtime);

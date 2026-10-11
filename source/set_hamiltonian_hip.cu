@@ -1,6 +1,7 @@
 #include <hip/hip_runtime.h>
 
 #include <cstddef>
+#include <cstdint>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -84,8 +85,10 @@ __global__ __launch_bounds__(kThreads) void matrix_elements_tiled_kernel(
    transformations need every product and sum rounded as written, so FP
    contraction is off in these functions and the wanted FMAs are explicit.
    gfx1200 has no FP64 atomic add (a compare-and-swap loop): the matrix
-   element kernel has one block per output, the density kernel one atomic
-   per point and spin.  OPENMX_GRID_PRECISION=df|fp64 selects the kernels;
+   element kernel has one block per output, the on-the-fly density kernel
+   one atomic per point and spin, and the local mode's CSR density kernel
+   (Set_Density_Grid_GPU.c) is a gather without atomics.
+   OPENMX_GRID_PRECISION selects the kernels (grid_precision_configure);
    the default is double-float where the FP32 rate is at least 8 times
    the FP64 rate (openmx_gpu_fp32_fp64_ratio).
    --------------------------------------------------------------------- */
@@ -259,21 +262,44 @@ __global__ void matrix_elements_df_reduce(std::size_t total_h, int zcount, const
 
 extern "C" int openmx_gpu_fp32_fp64_ratio(void);
 
-bool grid_precision_df()
-{
-    static int mode = -1;
+/* The arithmetic of the grid integrals' kernels, as the NVIDIA version's
+   grid_precision.c decides it (without its lossy FP32 stage): 1 for the
+   double-float kernels, 0 for the FP64 ones.  OPENMX_GRID_PRECISION=df, DF
+   or 2 selects double-float and any other non-empty value FP64 (fp64,
+   FP64, double and 0 as documented, anything else noted once by
+   openmx_grid_precision_announce); unset, double-float where the FP32 rate
+   is at least 8 times the FP64 rate (openmx_gpu_fp32_fp64_ratio: the
+   gcnArchName table, or OPENMX_GPU_FP32_FP64_RATIO; a failed device query
+   gives 0, so FP64).  Decided once per process and silently, since every
+   rank asks. */
+int grid_precision_mode = -1;
+char grid_precision_unrecognized[64] = "";
 
-    if (mode < 0) {
+int grid_precision_configure()
+{
+    if (grid_precision_mode < 0) {
         const char *value = std::getenv("OPENMX_GRID_PRECISION");
         if (value != nullptr && value[0] != '\0') {
-            mode = (std::strcmp(value, "fp64") == 0 || std::strcmp(value, "FP64") == 0 ||
-                    std::strcmp(value, "double") == 0 || std::strcmp(value, "0") == 0) ? 0 : 1;
+            if (std::strcmp(value, "df") == 0 || std::strcmp(value, "DF") == 0 || std::strcmp(value, "2") == 0) {
+                grid_precision_mode = 1;
+            }
+            else {
+                grid_precision_mode = 0;
+                if (!(std::strcmp(value, "fp64") == 0 || std::strcmp(value, "FP64") == 0 ||
+                      std::strcmp(value, "double") == 0 || std::strcmp(value, "0") == 0))
+                    std::snprintf(grid_precision_unrecognized, sizeof(grid_precision_unrecognized), "%s", value);
+            }
         }
         else {
-            mode = (8 <= openmx_gpu_fp32_fp64_ratio()) ? 1 : 0;
+            grid_precision_mode = (8 <= openmx_gpu_fp32_fp64_ratio()) ? 1 : 0;
         }
     }
-    return mode == 1;
+    return grid_precision_mode;
+}
+
+bool grid_precision_df()
+{
+    return grid_precision_configure() == 1;
 }
 
 int device_shared_limit()
@@ -659,10 +685,17 @@ __global__ __launch_bounds__(kThreads) void otf_density_kernel(
    and spin: rho += sum_i phi0[i] (sum_j DM[i][j] phi1[j]), each product
    exact (TwoProd), the hi parts of a row summed with TwoSum compensation
    and the lo parts plainly, the rows accumulated as a float pair, and the
-   pair added to the FP64 density by one atomic add. */
+   pair added to the FP64 density by one atomic add.  SPLIT gives every
+   spin its own blocks (blockIdx.z), each staging only that spin's block:
+   1/S of the LDS, for the pairs whose S x NO0 x NO1 (hi, lo) floats do not
+   fit (non-collinear with 46 or more orbitals), and NMAX = 0 reads the
+   neighbour orbitals from memory for more than 64 orbitals; the
+   arithmetic per point and spin is the same in every variant (the role
+   of the NVIDIA version's OpenACC double-float fallback, which reads a
+   host-split DM from memory). */
 constexpr int kDenDfThreads = 128;
 
-template <int NMAX>
+template <int NMAX, bool SPLIT>
 __global__ __launch_bounds__(kDenDfThreads) void otf_density_df_kernel(
     int spin_count, const int *__restrict__ no0, const int *__restrict__ no1, const int *__restrict__ nolg,
     const std::size_t *__restrict__ dmoff, const std::size_t *__restrict__ noff,
@@ -675,9 +708,12 @@ __global__ __launch_bounds__(kDenDfThreads) void otf_density_df_kernel(
     const int p = static_cast<int>(blockIdx.x);
     const int n0 = no0[p], n1 = no1[p], np = nolg[p];
     if (static_cast<int>(blockIdx.y * blockDim.x) >= np) return;   /* uniform over the block */
+    /* the block's spins: all of them, or the one of blockIdx.z */
+    const int s_first = SPLIT ? static_cast<int>(blockIdx.z) : 0;
+    const int s_count = SPLIT ? 1 : spin_count;
     const int mat = n0 * n1;
-    const int cnt = spin_count * mat;
-    const double *dp = dm + dmoff[p];
+    const int cnt = s_count * mat;
+    const double *dp = dm + dmoff[p] + static_cast<std::size_t>(s_first) * static_cast<std::size_t>(mat);
 
     for (int e = static_cast<int>(threadIdx.x); e < cnt; e += static_cast<int>(blockDim.x)) {
         const double x = dp[e];
@@ -690,22 +726,29 @@ __global__ __launch_bounds__(kDenDfThreads) void otf_density_df_kernel(
     const int Nc = nc[noff[p] + static_cast<std::size_t>(k)];
     const float *phi1 = o1 + o1off[p] + static_cast<std::size_t>(k) * n1;
     const float *phi0 = o0 + o0off[p] + static_cast<std::size_t>(Nc) * n0;
-    float f1[NMAX];
+    float f1[NMAX > 0 ? NMAX : 1];
+    if constexpr (0 < NMAX) {
 #pragma unroll
-    for (int j = 0; j < NMAX; ++j) f1[j] = (j < n1) ? phi1[j] : 0.0f;
+        for (int j = 0; j < NMAX; ++j) f1[j] = (j < n1) ? phi1[j] : 0.0f;
+    }
     float eh[4] = {0.0f, 0.0f, 0.0f, 0.0f}, el[4] = {0.0f, 0.0f, 0.0f, 0.0f};
 
     for (int i = 0; i < n0; ++i) {
         const float a = phi0[i];
 #pragma unroll
         for (int s = 0; s < 4; ++s) {
-            if (s >= spin_count) break;
+            if (s >= s_count) break;
             const float2 *row = dms + s * mat + i * n1;
             float ts = 0.0f, tc = 0.0f, qs = 0.0f;
+            if constexpr (0 < NMAX) {
 #pragma unroll
-            for (int j = 0; j < NMAX; ++j) {
-                if (j >= n1) break;
-                df_term(row[j], f1[j], ts, tc, qs);
+                for (int j = 0; j < NMAX; ++j) {
+                    if (j >= n1) break;
+                    df_term(row[j], f1[j], ts, tc, qs);
+                }
+            }
+            else {
+                for (int j = 0; j < n1; ++j) df_term(row[j], phi1[j], ts, tc, qs);
             }
             {
                 const float ph = a * ts;
@@ -718,24 +761,50 @@ __global__ __launch_bounds__(kDenDfThreads) void otf_density_df_kernel(
     double *out = den + denoff[p] + static_cast<std::size_t>(Nc);
 #pragma unroll
     for (int s = 0; s < 4; ++s) {
-        if (s >= spin_count) break;
-        atomicAdd(out + static_cast<std::size_t>(s) * den_stride, static_cast<double>(eh[s]) + static_cast<double>(el[s]));
+        if (s >= s_count) break;
+        atomicAdd(out + static_cast<std::size_t>(s_first + s) * den_stride,
+                  static_cast<double>(eh[s]) + static_cast<double>(el[s]));
     }
 }
 
-template <int NMAX>
+template <int NMAX, bool SPLIT>
 int otf_density_df_launch(int pair_count, int max_nolg, int spin_count, std::size_t shared, const int *d_no0,
                           const int *d_no1, const int *d_nolg, const std::size_t *d_dmoff, const std::size_t *d_noff,
                           const std::size_t *d_o0off, const std::size_t *d_o1off, const std::size_t *d_denoff,
                           const int *d_nc, const double *d_dm, const float *d_o0, const float *d_o1,
                           std::size_t den_stride, double *d_den)
 {
-    hipLaunchKernelGGL(otf_density_df_kernel<NMAX>,
+    hipLaunchKernelGGL((otf_density_df_kernel<NMAX, SPLIT>),
                        dim3(static_cast<unsigned>(pair_count),
-                            static_cast<unsigned>((max_nolg + kDenDfThreads - 1) / kDenDfThreads)),
+                            static_cast<unsigned>((max_nolg + kDenDfThreads - 1) / kDenDfThreads),
+                            static_cast<unsigned>(SPLIT ? spin_count : 1)),
                        dim3(kDenDfThreads), shared, 0, spin_count, d_no0, d_no1, d_nolg, d_dmoff, d_noff, d_o0off,
                        d_o1off, d_denoff, d_nc, d_dm, d_o0, d_o1, den_stride, d_den);
     return hipGetLastError() == hipSuccess ? 0 : 2;
+}
+
+template <bool SPLIT>
+int otf_density_df_dispatch(int pair_count, int max_nolg, int spin_count, int max_no, std::size_t shared,
+                            const int *d_no0, const int *d_no1, const int *d_nolg, const std::size_t *d_dmoff,
+                            const std::size_t *d_noff, const std::size_t *d_o0off, const std::size_t *d_o1off,
+                            const std::size_t *d_denoff, const int *d_nc, const double *d_dm, const float *d_o0,
+                            const float *d_o1, std::size_t den_stride, double *d_den)
+{
+    if (max_no <= 16)
+        return otf_density_df_launch<16, SPLIT>(pair_count, max_nolg, spin_count, shared, d_no0, d_no1, d_nolg,
+                                                d_dmoff, d_noff, d_o0off, d_o1off, d_denoff, d_nc, d_dm, d_o0, d_o1,
+                                                den_stride, d_den);
+    if (max_no <= 32)
+        return otf_density_df_launch<32, SPLIT>(pair_count, max_nolg, spin_count, shared, d_no0, d_no1, d_nolg,
+                                                d_dmoff, d_noff, d_o0off, d_o1off, d_denoff, d_nc, d_dm, d_o0, d_o1,
+                                                den_stride, d_den);
+    if (max_no <= 64)
+        return otf_density_df_launch<64, SPLIT>(pair_count, max_nolg, spin_count, shared, d_no0, d_no1, d_nolg,
+                                                d_dmoff, d_noff, d_o0off, d_o1off, d_denoff, d_nc, d_dm, d_o0, d_o1,
+                                                den_stride, d_den);
+    return otf_density_df_launch<0, SPLIT>(pair_count, max_nolg, spin_count, shared, d_no0, d_no1, d_nolg, d_dmoff,
+                                           d_noff, d_o0off, d_o1off, d_denoff, d_nc, d_dm, d_o0, d_o1, den_stride,
+                                           d_den);
 }
 
 } // namespace
@@ -751,22 +820,22 @@ extern "C" int Set_Hamiltonian_Hip_OTF_Density(int pair_count, int max_nolg, int
     unsigned ychunks;
 
     if (pair_count <= 0 || max_nolg <= 0) return 0;
-    if (0 < max_no && max_no <= 64 && spin_count <= 4 && grid_precision_df()) {
-        const std::size_t shared = static_cast<std::size_t>(spin_count) * static_cast<std::size_t>(max_no) *
-                                   static_cast<std::size_t>(max_no) * sizeof(float2);
-        if (static_cast<int>(shared) <= device_shared_limit()) {
-            if (max_no <= 16)
-                return otf_density_df_launch<16>(pair_count, max_nolg, spin_count, shared, d_no0, d_no1, d_nolg,
-                                                 d_dmoff, d_noff, d_o0off, d_o1off, d_denoff, d_nc, d_dm, d_o0, d_o1,
-                                                 den_stride, d_den);
-            if (max_no <= 32)
-                return otf_density_df_launch<32>(pair_count, max_nolg, spin_count, shared, d_no0, d_no1, d_nolg,
-                                                 d_dmoff, d_noff, d_o0off, d_o1off, d_denoff, d_nc, d_dm, d_o0, d_o1,
-                                                 den_stride, d_den);
-            return otf_density_df_launch<64>(pair_count, max_nolg, spin_count, shared, d_no0, d_no1, d_nolg,
-                                             d_dmoff, d_noff, d_o0off, d_o1off, d_denoff, d_nc, d_dm, d_o0, d_o1,
-                                             den_stride, d_den);
-        }
+    if (0 < max_no && 0 < spin_count && spin_count <= 4 && grid_precision_df()) {
+        /* the (hi, lo) DM blocks of a pair: every spin's in one block when
+           they fit in LDS, else one spin's per block (FP64 only when even
+           that does not fit: beyond 90 orbitals on 64 KiB) */
+        const std::size_t block = static_cast<std::size_t>(max_no) * static_cast<std::size_t>(max_no) * sizeof(float2);
+        const std::size_t limit = static_cast<std::size_t>(device_shared_limit() < 0 ? 0 : device_shared_limit());
+
+        if (static_cast<std::size_t>(spin_count) * block <= limit)
+            return otf_density_df_dispatch<false>(pair_count, max_nolg, spin_count, max_no,
+                                                  static_cast<std::size_t>(spin_count) * block, d_no0, d_no1, d_nolg,
+                                                  d_dmoff, d_noff, d_o0off, d_o1off, d_denoff, d_nc, d_dm, d_o0, d_o1,
+                                                  den_stride, d_den);
+        if (block <= limit)
+            return otf_density_df_dispatch<true>(pair_count, max_nolg, spin_count, max_no, block, d_no0, d_no1,
+                                                 d_nolg, d_dmoff, d_noff, d_o0off, d_o1off, d_denoff, d_nc, d_dm, d_o0,
+                                                 d_o1, den_stride, d_den);
     }
     ychunks = static_cast<unsigned>((max_nolg + kThreads - 1) / kThreads);
     if (ychunks > 16u) ychunks = 16u;
@@ -774,4 +843,200 @@ extern "C" int Set_Hamiltonian_Hip_OTF_Density(int pair_count, int max_nolg, int
                        pair_count, spin_count, d_no0, d_no1, d_nolg, d_dmoff, d_noff, d_o0off, d_o1off, d_denoff,
                        d_nc, d_dm, d_o0, d_o1, den_stride, d_den);
     return hipGetLastError() == hipSuccess ? 0 : 2;
+}
+
+namespace {
+
+/* The double-float density of the distributed quadrature's CSR gather
+   (Set_Density_Grid_GPU.c, the NVIDIA version's mode-2 local kernel), for
+   the ranks whose Set_Hamiltonian tables are device-resident.  One thread
+   per output point (a sphere point of one of the rank's atoms) sums its
+   terms -- its overlap points with the neighbours, in the CSR order, which
+   is the CPU loop's (h_AN, Nog) order -- each term as the on-the-fly
+   kernel above sums a point of a pair: the density matrix as (hi, lo)
+   floats, every product exact (TwoProd), the hi parts of a row summed with
+   TwoSum compensation and the lo parts plainly, the rows of the pair
+   accumulated as a float pair; then the pair's sum goes into the point's
+   FP64 density (FP64 between the pairs, as the FP64 kernel adds them).  A
+   gather: no atomics, the same result on every run.  The neighbour
+   orbitals of a term sit in a register row (NMAX >= every NO1; the
+   64-float row partly spills to scratch and is still several times faster
+   than reading the orbitals in the inner loop), beyond 64 orbitals NMAX =
+   0 reads them from memory.  Every variant gives the same bits. */
+constexpr int kCsrDfThreads = 128;
+
+/* the density matrix of the CSR kernel as (hi, lo) floats, in place: a
+   float2 takes the 8 bytes of its double */
+__global__ void csr_dm_split_kernel(std::size_t count, double *dm)
+{
+    float2 *dmf = reinterpret_cast<float2 *>(dm);
+
+    for (std::size_t e = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x; e < count;
+         e += static_cast<std::size_t>(gridDim.x) * blockDim.x) {
+        const double x = dm[e];
+        const float hi = static_cast<float>(x);
+        dmf[e] = make_float2(hi, static_cast<float>(x - static_cast<double>(hi)));
+    }
+}
+
+template <int NMAX>
+__global__ __launch_bounds__(kCsrDfThreads) void csr_density_df_kernel(
+    std::size_t output_count, int spin_count, const std::uint32_t *__restrict__ out_ptr,
+    const std::uint32_t *__restrict__ term_pt, const std::uint32_t *__restrict__ pt_pair,
+    const int *__restrict__ no0, const int *__restrict__ no1, const std::size_t *__restrict__ hoff,
+    const std::size_t *__restrict__ noff, const std::size_t *__restrict__ o0off,
+    const std::size_t *__restrict__ o1off, const int *__restrict__ nc, const float *__restrict__ o0,
+    const float *__restrict__ o1, const float2 *__restrict__ dmf, double *__restrict__ den)
+{
+#pragma clang fp contract(off)
+    const std::size_t out = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (out >= output_count) return;
+    double g[4] = {0.0, 0.0, 0.0, 0.0};
+
+    for (std::uint32_t q = out_ptr[out]; q < out_ptr[out + 1]; ++q) {
+        const std::uint32_t pt = term_pt[q];
+        const std::uint32_t pair = pt_pair[pt];
+        const int n0 = no0[pair], n1 = no1[pair];
+        const std::size_t mat = static_cast<std::size_t>(n0) * static_cast<std::size_t>(n1);
+        const float2 *dp = dmf + hoff[pair];
+        /* the central atom's sphere point and the neighbour's overlap point */
+        const float *phi0 = o0 + o0off[pair] + static_cast<std::size_t>(nc[pt]) * static_cast<std::size_t>(n0);
+        const float *phi1 = o1 + o1off[pair] + (static_cast<std::size_t>(pt) - noff[pair]) * static_cast<std::size_t>(n1);
+        float eh[4] = {0.0f, 0.0f, 0.0f, 0.0f}, el[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+        float f1[NMAX > 0 ? NMAX : 1];
+
+        if constexpr (0 < NMAX) {
+#pragma unroll
+            for (int j = 0; j < NMAX; ++j) f1[j] = (j < n1) ? phi1[j] : 0.0f;
+        }
+        for (int i = 0; i < n0; ++i) {
+            const float a = phi0[i];
+#pragma unroll
+            for (int s = 0; s < 4; ++s) {
+                if (s >= spin_count) break;
+                const float2 *row = dp + static_cast<std::size_t>(s) * mat + static_cast<std::size_t>(i) * n1;
+                float ts = 0.0f, tc = 0.0f, qs = 0.0f;
+                if constexpr (0 < NMAX) {
+#pragma unroll
+                    for (int j = 0; j < NMAX; ++j) {
+                        if (j >= n1) break;
+                        df_term(row[j], f1[j], ts, tc, qs);
+                    }
+                }
+                else {
+                    for (int j = 0; j < n1; ++j) df_term(row[j], phi1[j], ts, tc, qs);
+                }
+                {
+                    const float ph = a * ts;
+                    const float pl = __builtin_fmaf(a, ts, -ph) + a * (tc + qs);
+                    df_acc(eh[s], el[s], ph);
+                    el[s] += pl;
+                }
+            }
+        }
+#pragma unroll
+        for (int s = 0; s < 4; ++s) {
+            if (s >= spin_count) break;
+            g[s] += static_cast<double>(eh[s]) + static_cast<double>(el[s]);
+        }
+    }
+#pragma unroll
+    for (int s = 0; s < 4; ++s) {
+        if (s >= spin_count) break;
+        den[static_cast<std::size_t>(s) * output_count + out] = g[s];
+    }
+}
+
+template <int NMAX>
+hipError_t csr_density_df_launch(std::size_t output_count, int spin_count, const std::uint32_t *d_out_ptr,
+                                 const std::uint32_t *d_term_pt, const std::uint32_t *d_pt_pair, const int *d_no0,
+                                 const int *d_no1, const std::size_t *d_hoff, const std::size_t *d_noff,
+                                 const std::size_t *d_o0off, const std::size_t *d_o1off, const int *d_nc,
+                                 const float *d_o0, const float *d_o1, const float2 *d_dmf, double *d_den)
+{
+    hipLaunchKernelGGL(csr_density_df_kernel<NMAX>,
+                       dim3(static_cast<unsigned>((output_count + kCsrDfThreads - 1) / kCsrDfThreads)),
+                       dim3(kCsrDfThreads), 0, 0, output_count, spin_count, d_out_ptr, d_term_pt, d_pt_pair, d_no0,
+                       d_no1, d_hoff, d_noff, d_o0off, d_o1off, d_nc, d_o0, d_o1, d_dmf, d_den);
+    return hipGetLastError();
+}
+
+} // namespace
+
+/* The precision of the grid integrals for C code: 1 when the double-float
+   kernels run (grid_precision_configure), 0 for FP64. */
+extern "C" int openmx_grid_precision_df(void)
+{
+    return grid_precision_df() ? 1 : 0;
+}
+
+/* The banner of the NVIDIA version's Grid_Precision_BeginStep, once per
+   process; the caller prints it on one rank. */
+extern "C" void openmx_grid_precision_announce(void)
+{
+    static int announced = 0;
+
+    if (announced) return;
+    announced = 1;
+    if (grid_precision_configure() == 1) {
+        std::printf("<DFT>  grid integrals: double-float kernels (FP32 arithmetic with error-free transformations; "
+                    "OPENMX_GRID_PRECISION=fp64 restores the FP64 kernels)\n");
+    }
+    else if (grid_precision_unrecognized[0] != '\0') {
+        std::printf("<DFT>  grid integrals: OPENMX_GRID_PRECISION=%s is neither df nor fp64; FP64 kernels\n",
+                    grid_precision_unrecognized);
+    }
+    std::fflush(stdout);
+}
+
+/* The density of the local mode's CSR gather (Set_Density_Grid_GPU.c) in
+   double-float, every operand on the device: the rank's tables of
+   Set_Hamiltonian (d_no0 .. d_o1), the CSR over the output points, the
+   packed density matrix d_dm (dm_count doubles, overwritten by its (hi,
+   lo) split) and the density d_den (spin_count x output_count, written).
+   max_no bounds the NO1 of every pair the terms reach.  Returns 0 when
+   d_den holds the density, 1 when nothing ran (the FP64 mode or an
+   argument outside the kernel's range: the caller's FP64 kernel takes
+   over, d_dm intact), 2 on a device failure (d_dm and d_den undefined). */
+extern "C" int Set_Density_Grid_Hip_LocalDensity(std::size_t output_count, int spin_count, int max_no,
+                                                 std::size_t dm_count, const std::uint32_t *d_out_ptr,
+                                                 const std::uint32_t *d_term_pt, const std::uint32_t *d_pt_pair,
+                                                 const int *d_no0, const int *d_no1, const std::size_t *d_hoff,
+                                                 const std::size_t *d_noff, const std::size_t *d_o0off,
+                                                 const std::size_t *d_o1off, const int *d_nc, const float *d_o0,
+                                                 const float *d_o1, double *d_dm, double *d_den)
+{
+    const float2 *d_dmf = reinterpret_cast<const float2 *>(d_dm);
+    hipError_t status = hipSuccess;
+
+    if (spin_count < 1 || 4 < spin_count || max_no < 0 || !grid_precision_df()) return 1;
+    if (output_count == 0) return 0;
+    (void)hipGetLastError();
+    if (0 < dm_count) {
+        std::size_t blocks = (dm_count + kThreads - 1) / kThreads;
+        if (blocks > 4096) blocks = 4096;
+        hipLaunchKernelGGL(csr_dm_split_kernel, dim3(static_cast<unsigned>(blocks)), dim3(kThreads), 0, 0, dm_count,
+                           d_dm);
+        status = hipGetLastError();
+    }
+    if (status == hipSuccess) {
+        if (max_no <= 16)
+            status = csr_density_df_launch<16>(output_count, spin_count, d_out_ptr, d_term_pt, d_pt_pair, d_no0, d_no1,
+                                               d_hoff, d_noff, d_o0off, d_o1off, d_nc, d_o0, d_o1, d_dmf, d_den);
+        else if (max_no <= 32)
+            status = csr_density_df_launch<32>(output_count, spin_count, d_out_ptr, d_term_pt, d_pt_pair, d_no0, d_no1,
+                                               d_hoff, d_noff, d_o0off, d_o1off, d_nc, d_o0, d_o1, d_dmf, d_den);
+        else if (max_no <= 64)
+            status = csr_density_df_launch<64>(output_count, spin_count, d_out_ptr, d_term_pt, d_pt_pair, d_no0, d_no1,
+                                               d_hoff, d_noff, d_o0off, d_o1off, d_nc, d_o0, d_o1, d_dmf, d_den);
+        else
+            status = csr_density_df_launch<0>(output_count, spin_count, d_out_ptr, d_term_pt, d_pt_pair, d_no0, d_no1,
+                                              d_hoff, d_noff, d_o0off, d_o1off, d_nc, d_o0, d_o1, d_dmf, d_den);
+    }
+    if (status == hipSuccess) status = hipDeviceSynchronize();
+    if (status != hipSuccess) {
+        (void)hipGetLastError();
+        return 2;
+    }
+    return 0;
 }

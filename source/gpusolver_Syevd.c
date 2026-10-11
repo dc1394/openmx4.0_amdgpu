@@ -50,85 +50,26 @@
 #include "openmx_common.h"
 #include "set_hip_default_device_from_local_rank.h"
 #include "hip_runtime_compat.h"
-#include "hipsolver_compat.h"
 #include <stdint.h>
-#include <stdlib.h>
 
+/* All m eigenpairs of the m x m host matrix A on this rank's GPU: selects
+   the device, then delegates to the cached wrapper gpusolver_Syevdx (the
+   complete spectrum goes through rocSOLVER's dsyevd there).  Returns 0, the
+   solver's info, -1 for m < 0, or -1000-status when no device can be
+   selected; nothing aborts.  No caller in this tree. */
 int32_t gpusolver_Syevd(double * A, double * W, int32_t m)
 {
-    int32_t deviceCount;
-    wait_hipfunc(hipGetDeviceCount(&deviceCount));
+    int        count = 0;
+    hipError_t status;
 
-    if (0 < SCF_Gpu_Num && SCF_Gpu_Num < deviceCount) deviceCount = SCF_Gpu_Num;
-
-    wait_hipfunc(hipSetDevice(openmx_gpu_map_rank_to_device(
-        openmx_gpu_local_rank_noncollective(),
-        openmx_gpu_local_size_noncollective(), deviceCount)));
-
-    hipsolverDnHandle_t hipsolverH = NULL;
-    hipStream_t       stream    = NULL;
-
-    /* step 1: create gpusolver handle, bind a stream */
-    wait_hipfunc(hipsolverDnCreate(&hipsolverH));
-
-    wait_hipfunc(hipStreamCreateWithFlags(&stream, hipStreamNonBlocking));
-    wait_hipfunc(hipsolverDnSetStream(hipsolverH, stream));
-
-    int32_t const lda    = m;
-    double *      d_A    = NULL;
-    double *      d_W    = NULL;
-    int32_t *     d_info = NULL;
-
-    wait_hipfunc(hipMalloc((void **)(&d_A), sizeof(double) * lda * m));
-    wait_hipfunc(hipMalloc((void **)(&d_W), sizeof(double) * m));
-    wait_hipfunc(hipMalloc((void **)(&d_info), sizeof(int32_t)));
-
-    wait_hipfunc(hipMemcpyAsync(d_A, A, sizeof(double) * lda * m, hipMemcpyHostToDevice, stream));
-
-    // step 3: query working space of syevd
-    hipsolverEigMode_t const jobz = HIPSOLVER_EIG_MODE_VECTOR;  // compute eigenvalues and eigenvectors.
-    hipblasFillMode_t  const uplo = HIPBLAS_FILL_MODE_LOWER;
-
-    size_t d_lwork = 0; /* size of workspace */
-    size_t h_lwork = 0; /* size of workspace */
-
-    wait_hipfunc(hipsolverDnXsyevd_bufferSize(hipsolverH, NULL, jobz, uplo, m, HIP_R_64F, d_A, lda, HIP_R_64F, d_W,
-                                              HIP_R_64F, &d_lwork, &h_lwork));
-
-    void * d_work = NULL; /* device workspace */
-
-    wait_hipfunc(hipMalloc((void **)(&d_work), d_lwork));
-
-    // host workspace for
-    void * h_work = malloc(h_lwork);
-    if (!h_work) {
-        fprintf(stderr, "Could not allocate host memory.\n");
-        exit(1);
-    }
-
-    // step 4: compute spectrum
-    wait_hipfunc(hipsolverDnXsyevd(hipsolverH, NULL, jobz, uplo, m, HIP_R_64F, d_A, lda, HIP_R_64F, d_W, HIP_R_64F,
-                                   d_work, d_lwork, h_work, h_lwork, d_info));
-
-    wait_hipfunc(hipMemcpyAsync(A, d_A, sizeof(double) * lda * m, hipMemcpyDeviceToHost, stream));
-    wait_hipfunc(hipMemcpyAsync(W, d_W, sizeof(double) * m, hipMemcpyDeviceToHost, stream));
-
-    int32_t info;
-
-    wait_hipfunc(hipMemcpyAsync(&info, d_info, sizeof(int32_t), hipMemcpyDeviceToHost, stream));
-
-    wait_hipfunc(hipStreamSynchronize(stream));
-
-    /* free resources */
-    wait_hipfunc(hipFree(d_A));
-    wait_hipfunc(hipFree(d_W));
-    wait_hipfunc(hipFree(d_info));
-    wait_hipfunc(hipFree(d_work));
-    free(h_work);
-
-    wait_hipfunc(hipsolverDnDestroy(hipsolverH));
-
-    wait_hipfunc(hipStreamDestroy(stream));
-
-    return info;
+    if (m < 0) return -1;
+    if (m == 0) return 0;
+    status = hipGetDeviceCount(&count);
+    if (status != hipSuccess) return -1000 - (int)status;
+    if (count < 1) return -1000 - (int)hipErrorNoDevice;
+    if (0 < SCF_Gpu_Num && SCF_Gpu_Num < count) count = SCF_Gpu_Num;
+    status = hipSetDevice(openmx_gpu_map_rank_to_device(openmx_gpu_local_rank_noncollective(),
+                                                        openmx_gpu_local_size_noncollective(), count));
+    if (status != hipSuccess) return -1000 - (int)status;
+    return gpusolver_Syevdx(A, W, m, m);
 }

@@ -7,6 +7,7 @@
 #include <cstdio>
 #include <cstring>
 #include <atomic>
+#include <chrono>
 #include <mutex>
 #include <unordered_map>
 
@@ -57,6 +58,20 @@ int g_input_enabled = 1;
    products: on GPUs with slow FP64 a refinement through plain FP64 products
    costs more than the FP64 eigensolver it replaces. */
 std::atomic<long long> g_general_native[2];
+
+/* OPENMX_GEMMUL8_TIMING=1: every general GEMM of the bridge (openmx_gemmul8
+   {D,Z}gemm and their Solve and Unblocked variants) is timed between two
+   synchronizations of its stream and counted by type (real, complex) and
+   path (GEMMul8, plain hipBLAS); openmx_gemmul8ReportTiming() reports and
+   resets the totals.  The synchronizations keep the products from
+   overlapping other work, so the totals describe the products, not a run
+   without the option.  Ported from the NVIDIA version. */
+struct GeneralCounters {
+    long long calls[2][2]   = {{0, 0}, {0, 0}}; /* [real, complex][GEMMul8, hipBLAS] */
+    double    seconds[2][2] = {{0.0, 0.0}, {0.0, 0.0}};
+    double    flops[2][2]   = {{0.0, 0.0}, {0.0, 0.0}};
+};
+GeneralCounters g_general_counters;
 
 struct WorkspaceReport {
     size_t      required_bytes = 0;
@@ -441,13 +456,55 @@ hipblasStatus_t ensure_scratch(hipblasHandle_t handle, size_t required, void **w
     return HIPBLAS_STATUS_SUCCESS;
 }
 
+/* OPENMX_GEMMUL8_TIMING, read once */
+bool general_timing()
+{
+    static const bool timing = env_bool("OPENMX_GEMMUL8_TIMING", false);
+
+    return timing;
+}
+
+/* body(&native) performs the product and sets native when it took plain
+   hipBLAS; every such call is counted (g_general_native) whether timed or
+   not.  flops counts the real floating-point operations of the product. */
+template <class Body>
+hipblasStatus_t timed_general_gemm(hipblasHandle_t handle, int is_complex, double flops, Body body)
+{
+    bool native = false;
+
+    if (!general_timing()) {
+        const hipblasStatus_t status = body(&native);
+        if (native) g_general_native[is_complex].fetch_add(1, std::memory_order_relaxed);
+        return status;
+    }
+
+    hipStream_t     stream = nullptr;
+    hipblasStatus_t status = hipblasGetStream(handle, &stream);
+    if (status != HIPBLAS_STATUS_SUCCESS) return status;
+    if (hipStreamSynchronize(stream) != hipSuccess) return HIPBLAS_STATUS_INTERNAL_ERROR;
+    const auto start = std::chrono::steady_clock::now();
+    status = body(&native);
+    if (native) g_general_native[is_complex].fetch_add(1, std::memory_order_relaxed);
+    if (hipStreamSynchronize(stream) != hipSuccess) return HIPBLAS_STATUS_INTERNAL_ERROR;
+    const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+
+    std::lock_guard<std::mutex> lock(g_workspace_mutex);
+    const int path = native ? 1 : 0;
+    ++g_general_counters.calls[is_complex][path];
+    g_general_counters.seconds[is_complex][path] += seconds;
+    g_general_counters.flops[is_complex][path] += flops;
+    return status;
+}
+
 } // namespace
 
 namespace {
 
+/* *native is set when the product ran in plain hipBLAS FP64 (the callers
+   count it, see timed_general_gemm) */
 hipblasStatus_t dgemm_capped(hipblasHandle_t handle, hipblasOperation_t transa, hipblasOperation_t transb, int m, int n,
                              int k, const double *alpha, const double *A, int lda, const double *B, int ldb,
-                             const double *beta, double *C, int ldc, size_t reserve)
+                             const double *beta, double *C, int ldc, size_t reserve, bool *native)
 {
     if (m <= 0 || n <= 0 || k <= 0) {
         return HIPBLAS_STATUS_SUCCESS;
@@ -463,14 +520,14 @@ hipblasStatus_t dgemm_capped(hipblasHandle_t handle, hipblasOperation_t transa, 
     if (!g_input_enabled) {
         /* scf.gemmul8.enable off: the fallback is what the user asked for,
            so no warning (Input_std already reported it once) */
-        g_general_native[0].fetch_add(1, std::memory_order_relaxed);
+        *native = true;
         return hipblasDgemm(handle, gemmul8_transa, gemmul8_transb, m, n, k, alpha, A, lda, B, ldb, beta, C, ldc);
     }
 
     if (gemmul8_disabled("OPENMX_GEMMUL8_DISABLE_D", "GEMMUL8_DISABLE_D")) {
         report.reason = "environment disable";
         log_workspace_fallback_once<false>(report, "native hipBLAS");
-        g_general_native[0].fetch_add(1, std::memory_order_relaxed);
+        *native = true;
         return hipblasDgemm(handle, gemmul8_transa, gemmul8_transb, m, n, k, alpha, A, lda, B, ldb, beta, C, ldc);
     }
 
@@ -481,7 +538,7 @@ hipblasStatus_t dgemm_capped(hipblasHandle_t handle, hipblasOperation_t transa, 
                                 num_moduli, &work, &report, reserve);
     if (status == HIPBLAS_STATUS_ALLOC_FAILED) {
         log_workspace_fallback_once<false>(report, "native hipBLAS");
-        g_general_native[0].fetch_add(1, std::memory_order_relaxed);
+        *native = true;
         return hipblasDgemm(handle, gemmul8_transa, gemmul8_transb, m, n, k, alpha, A, lda, B, ldb, beta, C, ldc);
     }
     if (status != HIPBLAS_STATUS_SUCCESS) {
@@ -503,7 +560,11 @@ extern "C" hipblasStatus_t openmx_gemmul8Dgemm(hipblasHandle_t handle, hipblasOp
                                                const double *A, int lda, const double *B, int ldb, const double *beta,
                                                double *C, int ldc)
 {
-    return dgemm_capped(handle, transa, transb, m, n, k, alpha, A, lda, B, ldb, beta, C, ldc, general_reserve());
+    if (m <= 0 || n <= 0 || k <= 0) return HIPBLAS_STATUS_SUCCESS;
+    return timed_general_gemm(handle, 0, 2.0 * m * n * k, [&](bool *native) {
+        return dgemm_capped(handle, transa, transb, m, n, k, alpha, A, lda, B, ldb, beta, C, ldc, general_reserve(),
+                            native);
+    });
 }
 
 /* scf.gemmul8.enable from the input file (Input_std.c); default on */
@@ -561,10 +622,11 @@ extern "C" void openmx_gemmul8ReleaseWorkspaces(void)
 
 namespace {
 
+/* *native as in dgemm_capped */
 hipblasStatus_t zgemm_capped(hipblasHandle_t handle, hipblasOperation_t transa, hipblasOperation_t transb, int m, int n,
                              int k, const hipDoubleComplex *alpha, const hipDoubleComplex *A, int lda,
                              const hipDoubleComplex *B, int ldb, const hipDoubleComplex *beta, hipDoubleComplex *C,
-                             int ldc, size_t reserve)
+                             int ldc, size_t reserve, bool *native)
 {
     if (m <= 0 || n <= 0 || k <= 0) {
         return HIPBLAS_STATUS_SUCCESS;
@@ -578,14 +640,14 @@ hipblasStatus_t zgemm_capped(hipblasHandle_t handle, hipblasOperation_t transa, 
     if (!g_input_enabled) {
         /* scf.gemmul8.enable off: the fallback is what the user asked for,
            so no warning (Input_std already reported it once) */
-        g_general_native[1].fetch_add(1, std::memory_order_relaxed);
+        *native = true;
         return hipblasZgemm(handle, transa, transb, m, n, k, alpha, A, lda, B, ldb, beta, C, ldc);
     }
 
     if (gemmul8_disabled("OPENMX_GEMMUL8_DISABLE_Z", "GEMMUL8_DISABLE_Z")) {
         report.reason = "environment disable";
         log_workspace_fallback_once<true>(report, "native hipBLAS");
-        g_general_native[1].fetch_add(1, std::memory_order_relaxed);
+        *native = true;
         return hipblasZgemm(handle, transa, transb, m, n, k, alpha, A, lda, B, ldb, beta, C, ldc);
     }
 
@@ -599,7 +661,7 @@ hipblasStatus_t zgemm_capped(hipblasHandle_t handle, hipblasOperation_t transa, 
            hipBLAS (hipblasZgemm), which needs no extra workspace. If even that fails,
            its status propagates so the caller can fall back to CPU BLAS. */
         log_workspace_fallback_once<true>(report, "native hipBLAS");
-        g_general_native[1].fetch_add(1, std::memory_order_relaxed);
+        *native = true;
         return hipblasZgemm(handle, transa, transb, m, n, k, alpha, A, lda, B, ldb, beta, C, ldc);
     }
     if (status != HIPBLAS_STATUS_SUCCESS) {
@@ -622,7 +684,11 @@ extern "C" hipblasStatus_t openmx_gemmul8Zgemm(hipblasHandle_t handle, hipblasOp
                                                const hipDoubleComplex *B, int ldb, const hipDoubleComplex *beta,
                                                hipDoubleComplex *C, int ldc)
 {
-    return zgemm_capped(handle, transa, transb, m, n, k, alpha, A, lda, B, ldb, beta, C, ldc, general_reserve());
+    if (m <= 0 || n <= 0 || k <= 0) return HIPBLAS_STATUS_SUCCESS;
+    return timed_general_gemm(handle, 1, 8.0 * m * n * k, [&](bool *native) {
+        return zgemm_capped(handle, transa, transb, m, n, k, alpha, A, lda, B, ldb, beta, C, ldc, general_reserve(),
+                            native);
+    });
 }
 
 /* 1 when openmx_gemmul8Zgemm takes the GEMMul8 path at all: scf.gemmul8.enable
@@ -673,7 +739,11 @@ extern "C" hipblasStatus_t openmx_gemmul8ZgemmSolve(hipblasHandle_t handle, hipb
                                                     const hipDoubleComplex *B, int ldb, const hipDoubleComplex *beta,
                                                     hipDoubleComplex *C, int ldc)
 {
-    return zgemm_capped(handle, transa, transb, m, n, k, alpha, A, lda, B, ldb, beta, C, ldc, solve_reserve());
+    if (m <= 0 || n <= 0 || k <= 0) return HIPBLAS_STATUS_SUCCESS;
+    return timed_general_gemm(handle, 1, 8.0 * m * n * k, [&](bool *native) {
+        return zgemm_capped(handle, transa, transb, m, n, k, alpha, A, lda, B, ldb, beta, C, ldc, solve_reserve(),
+                            native);
+    });
 }
 
 /* the same for real products */
@@ -682,7 +752,11 @@ extern "C" hipblasStatus_t openmx_gemmul8DgemmSolve(hipblasHandle_t handle, hipb
                                                     const double *A, int lda, const double *B, int ldb,
                                                     const double *beta, double *C, int ldc)
 {
-    return dgemm_capped(handle, transa, transb, m, n, k, alpha, A, lda, B, ldb, beta, C, ldc, solve_reserve());
+    if (m <= 0 || n <= 0 || k <= 0) return HIPBLAS_STATUS_SUCCESS;
+    return timed_general_gemm(handle, 0, 2.0 * m * n * k, [&](bool *native) {
+        return dgemm_capped(handle, transa, transb, m, n, k, alpha, A, lda, B, ldb, beta, C, ldc, solve_reserve(),
+                            native);
+    });
 }
 
 /* openmx_gemmul8Zgemm for the products of a dense eigensolve, with the full
@@ -704,22 +778,25 @@ extern "C" hipblasStatus_t openmx_gemmul8ZgemmUnblocked(hipblasHandle_t handle, 
     if (!g_input_enabled || gemmul8_disabled("OPENMX_GEMMUL8_DISABLE_Z", "GEMMUL8_DISABLE_Z"))
         return openmx_gemmul8Zgemm(handle, transa, transb, m, n, k, alpha, A, lda, B, ldb, beta, C, ldc);
 
-    const unsigned num_moduli = gemmul8_num_moduli("OPENMX_GEMMUL8_NUM_MOD_Z", "GEMMUL8_NUM_MOD_Z");
-    const bool     fastmode   = env_bool("OPENMX_GEMMUL8_FASTMODE_Z", env_bool("GEMMUL8_FASTMODE_Z", false));
-    const size_t   sm = static_cast<size_t>(m), sn = static_cast<size_t>(n), sk = static_cast<size_t>(k);
-    const size_t   total = gemmul8::workSize<true, gemmul8::Backend::INT8>(sm, sn, sk, num_moduli);
-    void          *work = nullptr;
-    hipblasStatus_t status = ensure_scratch(handle, total, &work, solve_reserve());
+    return timed_general_gemm(handle, 1, 8.0 * m * n * k, [&](bool *native) -> hipblasStatus_t {
+        const unsigned num_moduli = gemmul8_num_moduli("OPENMX_GEMMUL8_NUM_MOD_Z", "GEMMUL8_NUM_MOD_Z");
+        const bool     fastmode   = env_bool("OPENMX_GEMMUL8_FASTMODE_Z", env_bool("GEMMUL8_FASTMODE_Z", false));
+        const size_t   sm = static_cast<size_t>(m), sn = static_cast<size_t>(n), sk = static_cast<size_t>(k);
+        const size_t   total = gemmul8::workSize<true, gemmul8::Backend::INT8>(sm, sn, sk, num_moduli);
+        void          *work = nullptr;
+        hipblasStatus_t status = ensure_scratch(handle, total, &work, solve_reserve());
 
-    if (status == HIPBLAS_STATUS_SUCCESS) {
-        gemmul8::set_memory_saving(handle, false);
-        (void)gemmul8::gemm<hipDoubleComplex, gemmul8::Backend::INT8>(
-            handle, transa, transb, sm, sn, sk, alpha, A, static_cast<size_t>(lda), B, static_cast<size_t>(ldb),
-            beta, C, static_cast<size_t>(ldc), num_moduli, fastmode, work);
-        return HIPBLAS_STATUS_SUCCESS;
-    }
-    if (status != HIPBLAS_STATUS_ALLOC_FAILED) return status;
-    return zgemm_capped(handle, transa, transb, m, n, k, alpha, A, lda, B, ldb, beta, C, ldc, solve_reserve());
+        if (status == HIPBLAS_STATUS_SUCCESS) {
+            gemmul8::set_memory_saving(handle, false);
+            (void)gemmul8::gemm<hipDoubleComplex, gemmul8::Backend::INT8>(
+                handle, transa, transb, sm, sn, sk, alpha, A, static_cast<size_t>(lda), B, static_cast<size_t>(ldb),
+                beta, C, static_cast<size_t>(ldc), num_moduli, fastmode, work);
+            return HIPBLAS_STATUS_SUCCESS;
+        }
+        if (status != HIPBLAS_STATUS_ALLOC_FAILED) return status;
+        return zgemm_capped(handle, transa, transb, m, n, k, alpha, A, lda, B, ldb, beta, C, ldc, solve_reserve(),
+                            native);
+    });
 }
 
 /* the same for real products (openmx_gemmul8Dgemm) */
@@ -733,22 +810,65 @@ extern "C" hipblasStatus_t openmx_gemmul8DgemmUnblocked(hipblasHandle_t handle, 
     if (!g_input_enabled || gemmul8_disabled("OPENMX_GEMMUL8_DISABLE_D", "GEMMUL8_DISABLE_D"))
         return openmx_gemmul8Dgemm(handle, transa, transb, m, n, k, alpha, A, lda, B, ldb, beta, C, ldc);
 
-    const unsigned num_moduli = gemmul8_num_moduli("OPENMX_GEMMUL8_NUM_MOD_D", "GEMMUL8_NUM_MOD_D");
-    const bool     fastmode   = env_bool("OPENMX_GEMMUL8_FASTMODE_D", env_bool("GEMMUL8_FASTMODE_D", false));
-    const hipblasOperation_t ta = (transa == HIPBLAS_OP_C) ? HIPBLAS_OP_T : transa;
-    const hipblasOperation_t tb = (transb == HIPBLAS_OP_C) ? HIPBLAS_OP_T : transb;
-    const size_t   sm = static_cast<size_t>(m), sn = static_cast<size_t>(n), sk = static_cast<size_t>(k);
-    const size_t   total = gemmul8::workSize<false, gemmul8::Backend::INT8>(sm, sn, sk, num_moduli);
-    void          *work = nullptr;
-    hipblasStatus_t status = ensure_scratch(handle, total, &work, solve_reserve());
+    return timed_general_gemm(handle, 0, 2.0 * m * n * k, [&](bool *native) -> hipblasStatus_t {
+        const unsigned num_moduli = gemmul8_num_moduli("OPENMX_GEMMUL8_NUM_MOD_D", "GEMMUL8_NUM_MOD_D");
+        const bool     fastmode   = env_bool("OPENMX_GEMMUL8_FASTMODE_D", env_bool("GEMMUL8_FASTMODE_D", false));
+        const hipblasOperation_t ta = (transa == HIPBLAS_OP_C) ? HIPBLAS_OP_T : transa;
+        const hipblasOperation_t tb = (transb == HIPBLAS_OP_C) ? HIPBLAS_OP_T : transb;
+        const size_t   sm = static_cast<size_t>(m), sn = static_cast<size_t>(n), sk = static_cast<size_t>(k);
+        const size_t   total = gemmul8::workSize<false, gemmul8::Backend::INT8>(sm, sn, sk, num_moduli);
+        void          *work = nullptr;
+        hipblasStatus_t status = ensure_scratch(handle, total, &work, solve_reserve());
 
-    if (status == HIPBLAS_STATUS_SUCCESS) {
-        gemmul8::set_memory_saving(handle, false);
-        (void)gemmul8::gemm<double, gemmul8::Backend::INT8>(handle, ta, tb, sm, sn, sk, alpha, A,
-                                                            static_cast<size_t>(lda), B, static_cast<size_t>(ldb), beta,
-                                                            C, static_cast<size_t>(ldc), num_moduli, fastmode, work);
-        return HIPBLAS_STATUS_SUCCESS;
+        if (status == HIPBLAS_STATUS_SUCCESS) {
+            gemmul8::set_memory_saving(handle, false);
+            (void)gemmul8::gemm<double, gemmul8::Backend::INT8>(handle, ta, tb, sm, sn, sk, alpha, A,
+                                                                static_cast<size_t>(lda), B, static_cast<size_t>(ldb),
+                                                                beta, C, static_cast<size_t>(ldc), num_moduli, fastmode,
+                                                                work);
+            return HIPBLAS_STATUS_SUCCESS;
+        }
+        if (status != HIPBLAS_STATUS_ALLOC_FAILED) return status;
+        return dgemm_capped(handle, transa, transb, m, n, k, alpha, A, lda, B, ldb, beta, C, ldc, solve_reserve(),
+                            native);
+    });
+}
+
+/* OPENMX_GEMMUL8_TIMING=1: the totals of the general GEMMs since the last
+   report, one line on stdout per rank that made such calls (the rank from
+   OMPI_COMM_WORLD_RANK or PMI_RANK), then reset.  DFT.c calls it at the end
+   of each SCF; without the variable it does nothing. */
+extern "C" void openmx_gemmul8ReportTiming(void)
+{
+    std::lock_guard<std::mutex> lock(g_workspace_mutex);
+    const GeneralCounters      &g = g_general_counters;
+
+    if (general_timing() && 0 < g.calls[0][0] + g.calls[0][1] + g.calls[1][0] + g.calls[1][1]) {
+        const char *rank = std::getenv("OMPI_COMM_WORLD_RANK");
+
+        if (rank == nullptr) rank = std::getenv("PMI_RANK");
+        std::printf("<openmx_gemmul8> general GEMMs, rank %s: real %lld + %lld calls, %.6f + %.6f s, %.3f + %.3f GFlop; "
+                    "complex %lld + %lld calls, %.6f + %.6f s, %.3f + %.3f GFlop (GEMMul8 + hipBLAS); "
+                    "moduli %u / %u, scaling %s / %s (real / complex)\n",
+                    rank != nullptr ? rank : "-", g.calls[0][0], g.calls[0][1], g.seconds[0][0], g.seconds[0][1],
+                    1e-9 * g.flops[0][0], 1e-9 * g.flops[0][1], g.calls[1][0], g.calls[1][1], g.seconds[1][0],
+                    g.seconds[1][1], 1e-9 * g.flops[1][0], 1e-9 * g.flops[1][1],
+                    gemmul8_num_moduli("OPENMX_GEMMUL8_NUM_MOD_D", "GEMMUL8_NUM_MOD_D"),
+                    gemmul8_num_moduli("OPENMX_GEMMUL8_NUM_MOD_Z", "GEMMUL8_NUM_MOD_Z"),
+                    env_bool("OPENMX_GEMMUL8_FASTMODE_D", env_bool("GEMMUL8_FASTMODE_D", false)) ? "fast" : "accurate",
+                    env_bool("OPENMX_GEMMUL8_FASTMODE_Z", env_bool("GEMMUL8_FASTMODE_Z", false)) ? "fast" : "accurate");
+        std::fflush(stdout);
     }
-    if (status != HIPBLAS_STATUS_ALLOC_FAILED) return status;
-    return dgemm_capped(handle, transa, transb, m, n, k, alpha, A, lda, B, ldb, beta, C, ldc, solve_reserve());
+    g_general_counters = GeneralCounters{};
+}
+
+/* bytes of the GEMMul8 workspaces this process holds (all devices and
+   streams): what openmx_gemmul8ReleaseWorkspaces would return */
+extern "C" size_t openmx_gemmul8WorkspaceBytes(void)
+{
+    std::lock_guard<std::mutex> lock(g_workspace_mutex);
+    size_t                      bytes = 0;
+
+    for (const auto &item : g_workspaces) bytes += item.second.size;
+    return bytes;
 }

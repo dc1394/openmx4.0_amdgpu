@@ -532,6 +532,8 @@ static inline void SDG_accumulate_nc1(int no0, int no1,
 
 int Set_Density_Grid_GPU_Local_Prepare(int Cnt_kind, int Calc_CntOrbital_ON);
 int Set_Density_Grid_GPU_Local_Run(double *****CDM, double ***Tmp_Den_Grid);
+int Set_Density_Grid_GPU_Local_OnTheFly(void);
+int openmx_grid_precision_df(void);
 
 double Set_Density_Grid(int Cnt_kind, int Calc_CntOrbital_ON, double *****CDM, double **Density_Grid_B0)
 {
@@ -574,6 +576,9 @@ double Set_Density_Grid(int Cnt_kind, int Calc_CntOrbital_ON, double *****CDM, d
   double time0,time1,time2;
   int use_local_gpu = 0;
   int use_otf_gpu = 0;
+  double sd_t0,sd_t1,sd_pre=0.0,sd_quad=0.0,sd_a2b=0.0,sd_sup=0.0,sd_b2d=0.0;
+  static int sd_prof = -1;
+  const char *sd_mode = "cpu";
   int use_nc_simd;
   int nc_simd_mode;
   int nc_grid_batch;
@@ -624,9 +629,45 @@ double Set_Density_Grid(int Cnt_kind, int Calc_CntOrbital_ON, double *****CDM, d
   
   dtime(&TStime);
 
+  /* stage profile: OPENMX_BAND_PROFILE=1 prints one SETDENPROF line per rank
+     and call (pre = GPU-mode decision + allocation, quad = the atom-sphere
+     quadrature, a2b = the atom-to-B communication, sup = the superposition
+     into the B partition, b2d = the B-to-D copy and the rest; mode =
+     gpu-local for the CSR kernel, otf for the on-the-fly tiles, cpu for
+     the CPU loop).  The single-owner service returns before it. */
+  sd_t0 = TStime;
+  if (sd_prof < 0){
+    const char *e = getenv("OPENMX_BAND_PROFILE");
+    sd_prof = (e != NULL && atoi(e) != 0) ? 1 : 0;
+  }
+
+  /* Preferred GPU mode: every rank integrates its own atoms on the device
+     -- the CSR kernel over its resident Set_Hamiltonian tables, or the
+     on-the-fly orbital tiles where it has none -- and the ordinary A-to-B
+     communication below distributes the result.  The all-rank on-the-fly
+     mode, the single-owner GPU service and the CPU/OpenMP loop remain as
+     fallbacks, in that order. */
   {
     int local_ok=Set_Density_Grid_GPU_Local_Prepare(Cnt_kind,Calc_CntOrbital_ON);
     MPI_Allreduce(&local_ok,&use_local_gpu,1,MPI_INT,MPI_MIN,mpi_comm_level1);
+
+    /* the first time on: every rank, as use_local_gpu is the agreed value */
+    if (use_local_gpu){
+      static int announced = 0;
+      if (!announced){
+        int kinds[2], kinds_sum[2] = {0,0};
+        kinds[0] = (0<Matomnum && !Set_Density_Grid_GPU_Local_OnTheFly()) ? 1 : 0;
+        kinds[1] = (0<Matomnum && Set_Density_Grid_GPU_Local_OnTheFly()) ? 1 : 0;
+        MPI_Reduce(kinds,kinds_sum,2,MPI_INT,MPI_SUM,Host_ID,mpi_comm_level1);
+        if (myid==Host_ID && 0<level_stdout){
+          printf("<Set_Density_Grid> distributed GPU quadrature: every rank integrates its own atoms "
+                 "(%d rank(s) on the resident tables, %s kernel; %d with on-the-fly tiles)\n",
+                 kinds_sum[0], openmx_grid_precision_df() ? "double-float" : "FP64", kinds_sum[1]);
+          fflush(stdout);
+        }
+        announced = 1;
+      }
+    }
   }
 
   /* the orbitals evaluated on the device batch by batch on every rank
@@ -905,14 +946,23 @@ double Set_Density_Grid(int Cnt_kind, int Calc_CntOrbital_ON, double *****CDM, d
   ***********************************************/
     
   dtime(&time1);
+  sd_pre = time1 - sd_t0; sd_t0 = time1;
 
-  if (use_local_gpu && !Set_Density_Grid_GPU_Local_Run(CDM,Tmp_Den_Grid)) use_local_gpu=0;
+  /* the distributed GPU quadrature fills Tmp_Den_Grid directly; a run-time
+     failure on any rank simply falls back to the CPU loop on that rank */
+  if (use_local_gpu){
+    if (!Set_Density_Grid_GPU_Local_Run(CDM,Tmp_Den_Grid)) use_local_gpu=0;
+    else sd_mode = Set_Density_Grid_GPU_Local_OnTheFly() ? "otf" : "gpu-local";
+  }
 
   /* the orbitals evaluated on the device batch by batch (Set_Hamiltonian.c),
      rank by rank, before the CPU loop */
   {
     extern int Set_Density_Grid_OTF_Run(int Cnt_kind, double *****CDM, double ***Tmp_Den_Grid);
-    if (!use_local_gpu && use_otf_gpu && Set_Density_Grid_OTF_Run(Cnt_kind,CDM,Tmp_Den_Grid)) use_local_gpu=1;
+    if (!use_local_gpu && use_otf_gpu && Set_Density_Grid_OTF_Run(Cnt_kind,CDM,Tmp_Den_Grid)){
+      use_local_gpu=1;
+      sd_mode = "otf";
+    }
   }
 
   if (!use_local_gpu){
@@ -1565,6 +1615,7 @@ double Set_Density_Grid(int Cnt_kind, int Calc_CntOrbital_ON, double *****CDM, d
   if(myid==0 && measure_time){
     printf("Time for Part1=%18.5f\n",(time2-time1));fflush(stdout);
   }
+  sd_quad = time2 - sd_t0; sd_t0 = time2;
 
   /******************************************************
       MPI communication from the partitions A to B 
@@ -1647,6 +1698,7 @@ double Set_Density_Grid(int Cnt_kind, int Calc_CntOrbital_ON, double *****CDM, d
     Den_Rcv_Grid_A2B[myid][i] = Den_Snd_Grid_A2B[myid][i];
   }
 
+  dtime(&sd_t1); sd_a2b = sd_t1 - sd_t0; sd_t0 = sd_t1;
   /******************************************************
    superposition of rho_i to calculate charge density 
    in the partition B.
@@ -1709,6 +1761,7 @@ double Set_Density_Grid(int Cnt_kind, int Calc_CntOrbital_ON, double *****CDM, d
     }
   }
 
+  dtime(&sd_t1); sd_sup = sd_t1 - sd_t0; sd_t0 = sd_t1;
   /******************************************************
              MPI: from the partitions B to D
   ******************************************************/
@@ -1733,6 +1786,11 @@ double Set_Density_Grid(int Cnt_kind, int Calc_CntOrbital_ON, double *****CDM, d
   /* elapsed time */
   dtime(&TEtime);
   time0 = TEtime - TStime;
+  sd_b2d = TEtime - sd_t0;
+  if (sd_prof){
+    fprintf(stderr,"SETDENPROF id=%d mode=%s pre=%.3f quad=%.3f a2b=%.3f sup=%.3f b2d=%.3f total=%.3f\n",
+            myid,sd_mode,sd_pre,sd_quad,sd_a2b,sd_sup,sd_b2d,time0);
+  }
   if(myid==0 && measure_time) printf("time0=%18.5f\n",time0);
 
   return time0;
@@ -1758,9 +1816,32 @@ void Data_Grid_Copy_B2C_2(double **data_B, double **data_C)
   MPI_Comm_rank(mpi_comm_level1,&myid);
 
   /* allocation of arrays */
-  
-  Work_Array_Snd_Grid_B2C = (double*)malloc(sizeof(double)*GP_B2C_S[NN_B2C_S]*(SpinP_switch+1)); 
-  Work_Array_Rcv_Grid_B2C = (double*)malloc(sizeof(double)*GP_B2C_R[NN_B2C_R]*(SpinP_switch+1)); 
+  /* the send/receive work arrays persist across calls (grow-only, as in
+     the NVIDIA version): this copy runs every SCF step, and allocating and
+     first touching its tens of MiB were a measurable part of its time.
+     The request/status arrays are allocated per call. */
+  {
+    static double *snd_keep = NULL, *rcv_keep = NULL;
+    static size_t snd_cap = 0, rcv_cap = 0;
+    const size_t snd_need = (size_t)GP_B2C_S[NN_B2C_S]*(size_t)(SpinP_switch+1);
+    const size_t rcv_need = (size_t)GP_B2C_R[NN_B2C_R]*(size_t)(SpinP_switch+1);
+
+    /* SDG_checked_alloc aborts with a message where malloc fails */
+    if (snd_keep==NULL || snd_cap<snd_need){
+      free(snd_keep);
+      snd_keep = (double*)SDG_checked_alloc(snd_need,sizeof(double),0,
+                                            "Data_Grid_Copy_B2C_2 send buffer",myid);
+      snd_cap = snd_need;
+    }
+    if (rcv_keep==NULL || rcv_cap<rcv_need){
+      free(rcv_keep);
+      rcv_keep = (double*)SDG_checked_alloc(rcv_need,sizeof(double),0,
+                                            "Data_Grid_Copy_B2C_2 receive buffer",myid);
+      rcv_cap = rcv_need;
+    }
+    Work_Array_Snd_Grid_B2C = snd_keep;
+    Work_Array_Rcv_Grid_B2C = rcv_keep;
+  }
 
   if (firsttime==1){
     PrintMemory("Data_Grid_Copy_B2C_2: Work_Array_Snd_Grid_B2C",
@@ -1911,8 +1992,7 @@ void Data_Grid_Copy_B2C_2(double **data_B, double **data_C)
   }
 
   /* freeing of arrays */
-  free(Work_Array_Snd_Grid_B2C);
-  free(Work_Array_Rcv_Grid_B2C);
+  /* Work_Array_Snd_Grid_B2C and Work_Array_Rcv_Grid_B2C persist */
 }
 
 

@@ -44,14 +44,24 @@ void Free_Arrays(int wherefrom)
     Set_Hamiltonian_Invalidate_GpuSolver_HS_Cache();
     (void)openmx_magma_release_z_workspace();
     (void)openmx_hipsolver_release_workspace();
+    (void)openmx_magma_release_d_workspace();
+    openmx_magma_release_fp32_workspace();
+    openmx_gpusolver_cache_release();
     Set_Density_Grid_GPU_Invalidate();
     Set_Hamiltonian_Invalidate_OpenMP_MatrixElements_Cache();
+    /* the on-the-fly state and its batch plans (keyed by the atom count,
+       not by the geometry) must not reach the next input */
+    Set_Hamiltonian_OTF_Release();
+    Set_Orbitals_Grid_OTF_Release();
   }
 
   if      (wherefrom==0) array0();
   else if (wherefrom==1) array1();
 
-  if (wherefrom==0) openmx_gemmul8ReleaseWorkspaces();
+  if (wherefrom==0){
+    openmx_gemmul8ReleaseWorkspaces();
+    openmx_gemmul8ReportTiming();
+  }
 
 }
 

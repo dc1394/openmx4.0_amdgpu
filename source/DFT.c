@@ -1376,6 +1376,9 @@ double DFT(int MD_iter, int Cnt_Now)
           if (!isfinite(guard_factor)) guard_factor = 100.0;
           if (guard_factor<0.0) guard_factor = 0.0;
         }
+        /* the host's value, so that no rank can take a different branch
+           into the collective solve below */
+        MPI_Bcast(&guard_factor, 1, MPI_DOUBLE, Host_ID, mpi_comm_level1);
       }
       bound = guard_factor*SCF_Criterion;
       normrd = sqrt(fabs(NormRD[0]));
@@ -2735,19 +2738,39 @@ double DFT(int MD_iter, int Cnt_Now)
   Cluster_DFT_NonCol_Release_GPU_Solver();
   Divide_Conquer_Release_GPU_SCache();
   Krylov_Release_GPU_KUCache();
+  /* the end of the SCF cycle for the grid integrals (the NVIDIA version
+     calls these right after the SCF loop): the on-the-fly state (sphere
+     indices, PAO tables, batch plans) and the density's local-mode device
+     buffers go before the forces, which do not read them.  Here and not
+     at the end of the loop, because the Cnt_kind 1 density above takes the
+     same paths on AMD and would rebuild them */
+  Set_Hamiltonian_OnTheFly_EndCycle();
+  Set_Density_Grid_GPU_EndCycle();
   /* The dense-GEMM and eigensolver library workspaces of the SCF loop are
      dead weight from here on (they are re-created on demand at the next SCF
      step), but on a device shared by many ranks they can hold the very GiBs
      the force-stage batches need: a 216-atom noncollinear cluster run on one
      16-GiB GPU died in Force3's task-force allocation with them resident. */
   openmx_gemmul8ReleaseWorkspaces();
+  /* OPENMX_GEMMUL8_TIMING=1: this rank's totals of the bridge's GEMMs over the SCF */
+  openmx_gemmul8ReportTiming();
   (void)openmx_magma_release_z_workspace();
+  (void)openmx_magma_release_d_workspace();
+  openmx_magma_release_fp32_workspace();
   (void)openmx_hipsolver_release_workspace();
+  openmx_gpusolver_cache_release();
   if (!orbitalOpt_Force_Skip) time7 += Force(H0,DS_NL,OLP,DM[0],EDM);
   
   if (scf_stress_flag){
     Stress(H0,DS_NL,OLP,DM[0],EDM); 
   }
+
+  /* the matrix-element tables that a non-band run (or a band run with
+     OPENMX_FORCE_RELEASE_SCF_CACHES=0) kept on the device through Force3:
+     nothing after the forces reads them, and the next geometry rebuilds
+     them anyway (idempotent when Force already released them) */
+  Set_Density_Grid_GPU_Invalidate();
+  Set_Hamiltonian_Invalidate_OpenMP_MatrixElements_Cache();
 
   /*
   if (SpinP_switch==3) {

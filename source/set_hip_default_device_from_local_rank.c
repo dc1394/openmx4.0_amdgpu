@@ -291,3 +291,8 @@ int set_hip_default_device_from_local_rank_noncollective(void)
 
     return dev;
 }
+
+int OpenMX_GpuMemGetInfo(size_t *free_bytes, size_t *total_bytes)
+{
+    return (int)hipMemGetInfo(free_bytes, total_bytes);
+}

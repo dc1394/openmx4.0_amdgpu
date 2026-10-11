@@ -8,9 +8,10 @@
   geometry, and the orbital values of any atom image at any list of grid
   points (an atom's sphere, a pair's overlap points) are evaluated on the
   device instead of read from the multi-GiB tables Orbs_Grid /
-  Orbs_Grid_FNAN.  The values agree with those tables (the same
-  transcription of Get_Orbitals; the double-float evaluation differs by
-  one float ulp in about one value in 10^6).  Uncontracted bases with
+  Orbs_Grid_FNAN.  Those tables are built by the FP64 evaluation here
+  (OTF_Orbitals_Eval_FP64), so the FP64 values equal them bit for bit
+  at the same grid point and image; the double-float evaluation differs
+  by one float ulp in about one value in 10^6.  Uncontracted bases with
   L <= 3 and at most 8 radial functions per L only.
 ***********************************************************************/
 #ifndef ORBS_OTF_HIP_H
@@ -54,7 +55,10 @@ typedef struct {
 } OTF_HostTables;
 
 /* uploads the tables (double_float: also the (hi, lo) tables of the
-   double-float evaluation); 1 on success */
+   double-float evaluation); 1 on success, 0 when a host or device
+   allocation or a transfer failed (worth a retry), -1 when the tables are
+   outside the evaluator (no species, L > OTF_L0MAX, more than OTF_MULMAX
+   radial functions of one L, fewer than 6 mesh points) */
 int    OTF_Orbitals_Upload(const OTF_HostTables *t, int double_float);
 void   OTF_Orbitals_Release(void);
 int    OTF_Orbitals_Ready(void);
@@ -70,6 +74,12 @@ size_t OTF_Orbitals_Bytes(void);
 int OTF_Orbitals_Eval(void *stream, int count, int max_npts, const OTF_Atom *atoms, const int *npts,
                       const size_t *idx_off, const size_t *out_off, const size_t *sph_off, const int *idx,
                       const int *gla, const int *cla, float *out);
+
+/* the same in FP64 whatever the uploaded precision (the tables
+   Orbs_Grid / Orbs_Grid_FNAN of Set_Orbitals_Grid.c) */
+int OTF_Orbitals_Eval_FP64(void *stream, int count, int max_npts, const OTF_Atom *atoms, const int *npts,
+                           const size_t *idx_off, const size_t *out_off, const size_t *sph_off, const int *idx,
+                           const int *gla, const int *cla, float *out);
 
 #ifdef __cplusplus
 }

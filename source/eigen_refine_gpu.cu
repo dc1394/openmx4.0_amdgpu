@@ -191,8 +191,11 @@ __global__ void k_f64_to_c32_phase(const double *__restrict__ a, float *__restri
             const double pr = cr * cc + sr * sc, pi = cr * sc - sr * cc;   /* conj(d_row) d_col */
             float        fr = (float)(re * pr - im * pi), fi = (float)(re * pi + im * pr);
 
+            /* 1e-30 still let ROCm 7.2's cheevd return NaN vectors for
+               matrices of two tridiagonal blocks (n = 100 to 1000); 1e-25,
+               far below the FP32 rounding of any element, did not */
             if (fr == 0.0f && fi == 0.0f && row != col)
-                fr = 1.0e-30f * (float)(1 + (unsigned)(row * 7 + col * 13) % 17u);
+                fr = 1.0e-25f * (float)(1 + (unsigned)(row * 7 + col * 13) % 17u);
             af[2 * idx] = fr;
             af[2 * idx + 1] = fi;
         }
@@ -436,16 +439,27 @@ void refine_blocks_release(EigenRefineState *st)
     st->products_ready = 0;
 }
 
+/* the layout of the product blocks of a solve of maxn wanted states: three
+   n x kc blocks while the unrefined columns are rotated against the refined
+   ones, two when every column is refined */
+void refine_blocks_layout(int cplx, int n, int maxn, int *blocks, size_t *block_bytes)
+{
+    const int    kc = env_flag("OPENMX_EIGEN_REFINE_ALL", 0) ? n : maxn;
+    const size_t nk = (size_t)n * (size_t)kc;
+
+    *blocks = (kc < n && env_flag("OPENMX_EIGEN_REFINE_COMPLEMENT", 1)) ? 3 : 2;
+    *block_bytes = (nk * (cplx ? 2 : 1) * sizeof(double) + 511u) / 512u * 512u;
+}
+
 /* the product blocks: the FP32 scratch once the solve is done, else a
    buffer of their own; 0 when there is no room */
 int refine_blocks_ensure(EigenRefineState *st, EigenRefineDevice *dev, const EigenRefineProblem *pb,
                          EigenRefineReport *report)
 {
-    const int    kc = env_flag("OPENMX_EIGEN_REFINE_ALL", 0) ? pb->n : pb->maxn;
-    const int    blocks = (kc < pb->n && env_flag("OPENMX_EIGEN_REFINE_COMPLEMENT", 1)) ? 3 : 2;
-    const size_t nk = (size_t)pb->n * (size_t)kc;
-    const size_t block_bytes = (nk * (pb->cplx ? 2 : 1) * sizeof(double) + 511u) / 512u * 512u;
+    int    blocks;
+    size_t block_bytes;
 
+    refine_blocks_layout(pb->cplx, pb->n, pb->maxn, &blocks, &block_bytes);
     refine_blocks_release(st);
     if ((size_t)blocks * block_bytes <= pb->region) {
         st->b1 = (double *)pb->fp32;
@@ -1042,6 +1056,20 @@ extern "C" size_t openmx_eigen_refine_fp32_work_bytes(int cplx, int n)
     }
     cached_n[slot] = n;
     return cached_bytes[slot];
+}
+
+/* bytes of the product blocks of a refined solve of maxn wanted states of an
+   n x n problem, whether they then take the FP32 scratch (when its region
+   holds them) or a buffer of their own: the memory models of the solvers
+   budget the latter */
+extern "C" size_t openmx_eigen_refine_product_bytes(int cplx, int n, int maxn)
+{
+    int    blocks;
+    size_t block_bytes;
+
+    if (n <= 0 || maxn <= 0) return 0;
+    refine_blocks_layout(cplx, n, std::min(maxn, n), &blocks, &block_bytes);
+    return (size_t)blocks * block_bytes;
 }
 
 extern "C" void openmx_eigen_refine_abandon(EigenRefineState *st)

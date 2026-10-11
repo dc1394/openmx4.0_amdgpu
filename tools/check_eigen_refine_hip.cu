@@ -12,6 +12,13 @@
 // states, f the Fermi occupations at 300 K with the chemical potential from
 // bisection.
 //
+// Then the product blocks in the layout of the collinear cluster solver
+// (FP32 scratch and block region = one n x n FP64 panel, d_tmp): with few
+// wanted states the blocks fit the region and no buffer of their own is
+// allocated, with more (or all n) the solve allocates exactly
+// openmx_eigen_refine_product_bytes(), the size its memory admission
+// budgets; each solve still matches FP64.
+//
 // Build (from the repository root, after building the OpenMX objects):
 //   MPI=/path/to/mpi        # the MPI installation of the OpenMX build
 //   /opt/rocm-7.2.0/bin/hipcc -std=c++20 -O2 --offload-arch=gfx1200 -Isource $($MPI/bin/mpicc --showme:compile) \
@@ -21,7 +28,7 @@
 //       source/third_party/GEMMul8/lib/libgemmul8.a $($MPI/bin/mpicc --showme:link) \
 //       -L/opt/rocm-7.2.0/lib -lhipsolver -lhipblas -lhipblaslt -lrocblas \
 //       -L$AOCL/lib -lflame -lblis -o check_eigen_refine_hip
-// Run: ./check_eigen_refine_hip [n_complex] [n_real]   (defaults 2808 2808)
+// Run: ./check_eigen_refine_hip [n_complex] [n_real] [n_blocks]   (defaults 2808 2808 1200; 0 skips)
 #include <hip/hip_runtime.h>
 #include <hipblas/hipblas.h>
 #include <hipsolver/hipsolver.h>
@@ -51,7 +58,16 @@ int MYID_MPI_COMM_WORLD = 0;
 
 static double now() { return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
 
-static hipError_t try_malloc(void **ptr, size_t bytes) { return hipMalloc(ptr, bytes); }
+/* the sizes the refinement asked for, while recording */
+static std::vector<size_t> g_requests;
+static bool                g_recording = false;
+static hipError_t try_malloc(void **ptr, size_t bytes)
+{
+    if (g_recording) g_requests.push_back(bytes);
+    return hipMalloc(ptr, bytes);
+}
+
+extern "C" size_t openmx_eigen_refine_product_bytes(int cplx, int n, int maxn);
 static void *host_malloc(size_t count, size_t elem, const char *label)
 {
     void *p = calloc(count ? count : 1, elem);
@@ -341,11 +357,128 @@ static int run_case(const Case &cs, hipblasHandle_t h)
     return failures;
 }
 
+/* The product blocks in the collinear cluster solver's layout: the FP32
+   scratch and the region of the blocks are one n x n FP64 panel (d_tmp).
+   A cold refined solve of maxn wanted states of a real symmetric n x n
+   matrix: the blocks take the region when they fit it, else the solve
+   allocates exactly openmx_eigen_refine_product_bytes(0, n, maxn) (what the
+   solver's admission budgets); the eigenvalues match FP64 either way. */
+static int check_product_blocks(int n, hipblasHandle_t h)
+{
+    const size_t nn = (size_t)n * n, panel = nn * sizeof(double);
+    const double nel = (double)(n / 6) + 1.0;
+    /* the first step's states of the cluster solver (n/6 occupied + a
+       margin, within the region), a third of n and more (beyond it), all */
+    const int maxns[3] = {n / 6 + n / 10, n / 2, n};
+    std::vector<double> H = make_matrix(0, n, 4242u + n, 2.0 / sqrt((double)n));
+    double *dA, *dRef, *dX, *dW, *dT, *dWork = nullptr;
+    size_t work_bytes = 0;
+    int32_t *dInfo;
+    int failures = 0;
+    hipsolverDnHandle_t sol;
+
+    printf("=== product blocks in the collinear cluster layout: real symmetric n=%d, region %.1f MiB\n", n,
+           (double)panel / 1048576.0);
+    CK(hipMalloc(&dA, panel));
+    CK(hipMalloc(&dRef, panel));
+    CK(hipMalloc(&dX, panel));
+    CK(hipMalloc(&dW, n * sizeof(double)));
+    CK(hipMalloc(&dT, panel));
+    CK(hipMalloc(&dInfo, sizeof(int32_t)));
+    CK(hipsolverDnCreate(&sol));
+
+    /* FP64 reference eigenvalues */
+    std::vector<double> eref(n);
+    {
+        int lwork = 0;
+        double *rwork;
+        CK(hipMemcpy(dRef, H.data(), panel, hipMemcpyHostToDevice));
+        CK(hipsolverDnDsyevd_bufferSize(sol, HIPSOLVER_EIG_MODE_VECTOR, HIPBLAS_FILL_MODE_LOWER, n, dRef, n, dW, &lwork));
+        CK(hipMalloc(&rwork, (size_t)lwork * sizeof(double)));
+        CK(hipsolverDnDsyevd(sol, HIPSOLVER_EIG_MODE_VECTOR, HIPBLAS_FILL_MODE_LOWER, n, dRef, n, dW, rwork, lwork, dInfo));
+        CK(hipDeviceSynchronize());
+        CK(hipFree(rwork));
+        CK(hipMemcpy(eref.data(), dW, n * sizeof(double), hipMemcpyDeviceToHost));
+    }
+
+    for (int c = 0; c < 3; c++) {
+        const int    maxn = maxns[c];
+        const size_t blocks = openmx_eigen_refine_product_bytes(0, n, maxn);
+        const bool   own = panel < blocks;
+        EigenRefineDevice dev;
+        EigenRefineState st;
+        EigenRefineProblem pb;
+        EigenRefineReport rep;
+        Fermi occ_ctx = {0.0};
+        std::vector<double> e0(n), f0(n), ew(maxn);
+        int rc;
+        bool allocated = false;
+        double de = 0.0;
+
+        memset(&dev, 0, sizeof(dev));
+        dev.hipblas = h;
+        dev.d_work = (void **)&dWork;
+        dev.d_work_bytes = &work_bytes;
+        dev.d_info = dInfo;
+        dev.try_malloc = try_malloc;
+        dev.host_malloc = host_malloc;
+        memset(&st, 0, sizeof(st));
+        memset(&pb, 0, sizeof(pb));
+        pb.cplx = 0;
+        pb.n = n;
+        pb.maxn = maxn;
+        pb.iterations = 2;
+        pb.a = dA;
+        pb.w = dW;
+        pb.fp32 = dT;
+        pb.region = panel;
+        pb.x = dX;
+        pb.transient = 1;
+        pb.occupation = fermi;
+        pb.occupation_ctx = &occ_ctx;
+
+        CK(hipMemcpy(dA, H.data(), panel, hipMemcpyHostToDevice));
+        g_requests.clear();
+        g_recording = true;
+        rc = openmx_eigen_refine_prepare(&st, &dev, &pb, e0.data(), &rep);
+        if (rc == 1) {
+            occ_ctx.mu = find_mu(e0.data(), maxn, nel);
+            for (int i = 0; i < n; i++) f0[i] = fermi(e0[i], i + 1, &occ_ctx);
+            rc = openmx_eigen_refine_finish(&st, &dev, &pb, f0.data(), &rep);
+        }
+        g_recording = false;
+        for (size_t r : g_requests) allocated = allocated || (r == blocks);
+        if (rc == 1) {
+            CK(hipMemcpy(ew.data(), dW, maxn * sizeof(double), hipMemcpyDeviceToHost));
+            for (int i = 0; i < maxn; i++) de = std::isfinite(ew[i]) ? std::max(de, fabs(ew[i] - eref[i])) : INFINITY;
+        }
+        printf("  maxn %5d: product blocks %.1f MiB, %s; %s; max|dE| %.2e\n", maxn, (double)blocks / 1048576.0,
+               own ? "beyond the region" : "within the region",
+               allocated ? "allocated by the solve" : "no allocation of that size", de);
+        if (rc != 1 || allocated != own || !(de <= 1e-9)) {
+            printf("  ** product block check FAILED (rc %d)\n", rc);
+            failures++;
+        }
+        openmx_eigen_refine_state_release(&st);
+        openmx_eigen_refine_device_release(&dev);
+    }
+    CK(hipsolverDnDestroy(sol));
+    CK(hipFree(dA));
+    CK(hipFree(dRef));
+    CK(hipFree(dX));
+    CK(hipFree(dW));
+    CK(hipFree(dT));
+    CK(hipFree(dInfo));
+    if (dWork) CK(hipFree(dWork));
+    return failures;
+}
+
 int main(int argc, char **argv)
 {
     MPI_Init(&argc, &argv);
     int nc = argc > 1 ? atoi(argv[1]) : 2808;
     int nr = argc > 2 ? atoi(argv[2]) : 2808;
+    int nb = argc > 3 ? atoi(argv[3]) : 1200;
     hipblasHandle_t h;
     CK(hipblasCreate(&h));
     int failures = 0;
@@ -353,6 +486,7 @@ int main(int argc, char **argv)
        an odd count fills one state of the pair at the Fermi level */
     if (nc > 0) failures += run_case({1, nc, (double)(nc / 3) + 1.0}, h);
     if (nr > 0) failures += run_case({0, nr, (double)(nr / 3) + 1.0}, h);
+    if (nb > 0) failures += check_product_blocks(nb, h);
     CK(hipblasDestroy(h));
     printf("%s (%d failure%s)\n", failures ? "FAILED" : "PASSED", failures, failures == 1 ? "" : "s");
     MPI_Finalize();

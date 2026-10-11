@@ -652,6 +652,11 @@ void EigenBand_lapack_openmp(dcomplex* A, double* W, int N0, int MaxN)
 {
     int info;
     info = gpusolver_zheevx_openmp(A, W, N0, MaxN);
+    if (info != 0) {
+        fprintf(stderr, "EigenBand_lapack_openmp: GPU eigensolver failed, info=%d\n", info);
+        fflush(stderr);
+        MPI_Abort(mpi_comm_level1, 1);
+    }
 }
 
 void Eigen_gpusolver_x_complex_openmp(dcomplex ** a, double * ko, int n0, int EVmax)
@@ -670,7 +675,18 @@ void Eigen_gpusolver_x_complex_openmp(dcomplex ** a, double * ko, int n0, int EV
             }
         }
 
+        /* the wrapper stages the host arrays through device memory (a dGPU
+           cannot read malloc'd memory) and checks the eigenpairs for
+           non-finite values, the defect of rocSOLVER's complex D&C */
         info = gpusolver_Syevdx_Complex_openmp(A, ko, n, EVmax);
+
+        if (info != 0) {
+            free(A);
+            fprintf(stderr, "Eigen_gpusolver_x_complex_openmp: GPU eigensolver failed, info=%d\n", info);
+            fflush(stderr);
+            MPI_Abort(mpi_comm_level1, 1);
+            return;
+        }
 
 #pragma omp parallel for collapse(2)
         for (int i = 0; i < EVmax; i++) {
@@ -683,11 +699,6 @@ void Eigen_gpusolver_x_complex_openmp(dcomplex ** a, double * ko, int n0, int EV
         for (int i = EVmax; i >= 1; i--) {
             ko[i] = ko[i - 1];
         }
-    }
-
-    if (info < 0) {
-        printf("hipsolverDnZheevdx: info=%d\n", info);
-        exit(10);
     }
 
     free(A);
@@ -706,6 +717,13 @@ int gpusolver_zheevx(dcomplex** A, double* W, int N0, int MaxN, int ev_flag)
     }
 
     int info = gpusolver_Syevdx_Complex(A0, W, N, MaxN);
+
+    /* on any failure (a non-finite result included) EigenBand_lapack solves
+       again with Eigen_HH, which needs the original A and W untouched */
+    if (info != 0) {
+        free(A0);
+        return info;
+    }
 
     if (ev_flag == 1) {
         for (int i = 1; i <= N; i++) {
@@ -731,6 +749,7 @@ int gpusolver_zheevx_openmp(dcomplex* A, double* W, int N0, int MaxN)
     int info;
 
     info = gpusolver_Syevdx_Complex_openmp(A, W, N0, MaxN);
+    if (info != 0) return info;
 
     {
         for (int i = N0; i >= 1; i--) {

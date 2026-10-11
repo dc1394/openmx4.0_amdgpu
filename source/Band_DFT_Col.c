@@ -50,6 +50,11 @@ extern size_t Set_Hamiltonian_DemoteResidency(void);
 extern int openmx_hipsolver_release_workspace(void);
 extern int BandCol_ReleaseDMDeviceWorkspace_HIP(void);
 extern void Set_Density_Grid_GPU_Release_Device_Caches(void);
+extern hipblasStatus_t openmx_gemmul8ZgemmSolve(hipblasHandle_t handle, hipblasOperation_t transa,
+                                                hipblasOperation_t transb, int m, int n, int k,
+                                                const hipDoubleComplex *alpha, const hipDoubleComplex *A, int lda,
+                                                const hipDoubleComplex *B, int ldb, const hipDoubleComplex *beta,
+                                                hipDoubleComplex *C, int ldc);
 
 static void Construct_Band_CsHs(int SCF_iter, int all_knum, int * order_GA, int * MP, double * S1, double * H1,
                                 double k1, double k2, double k3, dcomplex * Cs, dcomplex * Hs, int n,
@@ -60,6 +65,8 @@ static double get_max_value(double localValue);
 static void   BandCol_GpuSolver_EnsureMatrixCapacity(int n);
 static void   BandCol_ConstructCache_Reset(void);
 static void   BandCol_RefineRelease(void);
+static void   BandCol_RefineResetStage(void);
+static void   BandCol_RefineDropBasis(void);
 
 typedef struct
 {
@@ -142,13 +149,20 @@ static size_t BandCol_HostCacheLimit(const char *name, double default_mib)
     return limit;
 }
 
+/* An entry holds the transformed overlap (n x n complex) and, behind it,
+   the n overlap eigenvalues, which a hit restores to ko and koS as the
+   overlap solve would leave them (the outputs and diagnostics read them). */
 static void BandCol_KOverlapPrepare(int n, int points)
 {
+    size_t matrix_bytes, bytes;
+
     if (BandCol_k_overlap_n != n || BandCol_k_overlap_points != points)
         BandCol_KOverlapReset();
     if (BandCol_k_overlap != NULL || n <= 0 || points <= 0 ||
         (size_t)n > SIZE_MAX / (size_t)n / sizeof(dcomplex)) return;
-    size_t bytes = (size_t)n * (size_t)n * sizeof(dcomplex);
+    matrix_bytes = (size_t)n * (size_t)n * sizeof(dcomplex);
+    if ((size_t)n > (SIZE_MAX - matrix_bytes) / sizeof(double)) return;
+    bytes = matrix_bytes + (size_t)n * sizeof(double);
     if (bytes > BandCol_HostCacheLimit("OPENMX_BAND_COL_OVERLAP_CACHE_MB", 512.0)) return;
     BandCol_k_overlap = (BandColKOverlap*)calloc((size_t)points, sizeof(BandColKOverlap));
     if (BandCol_k_overlap == NULL) return;
@@ -157,22 +171,33 @@ static void BandCol_KOverlapPrepare(int n, int points)
     BandCol_k_overlap_bytes = bytes;
 }
 
-static int BandCol_KOverlapRestore(int point, double k1, double k2, double k3)
+static int BandCol_KOverlapRestore(int point, double k1, double k2, double k3, double *ko, double *koS)
 {
     BandColGpuSolverCtx *ctx = &BandCol_gpusolver_ctx;
-    if (BandCol_k_overlap == NULL) return 0;
-    BandColKOverlap *entry = &BandCol_k_overlap[point];
+    BandColKOverlap *entry;
+    size_t matrix_bytes, eigen_bytes;
+
+    if (BandCol_k_overlap == NULL || point < 0 || point >= BandCol_k_overlap_points) return 0;
+    entry = &BandCol_k_overlap[point];
     if (entry->matrix == NULL || entry->k1 != k1 || entry->k2 != k2 || entry->k3 != k3) return 0;
-    wait_hipfunc(hipMemcpy(ctx->d_S, entry->matrix, BandCol_k_overlap_bytes, hipMemcpyHostToDevice));
+    matrix_bytes = (size_t)BandCol_k_overlap_n * (size_t)BandCol_k_overlap_n * sizeof(dcomplex);
+    eigen_bytes = (size_t)BandCol_k_overlap_n * sizeof(double);
+    BandCol_GpuSolver_EnsureMatrixCapacity(BandCol_k_overlap_n);
+    wait_hipfunc(hipMemcpy(ctx->d_S, entry->matrix, matrix_bytes, hipMemcpyHostToDevice));
+    memcpy(ko + 1, (const char*)entry->matrix + matrix_bytes, eigen_bytes);
+    memcpy(koS + 1, (const char*)entry->matrix + matrix_bytes, eigen_bytes);
     ctx->transformed_s_valid = 1;
     ctx->transformed_s_dim = BandCol_k_overlap_n;
     return 1;
 }
 
-static void BandCol_KOverlapSave(int point, double k1, double k2, double k3)
+static void BandCol_KOverlapSave(int point, double k1, double k2, double k3, const double *koS)
 {
-    if (BandCol_k_overlap == NULL) return;
-    BandColKOverlap *entry = &BandCol_k_overlap[point];
+    BandColKOverlap *entry;
+    size_t matrix_bytes;
+
+    if (BandCol_k_overlap == NULL || point < 0 || point >= BandCol_k_overlap_points) return;
+    entry = &BandCol_k_overlap[point];
     if (entry->matrix == NULL) {
         size_t limit = BandCol_HostCacheLimit("OPENMX_BAND_COL_OVERLAP_CACHE_MB", 512.0);
         if (BandCol_k_overlap_used > limit || BandCol_k_overlap_bytes > limit - BandCol_k_overlap_used) return;
@@ -180,8 +205,9 @@ static void BandCol_KOverlapSave(int point, double k1, double k2, double k3)
         if (entry->matrix == NULL) return;
         BandCol_k_overlap_used += BandCol_k_overlap_bytes;
     }
-    wait_hipfunc(hipMemcpy(entry->matrix, BandCol_gpusolver_ctx.d_S,
-                          BandCol_k_overlap_bytes, hipMemcpyDeviceToHost));
+    matrix_bytes = (size_t)BandCol_k_overlap_n * (size_t)BandCol_k_overlap_n * sizeof(dcomplex);
+    wait_hipfunc(hipMemcpy(entry->matrix, BandCol_gpusolver_ctx.d_S, matrix_bytes, hipMemcpyDeviceToHost));
+    memcpy((char*)entry->matrix + matrix_bytes, koS + 1, (size_t)BandCol_k_overlap_n * sizeof(double));
     entry->k1 = k1;
     entry->k2 = k2;
     entry->k3 = k3;
@@ -616,6 +642,8 @@ static int BandCol_GpuDenseFits(int n, int owns_dense)
         if (fit!=0 || attempt==1) break;
         (void)BandCol_ReleaseDMDeviceWorkspace_HIP();
         BandCol_ConstructCache_Reset();
+        /* the basis the resident refined path keeps for its warm start */
+        BandCol_RefineDropBasis();
         Set_Density_Grid_GPU_Release_Device_Caches();
         /* the Hamiltonian's resident orbital tables as well, for the rest of
            the run: re-uploaded per call they leave the eigensolver its room */
@@ -1387,6 +1415,9 @@ void Band_DFT_Col_Release_GPU_Caches(void)
     BandCol_DMWorkspace_Reset();
     BandCol_DMEntryCache_Reset();
     BandCol_GpuSolver_Destroy();
+    /* the refinement's stage (iterations, a cycle or run turned to FP64)
+       starts over with the next input, read again by every rank */
+    BandCol_RefineResetStage();
 }
 
 static dcomplex *BandCol_GpuSolver_SaveDeviceEigenvectors(dcomplex *evec_device, int n, int stride)
@@ -1917,6 +1948,7 @@ static BandColKRefineSlot  *BandCol_kref = NULL;
 static int                  BandCol_kref_slots = 0, BandCol_kref_n = 0;
 static size_t               BandCol_kref_used = 0;
 static EigenRefineState     BandCol_kref_state;        /* the module's device state of the two-pass solves */
+static const BandColRefineState BandCol_refine_initial = {-1, 0.0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
 static BandColRefineState   BandCol_refine = {-1, 0.0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
 static EigenRefineState     BandCol_refine_state;      /* the two-half solves */
 static EigenRefineDevice    BandCol_refine_dev;
@@ -1964,20 +1996,38 @@ static void BandCol_RefineRelease(void)
     BandCol_refine_e0_n = 0;
 }
 
+/* the run boundary only (Band_DFT_Col_Release_GPU_Caches, every rank; not
+   BandCol_GpuSolver_Destroy, which a device change of one rank also calls):
+   the stage of the next input starts over, so a refinement turned off for
+   the rest of a run does not reach the next input of -runtest/-runtestL */
+static void BandCol_RefineResetStage(void)
+{
+    BandCol_refine = BandCol_refine_initial;
+}
+
 /* every rank, once: OPENMX_EIGEN_REFINE, or the default the global root's
-   device implies, for all ranks alike */
+   device implies, and OPENMX_EIGEN_REFINE_UNTIL, the global root's for all
+   ranks alike (a stage that differed between the ranks would take them
+   into different collectives) */
 static void BandCol_RefineConfigure(void)
 {
     BandColRefineState *st = &BandCol_refine;
-    int myid, config[2] = {0, 0};
+    double config[3] = {0.0, 0.0, 0.0};
+    int    myid;
 
     if (0 <= st->iterations) return;
     MPI_Comm_rank(mpi_comm_level1, &myid);
-    if (myid == Host_ID) config[0] = openmx_eigen_refine_configure(1, 0 < level_stdout, &config[1]);
-    MPI_Bcast(config, 2, MPI_INT, Host_ID, mpi_comm_level1);
-    st->iterations = config[0];
-    st->defaulted = (0 < config[1]);
-    st->until = openmx_eigen_refine_until();
+    if (myid == Host_ID) {
+        int ratio = 0;
+
+        config[0] = (double)openmx_eigen_refine_configure(1, 0 < level_stdout, &ratio);
+        config[1] = (double)ratio;
+        config[2] = openmx_eigen_refine_until();
+    }
+    MPI_Bcast(config, 3, MPI_DOUBLE, Host_ID, mpi_comm_level1);
+    st->iterations = (int)config[0];
+    st->defaulted = (0.0 < config[1]);
+    st->until = config[2];
 }
 
 static int BandCol_RefineIterations(void)
@@ -1988,25 +2038,33 @@ static int BandCol_RefineIterations(void)
 /* every rank: whether a dense owner's device has room for what a refined
    solve adds to the FP64 one (the basis, the FP32 eigensolver's workspace,
    the product blocks when they exceed the n x n scratch) for the turns that
-   solve at once; a refinement that would not fit leaves the step in FP64 */
-static int BandCol_RefineFits(int n, int maxn, int turns, int owns_dense)
+   solve at once; base is this rank's view of whether the call may refine at
+   all (OPENMX_EIGEN_REFINE_MIN_N is read per rank), folded into the common
+   verdict so that every rank takes the collective and the same path; a
+   refinement that would not fit leaves the step in FP64 */
+static int BandCol_RefineFits(int base, int n, int maxn, int turns, int owns_dense)
 {
     size_t const nn = (size_t)n * (size_t)n;
-    int          local_fit = 1, fit = 1;
+    int          local_fit = base ? 1 : 0, fit = 0;
 
     if (BandCol_RefineIterations() <= 0) return 0;
     if (turns < 1) turns = 1;
-    if (owns_dense) {
+    if (local_fit && owns_dense) {
         /* only the owners ask (the query creates the FP32 solver's handle) */
         size_t extra = sizeof(dcomplex) * nn + openmx_eigen_refine_fp32_work_bytes(1, n);
         size_t free_bytes = 0, total_bytes = 0;
 
         if (3 * (size_t)maxn > (size_t)n) extra += 3 * sizeof(dcomplex) * (size_t)n * (size_t)maxn;
+        /* the basis the resident one-k-point path keeps on the device for
+           the next step's warm start (that path's owners alike) is the one
+           their next solves use, and it is taken from the free memory
+           already: not counted twice */
+        if (BandCol_refine_x != NULL && BandCol_refine_x_n == n) extra -= sizeof(dcomplex) * nn;
 
         /* the room the FP64 path leaves: its own budget is checked by
            BandCol_GpuDenseFits, with the turns' FP64 buffers allocated
            later, so the refinement's share comes on top of the reserve */
-        if (hipMemGetInfo(&free_bytes, &total_bytes) != hipSuccess ||
+        if (OpenMX_GpuMemGetInfo(&free_bytes, &total_bytes) != 0 ||
             free_bytes < extra * (size_t)turns + (size_t)5 * sizeof(dcomplex) * nn * (size_t)turns +
                              (size_t)512 * 1024 * 1024)
             local_fit = 0;
@@ -2190,18 +2248,51 @@ static void BandCol_GpuSolver_ForwardTransformDevice(int n, const dcomplex *H_in
     BandCol_GpuSolver_ZgemmDevice(HIPBLAS_OP_C, HIPBLAS_OP_N, n, n, n, ctx->d_S, ctx->d_tmp, ctx->d_H);
 }
 
-/* The back transform of the first maxn vectors in d_H: C^T = (S V)^T, state-
-   major with stride maxn, into the eigenvector buffer */
-static dcomplex *BandCol_GpuSolver_BackTransformDevice(int n, int maxn)
+/* OPENMX_BAND_GEMMUL8_BACKTRANSFORM (default 1): the back transform of the
+   eigenvectors through GEMMul8, as the NVIDIA version does, with the solve's
+   workspace cap and reserve (openmx_gemmul8ZgemmSolve: the k-point turns
+   share the device); 0 the native FP64 hipBLAS ZGEMM.  On gfx1200, whose
+   FP64 rate is 1/32 of FP32, the maxn x n x n native product can dominate a
+   k-point's solve once the eigensolver is refined. */
+static int BandCol_GemmulBackTransformEnabled(void)
+{
+    static int enabled = -1;
+
+    if (enabled < 0) {
+        const char *value = getenv("OPENMX_BAND_GEMMUL8_BACKTRANSFORM");
+        enabled = (value == NULL || atoi(value) != 0);
+    }
+    return enabled;
+}
+
+/* C^T = (S V)^T of the first maxn vectors V in d_H: state-major with
+   stride maxn into evec_t */
+static void BandCol_GpuSolver_BackTransformGemm(int n, int maxn, dcomplex *evec_t)
 {
     BandColGpuSolverCtx *ctx = &BandCol_gpusolver_ctx;
     hipDoubleComplex     alpha = make_hipDoubleComplex(1.0, 0.0);
     hipDoubleComplex     beta = make_hipDoubleComplex(0.0, 0.0);
-    dcomplex            *evec_t = BandCol_GpuSolver_EnsureEigenvectorCapacity(n, maxn);
 
-    wait_hipfunc(hipblasZgemm(ctx->hipblas, HIPBLAS_OP_T, HIPBLAS_OP_T, maxn, n, n, &alpha,
-                              (hipDoubleComplex *)ctx->d_H, n, (hipDoubleComplex *)ctx->d_S, n, &beta,
-                              (hipDoubleComplex *)evec_t, maxn));
+    if (BandCol_GemmulBackTransformEnabled()) {
+        wait_hipfunc(openmx_gemmul8ZgemmSolve(ctx->hipblas, HIPBLAS_OP_T, HIPBLAS_OP_T, maxn, n, n, &alpha,
+                                              (const hipDoubleComplex *)ctx->d_H, n,
+                                              (const hipDoubleComplex *)ctx->d_S, n, &beta,
+                                              (hipDoubleComplex *)evec_t, maxn));
+    }
+    else {
+        wait_hipfunc(hipblasZgemm(ctx->hipblas, HIPBLAS_OP_T, HIPBLAS_OP_T, maxn, n, n, &alpha,
+                                  (hipDoubleComplex *)ctx->d_H, n, (hipDoubleComplex *)ctx->d_S, n, &beta,
+                                  (hipDoubleComplex *)evec_t, maxn));
+    }
+}
+
+/* The back transform of the first maxn vectors in d_H: C^T = (S V)^T, state-
+   major with stride maxn, into the eigenvector buffer */
+static dcomplex *BandCol_GpuSolver_BackTransformDevice(int n, int maxn)
+{
+    dcomplex *evec_t = BandCol_GpuSolver_EnsureEigenvectorCapacity(n, maxn);
+
+    BandCol_GpuSolver_BackTransformGemm(n, maxn, evec_t);
     return evec_t;
 }
 
@@ -2609,8 +2700,6 @@ static dcomplex *BandCol_GpuSolver_SolveHamiltonianImpl(int n, int maxn, const d
     BandColGpuSolverCtx * ctx = &BandCol_gpusolver_ctx;
     size_t               matrix_bytes;
     dcomplex            *evec_t;
-    hipDoubleComplex      alpha = make_hipDoubleComplex(1.0, 0.0);
-    hipDoubleComplex      beta = make_hipDoubleComplex(0.0, 0.0);
     const int             tdbg = BandCol_SolveTimingEnabled();
     double                tt0 = 0.0, tt1 = 0.0, tt2 = 0.0, tt3 = 0.0, tt4 = 0.0, tt5 = 0.0;
 
@@ -2650,10 +2739,7 @@ static dcomplex *BandCol_GpuSolver_SolveHamiltonianImpl(int n, int maxn, const d
     }
 
     evec_t = BandCol_GpuSolver_EnsureEigenvectorCapacity(n, maxn);
-    wait_hipfunc(hipblasZgemm(ctx->hipblas, HIPBLAS_OP_T, HIPBLAS_OP_T, maxn, n, n,
-                              &alpha, (hipDoubleComplex *)ctx->d_H, n,
-                              (hipDoubleComplex *)ctx->d_S, n, &beta,
-                              (hipDoubleComplex *)evec_t, maxn));
+    BandCol_GpuSolver_BackTransformGemm(n, maxn, evec_t);
 
     if (C_out != NULL) {
         wait_hipfunc(hipMemcpy(C_out, evec_t, sizeof(dcomplex) * (size_t)n * (size_t)maxn,
@@ -3334,12 +3420,19 @@ double Band_DFT_Col(int SCF_iter, int knum_i, int knum_j, int knum_k, int SpinP_
     owns_global_dense_rank = (all_knum == 1 && owns_dense_k_rank);
     if (use_gpusolver_dense && all_knum != 1) {
         const int turns = Num_Comm_World1 * T_knum;
-        const char *interleave = getenv("OPENMX_BAND_COL_INTERLEAVE_K");
+        int interleave_k = 1;
         gpu_k_order = (int*)malloc(sizeof(int)*(size_t)turns);
         if (gpu_k_order == NULL)
             BandCol_AbortWithMessage("Cannot allocate GPU k-point turn order.");
         for (int point=0; point<turns; ++point) gpu_k_order[point] = point;
-        if (interleave == NULL || atoi(interleave) != 0) {
+        /* the order makes the turn groups of both passes: the root's
+           OPENMX_BAND_COL_INTERLEAVE_K (default 1) holds for every rank */
+        if (myid0 == Host_ID) {
+            const char *interleave = getenv("OPENMX_BAND_COL_INTERLEAVE_K");
+            if (interleave != NULL) interleave_k = (atoi(interleave) != 0);
+        }
+        MPI_Bcast(&interleave_k, 1, MPI_INT, Host_ID, mpi_comm_level1);
+        if (interleave_k) {
             int *owners = (int*)malloc(sizeof(int)*(size_t)turns);
             int *next = (int*)calloc((size_t)numprocs0, sizeof(int));
             int turn = 0;
@@ -3403,23 +3496,28 @@ double Band_DFT_Col(int SCF_iter, int knum_i, int knum_j, int knum_k, int SpinP_
        group), the same in serialized turn groups (staged), or the k-dense
        path; a single rank of a spin-polarized run keeps FP64 */
     {
-        const int refine_base = (use_gpusolver_dense && !(SpinP_switch == 1 && numprocs0 == 1) && ParDM_flag == 0 &&
-                                 0 < BandCol_RefineIterations() && openmx_eigen_refine_size_ok(n));
+        const int refine_base = (!(SpinP_switch == 1 && numprocs0 == 1) && ParDM_flag == 0 &&
+                                 openmx_eigen_refine_size_ok(n));
         const int serialize_turns = BandCol_SerializeGpuSolverGpuTurns();
         const int total_turns = Num_Comm_World1 * T_knum;
         const int turn_group = serialize_turns ? BandCol_GpuTurnGroupForScf(SCF_iter) : total_turns;
         int refine_fits = 0;
 
-        if (refine_base) {
+        if (use_gpusolver_dense) {
             const int turns = (all_knum == 1) ? ((total_turns <= turn_group) ? total_turns : turn_group)
                                               : BandCol_MaxConcurrentKGpuTurns(n);
 
-            refine_fits = BandCol_RefineFits(n, MaxN, turns,
+            refine_fits = BandCol_RefineFits(refine_base, n, MaxN, turns,
                                              (all_knum == 1) ? owns_global_dense_rank : owns_dense_k_rank);
         }
         BandCol_RefineBeginStep(SCF_iter, refine_fits && all_knum == 1 && total_turns <= turn_group,
                                 refine_fits && all_knum != 1, refine_fits && all_knum == 1 && turn_group < total_turns);
         if (BandCol_refine.kdense || BandCol_refine.staged) BandCol_KRefEnsure(total_turns, n);
+        /* the basis the resident path keeps on the device between its steps
+           serves only that path's warm start: a call on another path (or in
+           FP64) gives its memory back at once instead of at the end of the
+           cycle */
+        if (!BandCol_refine.last_refined) BandCol_RefineDropBasis();
     }
 
     /***********************************************
@@ -3770,11 +3868,11 @@ diagonalize1:
                 if (measure_time)
                     dtime(&Stime);
 
-                if (BandCol_KOverlapRestore(kloop, k1, k2, k3)) {
+                if (BandCol_KOverlapRestore(kloop, k1, k2, k3, ko, koS)) {
                     ++k_overlap_hits;
                 } else {
                     BandCol_GpuSolver_PrepareTransformedS(1, n, construct_on_device ? NULL : Ss, ko, koS);
-                    BandCol_KOverlapSave(kloop, k1, k2, k3);
+                    BandCol_KOverlapSave(kloop, k1, k2, k3, koS);
                 }
 
                 if (measure_time) {
@@ -5307,12 +5405,11 @@ diagonalize1:
                         if (measure_time)
                             dtime(&Stime);
 
-                        const int overlap_cached = BandCol_KOverlapRestore(kloop, k1, k2, k3);
-                        if (overlap_cached) {
+                        if (BandCol_KOverlapRestore(kloop, k1, k2, k3, ko, koS)) {
                             ++k_overlap_hits;
                         } else {
                             BandCol_GpuSolver_PrepareTransformedS(1, n, construct_on_device ? NULL : Ss, ko, koS);
-                            BandCol_KOverlapSave(kloop, k1, k2, k3);
+                            BandCol_KOverlapSave(kloop, k1, k2, k3, koS);
                         }
 
                         if (measure_time) {
@@ -5320,14 +5417,12 @@ diagonalize1:
                             time9 += Etime - Stime;
                         }
 
+                        /* a cache hit restored the overlap eigenvalues too */
                         if (3 <= level_stdout) {
                             printf(" myid0=%2d kloop %2d  k1 k2 k3 %10.6f %10.6f %10.6f\n", myid0, kloop, T_KGrids1[kloop],
                                    T_KGrids2[kloop], T_KGrids3[kloop]);
-                            if (overlap_cached)
-                                printf("  Reusing cached overlap transformation.\n");
-                            else
-                                for (i1 = 1; i1 <= n; i1++)
-                                    printf("  Eigenvalues of OLP  %2d  %15.12f\n", i1, ko[i1]);
+                            for (i1 = 1; i1 <= n; i1++)
+                                printf("  Eigenvalues of OLP  %2d  %15.12f\n", i1, ko[i1]);
                         }
 
                         /****************************************************

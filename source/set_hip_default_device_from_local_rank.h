@@ -2,6 +2,7 @@
 #define _SET_HIP_DEFAULT_DEVICE_FROM_LOCAL_RANK_H_
 
 #include <mpi.h>
+#include <stddef.h>
 
 int set_hip_default_device_from_local_rank();
 int set_hip_default_device_from_local_rank_noncollective(void);
@@ -45,5 +46,13 @@ int openmx_band_gpu_dense_oversubscribed(void);
    initialization.  Ranks that fail keep the OpenMP initial device and must
    take host code paths. */
 int gpu_rank_device_usable(void);
+
+/* The free and total memory of this rank's device: 0 (hipSuccess) or the
+   HIP error.  The NVIDIA version caps the free memory with NVML because
+   under WSL2/WDDM a process does not see the others' allocations; on Linux
+   ROCm hipMemGetInfo is device-wide (other processes' allocations
+   included), so this is the plain query, kept as the single entry point of
+   the memory tests. */
+int OpenMX_GpuMemGetInfo(size_t *free_bytes, size_t *total_bytes);
 
 #endif // _SET_HIP_DEFAULT_DEVICE_FROM_LOCAL_RANK_H_

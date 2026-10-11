@@ -862,6 +862,22 @@ static void SDG_run_kernel(SetDensityGpuCache *cache)
   }
 }
 
+/* Eigensolvers whose density matrix the device paths integrate.  Every
+   solver hands Set_Density_Grid the same DM[spin][Mc_AN][h_AN][i][j] over
+   the FNAN neighbours, so the quadrature itself is solver-independent.
+   The distributed local mode (each rank its own atoms on Set_Hamiltonian's
+   resident tables; the on-the-fly tiles of Set_Hamiltonian.c have no
+   solver gate) takes the cluster and band solvers and DC (5), Krylov (8)
+   and DC-LNO (11); the single-owner service, which builds the whole grid's
+   orbital tables on one device, stays with the cluster and band solvers:
+   at the O(N) solvers' sizes those tables fit neither the device nor
+   comfortably the host (as in the NVIDIA version). */
+static int SDG_solver_supported(int local_mode)
+{
+  if (Solver == 2 || Solver == 3) return 1;
+  return local_mode && (Solver == 5 || Solver == 8 || Solver == 11);
+}
+
 int Set_Density_Grid_GPU_Service(int Cnt_kind, int Calc_CntOrbital_ON, double *****CDM,
                                  double **Density_Grid_B0, double *elapsed)
 {
@@ -885,7 +901,7 @@ int Set_Density_Grid_GPU_Service(int Cnt_kind, int Calc_CntOrbital_ON, double **
   if (myid == owner) {
     int requested = SDG_env_bool("OPENMX_DENSITY_GRID_GPU",
                                 SDG_env_bool("OPENMX_SETDENSITY_GPU", SDG_gpu_default_enabled()));
-    enabled = requested && scf_eigen_lib_flag == GPUSOLVER && (Solver == 2 || Solver == 3) &&
+    enabled = requested && scf_eigen_lib_flag == GPUSOLVER && SDG_solver_supported(0) &&
               Cnt_switch == 0 && (Cnt_kind == 0 || Cnt_kind == 1) &&
               (SpinP_switch == 0 || SpinP_switch == 1 || SpinP_switch == 3);
     if (enabled) {
@@ -1013,24 +1029,47 @@ int Set_Density_Grid_GPU_Service(int Cnt_kind, int Calc_CntOrbital_ON, double **
    Distributed (per-rank) GPU quadrature for Set_Density_Grid.
 
    Every rank evaluates the atomic-sphere density of its own atoms on
-   the device, reusing the Set_Hamiltonian matrix-elements tables (the
+   the device.  A rank whose Set_Hamiltonian matrix-elements tables (the
    central full-sphere orbitals, the FNAN-layout neighbour orbitals and
-   the overlap index lists).  When Set_Hamiltonian keeps those tables
-   device-resident the present_or_copyin staging below only attaches,
-   so a single copy serves both routines.  The kernel reproduces the
-   CPU loop exactly: per output point the pair contributions are summed
-   in (h_AN, Nog) order and each contribution is
-   sum_i orbs0[i] * (sum_j orbs1[j] * CDM[i][j]).  The result fills
-   Tmp_Den_Grid and the ordinary A-to-B communication of
-   Set_Density_Grid.c distributes it afterwards.
+   the overlap index lists) are device-resident runs the CSR kernel
+   below on them, so a single copy serves both routines; in the auto
+   mode a rank without resident tables integrates with the on-the-fly
+   orbital tiles of Set_Hamiltonian.c (Set_Density_Grid_OTF_Run) in the
+   same step.  The CSR kernel reproduces the CPU loop's order: per
+   output point the pair contributions are summed in (h_AN, Nog) order
+   and each contribution is sum_i orbs0[i] * (sum_j orbs1[j] * CDM[i][j]),
+   in FP64 or, where the grid integrals run in double-float
+   (openmx_grid_precision_df), with the double-float kernel of
+   set_hamiltonian_hip.cu (FP64 between the pairs, a gather either way).
+   The result fills Tmp_Den_Grid and the ordinary A-to-B communication
+   of Set_Density_Grid.c distributes it afterwards.
+
+   The preparation is rank-local (SDG_local_prepare); the public
+   Set_Density_Grid_GPU_Local_Prepare holds its only collective, which
+   every rank enters when the eigensolver is on the GPU (and none
+   otherwise), and Set_Density_Grid.c agrees on the result.  Empty
+   partitions, cached, on-the-fly and failed ranks therefore cannot
+   desynchronize the collectives.
 ***********************************************************************/
+
+/* set_hamiltonian_hip.cu */
+extern int openmx_grid_precision_df(void);
+extern int Set_Density_Grid_Hip_LocalDensity(size_t output_count, int spin_count, int max_no, size_t dm_count,
+                                             const uint32_t *d_out_ptr, const uint32_t *d_term_pt,
+                                             const uint32_t *d_pt_pair, const int *d_no0, const int *d_no1,
+                                             const size_t *d_hoff, const size_t *d_noff, const size_t *d_o0off,
+                                             const size_t *d_o1off, const int *d_nc, const float *d_o0,
+                                             const float *d_o1, double *d_dm, double *d_den);
+/* Set_Hamiltonian.c: the on-the-fly density of a rank (rank-local) */
+extern int Set_Density_Grid_OTF_Possible(int Cnt_kind);
+extern int Set_Density_Grid_OTF_Run(int Cnt_kind, double *****CDM, double ***Tmp_Den_Grid);
 
 typedef struct {
   int ready;
   int unavailable;
   int spin_count;
   int cnt_kind;
-  int node_ranks;
+  int node_ranks;          /* ranks sharing this rank's device: the budget's denominator */
   size_t output_count;     /* sum of GridN_Atom over the rank's atoms */
   size_t term_count;       /* overlap points of the rank's pairs */
   size_t dm_count;         /* packed density-matrix doubles */
@@ -1042,10 +1081,14 @@ typedef struct {
   double *dm;
   double *tmpden;
   int joins_validated;
+  int max_no1;             /* the largest NO1 the terms reach (validated with the joins) */
   int device_id;
   uint32_t *d_out_ptr, *d_term_pt, *d_pt_pair;
   double *d_dm, *d_tmpden;
   SetHamiltonianMETables t;
+  /* the on-the-fly mode of a rank without resident tables: no CSR, the
+     orbitals evaluated on the device batch by batch (Set_Hamiltonian.c) */
+  int otf;
 } SDGLocalContext;
 
 static SDGLocalContext SDG_local = {0};
@@ -1106,12 +1149,25 @@ void Set_Density_Grid_GPU_Release_Device_Caches(void)
   SDG_local_delete_device(&SDG_local);
 }
 
+/* The end of an SCF cycle (DFT.c, before the forces): only the local
+   mode's device buffers go -- the next cycle stages them again from the
+   host CSR, which stays -- while the single-owner service keeps its
+   small persistent tables (OPENMX_DENSITY_GRID_GPU_CACHE_MB), as in the
+   NVIDIA version.  Rank-local; no HIP call when nothing is held (a CPU
+   run). */
+void Set_Density_Grid_GPU_EndCycle(void)
+{
+  SDG_local_delete_device(&SDG_local);
+}
+
+/* Rank-local: OTF, cached, empty and failed ranks do not enter it, so it
+   holds no collective; a failure marks only this rank unavailable for
+   the geometry. */
 static int SDG_local_build(int Cnt_kind, int spin_count)
 {
   SDGLocalContext *c = &SDG_local;
   uint32_t *degree = NULL;
-  unsigned long long local_need, group_need = 0ULL;
-  int ok = 1, all_ok = 1;
+  int ok = 1;
   int Mc_AN, p;
   size_t out, pos;
 
@@ -1139,12 +1195,13 @@ static int SDG_local_build(int Cnt_kind, int spin_count)
     size_t base = 0;
     c->atom_out_base[0] = 0;
     for (Mc_AN = 1; Mc_AN <= Matomnum; Mc_AN++) {
+      const int n = GridN_Atom[M2G[Mc_AN]];
       c->atom_out_base[Mc_AN] = (uint32_t)base;
-      base += (size_t)GridN_Atom[M2G[Mc_AN]];
-      if (base > (size_t)UINT32_MAX) {
+      if (n < 0 || (size_t)n > (size_t)UINT32_MAX - base) {
         ok = 0;
         break;
       }
+      base += (size_t)n;
     }
     if (ok) {
       c->atom_out_base[Matomnum + 1] = (uint32_t)base;
@@ -1222,28 +1279,11 @@ static int SDG_local_build(int Cnt_kind, int spin_count)
          SDG_add_bytes(&c->extra_bytes, (size_t)spin_count * c->output_count, sizeof(double));
   }
 
-  {
-    MPI_Comm node_comm = MPI_COMM_NULL;
-    int node_ranks = 1;
-
-    MPI_Comm_split_type(mpi_comm_level1, MPI_COMM_TYPE_SHARED, 0, MPI_INFO_NULL, &node_comm);
-    MPI_Comm_size(node_comm, &node_ranks);
-    MPI_Comm_free(&node_comm);
-    c->node_ranks = (node_ranks < 1) ? 1 : node_ranks;
-  }
-
-  MPI_Allreduce(&ok, &all_ok, 1, MPI_INT, MPI_MIN, mpi_comm_level1);
-  if (!all_ok) {
+  if (!ok) {
     SDG_local_free();
     SDG_local.unavailable = 1;
     return 0;
   }
-
-  /* publish the mode's own transient need so long-lived caches
-     (Set_Hamiltonian residency) leave room for it */
-  local_need = (unsigned long long)c->extra_bytes;
-  MPI_Allreduce(&local_need, &group_need, 1, MPI_UNSIGNED_LONG_LONG, MPI_SUM, mpi_comm_level1);
-  OpenMX_GpuPhaseNeed_Register("density_grid_local", (size_t)group_need);
 
   c->ready = 1;
   return 1;
@@ -1264,19 +1304,30 @@ static size_t SDG_local_call_bytes(const SDGLocalContext *c)
   return bytes;
 }
 
-int Set_Density_Grid_GPU_Local_Prepare(int Cnt_kind, int Calc_CntOrbital_ON)
+/* This rank's choice, without communication: 1 when it can integrate its
+   atoms in the local mode (the CSR kernel, or the on-the-fly tiles:
+   SDG_local.otf), 0 when it cannot.  node_ranks: the ranks sharing the
+   device. */
+static int SDG_local_prepare(int Cnt_kind, int Calc_CntOrbital_ON, int node_ranks)
 {
   SDGLocalContext *c = &SDG_local;
   int spin_count = SpinP_switch + 1;
-  int enabled, mode = 1;
+  int enabled, mode = 1, my_ready;
   size_t reserve_bytes, need;
   size_t free_bytes = 0, total_bytes = 0;
 
   (void)Calc_CntOrbital_ON;
 
-  /* 0 = off, 1 = auto (only when the shared Set_Hamiltonian tables are
-     device-resident, so each call stages just the CSR/DM/density buffers),
-     2 = always (stage the shared tables per call too) */
+  /* 0 = off; 1 = auto: the CSR kernel on a rank whose Set_Hamiltonian
+     tables are device-resident, the on-the-fly tiles on a rank without
+     them; any other value = the CSR kernel on every rank.  The CSR kernel
+     needs the tables device-resident: unlike the NVIDIA version this one
+     neither builds missing tables (Set_Hamiltonian_GetMatrixElementsTables
+     only returns them -- on every rank at once the multi-GiB host build
+     can exhaust the host memory) nor stages host-only ones, so with a
+     value other than 0 and 1 a rank without resident tables declines and
+     the group falls back (to the all-rank on-the-fly mode, the
+     single-owner service or the CPU loop of Set_Density_Grid.c). */
   {
     const char *value = getenv("OPENMX_DENSITY_GRID_GPU_LOCAL");
     if (value != NULL && value[0] != '\0') mode = atoi(value);
@@ -1285,28 +1336,41 @@ int Set_Density_Grid_GPU_Local_Prepare(int Cnt_kind, int Calc_CntOrbital_ON)
   enabled = (mode != 0) &&
             SDG_env_bool("OPENMX_DENSITY_GRID_GPU",
                          SDG_env_bool("OPENMX_SETDENSITY_GPU", SDG_gpu_default_enabled())) &&
-            scf_eigen_lib_flag == GPUSOLVER && (Solver == 2 || Solver == 3) &&
+            scf_eigen_lib_flag == GPUSOLVER && SDG_solver_supported(1) &&
             Cnt_switch == 0 && (Cnt_kind == 0 || Cnt_kind == 1) &&
             (SpinP_switch == 0 || SpinP_switch == 1 || SpinP_switch == 3) &&
-            gpu_rank_device_usable();
+            (Matomnum == 0 || gpu_rank_device_usable());
   if (!enabled) return 0;
+  /* No quadrature work, but this rank must not veto the other ranks. */
+  if (Matomnum == 0) return 1;
 
-  /* Mode 1 rides on the tables Set_Hamiltonian has already built.  Asking
-     Set_Hamiltonian_GetMatrixElementsTables below would lazily BUILD the
-     multi-GiB host tables on every rank whose Set_Hamiltonian ran on the
-     CPU (a crowded device leaves most ranks without tables), and at
-     1000-atom scale that simultaneous build alone can exhaust the host
-     memory.  Probe for existing tables first — collectively, because
-     SDG_local_build contains collectives and every rank must take the
-     same branch. */
-  if (mode == 1) {
-    int my_ready = Set_Hamiltonian_MatrixElementsTables_Ready(Cnt_kind);
-    int all_ready = 0;
-
-    MPI_Allreduce(&my_ready, &all_ready, 1, MPI_INT, MPI_MIN, mpi_comm_level1);
-    if (!all_ready) return 0;
+  /* Ride on the tables Set_Hamiltonian has already built: probe for
+     them without building (Set_Hamiltonian_MatrixElementsTables_Ready),
+     then for their residency. */
+  my_ready = Set_Hamiltonian_MatrixElementsTables_Ready(Cnt_kind);
+  if (my_ready) {
+    SetHamiltonianMETables probe;
+    if (!Set_Hamiltonian_GetMatrixElementsTables(Cnt_kind, &probe) ||
+        !(probe.orbs0_resident && probe.orbs1_resident && probe.nolg_resident && probe.meta_resident))
+      my_ready = 0;
+  }
+  if (!my_ready) {
+    /* the on-the-fly tiles (auto mode only): this rank's Set_Hamiltonian
+       evaluated its orbitals the same way, and Set_Density_Grid_OTF_Possible
+       keeps its gates (the matrix-elements GPU path, at most
+       OPENMX_BAND_GPU_MAX_DEVICE_RANKS ranks per device,
+       OPENMX_DENSITY_GRID_ONTHEFLY) */
+    if (mode != 1 || !Set_Density_Grid_OTF_Possible(Cnt_kind)) return 0;
+    if (!c->otf) {
+      SDG_local_free();
+      c->otf = 1;
+    }
+    c->spin_count = spin_count;
+    c->cnt_kind = Cnt_kind;
+    return 1;
   }
 
+  if (c->otf) SDG_local_free(); /* back from the on-the-fly mode to the CSR */
   if (c->unavailable) return 0;
 
   if (c->ready && (c->spin_count != spin_count || c->cnt_kind != Cnt_kind)) {
@@ -1327,25 +1391,62 @@ int Set_Density_Grid_GPU_Local_Prepare(int Cnt_kind, int Calc_CntOrbital_ON)
 
   if (c->output_count == 0) return 0;
 
-  /* In auto mode the per-call staging of the multi-GiB orbital tables is
-     slower than the single-owner service, so engage only when the shared
-     tables already live on the device (Set_Hamiltonian residency). */
-  if (mode == 1 &&
-      !(c->t.orbs0_resident && c->t.orbs1_resident && c->t.nolg_resident && c->t.meta_resident)) {
+  /* the per-call staging of the multi-GiB orbital tables is not done here:
+     engage only when the shared tables live on the device */
+  if (!(c->t.orbs0_resident && c->t.orbs1_resident && c->t.nolg_resident && c->t.meta_resident)) {
     return 0;
   }
 
+  c->node_ranks = node_ranks > 0 ? node_ranks : 1;
   reserve_bytes = SDG_env_mib("OPENMX_DENSITY_GRID_GPU_RESERVE_MB", 256);
   if (c->d_out_ptr != NULL) {
     int device;
     if (hipGetDevice(&device) != hipSuccess) return 0;
     if (device != c->device_id) SDG_local_delete_device(c);
   }
-  if (hipMemGetInfo(&free_bytes, &total_bytes) != hipSuccess) return 0;
+  if (OpenMX_GpuMemGetInfo(&free_bytes, &total_bytes) != hipSuccess) return 0;
   need = SDG_local_call_bytes(c);
   if (free_bytes < reserve_bytes) return 0;
   if ((free_bytes - reserve_bytes) / (size_t)c->node_ranks < need) return 0;
   return 1;
+}
+
+/* Every rank enters this when the eigensolver runs on the GPU -- the
+   ranks that take the CSR kernel, the on-the-fly ranks, empty partitions
+   and the ranks whose preparation failed alike -- and none enters a
+   collective otherwise: Input and DFT_GPU_DeviceInit set
+   scf_eigen_lib_flag identically on every rank (a device failure on any
+   rank demotes all of them).  The budget's denominator is the number of
+   ranks sharing the device (openmx_gpu_ranks_per_device_noncollective,
+   no communication), not of the node as in the NVIDIA version.  The
+   CSR ranks' transient device need is published for compatibility
+   (OpenMX_GpuPhaseNeed_Register; this version's Set_Hamiltonian demotes
+   its resident tables on the eigensolvers' memory failures instead of
+   reading it). */
+int Set_Density_Grid_GPU_Local_Prepare(int Cnt_kind, int Calc_CntOrbital_ON)
+{
+  unsigned long long local_need, group_need = 0ULL;
+  int ok;
+
+  if (scf_eigen_lib_flag != GPUSOLVER) {
+    OpenMX_GpuPhaseNeed_Register("density_grid_local", 0);
+    return 0;
+  }
+
+  ok = SDG_local_prepare(Cnt_kind, Calc_CntOrbital_ON, openmx_gpu_ranks_per_device_noncollective());
+
+  /* ranks without CSR buffers contribute zero */
+  local_need = (SDG_local.ready && !SDG_local.otf) ? (unsigned long long)SDG_local.extra_bytes : 0ULL;
+  MPI_Allreduce(&local_need, &group_need, 1, MPI_UNSIGNED_LONG_LONG, MPI_SUM, mpi_comm_level1);
+  OpenMX_GpuPhaseNeed_Register("density_grid_local", (size_t)group_need);
+  return ok;
+}
+
+/* 1 when the last local preparation of this rank chose the on-the-fly
+   tiles, 0 for the CSR kernel (for the stage profile of Set_Density_Grid.c) */
+int Set_Density_Grid_GPU_Local_OnTheFly(void)
+{
+  return SDG_local.otf;
 }
 
 int Set_Density_Grid_GPU_Local_Run(double *****CDM, double ***Tmp_Den_Grid)
@@ -1375,6 +1476,11 @@ int Set_Density_Grid_GPU_Local_Run(double *****CDM, double ***Tmp_Den_Grid)
   double *tmpden = c->tmpden;
   int Mc_AN, spin;
 
+  if (Matomnum == 0) return 1;
+  /* the on-the-fly tiles fill Tmp_Den_Grid themselves (and leave it as
+     they found it when they fail) */
+  if (c->otf) return Set_Density_Grid_OTF_Run(c->cnt_kind, CDM, Tmp_Den_Grid);
+
   if (!c->ready || output_count == 0) return 0;
   if (!SDG_pack_local_cdm(CDM, dm, dm_count, spin_count)) return 0;
 
@@ -1382,6 +1488,7 @@ int Set_Density_Grid_GPU_Local_Run(double *****CDM, double ***Tmp_Den_Grid)
      cache together with its CSR. Rewalking every join on the CPU in every
      SCF step can cost more than the GPU contraction itself. */
   if (!c->joins_validated) {
+    int max_no1 = 0;
     for (size_t out=0; out<output_count; out++) {
       if (out_ptr[out]>out_ptr[out+1] || out_ptr[out+1]>term_count) return 0;
       for (uint32_t q=out_ptr[out]; q<out_ptr[out+1]; q++) {
@@ -1396,8 +1503,10 @@ int Set_Density_Grid_GPU_Local_Run(double *****CDM, double ***Tmp_Den_Grid)
         if (pair_h_offset[pair]+(size_t)spin_count*mat>dm_count ||
             o0+(size_t)pair_NO0[pair]>total_orbs0 ||
             o1+(size_t)pair_NO1[pair]>total_orbs1) return 0;
+        if (max_no1<pair_NO1[pair]) max_no1=pair_NO1[pair];
       }
     }
+    c->max_no1 = max_no1;
     c->joins_validated = 1;
   }
 
@@ -1405,12 +1514,13 @@ int Set_Density_Grid_GPU_Local_Run(double *****CDM, double ***Tmp_Den_Grid)
     double *dm_host=dm, *tmpden_host=tmpden;
     int dev=omp_get_default_device();
     int keep_resident = 0;
+    int status = 1;   /* 0: the double-float kernel ran, 1: the FP64 kernel runs, 2: failure */
     size_t free_bytes = 0, total_bytes = 0;
     size_t cap = SDG_env_mib("OPENMX_DENSITY_GRID_GPU_LOCAL_CACHE_MB", 32);
 
     if (c->extra_bytes <= cap && cap != 0) {
       if (c->d_out_ptr != NULL) keep_resident = 1;
-      else if (hipMemGetInfo(&free_bytes, &total_bytes) == hipSuccess)
+      else if (OpenMX_GpuMemGetInfo(&free_bytes, &total_bytes) == hipSuccess)
         keep_resident = c->extra_bytes <= free_bytes / 32U / (size_t)c->node_ranks;
     }
 
@@ -1437,57 +1547,73 @@ int Set_Density_Grid_GPU_Local_Run(double *****CDM, double ***Tmp_Den_Grid)
       return 0;
     }
 
-#pragma omp target teams distribute parallel for is_device_ptr(pair_NO0,pair_NO1,pair_h_offset,pair_nolg_offset,pair_orbs0_offset,pair_orbs1_offset,nolg_Nc,orbs0buf,orbs1buf,out_ptr,term_pt,pt_pair,dm,tmpden)
-    for (size_t out = 0; out < output_count; out++) {
-      double g0 = 0.0, g1 = 0.0, g2 = 0.0, g3 = 0.0;
-
-      for (uint32_t q = out_ptr[out]; q < out_ptr[out + 1]; q++) {
-        uint32_t pt = term_pt[q];
-        uint32_t pair = pt_pair[pt];
-        int NO0 = pair_NO0[pair];
-        int NO1 = pair_NO1[pair];
-        size_t mat = (size_t)NO0 * (size_t)NO1;
-        size_t base = pair_h_offset[pair];
-        /* orbs0: the central atom's sphere, selected through nolg_Nc */
-        size_t o0 = pair_orbs0_offset[pair] + (size_t)nolg_Nc[pt] * (size_t)NO0;
-        size_t o1 = pair_orbs1_offset[pair] + ((size_t)pt - pair_nolg_offset[pair]) * (size_t)NO1;
-        double e0 = 0.0, e1 = 0.0, e2 = 0.0, e3 = 0.0;
-
-        for (int ii = 0; ii < NO0; ii++) {
-          double t0 = 0.0, t1 = 0.0, t2 = 0.0, t3 = 0.0;
-          for (int jj = 0; jj < NO1; jj++) {
-            double phi1 = (double)orbs1buf[o1 + (size_t)jj];
-            size_t ij = (size_t)ii * (size_t)NO1 + (size_t)jj;
-            t0 += phi1 * dm[base + ij];
-            if (spin_count >= 2) t1 += phi1 * dm[base + mat + ij];
-            if (spin_count == 4) {
-              t2 += phi1 * dm[base + 2U * mat + ij];
-              t3 += phi1 * dm[base + 3U * mat + ij];
-            }
-          }
-          {
-            double phi0 = (double)orbs0buf[o0 + (size_t)ii];
-            e0 += phi0 * t0;
-            if (spin_count >= 2) e1 += phi0 * t1;
-            if (spin_count == 4) {
-              e2 += phi0 * t2;
-              e3 += phi0 * t3;
-            }
-          }
-        }
-        g0 += e0;
-        if (spin_count >= 2) g1 += e1;
-        if (spin_count == 4) {
-          g2 += e2;
-          g3 += e3;
-        }
+    /* the double-float kernel splits the device copy of the density
+       matrix in place (the next call uploads it again) */
+    if (sizeof(Type_Orbs_Grid) == sizeof(float) && openmx_grid_precision_df()) {
+      status = Set_Density_Grid_Hip_LocalDensity(output_count, spin_count, c->max_no1, dm_count,
+                                                 out_ptr, term_pt, pt_pair, pair_NO0, pair_NO1,
+                                                 pair_h_offset, pair_nolg_offset, pair_orbs0_offset,
+                                                 pair_orbs1_offset, nolg_Nc, (const float *)orbs0buf,
+                                                 (const float *)orbs1buf, dm, tmpden);
+      if (status == 2) {
+        SDG_local_delete_device(c);
+        return 0;
       }
+    }
 
-      tmpden[out] = g0;
-      if (spin_count >= 2) tmpden[output_count + out] = g1;
-      if (spin_count == 4) {
-        tmpden[2U * output_count + out] = g2;
-        tmpden[3U * output_count + out] = g3;
+    if (status == 1) {
+#pragma omp target teams distribute parallel for is_device_ptr(pair_NO0,pair_NO1,pair_h_offset,pair_nolg_offset,pair_orbs0_offset,pair_orbs1_offset,nolg_Nc,orbs0buf,orbs1buf,out_ptr,term_pt,pt_pair,dm,tmpden)
+      for (size_t out = 0; out < output_count; out++) {
+        double g0 = 0.0, g1 = 0.0, g2 = 0.0, g3 = 0.0;
+
+        for (uint32_t q = out_ptr[out]; q < out_ptr[out + 1]; q++) {
+          uint32_t pt = term_pt[q];
+          uint32_t pair = pt_pair[pt];
+          int NO0 = pair_NO0[pair];
+          int NO1 = pair_NO1[pair];
+          size_t mat = (size_t)NO0 * (size_t)NO1;
+          size_t base = pair_h_offset[pair];
+          /* orbs0: the central atom's sphere, selected through nolg_Nc */
+          size_t o0 = pair_orbs0_offset[pair] + (size_t)nolg_Nc[pt] * (size_t)NO0;
+          size_t o1 = pair_orbs1_offset[pair] + ((size_t)pt - pair_nolg_offset[pair]) * (size_t)NO1;
+          double e0 = 0.0, e1 = 0.0, e2 = 0.0, e3 = 0.0;
+
+          for (int ii = 0; ii < NO0; ii++) {
+            double t0 = 0.0, t1 = 0.0, t2 = 0.0, t3 = 0.0;
+            for (int jj = 0; jj < NO1; jj++) {
+              double phi1 = (double)orbs1buf[o1 + (size_t)jj];
+              size_t ij = (size_t)ii * (size_t)NO1 + (size_t)jj;
+              t0 += phi1 * dm[base + ij];
+              if (spin_count >= 2) t1 += phi1 * dm[base + mat + ij];
+              if (spin_count == 4) {
+                t2 += phi1 * dm[base + 2U * mat + ij];
+                t3 += phi1 * dm[base + 3U * mat + ij];
+              }
+            }
+            {
+              double phi0 = (double)orbs0buf[o0 + (size_t)ii];
+              e0 += phi0 * t0;
+              if (spin_count >= 2) e1 += phi0 * t1;
+              if (spin_count == 4) {
+                e2 += phi0 * t2;
+                e3 += phi0 * t3;
+              }
+            }
+          }
+          g0 += e0;
+          if (spin_count >= 2) g1 += e1;
+          if (spin_count == 4) {
+            g2 += e2;
+            g3 += e3;
+          }
+        }
+
+        tmpden[out] = g0;
+        if (spin_count >= 2) tmpden[output_count + out] = g1;
+        if (spin_count == 4) {
+          tmpden[2U * output_count + out] = g2;
+          tmpden[3U * output_count + out] = g3;
+        }
       }
     }
 

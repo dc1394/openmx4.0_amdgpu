@@ -46,6 +46,10 @@ static int Krylov_MeasureTime(void)
 static double Krylov_gpu_dgemm_min_flops = KRYLOV_GPU_DGEMM_MIN_FLOPS;
 static int Krylov_gpu_eigen_min = KRYLOV_GPU_EIGEN_MIN;
 static int Krylov_gpu_fused = 1;
+/* the device GEMMs of the projected solve go through openmx_gemmul8Dgemm
+   (INT8 Ozaki-II emulation of FP64, as on the NVIDIA version); 0 =
+   native hipBLAS FP64 (OPENMX_KRYLOV_GEMMUL8) */
+static int Krylov_gpu_gemmul8 = 1;
 
 #include "tran_prototypes.h"
 
@@ -227,6 +231,10 @@ static void Krylov_GPU_InitOnce(void)
     }
     env = getenv("OPENMX_KRYLOV_GPU_FUSED");
     if (env != NULL && env[0] != '\0') Krylov_gpu_fused = (atoi(env) != 0);
+    /* scf.gemmul8.enable off and OPENMX_GEMMUL8_DISABLE_D make
+       openmx_gemmul8Dgemm native as well */
+    env = getenv("OPENMX_KRYLOV_GEMMUL8");
+    if (env != NULL && env[0] != '\0') Krylov_gpu_gemmul8 = (atoi(env) != 0);
   }
 
   if (Krylov_GPU_Enabled()){
@@ -372,6 +380,43 @@ static int Krylov_GPU_EnsureHipblas(Krylov_GPU_Workspace *ws)
   return 1;
 }
 
+/* C = op(A) op(B) on the device, all operands resident, on the stream of
+   ws: openmx_gemmul8Dgemm unless OPENMX_KRYLOV_GEMMUL8=0 */
+static hipblasStatus_t Krylov_GPU_DeviceDgemm(Krylov_GPU_Workspace *ws,
+                                              hipblasOperation_t transa, hipblasOperation_t transb,
+                                              int m, int n, int k,
+                                              const double *dA, int lda,
+                                              const double *dB, int ldb,
+                                              double *dC, int ldc)
+{
+  const double alpha = 1.0;
+  const double beta  = 0.0;
+
+  if (Krylov_gpu_gemmul8)
+    return openmx_gemmul8Dgemm(ws->hipblas, transa, transb, m, n, k,
+                               &alpha, dA, lda, dB, ldb, &beta, dC, ldc);
+  return hipblasDgemm(ws->hipblas, transa, transb, m, n, k,
+                      &alpha, dA, lda, dB, ldb, &beta, dC, ldc);
+}
+
+/* A device GEMM that returned an error: the host operands are intact, so
+   the caller redoes the product on the CPU, and the rest of the call stays
+   there (like a failed allocation).  The stream is drained first, so that
+   no copy of this call is still in flight when the host buffers are
+   reused. */
+static void Krylov_GPU_GemmFailed(Krylov_GPU_Workspace *ws, hipblasStatus_t status,
+                                  int m, int n, int k)
+{
+  char reason[96];
+
+  (void)hipStreamSynchronize(ws->stream);
+  (void)hipGetLastError();
+  Krylov_gpu_fits = 0;
+  snprintf(reason, sizeof(reason), "%s status %d, m=%d n=%d k=%d",
+           Krylov_gpu_gemmul8 ? "GEMMul8" : "hipBLAS", (int)status, m, n, k);
+  Krylov_GPU_ReportAllocFailure("DGEMM", 0, reason);
+}
+
 static void Krylov_Dgemm(Krylov_GPU_Workspace *ws,
                          hipblasOperation_t transa, hipblasOperation_t transb,
                          int m, int n, int k,
@@ -386,6 +431,7 @@ static void Krylov_Dgemm(Krylov_GPU_Workspace *ws,
   size_t count_A = (size_t)lda*cols_A;
   size_t count_B = (size_t)ldb*cols_B;
   size_t count_C = (size_t)ldc*(size_t)n;
+  hipblasStatus_t status;
   int on_gpu = Krylov_GPU_Usable(ws) &&
                !((double)m*(double)n*(double)k < Krylov_gpu_dgemm_min_flops);
 
@@ -396,25 +442,29 @@ static void Krylov_Dgemm(Krylov_GPU_Workspace *ws,
              Krylov_GPU_EnsureDouble(&ws->d_C, &ws->d_C_count, count_C);
   }
 
-  if (!on_gpu){
+  if (on_gpu){
+    wait_hipfunc(hipMemcpyAsync(ws->d_A, A, sizeof(double)*count_A,
+                                  hipMemcpyHostToDevice, ws->stream));
+    wait_hipfunc(hipMemcpyAsync(ws->d_B, B, sizeof(double)*count_B,
+                                  hipMemcpyHostToDevice, ws->stream));
+
+    status = Krylov_GPU_DeviceDgemm(ws, transa, transb, m, n, k,
+                                    ws->d_A, lda, ws->d_B, ldb, ws->d_C, ldc);
+    if (status == HIPBLAS_STATUS_SUCCESS){
+      wait_hipfunc(hipMemcpyAsync(C, ws->d_C, sizeof(double)*count_C,
+                                    hipMemcpyDeviceToHost, ws->stream));
+      wait_hipfunc(hipStreamSynchronize(ws->stream));
+      return;
+    }
+    Krylov_GPU_GemmFailed(ws, status, m, n, k);
+  }
+
+  {
     char ta = (transa == HIPBLAS_OP_N) ? 'N' : 'T';
     char tb = (transb == HIPBLAS_OP_N) ? 'N' : 'T';
     F77_NAME(dgemm,DGEMM)(&ta, &tb, &m, &n, &k, (double*)&alpha,
                           (double*)A, &lda, (double*)B, &ldb, (double*)&beta, C, &ldc);
-    return;
   }
-
-  wait_hipfunc(hipMemcpyAsync(ws->d_A, A, sizeof(double)*count_A,
-                                hipMemcpyHostToDevice, ws->stream));
-  wait_hipfunc(hipMemcpyAsync(ws->d_B, B, sizeof(double)*count_B,
-                                hipMemcpyHostToDevice, ws->stream));
-
-  wait_hipfunc(hipblasDgemm(ws->hipblas, transa, transb, m, n, k,
-                            &alpha, ws->d_A, lda, ws->d_B, ldb, &beta, ws->d_C, ldc));
-
-  wait_hipfunc(hipMemcpyAsync(C, ws->d_C, sizeof(double)*count_C,
-                                hipMemcpyDeviceToHost, ws->stream));
-  wait_hipfunc(hipStreamSynchronize(ws->stream));
 }
 
 static void Krylov_Eigen2(Krylov_GPU_Workspace *ws, double *a, int csize, double *ko, int n, int EVmax)
@@ -523,6 +573,7 @@ static void Krylov_KUCache_Prepare(int matomnum, int nspin, const int *Msize,
   size_t nslot = (size_t)nspin*(size_t)(matomnum+1);
   size_t free_bytes=0,total_bytes=0,reserve=(size_t)4096*1024*1024;
   size_t budget,used=0;
+  int admitted=0;
 
   if (enable!=NULL && atoi(enable)==0) return;
   if (reserve_env!=NULL){
@@ -556,7 +607,7 @@ static void Krylov_KUCache_Prepare(int matomnum, int nspin, const int *Msize,
   }
 
   if (device_ranks<1) device_ranks=1;
-  if (hipMemGetInfo(&free_bytes,&total_bytes)!=hipSuccess){
+  if (OpenMX_GpuMemGetInfo(&free_bytes,&total_bytes)!=hipSuccess){
     (void)hipGetLastError();
     Krylov_Release_GPU_KUCache();
     Krylov_kucache.state=-1;
@@ -573,8 +624,10 @@ static void Krylov_KUCache_Prepare(int matomnum, int nspin, const int *Msize,
     Krylov_kucache.dim_m[slot]=Msize3[a];
     Krylov_kucache.off[slot]=used;
     used+=elems;
+    admitted++;
   }
   if (used!=0 && hipMalloc((void**)&Krylov_kucache.d_arena,used*sizeof(double))!=hipSuccess){
+    (void)hipGetLastError();
     Krylov_Release_GPU_KUCache();
     Krylov_kucache.state=-1;
     return;
@@ -583,6 +636,16 @@ static void Krylov_KUCache_Prepare(int matomnum, int nspin, const int *Msize,
   Krylov_kucache.matomnum=matomnum;
   Krylov_kucache.nspin=nspin;
   Krylov_kucache.arena_elems=used;
+
+  if (0<level_stdout && 0<admitted){
+    int myid=-1;
+    MPI_Comm_rank(mpi_comm_level1,&myid);
+    if (myid==Host_ID){
+      printf("<Krylov> GPU KU-cache: rank %d keeps %d of %d basis panels on the device (%.1f MiB)\n",
+             myid,admitted,(int)(nslot-(size_t)nspin),(double)(used*sizeof(double))/(1024.0*1024.0));
+      fflush(stdout);
+    }
+  }
 }
 
 /*
@@ -590,9 +653,10 @@ static void Krylov_KUCache_Prepare(int matomnum, int nspin, const int *Msize,
   ranks sharing a GPU run concurrently, so the estimate is summed over
   those ranks and compared with the free memory of the device: the growth
   of the per-thread device buffers (H_DC, KU and the product, the largest
-  local atom), the MAGMA workspace of the projected eigenproblem, and a
-  per-rank reserve for the BLAS library workspaces
-  (OPENMX_KRYLOV_GPU_RESERVE_MB, default 512 MiB).  It runs at every call
+  local atom), the MAGMA workspace of the projected eigenproblem, the
+  per-thread GEMMul8 workspace of the products, and a per-rank reserve for
+  the BLAS library workspaces (OPENMX_KRYLOV_GPU_RESERVE_MB, default
+  512 MiB).  It runs at every call
   because the free memory shrinks over the SCF loop (mixing history, ...),
   before the KU cache of the call is sized so that the cache only takes
   what the solves leave over, and its verdict is collective over the ranks
@@ -609,7 +673,7 @@ static void Krylov_GPU_Preflight(int matomnum, const int *Msize, const int *Msiz
   const double MiB = 1024.0*1024.0;
   size_t free_bytes = 0, total_bytes = 0;
   size_t nn_max = 0, nm_max = 0, mm_max = 0, m3_max = 0, n_max = 0;
-  size_t growth = 0, magma_bytes, lib_bytes, need_rank;
+  size_t growth = 0, magma_bytes, lib_bytes, gemmul8_bytes = 0, need_rank;
   unsigned long long need_local, need_total, free_local, free_min;
   int myid, Mc_AN, t;
 
@@ -663,9 +727,40 @@ static void Krylov_GPU_Preflight(int matomnum, const int *Msize, const int *Msiz
      covers.  Four copies of the largest operand are added on top so the
      margin also grows with the cluster size. */
   lib_bytes = 4*sizeof(double)*nn_max;
-  need_rank = growth + magma_bytes + lib_bytes + reserve_bytes;
 
-  if (hipMemGetInfo(&free_bytes, &total_bytes) != hipSuccess){
+  /* The GEMMul8 workspace of the device GEMMs (C=H*u1, u1^T*C, the back
+     transformation): the bridge keeps one per stream, i.e. per thread of
+     the pool, grown to the largest product the thread has run, and it is
+     allocated inside the GEMM call, where hipBLASLt would terminate the
+     process if the memory ran out.  0 when the products are native
+     (OPENMX_KRYLOV_GEMMUL8=0, scf.gemmul8.enable off, GEMMUL8_DISABLE*). */
+  if (Krylov_gpu_gemmul8){
+    size_t per_thread = 0;
+
+    for (Mc_AN=1; Mc_AN<=matomnum; Mc_AN++){
+      const int n = Msize[Mc_AN], m3 = Msize3[Mc_AN];
+      const int shape[3][3] = {{n,m3,n}, {m3,m3,n}, {m3,n,m3}};
+      int s;
+
+      for (s=0; s<3; s++){
+        size_t bytes;
+        if ((double)shape[s][0]*(double)shape[s][1]*(double)shape[s][2] < Krylov_gpu_dgemm_min_flops)
+          continue;
+        bytes = openmx_gemmul8DWorkspaceSize(shape[s][0], shape[s][1], shape[s][2]);
+        if (per_thread < bytes) per_thread = bytes;
+      }
+    }
+    gemmul8_bytes = per_thread*(size_t)Krylov_gpu_ws_pool_size;
+  }
+  need_rank = growth + magma_bytes + lib_bytes + gemmul8_bytes + reserve_bytes;
+
+  /* the workspaces still held from an earlier call (of any GEMMul8 user of
+     this rank) are returned first and counted in full above; the barrier
+     makes every rank of the device measure after all of them did so */
+  if (gemmul8_bytes != 0) openmx_gemmul8ReleaseWorkspaces();
+  MPI_Barrier(device_comm);
+
+  if (OpenMX_GpuMemGetInfo(&free_bytes, &total_bytes) != hipSuccess){
     (void)hipGetLastError();
     free_bytes = 0;
   }
@@ -687,10 +782,11 @@ static void Krylov_GPU_Preflight(int matomnum, const int *Msize, const int *Msiz
       fprintf(stderr,
               "Krylov: GPU device %d is shared by %d rank(s), has %.3f MiB free "
               "(%.3f MiB total on rank %d), but %.3f MiB is required for the GPU projected "
-              "solves (largest local cluster n=%d, m=%d; %.3f MiB reserve per rank); "
-              "switching to CPU path.\n",
+              "solves (largest local cluster n=%d, m=%d; %.3f MiB reserve and %.3f MiB "
+              "GEMMul8 workspace on rank %d); switching to CPU path.\n",
               hip_device, Krylov_gpu_device_ranks, (double)free_min/MiB, (double)total_bytes/MiB,
-              myid, (double)need_total/MiB, (int)n_max, (int)m3_max, (double)reserve_bytes/MiB);
+              myid, (double)need_total/MiB, (int)n_max, (int)m3_max, (double)reserve_bytes/MiB,
+              (double)gemmul8_bytes/MiB, myid);
       fflush(stderr);
     }
   }
@@ -722,20 +818,32 @@ static int Krylov_ProjectedSolve_GPU(Krylov_GPU_Workspace *ws,int spin,int Mc_AN
                                      double ***Krylov_U,double ****EC_matrix,
                                      double *H_DC,double *KU,double *C,double *ko)
 {
-  const double alpha=1.0,beta=0.0;
   const double *d_KU;
-  int n=Msize[Mc_AN],m3=Msize3[Mc_AN],info,mout=0;
+  int n=Msize[Mc_AN],m3=Msize3[Mc_AN],info,mout=0,eig_on_device=0;
   size_t nn=(size_t)n*(size_t)n;
   size_t nm=(size_t)n*(size_t)m3;
   size_t mm=(size_t)m3*(size_t)m3;
+  hipblasStatus_t status;
+  /* OPENMX_KRYLOV_GPU_PROFILE: the stage times of the fused path (the
+     KRYFUSE line of the NVIDIA version, plus pack, the compact panel MAGMA
+     reads); with the profile on every stage ends with a stream
+     synchronization so that the GPU time lands in its own stage */
+  static int profile=-1;
+  double t0=0.0,t1=0.0,t2=0.0,t3=0.0,t4=0.0,t5=0.0,t6=0.0,t7=0.0,t8=0.0;
 
   if (!Krylov_GPU_Usable(ws) || !Krylov_gpu_fused) return 0;
   if ((double)n*(double)m3*(double)n<Krylov_gpu_dgemm_min_flops ||
       (double)m3*(double)m3*(double)n<Krylov_gpu_dgemm_min_flops ||
       (double)m3*(double)n*(double)m3<Krylov_gpu_dgemm_min_flops) return 0;
 
-  /* a failed allocation hands the whole atom to the CPU path (return 0);
-     nothing computed so far is reused there */
+  if (profile<0){
+    const char *env=getenv("OPENMX_KRYLOV_GPU_PROFILE");
+    profile=(env!=NULL && env[0]!='\0' && atoi(env)!=0);
+  }
+  if (profile) dtime(&t0);
+
+  /* a failed allocation or product hands the whole atom to the CPU path
+     (return 0); nothing computed so far is reused there */
   if (!Krylov_GPU_EnsureHipblas(ws) ||
       !Krylov_GPU_EnsureDouble(&ws->d_A,&ws->d_A_count,nn>mm?nn:mm) ||
       !Krylov_GPU_EnsureDouble(&ws->d_C,&ws->d_C_count,nm)) return 0;
@@ -747,32 +855,79 @@ static int Krylov_ProjectedSolve_GPU(Krylov_GPU_Workspace *ws,int spin,int Mc_AN
     wait_hipfunc(hipMemcpyAsync(ws->d_B,KU,sizeof(double)*nm,hipMemcpyHostToDevice,ws->stream));
     d_KU=ws->d_B;
   }
+  if (profile){ wait_hipfunc(hipStreamSynchronize(ws->stream)); dtime(&t1); }
   wait_hipfunc(hipMemcpyAsync(ws->d_A,H_DC,sizeof(double)*nn,hipMemcpyHostToDevice,ws->stream));
-  wait_hipfunc(hipblasDgemm(ws->hipblas,HIPBLAS_OP_N,HIPBLAS_OP_N,n,m3,n,
-                            &alpha,ws->d_A,n,d_KU,n,&beta,ws->d_C,n));
-  wait_hipfunc(hipblasDgemm(ws->hipblas,HIPBLAS_OP_T,HIPBLAS_OP_N,m3,m3,n,
-                            &alpha,d_KU,n,ws->d_C,n,&beta,ws->d_A,m3));
+  if (profile){ wait_hipfunc(hipStreamSynchronize(ws->stream)); dtime(&t2); }
+  /* C = H_DC * u1 */
+  status=Krylov_GPU_DeviceDgemm(ws,HIPBLAS_OP_N,HIPBLAS_OP_N,n,m3,n,ws->d_A,n,d_KU,n,ws->d_C,n);
+  if (status!=HIPBLAS_STATUS_SUCCESS){ Krylov_GPU_GemmFailed(ws,status,n,m3,n); return 0; }
+  if (profile){ wait_hipfunc(hipStreamSynchronize(ws->stream)); dtime(&t3); }
+  /* u1^+ * H_DC * u1 (the projected Hamiltonian replaces H_DC on the host) */
+  status=Krylov_GPU_DeviceDgemm(ws,HIPBLAS_OP_T,HIPBLAS_OP_N,m3,m3,n,d_KU,n,ws->d_C,n,ws->d_A,m3);
+  if (status!=HIPBLAS_STATUS_SUCCESS){ Krylov_GPU_GemmFailed(ws,status,m3,m3,n); return 0; }
+  if (profile){ wait_hipfunc(hipStreamSynchronize(ws->stream)); dtime(&t4); }
   wait_hipfunc(hipMemcpyAsync(H_DC,ws->d_A,sizeof(double)*mm,hipMemcpyDeviceToHost,ws->stream));
   wait_hipfunc(hipStreamSynchronize(ws->stream));
 
   for (int i=0;i<(int)Krylov_U[spin][Mc_AN][0];i++) H_DC[i*m3+i]=1.0e3;
   for (int i=m3-1;0<=i;i--) for (int j=0;j<m3;j++)
     H_DC[(i+1)*(m3+1)+(j+1)]=H_DC[i*m3+j]+EC_matrix[spin][Mc_AN][i+1][j+1];
+  if (profile) dtime(&t5);
 
-  /* MAGMA consumes a compact column-major panel. */
-  for (int i=0;i<m3;i++) for (int j=0;j<m3;j++) KU[(size_t)i*(size_t)m3+(size_t)j]=H_DC[(i+1)*(m3+1)+(j+1)];
-  wait_hipfunc(hipMemcpyAsync(ws->d_A,KU,sizeof(double)*mm,hipMemcpyHostToDevice,ws->stream));
-  wait_hipfunc(hipStreamSynchronize(ws->stream));
-  info=openmx_magma_dsyevdx_gpu(m3,m3,ws->d_A,ko+1,&mout);
-  if (info!=0 || mout!=m3){
-    Eigen_lapack2(H_DC,m3+1,ko,m3,m3);
-    for (int i=0;i<m3;i++) for (int j=0;j<m3;j++) KU[(size_t)i*(size_t)m3+(size_t)j]=H_DC[(size_t)i*(size_t)m3+(size_t)j];
+  /* diagonalize; the eigenvector panel ends up in ws->d_A either way.
+     Below Krylov_gpu_eigen_min LAPACK solves it, as in Krylov_Eigen2 (the
+     dispatch of the NVIDIA version). */
+  if (Krylov_gpu_eigen_min<=m3){
+    /* MAGMA consumes a compact column-major panel. */
+    for (int i=0;i<m3;i++) for (int j=0;j<m3;j++) KU[(size_t)i*(size_t)m3+(size_t)j]=H_DC[(i+1)*(m3+1)+(j+1)];
     wait_hipfunc(hipMemcpyAsync(ws->d_A,KU,sizeof(double)*mm,hipMemcpyHostToDevice,ws->stream));
+    wait_hipfunc(hipStreamSynchronize(ws->stream));
+    if (profile) dtime(&t6);
+    info=openmx_magma_dsyevdx_gpu(m3,m3,ws->d_A,ko+1,&mout);
+    eig_on_device=(info==0 && mout==m3);
+    if (info!=0)
+      fprintf(stderr,"Krylov: magma_dsyevdx_gpu failed, info=%d; falling back to LAPACK.\n",info);
+    else if (mout!=m3)
+      fprintf(stderr,"Krylov: magma_dsyevdx_gpu returned %d eigenpairs, expected %d; falling back to LAPACK.\n",
+              mout,m3);
   }
-  wait_hipfunc(hipblasDgemm(ws->hipblas,HIPBLAS_OP_T,HIPBLAS_OP_T,m3,n,m3,
-                            &alpha,ws->d_A,m3,d_KU,n,&beta,ws->d_C,m3));
+  else t6=t5;
+  if (!eig_on_device){
+    Eigen_lapack2(H_DC,m3+1,ko,m3,m3);
+    wait_hipfunc(hipMemcpyAsync(ws->d_A,H_DC,sizeof(double)*mm,hipMemcpyHostToDevice,ws->stream));
+  }
+  if (profile){ wait_hipfunc(hipStreamSynchronize(ws->stream)); dtime(&t7); }
+  /* back transformation of eigenvectors: c = u1 * b */
+  status=Krylov_GPU_DeviceDgemm(ws,HIPBLAS_OP_T,HIPBLAS_OP_T,m3,n,m3,ws->d_A,m3,d_KU,n,ws->d_C,m3);
+  if (status!=HIPBLAS_STATUS_SUCCESS){
+    /* H_DC no longer holds the input: this atom is finished on the CPU
+       from the eigenvector panel (on the device after MAGMA) and the
+       basis, as the per-call path would do it */
+    const double alpha=1.0,beta=0.0;
+    int lda=m3,ldb=n,ldc=m3;
+
+    Krylov_GPU_GemmFailed(ws,status,m3,n,m3);
+    if (eig_on_device){
+      wait_hipfunc(hipMemcpyAsync(H_DC,ws->d_A,sizeof(double)*mm,hipMemcpyDeviceToHost,ws->stream));
+      wait_hipfunc(hipStreamSynchronize(ws->stream));
+    }
+    for (int i=0;i<n;i++) for (int j=0;j<m3;j++)
+      KU[(size_t)j*(size_t)n+(size_t)i]=Krylov_U[spin][Mc_AN][j*Msize2[Mc_AN]+i+1];
+    F77_NAME(dgemm,DGEMM)("T","T",&m3,&n,&m3,(double*)&alpha,H_DC,&lda,KU,&ldb,(double*)&beta,C,&ldc);
+    return 1;
+  }
   wait_hipfunc(hipMemcpyAsync(C,ws->d_C,sizeof(double)*nm,hipMemcpyDeviceToHost,ws->stream));
   wait_hipfunc(hipStreamSynchronize(ws->stream));
+  if (profile){
+    dtime(&t8);
+    if (Mc_AN==1 && spin==0){
+      printf("KRYFUSE n=%d m3=%d ku=%.4f hup=%.4f g1=%.4f g2=%.4f h33=%.4f pack=%.4f eig=%.4f g3=%.4f tot=%.4f"
+             " gemm=%s eigensolver=%s\n",
+             n,m3,t1-t0,t2-t1,t3-t2,t4-t3,t5-t4,t6-t5,t7-t6,t8-t7,t8-t0,
+             Krylov_gpu_gemmul8 ? "gemmul8" : "hipblas",eig_on_device ? "magma" : "lapack");
+      fflush(stdout);
+    }
+  }
   return 1;
 }
 

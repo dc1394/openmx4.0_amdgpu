@@ -29,6 +29,26 @@
 // #define _BENCHMARK   1
 
 extern int openmx_magma_dsyevdx_gpu(int n, int maxn, double *d_A, double *w, int *mout);
+/* complex Hermitian solves of magma_openmx.cu: device matrix (lower
+   triangle, vectors in place), host eigenvalues; the hipSOLVER one guards
+   rocSOLVER's zheevd against its NaN eigenvectors */
+extern int openmx_magma_zheevdx_gpu(int n, int maxn, void *d_A, double *w, int *mout);
+extern int openmx_hipsolver_zheevd_gpu(int n, int maxn, void *d_A, double *w, int *mout);
+extern int openmx_gpu_eigensolver_use_hipsolver(void);
+extern void openmx_magma_ozaki2_release(void);
+extern int openmx_hipsolver_release_workspace(void);
+/* geam is outside the C subset of hipblas_compat.h */
+hipblasStatus_t hipblasDgeam(hipblasHandle_t handle, hipblasOperation_t transa, hipblasOperation_t transb, int m,
+                             int n, const double *alpha, const double *A, int lda, const double *beta,
+                             const double *B, int ldb, double *C, int ldc);
+hipblasStatus_t hipblasZgeam(hipblasHandle_t handle, hipblasOperation_t transa, hipblasOperation_t transb, int m,
+                             int n, const hipDoubleComplex *alpha, const hipDoubleComplex *A, int lda,
+                             const hipDoubleComplex *beta, const hipDoubleComplex *B, int ldb, hipDoubleComplex *C,
+                             int ldc);
+
+/* MAGMA's allocation failures (magma_types.h) */
+#define DC_MAGMA_ERR_HOST_ALLOC   (-112)
+#define DC_MAGMA_ERR_DEVICE_ALLOC (-113)
 
 static double DC_Col(char * mode, int SCF_iter, double ***** Hks, double **** OLP0, double ***** CDM, double ***** EDM,
                      double Eele0[2], double Eele1[2]);
@@ -256,11 +276,14 @@ typedef struct {
 
 static DCGpuSolverCtx DC_gpusolver_ctx = {0};
 static int           DC_gpusolver_gemm_disabled = 0;
+/* the GEMMul8 products of DC are off by default on AMD GPUs; the run
+   boundary resets the flag to this value, not to 0 */
 #ifdef __HIP_PLATFORM_AMD__
-static int           DC_gpusolver_gemmul8_disabled = 1;
+#define DC_GPUSOLVER_GEMMUL8_DISABLED_DEFAULT 1
 #else
-static int           DC_gpusolver_gemmul8_disabled = 0;
+#define DC_GPUSOLVER_GEMMUL8_DISABLED_DEFAULT 0
 #endif
+static int           DC_gpusolver_gemmul8_disabled = DC_GPUSOLVER_GEMMUL8_DISABLED_DEFAULT;
 static int           DC_gpusolver_eigen_disabled = 0;
 /* Once these monotonically growing workspaces have passed a memory
    preflight, equal or smaller per-atom solves need no further query. */
@@ -280,6 +303,14 @@ typedef struct {
 
 static DCColSCacheCtx DC_scache = {0};
 
+/* A slot starts on a 512-byte boundary like a hipMalloc'd matrix, so a
+   solve that reads it in place sees the operand alignment it had before. */
+#define DC_SCACHE_SLOT_ALIGN 64
+
+static int DC_GpuSolver_RankAllowed(void);
+static int DC_GpuSolver_GemmDisabled(void);
+static int DC_GpuSolver_EigenDisabled(void);
+
 void Divide_Conquer_Release_GPU_SCache(void)
 {
     if (DC_scache.d_arena != NULL) wait_hipfunc(hipFree(DC_scache.d_arena));
@@ -289,6 +320,25 @@ void Divide_Conquer_Release_GPU_SCache(void)
     memset(&DC_scache, 0, sizeof(DC_scache));
 }
 
+/* Ranks sharing this node's device(s); conservative on multi-GPU nodes.
+   The split is collective, so the first call must be reached by every rank. */
+static int DC_NodeRanks(void)
+{
+    static int ranks = 0;
+
+    if (ranks == 0) {
+        MPI_Comm node_comm = MPI_COMM_NULL;
+
+        MPI_Comm_split_type(mpi_comm_level1, MPI_COMM_TYPE_SHARED, 0, MPI_INFO_NULL, &node_comm);
+        MPI_Comm_size(node_comm, &ranks);
+        MPI_Comm_free(&node_comm);
+        if (ranks < 1)
+            ranks = 1;
+    }
+
+    return ranks;
+}
+
 static void DCCol_SCache_Prepare(int matomnum, const int *Msize, int scf_iter)
 {
     const char *enabled_env = getenv("OPENMX_DC_GPU_S_CACHE");
@@ -296,13 +346,20 @@ static void DCCol_SCache_Prepare(int matomnum, const int *Msize, int scf_iter)
     size_t free_bytes = 0, total_bytes = 0, reserve = (size_t)4096 * 1024 * 1024;
     size_t used = 0, budget;
     int threshold = DC_GPU_Threshold();
-    int node_ranks = 1;
-    MPI_Comm node_comm = MPI_COMM_NULL;
+    /* collective on the first call, so it precedes every rank-local return */
+    int node_ranks = DC_NodeRanks();
+    int admitted = 0;
 
     if (enabled_env != NULL && atoi(enabled_env) == 0) return;
     if (reserve_env != NULL) {
         long mib = atol(reserve_env);
         if (0 <= mib) reserve = (size_t)mib * 1024U * 1024U;
+    }
+    /* a rank that never runs the GPU solve (rank limit, or the path is off
+       for the rest of the run) holds no arena */
+    if (!DC_GpuSolver_RankAllowed() || DC_GpuSolver_GemmDisabled() || DC_GpuSolver_EigenDisabled()) {
+        Divide_Conquer_Release_GPU_SCache();
+        return;
     }
     if (DC_scache.state == 1 && DC_scache.matomnum == matomnum) {
         int same = 1;
@@ -322,25 +379,27 @@ static void DCCol_SCache_Prepare(int matomnum, const int *Msize, int scf_iter)
     if (DC_scache.dim == NULL || DC_scache.valid == NULL || DC_scache.off == NULL)
         DC_AbortWithMessage("Could not allocate DC GPU S-cache tables.");
 
-    MPI_Comm_split_type(mpi_comm_level1, MPI_COMM_TYPE_SHARED, 0, MPI_INFO_NULL, &node_comm);
-    MPI_Comm_size(node_comm, &node_ranks);
-    MPI_Comm_free(&node_comm);
-    if (node_ranks < 1) node_ranks = 1;
-    if (hipMemGetInfo(&free_bytes, &total_bytes) != hipSuccess) {
+    if (OpenMX_GpuMemGetInfo(&free_bytes, &total_bytes) != hipSuccess) {
+        (void)hipGetLastError();
         Divide_Conquer_Release_GPU_SCache();
         DC_scache.state = -1;
         return;
     }
     budget = free_bytes > reserve ? (free_bytes-reserve)/(size_t)node_ranks : 0;
     for (int a=1; a<=matomnum; a++) {
-        size_t elems = (size_t)Msize[a]*(size_t)Msize[a];
-        size_t bytes = elems*sizeof(double);
+        size_t elems = DC_CheckedMulCount((size_t)Msize[a], (size_t)Msize[a], "DC S-cache slot");
+        size_t bytes = DC_CheckedArrayBytes(elems, sizeof(double), "DC S-cache slot");
         if (Msize[a] < threshold || bytes > budget || used*sizeof(double) > budget-bytes) continue;
         DC_scache.dim[a] = Msize[a];
         DC_scache.off[a] = used;
-        used += elems;
+        used += (elems + DC_SCACHE_SLOT_ALIGN - 1) / DC_SCACHE_SLOT_ALIGN * DC_SCACHE_SLOT_ALIGN;
+        admitted++;
     }
     if (used != 0 && hipMalloc((void**)&DC_scache.d_arena, used*sizeof(double)) != hipSuccess) {
+        /* the run goes on without the cache: no latched error may remain
+           for the next hipGetLastError() caller */
+        DC_scache.d_arena = NULL;
+        (void)hipGetLastError();
         Divide_Conquer_Release_GPU_SCache();
         DC_scache.state = -1;
         return;
@@ -348,6 +407,17 @@ static void DCCol_SCache_Prepare(int matomnum, const int *Msize, int scf_iter)
     DC_scache.matomnum = matomnum;
     DC_scache.arena_elems = used;
     DC_scache.state = 1;
+
+    if (0 < level_stdout && 0 < admitted) {
+        int myid = -1;
+
+        MPI_Comm_rank(mpi_comm_level1, &myid);
+        if (myid == Host_ID) {
+            printf("<DC> GPU S-cache: rank %d keeps %d of %d cluster overlaps on the device (%.1f MiB)\n",
+                   myid, admitted, matomnum, (double)(used * sizeof(double)) / (1024.0 * 1024.0));
+            fflush(stdout);
+        }
+    }
 }
 
 static double *DCCol_SCache_Ptr(int Mc_AN, int n)
@@ -355,6 +425,14 @@ static double *DCCol_SCache_Ptr(int Mc_AN, int n)
     if (DC_scache.state != 1 || Mc_AN < 1 || DC_scache.matomnum < Mc_AN ||
         DC_scache.dim[Mc_AN] != n) return NULL;
     return DC_scache.d_arena + DC_scache.off[Mc_AN];
+}
+
+/* the slot of Mc_AN when it holds this geometry's transformed overlap */
+static const double *DCCol_SCache_ValidPtr(int Mc_AN, int n)
+{
+    double *slot = DCCol_SCache_Ptr(Mc_AN, n);
+
+    return (slot != NULL && DC_scache.valid[Mc_AN]) ? slot : NULL;
 }
 
 static unsigned DC_EnvU32(const char *name, unsigned fallback)
@@ -553,15 +631,30 @@ static void DC_GpuSolver_ReleaseOverlapBuffer(void)
     ctx->loaded_s_dim = 0;
 }
 
+static void DC_GpuSolver_Destroy(void);
+static void DCNonCol_GpuRelease(int keep_stage);
+
 /* Run-boundary reset (between -runtest/-runtestL inputs): drop every scratch
    buffer and the overlap cache, all sized and indexed by the previous
-   system.  Idempotent. */
+   system, and return the stream, the hipBLAS handle and the pinned staging
+   buffers too; the next GPU solve re-creates them on demand
+   (DC_GpuSolver_Init).  The S-cache is not part of the context and is
+   dropped on its own.  Idempotent. */
 void Divide_Conquer_Release_GPU_Caches(void)
 {
-    DC_GpuSolver_ReleaseGemmScratch();
-    DC_GpuSolver_ReleaseTransformScratch();
-    DC_GpuSolver_ReleaseOverlapBuffer();
+    DCNonCol_GpuRelease(0);
+    DC_GpuSolver_Destroy();
     Divide_Conquer_Release_GPU_SCache();
+
+    /* A memory admission failure belongs to the finished system: the next
+       input starts with the GPU paths enabled again (and the GEMMul8
+       products at their build default). */
+    DC_gpusolver_gemm_disabled = 0;
+    DC_gpusolver_gemmul8_disabled = DC_GPUSOLVER_GEMMUL8_DISABLED_DEFAULT;
+    DC_gpusolver_eigen_disabled = 0;
+    DC_gpusolver_approved_gemm_n = 0;
+    DC_gpusolver_approved_gemm_num1 = 0;
+    DC_gpusolver_native_approved = 0;
 }
 
 static void DC_GpuSolver_DisableEigenPathInfo(const char *where, int32_t info)
@@ -571,6 +664,8 @@ static void DC_GpuSolver_DisableEigenPathInfo(const char *where, int32_t info)
     DC_gpusolver_eigen_disabled = 1;
     DC_gpusolver_gemm_disabled  = 1;
     openmx_gemmul8ReleaseWorkspaces();
+    /* a failed MAGMA allocation can leave a latched HIP error behind */
+    (void)hipGetLastError();
 
     MPI_Comm_rank(mpi_comm_level1, &rank);
     fprintf(stderr,
@@ -628,7 +723,7 @@ static int DC_GpuSolver_HasHipblasMemoryForSolve(const char *where)
     }
 
     reserve_bytes = DC_GpuSolver_HipblasReserveBytes();
-    status        = hipMemGetInfo(&free_bytes, &total_bytes);
+    status        = OpenMX_GpuMemGetInfo(&free_bytes, &total_bytes);
     if (status != hipSuccess) {
         DC_GpuSolver_DisableGemmPathHip("hipMemGetInfo(native hipBLAS preflight)", status);
         return 0;
@@ -681,7 +776,7 @@ static int DC_GpuSolver_PrepareGemmBackendForSolve(int n, int num1)
         estimate_bytes = estimate2;
     }
 
-    status = hipMemGetInfo(&free_bytes, &total_bytes);
+    status = OpenMX_GpuMemGetInfo(&free_bytes, &total_bytes);
     if (status != hipSuccess) {
         DC_GpuSolver_DisableGemmPathHip("hipMemGetInfo(GEMM preflight)", status);
         return 0;
@@ -719,6 +814,10 @@ static void DC_GpuSolver_DisableGemmPath(const char *where, const char *backend,
     DC_gpusolver_eigen_disabled = 1;
     openmx_gemmul8ReleaseWorkspaces();
 
+    /* pop any latched HIP error: this path recovers by falling back to the
+       CPU, so the error must not linger for the next hipGetLastError() caller */
+    (void)hipGetLastError();
+
     MPI_Comm_rank(mpi_comm_level1, &rank);
     fprintf(stderr,
             "<DC> rank %d: %s failed in %s for GEMM(m=%d,n=%d,k=%d): %s (%d). "
@@ -734,6 +833,10 @@ static void DC_GpuSolver_DisableGemmPathHip(const char *where, hipError_t status
     DC_gpusolver_gemm_disabled = 1;
     DC_gpusolver_eigen_disabled = 1;
     openmx_gemmul8ReleaseWorkspaces();
+
+    /* pop any latched HIP error: this path recovers by falling back to the
+       CPU, so the error must not linger for the next hipGetLastError() caller */
+    (void)hipGetLastError();
 
     MPI_Comm_rank(mpi_comm_level1, &rank);
     fprintf(stderr,
@@ -810,30 +913,59 @@ static void DC_GpuSolver_Destroy(void)
     ctx->loaded_s_dim = 0;
 }
 
-static void DC_GpuSolver_Init(void)
+/* Stream and hipBLAS handle, created on demand (also after the run-boundary
+   release); a failure turns the GPU solve off, the caller falls back. */
+static int DC_GpuSolver_Init(void)
 {
     DCGpuSolverCtx *ctx = &DC_gpusolver_ctx;
     int            current_device;
+    hipError_t     hip_status;
+    hipblasStatus_t blas_status;
 
-    wait_hipfunc(hipGetDevice(&current_device));
+    hip_status = hipGetDevice(&current_device);
+    if (hip_status != hipSuccess) {
+        DC_GpuSolver_DisableGemmPathHip("hipGetDevice", hip_status);
+        return 0;
+    }
 
     if (ctx->initialized && ctx->device_id == current_device) {
-        return;
+        return 1;
     }
 
     if (ctx->initialized) {
         DC_GpuSolver_Destroy();
     }
 
-    wait_hipfunc(hipStreamCreateWithFlags(&ctx->stream, hipStreamNonBlocking));
-    wait_hipfunc(hipblasCreate(&ctx->hipblas));
-    wait_hipfunc(hipblasSetStream(ctx->hipblas, ctx->stream));
+    hip_status = hipStreamCreateWithFlags(&ctx->stream, hipStreamNonBlocking);
+    if (hip_status != hipSuccess) {
+        ctx->stream = NULL;
+        DC_GpuSolver_DisableGemmPathHip("hipStreamCreateWithFlags", hip_status);
+        DC_GpuSolver_Destroy();
+        return 0;
+    }
+    blas_status = hipblasCreate(&ctx->hipblas);
+    if (blas_status != HIPBLAS_STATUS_SUCCESS) {
+        ctx->hipblas = NULL;
+    } else {
+        blas_status = hipblasSetStream(ctx->hipblas, ctx->stream);
+    }
+    if (blas_status != HIPBLAS_STATUS_SUCCESS) {
+        DC_GpuSolver_DisableGemmPath("the solver setup", "hipblasCreate/hipblasSetStream", blas_status, 0, 0, 0);
+        DC_GpuSolver_Destroy();
+        return 0;
+    }
 
     ctx->initialized  = 1;
     ctx->device_id    = current_device;
     ctx->loaded_s_dim = 0;
+    return 1;
 }
 
+/* The pinned staging buffer and the capacity of the device matrices.
+   Growing frees every device matrix, and DC_GpuSolver_AllocMatrix always
+   allocates matrix_dim x matrix_dim, so a buffer that exists fits any
+   atom up to matrix_dim (an overlap reloaded for a smaller atom must not
+   be taken as large enough for the next one). */
 static int DC_GpuSolver_EnsureMatrixCapacity(int num)
 {
     DCGpuSolverCtx *ctx = &DC_gpusolver_ctx;
@@ -844,16 +976,15 @@ static int DC_GpuSolver_EnsureMatrixCapacity(int num)
         DC_AbortWithMessage("Invalid matrix size in DC_GpuSolver_EnsureMatrixCapacity.");
     }
 
-    DC_GpuSolver_Init();
+    if (!DC_GpuSolver_Init()) {
+        return 0;
+    }
 
-    if (num <= ctx->matrix_dim && ctx->d_S != NULL && ctx->h_matrix != NULL) {
+    if (num <= ctx->matrix_dim && ctx->h_matrix != NULL) {
         return 1;
     }
 
-    if (ctx->d_S != NULL) {
-        wait_hipfunc(hipFree(ctx->d_S));
-        ctx->d_S = NULL;
-    }
+    DC_GpuSolver_ReleaseOverlapBuffer();
     DC_GpuSolver_ReleaseGemmScratch();
     if (ctx->h_matrix != NULL) {
         wait_hipfunc(hipHostFree(ctx->h_matrix));
@@ -866,14 +997,9 @@ static int DC_GpuSolver_EnsureMatrixCapacity(int num)
     matrix_bytes = DC_CheckedArrayBytes(DC_CheckedMulCount((size_t)num, (size_t)num, "GPU solver dense matrix"),
                                         sizeof(double), "GPU solver dense matrix");
 
-    hip_status = hipMalloc((void **)&ctx->d_S, matrix_bytes);
-    if (hip_status != hipSuccess) {
-        DC_GpuSolver_DisableGemmPathHip("hipMalloc(d_S)", hip_status);
-        DC_GpuSolver_Destroy();
-        return 0;
-    }
     hip_status = hipHostMalloc((void **)&ctx->h_matrix, matrix_bytes, 0);
     if (hip_status != hipSuccess) {
+        ctx->h_matrix = NULL;
         DC_GpuSolver_DisableGemmPathHip("hipHostMalloc(h_matrix)", hip_status);
         DC_GpuSolver_Destroy();
         return 0;
@@ -884,44 +1010,42 @@ static int DC_GpuSolver_EnsureMatrixCapacity(int num)
     return 1;
 }
 
-static int DC_GpuSolver_EnsureGemmCapacity(int num)
+/* *d_matrix becomes a matrix_dim x matrix_dim device matrix (kept if it
+   exists); on failure the GPU path is off and the context is gone. */
+static int DC_GpuSolver_AllocMatrix(double **d_matrix, const char *where)
 {
     DCGpuSolverCtx *ctx = &DC_gpusolver_ctx;
     size_t         matrix_bytes;
     hipError_t    hip_status;
 
-    if (!DC_GpuSolver_EnsureMatrixCapacity(num)) {
+    if (*d_matrix != NULL) {
+        return 1;
+    }
+    if (ctx->matrix_dim <= 0) {
+        DC_AbortWithMessage("DC_GpuSolver_AllocMatrix called before DC_GpuSolver_EnsureMatrixCapacity.");
+    }
+
+    matrix_bytes = DC_CheckedArrayBytes(DC_CheckedMulCount((size_t)ctx->matrix_dim, (size_t)ctx->matrix_dim,
+                                                           "GPU solver dense matrix"),
+                                        sizeof(double), "GPU solver dense matrix");
+
+    hip_status = hipMalloc((void **)d_matrix, matrix_bytes);
+    if (hip_status != hipSuccess) {
+        *d_matrix = NULL;
+        DC_GpuSolver_DisableGemmPathHip(where, hip_status);
+        DC_GpuSolver_Destroy();
         return 0;
     }
-
-    matrix_bytes = DC_CheckedArrayBytes(DC_CheckedMulCount((size_t)num, (size_t)num, "GPU solver GEMM matrix"),
-                                        sizeof(double), "GPU solver GEMM matrix");
-
-    if (ctx->d_H == NULL) {
-        hip_status = hipMalloc((void **)&ctx->d_H, matrix_bytes);
-        if (hip_status != hipSuccess) {
-            DC_GpuSolver_DisableGemmPathHip("hipMalloc(d_H)", hip_status);
-            DC_GpuSolver_Destroy();
-            return 0;
-        }
-    }
-    if (ctx->d_tmp == NULL) {
-        hip_status = hipMalloc((void **)&ctx->d_tmp, matrix_bytes);
-        if (hip_status != hipSuccess) {
-            DC_GpuSolver_DisableGemmPathHip("hipMalloc(d_tmp)", hip_status);
-            DC_GpuSolver_Destroy();
-            return 0;
-        }
-    }
-    if (ctx->d_A == NULL) {
-        hip_status = hipMalloc((void **)&ctx->d_A, matrix_bytes);
-        if (hip_status != hipSuccess) {
-            DC_GpuSolver_DisableGemmPathHip("hipMalloc(d_A)", hip_status);
-            DC_GpuSolver_Destroy();
-            return 0;
-        }
-    }
     return 1;
+}
+
+static int DC_GpuSolver_EnsureGemmCapacity(int num)
+{
+    DCGpuSolverCtx *ctx = &DC_gpusolver_ctx;
+
+    return DC_GpuSolver_EnsureMatrixCapacity(num) && DC_GpuSolver_AllocMatrix(&ctx->d_H, "hipMalloc(d_H)") &&
+           DC_GpuSolver_AllocMatrix(&ctx->d_tmp, "hipMalloc(d_tmp)") &&
+           DC_GpuSolver_AllocMatrix(&ctx->d_A, "hipMalloc(d_A)");
 }
 
 static int DC_GpuSolver_Eigen(double *d_A, int m, int maxn, double *W, const char *where)
@@ -935,11 +1059,9 @@ static int DC_GpuSolver_Eigen(double *d_A, int m, int maxn, double *W, const cha
         DC_AbortWithMessage("Invalid eigensolver arguments in DC_GpuSolver_Eigen.");
     }
 
-    if (DC_GpuSolver_EigenDisabled()) {
+    if (DC_GpuSolver_EigenDisabled() || !DC_GpuSolver_Init()) {
         return 0;
     }
-
-    DC_GpuSolver_Init();
 
     hip_status = hipStreamSynchronize(ctx->stream);
     if (hip_status != hipSuccess) {
@@ -960,47 +1082,81 @@ static int DC_GpuSolver_Eigen(double *d_A, int m, int maxn, double *W, const cha
     return 1;
 }
 
-static void DCCol_GpuSolver_PackMatrix(int n, double **src, double *dst)
+/* The host matrices are row-contiguous, so staging them row by row into
+   the pinned buffer is a plain streaming copy; the transpose that
+   column-major hipBLAS and MAGMA need is done on the device instead
+   (DC_GpuSolver_DeviceTranspose), which is bitwise-exact data movement. */
+static void DCCol_GpuSolver_PackRows(int n, double **src, double *dst)
 {
-    int i, j;
+    int j;
 
     for (j = 1; j <= n; j++) {
-        for (i = 1; i <= n; i++) {
-            dst[(size_t)(j - 1) * (size_t)n + (size_t)(i - 1)] = src[i][j];
-        }
+        memcpy(dst + (size_t)(j - 1) * (size_t)n, &src[j][1], sizeof(double) * (size_t)n);
     }
 }
 
-static void DCCol_GpuSolver_UnpackMatrix(int n, const double *src, double **dst)
+static void DCCol_GpuSolver_UnpackRows(int n_rows, int n_cols, const double *src, double **dst)
 {
-    int i, j;
+    int i;
 
-    for (j = 1; j <= n; j++) {
-        for (i = 1; i <= n; i++) {
-            dst[i][j] = src[(size_t)(j - 1) * (size_t)n + (size_t)(i - 1)];
-        }
+    for (i = 1; i <= n_rows; i++) {
+        memcpy(&dst[i][1], src + (size_t)(i - 1) * (size_t)n_cols, sizeof(double) * (size_t)n_cols);
     }
+}
+
+/* d_out (rows_out x cols_out, column-major, ld_out) = transpose of d_in
+   (cols_out x rows_out, column-major, ld_in).  geam in its in-place-B mode
+   (B == C, transb == N) with beta == 0 never reads the old contents of
+   d_out (checked on gfx1200 with d_out filled with NaN). */
+static int DC_GpuSolver_DeviceTranspose(int rows_out, int cols_out, const double *d_in, int ld_in, double *d_out,
+                                        int ld_out, const char *where)
+{
+    double          alpha = 1.0;
+    double          beta  = 0.0;
+    hipblasStatus_t status;
+
+    status = hipblasDgeam(DC_gpusolver_ctx.hipblas, HIPBLAS_OP_T, HIPBLAS_OP_N, rows_out, cols_out, &alpha, d_in,
+                          ld_in, &beta, d_out, ld_out, d_out, ld_out);
+    if (status != HIPBLAS_STATUS_SUCCESS) {
+        DC_GpuSolver_DisableGemmPath(where, "hipblasDgeam", status, rows_out, cols_out, 0);
+        return 0;
+    }
+
+    return 1;
+}
+
+/* rows of a host matrix -> column-major device matrix d_out, through the
+   pinned buffer and the device scratch d_scratch */
+static int DCCol_GpuSolver_UploadMatrix(int n, double **src, double *d_scratch, double *d_out, const char *where)
+{
+    DCGpuSolverCtx *ctx = &DC_gpusolver_ctx;
+    hipError_t      hip_status;
+
+    DCCol_GpuSolver_PackRows(n, src, ctx->h_matrix);
+    hip_status = hipMemcpyAsync(d_scratch, ctx->h_matrix, sizeof(double) * (size_t)n * (size_t)n,
+                                hipMemcpyHostToDevice, ctx->stream);
+    if (hip_status != hipSuccess) {
+        DC_GpuSolver_DisableGemmPathHip(where, hip_status);
+        return 0;
+    }
+
+    return DC_GpuSolver_DeviceTranspose(n, n, d_scratch, n, d_out, n, where);
 }
 
 static int DCCol_GpuSolver_LoadTransformedOverlap(int n, double **S_DC)
 {
     DCGpuSolverCtx *ctx = &DC_gpusolver_ctx;
-    size_t         matrix_bytes;
-    hipError_t    hip_status;
+    hipError_t      hip_status;
 
-    if (!DC_GpuSolver_EnsureMatrixCapacity(n)) {
+    if (!DC_GpuSolver_EnsureMatrixCapacity(n) || !DC_GpuSolver_AllocMatrix(&ctx->d_S, "hipMalloc(d_S)") ||
+        !DC_GpuSolver_AllocMatrix(&ctx->d_tmp, "hipMalloc(d_tmp)")) {
         return 0;
     }
 
-    matrix_bytes = DC_CheckedArrayBytes(DC_CheckedMulCount((size_t)n, (size_t)n, "DC transformed overlap"),
-                                        sizeof(double), "DC transformed overlap");
-
-    DCCol_GpuSolver_PackMatrix(n, S_DC, ctx->h_matrix);
-    hip_status = hipMemcpyAsync(ctx->d_S, ctx->h_matrix, matrix_bytes, hipMemcpyHostToDevice, ctx->stream);
-    if (hip_status != hipSuccess) {
-        DC_GpuSolver_DisableGemmPathHip("hipMemcpyAsync(transformed overlap)", hip_status);
+    if (!DCCol_GpuSolver_UploadMatrix(n, S_DC, ctx->d_tmp, ctx->d_S, "transformed overlap staging")) {
         return 0;
     }
+    /* h_matrix is restaged by the Hamiltonian solve */
     hip_status = hipStreamSynchronize(ctx->stream);
     if (hip_status != hipSuccess) {
         DC_GpuSolver_DisableGemmPathHip("hipStreamSynchronize(transformed overlap)", hip_status);
@@ -1011,57 +1167,65 @@ static int DCCol_GpuSolver_LoadTransformedOverlap(int n, double **S_DC)
     return 1;
 }
 
-static int DCCol_GpuSolver_LoadCachedOverlap(int Mc_AN, int n, double **S_DC)
+/* Refresh Mc_AN's S-cache slot from the overlap just staged in ctx->d_S.
+   *d_S_use is the slot for the solve to read in place, or NULL when the
+   atom has no slot (the solve then uses, and reloads, ctx->d_S). */
+static int DCCol_SCache_Store(int Mc_AN, int n, const double **d_S_use)
 {
-    DCGpuSolverCtx *ctx = &DC_gpusolver_ctx;
-    double *cached = DCCol_SCache_Ptr(Mc_AN, n);
-    size_t bytes = (size_t)n*(size_t)n*sizeof(double);
-    hipError_t status;
+    DCGpuSolverCtx *ctx  = &DC_gpusolver_ctx;
+    double *        slot = DCCol_SCache_Ptr(Mc_AN, n);
+    hipError_t      hip_status;
 
-    if (cached != NULL && DC_scache.valid[Mc_AN]) {
-        if (!DC_GpuSolver_EnsureMatrixCapacity(n)) return 0;
-        status = hipMemcpyAsync(ctx->d_S, cached, bytes, hipMemcpyDeviceToDevice, ctx->stream);
-        if (status != hipSuccess) return 0;
-        status = hipStreamSynchronize(ctx->stream);
-        if (status != hipSuccess) return 0;
-        ctx->loaded_s_dim = n;
+    *d_S_use = NULL;
+    if (slot == NULL) {
         return 1;
     }
 
-    if (!DCCol_GpuSolver_LoadTransformedOverlap(n, S_DC)) return 0;
-    if (cached != NULL) {
-        status = hipMemcpyAsync(cached, ctx->d_S, bytes, hipMemcpyDeviceToDevice, ctx->stream);
-        if (status == hipSuccess && hipStreamSynchronize(ctx->stream) == hipSuccess)
-            DC_scache.valid[Mc_AN] = 1;
+    hip_status = hipMemcpyAsync(slot, ctx->d_S, sizeof(double) * (size_t)n * (size_t)n, hipMemcpyDeviceToDevice,
+                                ctx->stream);
+    if (hip_status != hipSuccess) {
+        DC_scache.valid[Mc_AN] = 0;
+        DC_GpuSolver_DisableGemmPathHip("hipMemcpyAsync(S-cache refresh)", hip_status);
+        return 0;
     }
+
+    DC_scache.valid[Mc_AN] = 1;
+    *d_S_use = slot;
     return 1;
 }
 
 static int DCCol_GpuSolver_DiagonalizeOverlap(int n, double **S_DC, double *ko)
 {
     DCGpuSolverCtx *ctx = &DC_gpusolver_ctx;
-    size_t         matrix_bytes;
-    hipError_t    hip_status;
+    hipError_t      hip_status;
 
-    if (!DC_GpuSolver_EnsureMatrixCapacity(n)) {
+    if (!DC_GpuSolver_EnsureMatrixCapacity(n) || !DC_GpuSolver_AllocMatrix(&ctx->d_S, "hipMalloc(d_S)") ||
+        !DC_GpuSolver_AllocMatrix(&ctx->d_tmp, "hipMalloc(d_tmp)")) {
         return 0;
     }
+    ctx->loaded_s_dim = 0;
 
-    matrix_bytes = DC_CheckedArrayBytes(DC_CheckedMulCount((size_t)n, (size_t)n, "DC overlap matrix"),
-                                        sizeof(double), "DC overlap matrix");
-
-    DCCol_GpuSolver_PackMatrix(n, S_DC, ctx->h_matrix);
-    hip_status = hipMemcpyAsync(ctx->d_S, ctx->h_matrix, matrix_bytes, hipMemcpyHostToDevice, ctx->stream);
+    if (!DCCol_GpuSolver_UploadMatrix(n, S_DC, ctx->d_tmp, ctx->d_S, "overlap staging")) {
+        return 0;
+    }
+    /* MAGMA gets the room of the staging scratch */
+    hip_status = hipStreamSynchronize(ctx->stream);
     if (hip_status != hipSuccess) {
-        DC_GpuSolver_DisableGemmPathHip("hipMemcpyAsync(overlap)", hip_status);
+        DC_GpuSolver_DisableGemmPathHip("hipStreamSynchronize(overlap staging)", hip_status);
         return 0;
     }
+    DC_GpuSolver_ReleaseTransformScratch();
 
     if (!DC_GpuSolver_Eigen(ctx->d_S, n, n, ko + 1, "overlap diagonalization")) {
         return 0;
     }
 
-    hip_status = hipMemcpyAsync(ctx->h_matrix, ctx->d_S, matrix_bytes, hipMemcpyDeviceToHost, ctx->stream);
+    if (!DC_GpuSolver_AllocMatrix(&ctx->d_tmp, "hipMalloc(d_tmp)") ||
+        !DC_GpuSolver_DeviceTranspose(n, n, ctx->d_S, n, ctx->d_tmp, n, "overlap eigenvector readback")) {
+        return 0;
+    }
+    hip_status = hipMemcpyAsync(ctx->h_matrix, ctx->d_tmp, sizeof(double) * (size_t)n * (size_t)n,
+                                hipMemcpyDeviceToHost, ctx->stream);
     if (hip_status != hipSuccess) {
         DC_GpuSolver_DisableGemmPathHip("hipMemcpyAsync(overlap eigenvectors)", hip_status);
         return 0;
@@ -1072,8 +1236,7 @@ static int DCCol_GpuSolver_DiagonalizeOverlap(int n, double **S_DC, double *ko)
         return 0;
     }
 
-    DCCol_GpuSolver_UnpackMatrix(n, ctx->h_matrix, S_DC);
-    ctx->loaded_s_dim = 0;
+    DCCol_GpuSolver_UnpackRows(n, n, ctx->h_matrix, S_DC);
     return 1;
 }
 
@@ -1215,45 +1378,45 @@ static int DCCol_CPU_SolveHamiltonian(int n, int p_min, double **S_DC, double **
     return num1;
 }
 
-static int DCCol_GpuSolver_SolveHamiltonian(int n, int p_min, double **S_DC, double **H_DC_spin, double *ko,
-                                           double **C)
+/* d_S_use == NULL means "use the overlap staged in ctx->d_S by
+   LoadTransformedOverlap"; that copy makes room for MAGMA and is reloaded
+   from the host S_DC afterwards.  Otherwise d_S_use is the resident copy in
+   the S-cache arena, read in place, and S_DC is not used. */
+static int DCCol_GpuSolver_SolveHamiltonian(int n, int p_min, const double *d_S_use, double **S_DC,
+                                           double **H_DC_spin, double *ko, double **C)
 {
     DCGpuSolverCtx *ctx = &DC_gpusolver_ctx;
     double         alpha = 1.0;
     double         beta  = 0.0;
     int            num1  = n - (p_min - 1);
-    int            i, j;
-    size_t         matrix_bytes;
+    int            reload_s = (d_S_use == NULL);
     hipError_t    hip_status;
 
-    if (ctx->loaded_s_dim != n) {
+    if (reload_s && (ctx->loaded_s_dim != n || ctx->d_S == NULL)) {
         DC_AbortWithMessage("Transformed overlap is not loaded in DCCol_GpuSolver_SolveHamiltonian.");
     }
     if (num1 <= 0 || num1 > n) {
         DC_AbortWithMessage("Invalid active subspace size in DCCol_GpuSolver_SolveHamiltonian.");
     }
 
-    matrix_bytes = DC_CheckedArrayBytes(DC_CheckedMulCount((size_t)n, (size_t)n, "DC Hamiltonian matrix"),
-                                        sizeof(double), "DC Hamiltonian matrix");
-
     if (!DC_GpuSolver_EnsureGemmCapacity(n)) {
         return 0;
     }
+    if (reload_s) {
+        d_S_use = ctx->d_S;
+    }
 
-    DCCol_GpuSolver_PackMatrix(n, H_DC_spin, ctx->h_matrix);
-    hip_status = hipMemcpyAsync(ctx->d_H, ctx->h_matrix, matrix_bytes, hipMemcpyHostToDevice, ctx->stream);
-    if (hip_status != hipSuccess) {
-        DC_GpuSolver_DisableGemmPathHip("hipMemcpyAsync(H)", hip_status);
+    if (!DCCol_GpuSolver_UploadMatrix(n, H_DC_spin, ctx->d_tmp, ctx->d_H, "Hamiltonian staging")) {
         DC_GpuSolver_ReleaseGemmScratch();
         return 0;
     }
 
-    if (!DC_GpuSolver_TryGpuDgemm(ctx->hipblas, HIPBLAS_OP_N, HIPBLAS_OP_N, n, n, n, &alpha, ctx->d_H, n, ctx->d_S,
+    if (!DC_GpuSolver_TryGpuDgemm(ctx->hipblas, HIPBLAS_OP_N, HIPBLAS_OP_N, n, n, n, &alpha, ctx->d_H, n, d_S_use,
                                  n, &beta, ctx->d_tmp, n, "H*S")) {
         DC_GpuSolver_ReleaseGemmScratch();
         return 0;
     }
-    if (!DC_GpuSolver_TryGpuDgemm(ctx->hipblas, HIPBLAS_OP_T, HIPBLAS_OP_N, n, n, n, &alpha, ctx->d_S, n,
+    if (!DC_GpuSolver_TryGpuDgemm(ctx->hipblas, HIPBLAS_OP_T, HIPBLAS_OP_N, n, n, n, &alpha, d_S_use, n,
                                  ctx->d_tmp, n, &beta, ctx->d_H, n, "S^T*H*S")) {
         DC_GpuSolver_ReleaseGemmScratch();
         return 0;
@@ -1274,6 +1437,8 @@ static int DCCol_GpuSolver_SolveHamiltonian(int n, int p_min, double **S_DC, dou
         DC_GpuSolver_ReleaseGemmScratch();
         return 0;
     }
+    /* MAGMA gets the room of the transform scratch and of the staged
+       overlap (a resident S-cache copy stays) */
     DC_GpuSolver_ReleaseTransformScratch();
     DC_GpuSolver_ReleaseOverlapBuffer();
 
@@ -1282,44 +1447,35 @@ static int DCCol_GpuSolver_SolveHamiltonian(int n, int p_min, double **S_DC, dou
         return 0;
     }
 
-    hip_status = hipMalloc((void **)&ctx->d_S, matrix_bytes);
-    if (hip_status != hipSuccess) {
-        DC_GpuSolver_DisableGemmPathHip("hipMalloc(d_S reload)", hip_status);
-        DC_GpuSolver_ReleaseGemmScratch();
+    if (!DC_GpuSolver_AllocMatrix(&ctx->d_C, "hipMalloc(d_C)")) {
         return 0;
     }
-    DCCol_GpuSolver_PackMatrix(n, S_DC, ctx->h_matrix);
-    hip_status = hipMemcpyAsync(ctx->d_S, ctx->h_matrix, matrix_bytes, hipMemcpyHostToDevice, ctx->stream);
-    if (hip_status != hipSuccess) {
-        DC_GpuSolver_DisableGemmPathHip("hipMemcpyAsync(reloaded S)", hip_status);
-        DC_GpuSolver_ReleaseGemmScratch();
-        return 0;
-    }
-    hip_status = hipStreamSynchronize(ctx->stream);
-    if (hip_status != hipSuccess) {
-        DC_GpuSolver_DisableGemmPathHip("hipStreamSynchronize(reloaded S)", hip_status);
-        DC_GpuSolver_ReleaseGemmScratch();
-        return 0;
-    }
-    ctx->loaded_s_dim = n;
-
-    if (ctx->d_C == NULL) {
-        hip_status = hipMalloc((void **)&ctx->d_C, matrix_bytes);
-        if (hip_status != hipSuccess) {
-            DC_GpuSolver_DisableGemmPathHip("hipMalloc(d_C)", hip_status);
+    if (reload_s) {
+        /* d_C is the staging scratch until the back-transform writes it */
+        if (!DC_GpuSolver_AllocMatrix(&ctx->d_S, "hipMalloc(d_S reload)")) {
+            return 0;
+        }
+        if (!DCCol_GpuSolver_UploadMatrix(n, S_DC, ctx->d_C, ctx->d_S, "overlap reload")) {
             DC_GpuSolver_ReleaseGemmScratch();
             return 0;
         }
+        ctx->loaded_s_dim = n;
+        d_S_use           = ctx->d_S;
     }
 
     if (!DC_GpuSolver_TryGpuDgemm(ctx->hipblas, HIPBLAS_OP_N, HIPBLAS_OP_N, n, num1, num1, &alpha,
-                                 ctx->d_S + (size_t)(p_min - 1) * (size_t)n, n, ctx->d_A, num1, &beta,
+                                 d_S_use + (size_t)(p_min - 1) * (size_t)n, n, ctx->d_A, num1, &beta,
                                  ctx->d_C, n, "S*C")) {
         DC_GpuSolver_ReleaseGemmScratch();
         return 0;
     }
 
-    hip_status = hipMemcpyAsync(ctx->h_matrix, ctx->d_C, sizeof(double) * (size_t)n * (size_t)num1,
+    /* row-major C (n x num1) for the host rows; d_A is free again */
+    if (!DC_GpuSolver_DeviceTranspose(num1, n, ctx->d_C, n, ctx->d_A, num1, "eigenvector readback")) {
+        DC_GpuSolver_ReleaseGemmScratch();
+        return 0;
+    }
+    hip_status = hipMemcpyAsync(ctx->h_matrix, ctx->d_A, sizeof(double) * (size_t)n * (size_t)num1,
                                   hipMemcpyDeviceToHost, ctx->stream);
     if (hip_status != hipSuccess) {
         DC_GpuSolver_DisableGemmPathHip("hipMemcpyAsync(C)", hip_status);
@@ -1334,13 +1490,446 @@ static int DCCol_GpuSolver_SolveHamiltonian(int n, int p_min, double **S_DC, dou
         return 0;
     }
 
-    for (j = 1; j <= num1; j++) {
-        for (i = 1; i <= n; i++) {
-            C[i][j] = ctx->h_matrix[(size_t)(j - 1) * (size_t)n + (size_t)(i - 1)];
+    DCCol_GpuSolver_UnpackRows(n, num1, ctx->h_matrix, C);
+
+    DC_GpuSolver_ReleaseGemmScratch();
+    return 1;
+}
+
+/* Host copy of the transformed overlap, needed only by the CPU solve; the
+   GPU path with an S-cache hit skips it until a fallback actually happens. */
+static void DCCol_FillSDCFromS12(int Mc_AN, int n, double **S_DC)
+{
+    int i1, j1;
+
+    for (i1 = 1; i1 <= n; i1++) {
+        for (j1 = 1; j1 <= n; j1++) {
+            S_DC[i1][j1] = S12[Mc_AN][i1][j1];
+        }
+    }
+}
+
+/****************************************************
+   GPU solve of the non-collinear clusters (DC_NonCol)
+****************************************************/
+
+/* EigenBand_lapack on the CPU at every size: under scf.eigen.lib gpusolver
+   it would send n >= GPU_CPU_SWITCH_NUM to the GPU solver wrappers, which
+   the CPU path of DC_NonCol (also the fallback of its GPU solve) must not
+   do. */
+static void DC_EigenBand_lapack_cpu(dcomplex **a, double *ko, int n)
+{
+    int saved_scf_eigen_lib_flag = scf_eigen_lib_flag;
+
+    scf_eigen_lib_flag = ELPA2;
+    EigenBand_lapack(a, ko, n, n, 1);
+    scf_eigen_lib_flag = saved_scf_eigen_lib_flag;
+}
+
+/* Device memory a GPU eigensolve leaves free (the NVIDIA version's cuSOLVER
+   workspace preflight).  The collinear solves use MAGMA, which sizes and
+   checks its own workspace; the non-collinear admission keeps this much
+   of the shared device free. */
+static size_t DC_GpuSolver_EigenReserveBytes(void)
+{
+    unsigned reserve_mib;
+
+    reserve_mib = DC_EnvU32("GPUSOLVER_MIN_FREE_AFTER_MB", 1536u);
+    reserve_mib = DC_EnvU32("OPENMX_GPUSOLVER_MIN_FREE_AFTER_MB", reserve_mib);
+
+    return (size_t)reserve_mib * (size_t)1024 * (size_t)1024;
+}
+
+/* Buffers of the non-collinear solve.  The device matrices are sized once
+   per DC_NonCol call for the largest admitted cluster and returned at its
+   end; the stream and hipBLAS handle are those of DC_gpusolver_ctx, and the
+   pinned staging buffer stays until the run boundary. */
+typedef struct {
+    int               num;     /* capacity, as the NUM of a cluster */
+    int               off;     /* no device memory: the rest of this call runs on the CPU */
+    int               reports; /* per-atom fallback messages printed in this run */
+    hipDoubleComplex *d_A;     /* 2NUM x 2NUM */
+    hipDoubleComplex *d_Y;     /* 2NUM x 2NUM */
+    double *          d_T;     /* NUM x NUM */
+    void *            h_stage; /* rows of T, then the 2NUM x 2NUM complex rows of H and C */
+    size_t            h_stage_bytes;
+} DCNonColGpuCtx;
+
+static DCNonColGpuCtx DC_noncol_gpu = {0};
+
+static void DCNonCol_GpuRelease(int keep_stage)
+{
+    DCNonColGpuCtx *nc = &DC_noncol_gpu;
+
+    if (nc->d_A != NULL)
+        wait_hipfunc(hipFree(nc->d_A));
+    if (nc->d_Y != NULL)
+        wait_hipfunc(hipFree(nc->d_Y));
+    if (nc->d_T != NULL)
+        wait_hipfunc(hipFree(nc->d_T));
+    nc->d_A = NULL;
+    nc->d_Y = NULL;
+    nc->d_T = NULL;
+    nc->num = 0;
+
+    if (!keep_stage) {
+        if (nc->h_stage != NULL)
+            wait_hipfunc(hipHostFree(nc->h_stage));
+        nc->h_stage       = NULL;
+        nc->h_stage_bytes = 0;
+        nc->reports       = 0;
+    }
+}
+
+/* byte offset of the complex rows in the staging buffer */
+static size_t DCNonCol_StageOffset(int num)
+{
+    size_t bytes = DC_CheckedArrayBytes(DC_CheckedMulCount((size_t)num, (size_t)num, "DC NonCol GPU overlap"),
+                                        sizeof(double), "DC NonCol GPU overlap");
+
+    return (bytes + 255) / 256 * 256;
+}
+
+static size_t DCNonCol_ComplexBytes(int num)
+{
+    return DC_CheckedArrayBytes(DC_CheckedMulCount(2 * (size_t)num, 2 * (size_t)num, "DC NonCol GPU matrix"),
+                                sizeof(hipDoubleComplex), "DC NonCol GPU matrix");
+}
+
+/* Device bytes of one rank for clusters up to num: d_A, d_Y and d_T, the
+   eigensolver workspace (MAGMA's is about one matrix, rocSOLVER's zheevd is
+   counted as two), the hipBLAS (or GEMMul8) workspace and some slack. */
+static size_t DCNonCol_GpuNeedBytes(int num)
+{
+    size_t zmat = DCNonCol_ComplexBytes(num);
+    size_t gemm = DC_GpuSolver_HipblasReserveBytes();
+    size_t need;
+
+    if (!DC_gpusolver_gemmul8_disabled) {
+        size_t gemmul8 = openmx_gemmul8DWorkspaceSize(4 * num, num, num);
+
+        if (gemm < gemmul8)
+            gemm = gemmul8;
+    }
+
+    need = DC_CheckedMulCount(zmat, openmx_gpu_eigensolver_use_hipsolver() ? 4u : 3u, "DC NonCol GPU memory");
+    need += DCNonCol_StageOffset(num) + gemm + (size_t)64 * 1024 * 1024;
+    return need;
+}
+
+/* Device-memory admission of the non-collinear GPU solve for one DC_NonCol
+   call, agreed by the ranks sharing a GPU.  Collective over mpi_comm_level1:
+   every rank calls it whenever scf.eigen.lib is gpusolver (that flag is the
+   same on all ranks).  A rank needs DCNonCol_GpuNeedBytes() for its largest
+   cluster with 2*NUM >= OPENMX_DC_NONCOL_GPU_THRESHOLD; the sum over the
+   ranks of a GPU must fit into the smallest free memory they see minus
+   GPUSOLVER_MIN_FREE_AFTER_MB.  Returns the admitted capacity (that NUM),
+   or 0 when this call solves every cluster on the CPU. */
+static int DCNonCol_GpuAdmit(int matomnum, const int *Msize)
+{
+    static int         warned = 0;
+    MPI_Comm           node_comm = MPI_COMM_NULL, gpu_comm = MPI_COMM_NULL;
+    unsigned long long my_need = 0, my_free, group_need = 0, group_free = 0;
+    unsigned long long reserve = (unsigned long long)DC_GpuSolver_EigenReserveBytes();
+    size_t             free_bytes = 0, total_bytes = 0;
+    int                max_num = 0, device = 0, node_rank = 0, gpu_rank = 0, gpu_ranks = 1, Mc_AN, fits;
+
+    DC_noncol_gpu.off = 0;
+
+    if (!DC_GpuSolver_GemmDisabled() && !DC_GpuSolver_EigenDisabled()) {
+        for (Mc_AN = 1; Mc_AN <= matomnum; Mc_AN++) {
+            if (DC_NonCol_GPU_Threshold() <= 2 * Msize[Mc_AN] && max_num < Msize[Mc_AN]) {
+                max_num = Msize[Mc_AN];
+            }
+        }
+    }
+    if (0 < max_num) {
+        my_need = (unsigned long long)DCNonCol_GpuNeedBytes(max_num);
+    }
+    if (OpenMX_GpuMemGetInfo(&free_bytes, &total_bytes) != hipSuccess) {
+        (void)hipGetLastError();
+        free_bytes = 0;
+    }
+    my_free = (unsigned long long)free_bytes;
+    if (hipGetDevice(&device) != hipSuccess) {
+        (void)hipGetLastError();
+        device = 0;
+    }
+
+    MPI_Comm_split_type(mpi_comm_level1, MPI_COMM_TYPE_SHARED, 0, MPI_INFO_NULL, &node_comm);
+    MPI_Comm_rank(node_comm, &node_rank);
+    MPI_Comm_split(node_comm, device, node_rank, &gpu_comm);
+    MPI_Comm_rank(gpu_comm, &gpu_rank);
+    MPI_Comm_size(gpu_comm, &gpu_ranks);
+    MPI_Allreduce(&my_need, &group_need, 1, MPI_UNSIGNED_LONG_LONG, MPI_SUM, gpu_comm);
+    MPI_Allreduce(&my_free, &group_free, 1, MPI_UNSIGNED_LONG_LONG, MPI_MIN, gpu_comm);
+    MPI_Comm_free(&gpu_comm);
+    MPI_Comm_free(&node_comm);
+
+    fits = (reserve <= group_free && group_need <= group_free - reserve);
+    if (!fits && 0 < group_need && !warned && gpu_rank == 0 && 0 < level_stdout) {
+        printf("<DC> GPU device %d: %d rank(s) would need %.3f GiB for the non-collinear solves "
+               "(free %.3f GiB, reserve %.3f GiB); solving them on the CPU instead.\n",
+               device, gpu_ranks, (double)group_need / (1024.0 * 1024.0 * 1024.0),
+               (double)group_free / (1024.0 * 1024.0 * 1024.0), (double)reserve / (1024.0 * 1024.0 * 1024.0));
+        fflush(stdout);
+        warned = 1;
+    }
+
+    return fits ? max_num : 0;
+}
+
+/* Buffers for clusters up to num; a failure leaves the rest of this call
+   on the CPU (the next call is admitted afresh). */
+static int DCNonCol_GpuEnsure(int num)
+{
+    DCNonColGpuCtx *nc      = &DC_noncol_gpu;
+    size_t          zbytes  = DCNonCol_ComplexBytes(num);
+    size_t          dbytes  = DC_CheckedArrayBytes(DC_CheckedMulCount((size_t)num, (size_t)num, "DC NonCol GPU overlap"),
+                                                   sizeof(double), "DC NonCol GPU overlap");
+    size_t          sbytes  = DCNonCol_StageOffset(num) + zbytes;
+    const char *    what    = NULL;
+    hipError_t      status  = hipSuccess;
+    int             rank    = -1;
+
+    if (num <= nc->num && nc->d_A != NULL && nc->h_stage != NULL) {
+        return 1;
+    }
+
+    if (!DC_GpuSolver_Init()) {
+        return 0;
+    }
+    DCNonCol_GpuRelease(1);
+
+    if ((status = hipMalloc((void **)&nc->d_A, zbytes)) != hipSuccess) {
+        nc->d_A = NULL;
+        what    = "hipMalloc(non-collinear H)";
+    } else if ((status = hipMalloc((void **)&nc->d_Y, zbytes)) != hipSuccess) {
+        nc->d_Y = NULL;
+        what    = "hipMalloc(non-collinear work)";
+    } else if ((status = hipMalloc((void **)&nc->d_T, dbytes)) != hipSuccess) {
+        nc->d_T = NULL;
+        what    = "hipMalloc(non-collinear overlap)";
+    } else if (nc->h_stage_bytes < sbytes) {
+        if (nc->h_stage != NULL)
+            wait_hipfunc(hipHostFree(nc->h_stage));
+        nc->h_stage       = NULL;
+        nc->h_stage_bytes = 0;
+        if ((status = hipHostMalloc(&nc->h_stage, sbytes, 0)) != hipSuccess) {
+            nc->h_stage = NULL;
+            what        = "hipHostMalloc(non-collinear staging)";
+        } else {
+            nc->h_stage_bytes = sbytes;
         }
     }
 
-    DC_GpuSolver_ReleaseGemmScratch();
+    if (what != NULL) {
+        (void)hipGetLastError();
+        DCNonCol_GpuRelease(1);
+        nc->off = 1;
+        if (nc->reports < 8) {
+            nc->reports++;
+            MPI_Comm_rank(mpi_comm_level1, &rank);
+            fprintf(stderr,
+                    "<DC> rank %d: %s failed for a %d x %d non-collinear cluster: %s (%d). "
+                    "Solving the rest of this step on the CPU.\n",
+                    rank, what, 2 * num, 2 * num, hipGetErrorString(status), (int)status);
+            fflush(stderr);
+        }
+        return 0;
+    }
+
+    nc->num = num;
+    return 1;
+}
+
+/* a failed solve of one cluster; the first few of a run are reported */
+static void DCNonCol_GpuReport(const char *what, int code, int num)
+{
+    int rank = -1;
+
+    if (8 <= DC_noncol_gpu.reports) {
+        return;
+    }
+    DC_noncol_gpu.reports++;
+
+    MPI_Comm_rank(mpi_comm_level1, &rank);
+    fprintf(stderr,
+            "<DC> rank %d: GPU solve of a %d x %d non-collinear cluster failed (%s: %d); "
+            "solving this atom on the CPU.\n",
+            rank, 2 * num, 2 * num, what, code);
+    fflush(stderr);
+}
+
+/* d_out (dim x dim) = plain transpose of d_in, by the in-place-B mode of
+   geam with beta == 0 (d_out's old contents are not read) */
+static int DCNonCol_GpuTranspose(int dim, const hipDoubleComplex *d_in, hipDoubleComplex *d_out, const char *where)
+{
+    const hipDoubleComplex one  = make_hipDoubleComplex(1.0, 0.0);
+    const hipDoubleComplex zero = make_hipDoubleComplex(0.0, 0.0);
+    hipblasStatus_t        status;
+
+    status = hipblasZgeam(DC_gpusolver_ctx.hipblas, HIPBLAS_OP_T, HIPBLAS_OP_N, dim, dim, &one, d_in, dim, &zero,
+                          d_out, dim, d_out, dim);
+    if (status != HIPBLAS_STATUS_SUCCESS) {
+        DC_GpuSolver_DisableGemmPath(where, "hipblasZgeam", status, dim, dim, 0);
+        return 0;
+    }
+
+    return 1;
+}
+
+/* d_out = d_in * diag(R, R) for the complex dim x dim matrix d_in, column
+   block by column block.  d_T holds the rows of T (column-major T^T), so
+   op_t == HIPBLAS_OP_T gives R = T and HIPBLAS_OP_N gives R = T^T.  A
+   complex column-major matrix times a real one on the right is a real GEMM
+   on its interleaved (re, im) storage viewed as a 2*dim-row real matrix:
+   half the flops of a complex GEMM against a zero-imaginary T. */
+static int DCNonCol_GpuTimesT(int num, const hipDoubleComplex *d_in, hipblasOperation_t op_t,
+                              hipDoubleComplex *d_out, const char *where)
+{
+    const double one  = 1.0;
+    const double zero = 0.0;
+    const int    dim  = 2 * num;
+    int          k;
+
+    for (k = 0; k < 2; k++) {
+        if (!DC_GpuSolver_TryGpuDgemm(DC_gpusolver_ctx.hipblas, HIPBLAS_OP_N, op_t, 2 * dim, num, num, &one,
+                                     (const double *)(d_in + (size_t)k * (size_t)num * (size_t)dim), 2 * dim,
+                                     DC_noncol_gpu.d_T, num, &zero,
+                                     (double *)(d_out + (size_t)k * (size_t)num * (size_t)dim), 2 * dim, where)) {
+            return 0;
+        }
+    }
+
+    return 1;
+}
+
+/* GPU solve of one non-collinear cluster with P_min == 1 (all NUM overlap
+   eigenvectors kept): fills ko[1..2NUM] and C[1..2NUM][1..2NUM] like the
+   CPU path of DC_NonCol and returns 1, or returns 0 for the CPU path.
+   With T = S_DC (NUM x NUM, real, U * lambda^-1/2) and B = diag(T, T), the
+   CPU path diagonalizes X^T H X with X = B P^T, P interleaving the two spin
+   blocks, and back-transforms C = X V.  The same spectrum comes from
+   H' = B^T H B, whose eigenvectors are W = P^T V, and C = B W:
+     d_A <- rows of H        (column-major: H^T)
+     d_Y <- H^T B
+     d_A <- (H^T B)^T = B^T H
+     d_Y <- B^T H B = H'     -> eigenvalues ko, eigenvectors W in place
+     d_A <- W^T
+     d_Y <- W^T B^T = C^T    (column-major: C row by row, as the host wants)
+   S_DC and H_DC are only read, so the CPU path can redo the atom after any
+   failure.  The context is shared, so DC_NonCol's atom loop stays serial. */
+static int DCNonCol_GpuSolve(int num, int capacity, double **S_DC, dcomplex **H_DC, dcomplex **C, double *ko)
+{
+    DCGpuSolverCtx *  ctx    = &DC_gpusolver_ctx;
+    DCNonColGpuCtx *  nc     = &DC_noncol_gpu;
+    const int         dim    = 2 * num;
+    const size_t      zcount = (size_t)dim * (size_t)dim;
+    double *          h_T;
+    hipDoubleComplex *h_Z;
+    const double *    h_check;
+    hipError_t        status;
+    size_t            idx;
+    int               i, info, mout = 0;
+
+    if (omp_in_parallel() || nc->off || num <= 0) {
+        return 0;
+    }
+    if (!DCNonCol_GpuEnsure(num < capacity ? capacity : num)) {
+        return 0;
+    }
+
+    h_T = (double *)nc->h_stage;
+    h_Z = (hipDoubleComplex *)((char *)nc->h_stage + DCNonCol_StageOffset(num));
+
+    for (i = 0; i < num; i++) {
+        memcpy(h_T + (size_t)i * (size_t)num, &S_DC[i + 1][1], sizeof(double) * (size_t)num);
+    }
+    status = hipMemcpyAsync(nc->d_T, h_T, sizeof(double) * (size_t)num * (size_t)num, hipMemcpyHostToDevice,
+                            ctx->stream);
+    if (status != hipSuccess) {
+        DC_GpuSolver_DisableGemmPathHip("hipMemcpyAsync(non-collinear overlap)", status);
+        return 0;
+    }
+    for (i = 0; i < dim; i++) {
+        memcpy(h_Z + (size_t)i * (size_t)dim, &H_DC[i + 1][1], sizeof(dcomplex) * (size_t)dim);
+    }
+    status = hipMemcpyAsync(nc->d_A, h_Z, sizeof(hipDoubleComplex) * zcount, hipMemcpyHostToDevice, ctx->stream);
+    if (status != hipSuccess) {
+        DC_GpuSolver_DisableGemmPathHip("hipMemcpyAsync(non-collinear Hamiltonian)", status);
+        return 0;
+    }
+
+    if (!DCNonCol_GpuTimesT(num, nc->d_A, HIPBLAS_OP_T, nc->d_Y, "non-collinear H*T") ||
+        !DCNonCol_GpuTranspose(dim, nc->d_Y, nc->d_A, "non-collinear T^T*H") ||
+        !DCNonCol_GpuTimesT(num, nc->d_A, HIPBLAS_OP_T, nc->d_Y, "non-collinear T^T*H*T")) {
+        return 0;
+    }
+
+    /* MAGMA and rocSOLVER run outside ctx->stream */
+    status = hipStreamSynchronize(ctx->stream);
+    if (status != hipSuccess) {
+        DC_GpuSolver_DisableGemmPathHip("hipStreamSynchronize(non-collinear eigensolver input)", status);
+        return 0;
+    }
+    if (openmx_gpu_eigensolver_use_hipsolver()) {
+        info = openmx_hipsolver_zheevd_gpu(dim, dim, nc->d_Y, ko + 1, &mout);
+    } else {
+        info = openmx_magma_zheevdx_gpu(dim, dim, nc->d_Y, ko + 1, &mout);
+    }
+    if (info != 0) {
+        /* a failed solve can return before its closing device
+           synchronization */
+        (void)hipDeviceSynchronize();
+        (void)hipGetLastError();
+        if (info == DC_MAGMA_ERR_DEVICE_ALLOC || info == DC_MAGMA_ERR_HOST_ALLOC) {
+            /* no memory for the eigensolver workspace: the rest of this
+               call runs on the CPU */
+            nc->off = 1;
+            DCNonCol_GpuReport("eigensolver workspace allocation", info, num);
+        } else {
+            DCNonCol_GpuReport("eigensolver info", info, num);
+        }
+        return 0;
+    }
+    if (mout != dim) {
+        DCNonCol_GpuReport("eigenpairs returned", mout, num);
+        return 0;
+    }
+    for (i = 1; i <= dim; i++) {
+        if (!isfinite(ko[i])) {
+            DCNonCol_GpuReport("non-finite eigenvalue", i, num);
+            return 0;
+        }
+    }
+
+    if (!DCNonCol_GpuTranspose(dim, nc->d_Y, nc->d_A, "non-collinear eigenvector transpose") ||
+        !DCNonCol_GpuTimesT(num, nc->d_A, HIPBLAS_OP_N, nc->d_Y, "non-collinear W^T*T^T")) {
+        return 0;
+    }
+    status = hipMemcpyAsync(h_Z, nc->d_Y, sizeof(hipDoubleComplex) * zcount, hipMemcpyDeviceToHost, ctx->stream);
+    if (status != hipSuccess) {
+        DC_GpuSolver_DisableGemmPathHip("hipMemcpyAsync(non-collinear eigenvectors)", status);
+        return 0;
+    }
+    status = hipStreamSynchronize(ctx->stream);
+    if (status != hipSuccess) {
+        DC_GpuSolver_DisableGemmPathHip("hipStreamSynchronize(non-collinear eigenvectors)", status);
+        return 0;
+    }
+
+    h_check = (const double *)h_Z;
+    for (idx = 0; idx < 2 * zcount; idx++) {
+        if (!isfinite(h_check[idx])) {
+            DCNonCol_GpuReport("non-finite eigenvector element", (int)(idx / 2 / (size_t)dim) + 1, num);
+            return 0;
+        }
+    }
+    for (i = 0; i < dim; i++) {
+        memcpy(&C[i + 1][1], h_Z + (size_t)i * (size_t)dim, sizeof(dcomplex) * (size_t)dim);
+    }
+
     return 1;
 }
 
@@ -1423,7 +2012,6 @@ static double DC_Col(char * mode, int SCF_iter, double ***** Hks, double **** OL
 
         // OpenMP
         set_openmp_nvidia_device_from_local_rank();
-        DCCol_SCache_Prepare(Matomnum, Msize, SCF_iter);
     }
 
     dtime(&TStime);
@@ -1486,6 +2074,11 @@ static double DC_Col(char * mode, int SCF_iter, double ***** Hks, double **** OL
 
     if (firsttime)
         PrintMemory("Divide_Conquer: EVal", sizeof(double) * m_size, NULL);
+
+    /* needs the cluster sizes Msize[] of this call */
+    if (scf_eigen_lib_flag == GPUSOLVER) {
+        DCCol_SCache_Prepare(Matomnum, Msize, SCF_iter);
+    }
 
     if (2 <= level_stdout) {
         for (Mc_AN = 1; Mc_AN <= Matomnum; Mc_AN++) {
@@ -2014,6 +2607,10 @@ static double DC_Col(char * mode, int SCF_iter, double ***** Hks, double **** OL
             int use_dc_gpu =
                 (scf_eigen_lib_flag == GPUSOLVER && !DC_GpuSolver_GemmDisabled() && !DC_GpuSolver_EigenDisabled() &&
                  DC_GpuSolver_RankAllowed() && DC_GPU_Threshold() <= NUM);
+            /* the overlap the GPU solve reads: a resident S-cache copy, or
+               NULL for the one staged in the solver context */
+            const double *d_S_use          = NULL;
+            int           s_dc_host_filled = 1;
             if (SCF_iter <= 2) {
                 memset(S_DC_store, 0, sizeof(double) * (size_t)n2 * (size_t)n2);
             }
@@ -2120,10 +2717,10 @@ static double DC_Col(char * mode, int SCF_iter, double ***** Hks, double **** OL
 
                 P_min = (int)S12[Mc_AN][0][0];
 
-                for (i1 = 1; i1 <= NUM; i1++) {
-                    for (j1 = 1; j1 <= NUM; j1++) {
-                        S_DC[i1][j1] = S12[Mc_AN][i1][j1];
-                    }
+                if (use_dc_gpu && (d_S_use = DCCol_SCache_ValidPtr(Mc_AN, NUM)) != NULL) {
+                    s_dc_host_filled = 0; /* filled lazily, only if the GPU solve falls back */
+                } else {
+                    DCCol_FillSDCFromS12(Mc_AN, NUM, S_DC);
                 }
             }
 
@@ -2141,8 +2738,9 @@ static double DC_Col(char * mode, int SCF_iter, double ***** Hks, double **** OL
             }
             NUM = Anum - 1;
 
-            if (use_dc_gpu) {
-                if (!DCCol_GpuSolver_LoadCachedOverlap(Mc_AN, NUM, S_DC)) {
+            if (use_dc_gpu && d_S_use == NULL) {
+                if (!DCCol_GpuSolver_LoadTransformedOverlap(NUM, S_DC) ||
+                    !DCCol_SCache_Store(Mc_AN, NUM, &d_S_use)) {
                     use_dc_gpu = 0;
                 }
             }
@@ -2158,7 +2756,7 @@ static double DC_Col(char * mode, int SCF_iter, double ***** Hks, double **** OL
                 needmemsize += sizeof(double) * (NUM + 1) * (NUM + 1);
 
                 while (true) {
-                    hipMemGetInfo(&free_memory, &total_memory);
+                    OpenMX_GpuMemGetInfo(&free_memory, &total_memory);
                     if (free_memory > needmemsize) {
                         break;
                     }
@@ -2179,12 +2777,14 @@ static double DC_Col(char * mode, int SCF_iter, double ***** Hks, double **** OL
 
                 if (use_dc_gpu) {
                     NUM1 = NUM - (P_min - 1);
-                    if (!DC_GpuSolver_PrepareGemmBackendForSolve(NUM, NUM1)) {
+                    if (!DC_GpuSolver_PrepareGemmBackendForSolve(NUM, NUM1) ||
+                        !DCCol_GpuSolver_SolveHamiltonian(NUM, P_min, d_S_use, S_DC, H_DC[spin], ko, C)) {
                         use_dc_gpu = 0;
-                        NUM1       = DCCol_CPU_SolveHamiltonian(NUM, P_min, S_DC, H_DC[spin], ko, C);
-                    } else if (!DCCol_GpuSolver_SolveHamiltonian(NUM, P_min, S_DC, H_DC[spin], ko, C)) {
-                        use_dc_gpu = 0;
-                        NUM1       = DCCol_CPU_SolveHamiltonian(NUM, P_min, S_DC, H_DC[spin], ko, C);
+                        if (!s_dc_host_filled) {
+                            DCCol_FillSDCFromS12(Mc_AN, NUM, S_DC);
+                            s_dc_host_filled = 1;
+                        }
+                        NUM1 = DCCol_CPU_SolveHamiltonian(NUM, P_min, S_DC, H_DC[spin], ko, C);
                     }
 
                 } else if (use_dc_openmp) {
@@ -2371,6 +2971,10 @@ static double DC_Col(char * mode, int SCF_iter, double ***** Hks, double **** OL
                     NUM = Anum - 1;
 
                 } else {
+                    if (!s_dc_host_filled) {
+                        DCCol_FillSDCFromS12(Mc_AN, NUM, S_DC);
+                        s_dc_host_filled = 1;
+                    }
                     NUM1 = DCCol_CPU_SolveHamiltonian(NUM, P_min, S_DC, H_DC[spin], ko, C);
                 }
 
@@ -3511,6 +4115,13 @@ static double DC_NonCol(char * mode, int SCF_iter, double ***** Hks, double ****
 
     // static double timeA = 0.0, timeB = 0.0, timeC = 0.0, timeD = 0.0, timeE = 0.0, timeF = 0.0, timeG = 0.0, timeH = 0.0;
 
+    /* the GPU solves of this call (the largest admitted NUM, 0 for none);
+       collective, so every rank asks */
+    int dc_gpu_capacity = 0;
+    if (scf_eigen_lib_flag == GPUSOLVER) {
+        dc_gpu_capacity = DCNonCol_GpuAdmit(Matomnum, Msize);
+    }
+
     /****************************************************
         Setting of Hamiltonian and overlap matrices
 
@@ -3570,32 +4181,36 @@ static double DC_NonCol(char * mode, int SCF_iter, double ***** Hks, double ****
              dcomplex C[n2][n2];
             ***********************************************/
 
-            S_DC = (double **)malloc(sizeof(double *) * (NUM + 2));
+            /* contiguous stores: one allocation per matrix, and the GPU
+               solve stages each one with a single transfer */
+            double *S_DC_store = (double *)DC_MallocArray((size_t)(NUM + 2) * (size_t)(NUM + 2), sizeof(double),
+                                                          "DC NonCol overlap matrix");
+            S_DC = (double **)DC_MallocArray((size_t)(NUM + 2), sizeof(double *), "DC NonCol overlap rows");
             for (i = 0; i < (NUM + 2); i++) {
-                S_DC[i] = (double *)malloc(sizeof(double) * (NUM + 2));
+                S_DC[i] = S_DC_store + (size_t)i * (size_t)(NUM + 2);
             }
 
-            H_DC = (dcomplex **)malloc(sizeof(dcomplex *) * n2);
+            dcomplex *H_DC_store = (dcomplex *)DC_MallocArray((size_t)n2 * (size_t)n2, sizeof(dcomplex),
+                                                              "DC NonCol Hamiltonian matrix");
+            H_DC = (dcomplex **)DC_MallocArray((size_t)n2, sizeof(dcomplex *), "DC NonCol Hamiltonian rows");
             for (i = 0; i < n2; i++) {
-                H_DC[i] = (dcomplex *)malloc(sizeof(dcomplex) * n2);
+                H_DC[i] = H_DC_store + (size_t)i * (size_t)n2;
             }
 
-            ko = (double *)malloc(sizeof(double) * n2);
-            M1 = (double *)malloc(sizeof(double) * n2);
+            ko = (double *)DC_MallocArray((size_t)n2, sizeof(double), "DC NonCol eigenvalues");
+            M1 = (double *)DC_MallocArray((size_t)n2, sizeof(double), "DC NonCol overlap scales");
 
-            C = (dcomplex **)malloc(sizeof(dcomplex *) * n2);
+            dcomplex *C_store = (dcomplex *)DC_MallocArray((size_t)n2 * (size_t)n2, sizeof(dcomplex),
+                                                           "DC NonCol eigenvector matrix");
+            C = (dcomplex **)DC_MallocArray((size_t)n2, sizeof(dcomplex *), "DC NonCol eigenvector rows");
             for (i = 0; i < n2; i++) {
-                C[i] = (dcomplex *)malloc(sizeof(dcomplex) * n2);
+                C[i] = C_store + (size_t)i * (size_t)n2;
             }
 
             if (SCF_iter <= 2) {
-                for (i = 0; i < (NUM + 2); i++) {
-                    memset(S_DC[i], 0, sizeof(double) * (size_t)(NUM + 2));
-                }
+                memset(S_DC_store, 0, sizeof(double) * (size_t)(NUM + 2) * (size_t)(NUM + 2));
             }
-            for (i = 0; i < n2; i++) {
-                memset(H_DC[i], 0, sizeof(dcomplex) * (size_t)n2);
-            }
+            memset(H_DC_store, 0, sizeof(dcomplex) * (size_t)n2 * (size_t)n2);
 
             /***********************************************
              construct cluster full matrices of Hamiltonian
@@ -3771,223 +4386,15 @@ static double DC_NonCol(char * mode, int SCF_iter, double ***** Hks, double ****
                    transform Hamiltonian matrix
             ************************************************/
 
-            int use_dc_openmp = (scf_eigen_lib_flag == GPUSOLVER && DC_NonCol_GPU_Threshold() <= 2*NUM);
+            /* GPU solve for the larger clusters.  It needs P_min == 1: for
+               P_min > 1 the index arithmetic of the CPU path below solves
+               NUM1 = 2*NUM-(P_min-1) states although its transform fills
+               only 2*(NUM-P_min+1), so such clusters keep that path as it is. */
+            int use_dc_gpu = (0 < dc_gpu_capacity && DC_NonCol_GPU_Threshold() <= 2 * NUM && P_min == 1 &&
+                              !DC_GpuSolver_GemmDisabled() && !DC_GpuSolver_EigenDisabled());
 
-            if (use_dc_openmp) {
-                // compiler's bug
-
-                Anum = 1;
-                for (i = 0; i <= (FNAN[Gc_AN] + SNAN[Gc_AN]); i++) {
-                    MP[i] = Anum;
-                    Gi    = natn[Gc_AN][i];
-                    wanA  = WhatSpecies[Gi];
-                    Anum  = Anum + Spe_Total_CNO[wanA];
-                }
-                NUM = Anum - 1;
-
-                n2 = 2 * NUM + 3;
-
-                /* transpose S */
-
-                {
-#pragma omp parallel for
-                    for (i1 = 1; i1 <= NUM; i1++) {
-                        for (j1 = i1 + 1; j1 <= NUM; j1++) {
-                            double tmp1  = S_DC[i1][j1];
-                            double tmp2  = S_DC[j1][i1];
-                            S_DC[i1][j1] = tmp2;
-                            S_DC[j1][i1] = tmp1;
-                        }
-                    }
-
-                    /* H * U * M1 */
-
-#pragma omp parallel for collapse(3) private(jj1, k1, l1, sum_r, sum_i)
-                    for (j1 = P_min; j1 <= NUM; j1++) {
-                        for (k = 0; k <= 1; k++) {
-                            for (i1 = 1; i1 <= 2 * NUM; i1++) {
-                                jj1 = 2 * j1 - P_min + k;
-                                k1  = k * NUM;
-
-                                double sum_r = 0.0;
-                                double sum_i = 0.0;
-                                for (l = 1; l <= NUM; l++) {
-                                    l1 = k1 + l;
-                                    sum_r += H_DC[i1][l1].r * S_DC[j1][l];
-                                    sum_i += H_DC[i1][l1].i * S_DC[j1][l];
-                                }
-
-                                C[jj1][i1].r = sum_r;
-                                C[jj1][i1].i = sum_i;
-                            }
-                        }
-                    }
-
-                    /*
-                if (Gc_AN==1){
-                printf("C.r\n");
-                for (i=1; i<=NUM*2; i++){
-                    for (j=1; j<=NUM*2; j++){
-                    printf("ABC1 C.r i=%2d j=%2d %7.4f\n",i,j,C[i][j].r);
-                    }
-                }
-
-                printf("C.i\n");
-                for (i=1; i<=NUM*2; i++){
-                    for (j=1; j<=NUM*2; j++){
-                    printf("ABC1 C.i i=%2d j=%2d %7.4f\n",i,j,C[i][j].i);
-                    }
-                }
-                }
-                    */
-
-                    /* M1 * U^+ H * U * M1 */
-
-#pragma omp parallel for collapse(2) private(l, l1)
-                    for (j1 = 1; j1 <= 2 * NUM; j1++) {
-                        for (i1 = P_min; i1 <= NUM; i1++) {
-
-                            double sum1_r = 0.0;
-                            double sum1_i = 0.0;
-                            double sum2_r = 0.0;
-                            double sum2_i = 0.0;
-
-                            for (l = 1; l <= NUM; l++) {
-                                sum1_r += S_DC[i1][l] * C[j1][l].r;
-                                sum1_i += S_DC[i1][l] * C[j1][l].i;
-                            }
-
-                            for (l = NUM + 1; l <= 2 * NUM; l++) {
-                                l1 = l - NUM;
-                                sum2_r += S_DC[i1][l1] * C[j1][l].r;
-                                sum2_i += S_DC[i1][l1] * C[j1][l].i;
-                            }
-
-                            int ii1         = 2 * i1 - P_min;
-                            H_DC[j1][ii1].r = sum1_r;
-                            H_DC[j1][ii1].i = sum1_i;
-
-                            ii1             = 2 * i1 - P_min + 1;
-                            H_DC[j1][ii1].r = sum2_r;
-                            H_DC[j1][ii1].i = sum2_i;
-                        }
-                    }
-
-                    /* H to C (transposition) */
-
-#pragma omp parallel for collapse(2)
-                    for (i1 = P_min; i1 <= 2 * NUM; i1++) {
-                        for (j1 = P_min; j1 <= 2 * NUM; j1++) {
-                            C[j1 - (P_min - 1)][i1 - (P_min - 1)].r = H_DC[i1][j1].r;
-                            C[j1 - (P_min - 1)][i1 - (P_min - 1)].i = H_DC[i1][j1].i;
-                        }
-                    }
-
-                    if (Gc_AN == 1) {
-
-                        /*
-                printf("C.r\n");
-                for (i=1; i<=NUM*2; i++){
-                    for (j=1; j<=NUM*2; j++){
-                    printf("ABC2 C.r i=%2d j=%2d %7.4f\n",i,j,C[i][j].r);
-                    }
-                }
-
-                printf("C.i\n");
-                for (i=1; i<=NUM*2; i++){
-                    for (j=1; j<=NUM*2; j++){
-                    printf("ABC2 C.i i=%2d j=%2d %7.4f\n",i,j,C[i][j].i);
-                    }
-                }
-                    */
-
-                        /*
-                printf("C.r\n");
-                for (i=1; i<=NUM*2; i++){
-                    for (j=1; j<=NUM*2; j++){
-                    printf("%7.4f",C[i][j].r);
-                    }
-                    printf("\n");
-                }
-
-                printf("C.i\n");
-                for (i=1; i<=NUM*2; i++){
-                    for (j=1; j<=NUM*2; j++){
-                    printf("%7.4f",C[i][j].i);
-                    }
-                    printf("\n");
-                }
-                    */
-                    }
-
-                    /***********************************************
-                 diagonalize the trasformed Hamiltonian matrix
-                ************************************************/
-
-                    // dtime(&timeD);
-                    // printf("timeC = %.3f\n", timeD - timeC);
-
-                    NUM1 = 2 * NUM - (P_min - 1);
-
-                    Eigen_gpusolver_x_complex_openmp(C, ko, NUM1, NUM1);
-
-                    // dtime(&timeE);
-                    // printf("timeD = %.3f\n", timeE - timeD);
-
-                    /*
-            if (Gc_AN==1){
-                for (l=1; l<=NUM1; l++){
-                printf("ABC10 myid=%2d l=%2d ko=%15.12f\n",myid,l,ko[l]);fflush(stdout);
-                }
-            }
-
-            MPI_Finalize();
-            exit(0);
-                */
-
-                    /* C to H (transposition) */
-
-#pragma omp parallel for collapse(2)
-                    for (i1 = 1; i1 <= NUM1; i1++) {
-                        for (j1 = 1; j1 <= NUM1; j1++) {
-                            H_DC[j1][i1].r = C[i1][j1].r;
-                            H_DC[j1][i1].i = C[i1][j1].i;
-                        }
-                    }
-
-                    /***********************************************
-                    transformation to the original eigen vectors.
-                    NOTE 244P    C = U * lambda^{-1/2} * D
-                    ***********************************************/
-
-                    /* transpose S */
-#pragma omp parallel for
-                    for (i1 = 1; i1 <= NUM; i1++) {
-                        for (j1 = i1 + 1; j1 <= NUM; j1++) {
-                            double tmp1  = S_DC[i1][j1];
-                            double tmp2  = S_DC[j1][i1];
-                            S_DC[i1][j1] = tmp2;
-                            S_DC[j1][i1] = tmp1;
-                        }
-                    }
-
-#pragma omp parallel for collapse(3)
-                    for (j1 = 1; j1 <= NUM1; j1++) {
-                        for (k = 0; k <= 1; k++) {
-                            for (i1 = 1; i1 <= NUM; i1++) {
-                                double sum_r = 0.0;
-                                double sum_i = 0.0;
-
-                                for (int l = P_min; l <= NUM; l++) {
-                                    sum_r += S_DC[i1][l] * H_DC[j1][2 * (l - P_min) + 1 + k].r;
-                                    sum_i += S_DC[i1][l] * H_DC[j1][2 * (l - P_min) + 1 + k].i;
-                                }
-                                C[i1 + k * NUM][j1].r = sum_r;
-                                C[i1 + k * NUM][j1].i = sum_i;
-                            }
-                        }
-                    }
-                }
+            if (use_dc_gpu && DCNonCol_GpuSolve(NUM, dc_gpu_capacity, S_DC, H_DC, C, ko)) {
+                NUM1 = 2 * NUM;
             } else {
                 /* transpose S */
 
@@ -4127,7 +4534,7 @@ static double DC_NonCol(char * mode, int SCF_iter, double ***** Hks, double ****
                 // printf("timeC = %.3f\n", timeD - timeC);
 
                 NUM1 = 2 * NUM - (P_min - 1);
-                EigenBand_lapack(C, ko, NUM1, NUM1, 1);
+                DC_EigenBand_lapack_cpu(C, ko, NUM1);
 
                 // dtime(&timeE);
                 // printf("timeD = %.3f\n", timeE - timeD);
@@ -4269,22 +4676,16 @@ static double DC_NonCol(char * mode, int SCF_iter, double ***** Hks, double ****
                               free arrays
             ****************************************************/
 
-            for (i = 0; i < (NUM + 2); i++) {
-                free(S_DC[i]);
-            }
+            free(S_DC_store);
             free(S_DC);
 
-            for (i = 0; i < n2; i++) {
-                free(H_DC[i]);
-            }
+            free(H_DC_store);
             free(H_DC);
 
             free(ko);
             free(M1);
 
-            for (i = 0; i < n2; i++) {
-                free(C[i]);
-            }
+            free(C_store);
             free(C);
 
             dtime(&Etime_atom);
@@ -4303,6 +4704,16 @@ static double DC_NonCol(char * mode, int SCF_iter, double ***** Hks, double ****
         free(MP);
 
     } /* //#pragma omp parallel */
+
+    /* the device matrices of the non-collinear GPU solve go back to the
+       shared GPU for the grid and force phases, and so do the device
+       workspaces the eigensolvers keep (MAGMA's GEMMul8 cache, rocSOLVER's
+       zheevd scratch); the next call re-admits */
+    DCNonCol_GpuRelease(1);
+    if (0 < dc_gpu_capacity) {
+        openmx_magma_ozaki2_release();
+        (void)openmx_hipsolver_release_workspace();
+    }
 
     if (is_scf_mode) {
 

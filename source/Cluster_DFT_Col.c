@@ -17,6 +17,16 @@
 #include "eigen_refine_gpu.h"
 #include "eigen_refine_hooks.h"
 extern void openmx_gemmul8TrimWorkspaces(void);
+extern size_t openmx_gemmul8WorkspaceBytes(void);
+extern hipblasStatus_t openmx_gemmul8DgemmUnblocked(hipblasHandle_t handle, hipblasOperation_t transa,
+                                                    hipblasOperation_t transb, int m, int n, int k,
+                                                    const double *alpha, const double *A, int lda,
+                                                    const double *B, int ldb, const double *beta, double *C,
+                                                    int ldc);
+extern int openmx_gpu_is_apu(void);
+/* eigen_refine_gpu.cu: device bytes of the product blocks of a refined solve
+   of maxn wanted states of an n x n problem */
+extern size_t openmx_eigen_refine_product_bytes(int cplx, int n, int maxn);
 #include <fftw3.h>
 #include <math.h>
 #include <omp.h>
@@ -25,6 +35,7 @@ extern void openmx_gemmul8TrimWorkspaces(void);
 #include <limits.h>
 #include <stdint.h>
 #include <string.h>
+#include <strings.h>
 #include <time.h>
 
 #define  measure_time   0
@@ -494,6 +505,7 @@ static void ClusterCol_StashGpuSolverDenseEVec(int myid1, int spin, int n, int m
 }
 
 static void ClusterCol_RefineRelease(void);
+static void ClusterCol_RefineResetStage(void);
 
 static void ClusterCol_GpuSolver_Destroy(void)
 {
@@ -521,7 +533,9 @@ void Cluster_DFT_Col_Release_GPU_Solver(void)
 
 /* Run-boundary reset (between -runtest/-runtestL inputs): additionally drop
    the geometry-derived DM entry cache, the root DM workspace and the cached
-   dense eigenvectors, none of which may survive into a different system.
+   dense eigenvectors, none of which may survive into a different system,
+   and return the refined eigensolver's stage to its initial state (every
+   rank calls this, so the next input configures it collectively again).
    Idempotent; only the root rank ever owns the cached eigenvectors, and on
    the other ranks the pointers are NULL. */
 void Cluster_DFT_Col_Release_GPU_Caches(void)
@@ -532,6 +546,7 @@ void Cluster_DFT_Col_Release_GPU_Caches(void)
     ClusterCol_RootDMWorkspace_Reset();
     ClusterCol_ReleaseGpuSolverCachedEVec(0);
     ClusterCol_GpuSolver_Destroy();
+    ClusterCol_RefineResetStage();
 }
 
 /* Budget the three retained OpenMX panels, MAGMA's ~1.5-panel device
@@ -539,10 +554,25 @@ void Cluster_DFT_Col_Release_GPU_Caches(void)
    owner. Group roots by node and PCI identity, so separate devices and
    sequential spins do not get charged twice. Already resident OpenMX
    buffers count toward the budget on later SCF iterations. Return 2 when
-   one spin at a time fits, so a shared GPU need not fall back to ELPA. */
-static size_t ClusterCol_RefineBytes(int n);
+   one spin at a time fits, so a shared GPU need not fall back to ELPA.
+   When the concurrent mode fits the budget, the owners reserve their
+   matrices right here (ClusterCol_TryEnsureMatrixCapacity), so that a
+   failed allocation is part of the collective verdict instead of an abort
+   on one rank; *allocated (owners) accumulates what that allocated.
+   maxn: the states a refined solve of this step would refine (its product
+   blocks are budgeted, see ClusterCol_RefineBytes).
+   OPENMX_CLUSTER_GPU_SERIAL (or the NVIDIA name OPENMX_CLUSTER_GPU_DIAG_
+   SERIAL) =0 disables the serialized tier, =2 skips the concurrent one. */
+static size_t ClusterCol_RefineBytes(int n, int maxn);
+static int ClusterCol_TryEnsureMatrixCapacity(int n, int *allocated);
+static void ClusterCol_GpuSolver_FreeMatrices(void);
 
-static int ClusterCol_GpuDiagFitsOnce(int n, int myworld1, int myid1, int *retryable)
+/* dense owners of the current solve on this rank's device (owners only;
+   GpuDiagFitsOnce): with two spin worlds on one device both forward
+   transforms run at the same time */
+static int ClusterCol_owners_on_device = 1;
+
+static int ClusterCol_GpuDiagFitsOnce(int n, int maxn, int myworld1, int myid1, int *retryable, int *allocated)
 {
     const char *env = getenv("OPENMX_CLUSTER_GPU_DIAG");
     const char *reserve_env = getenv("OPENMX_CLUSTER_GPU_DIAG_RESERVE_MB");
@@ -554,6 +584,7 @@ static int ClusterCol_GpuDiagFitsOnce(int n, int myworld1, int myid1, int *retry
     int local_retryable = 1;
     MPI_Comm node_comm, roots_comm;
 
+    if (serial_env == NULL) serial_env = getenv("OPENMX_CLUSTER_GPU_DIAG_SERIAL");
     if (env != NULL && atoi(env) == 0)
         local_fit = local_serial_fit = local_retryable = 0;
     if (serial_env != NULL && atoi(serial_env) == 0) local_serial_fit = 0;
@@ -578,7 +609,7 @@ static int ClusterCol_GpuDiagFitsOnce(int n, int myworld1, int myid1, int *retry
             ClusterCol_AbortWithMessage("Cannot allocate GPU memory preflight metadata.");
         if (hipGetDevice(&device) != hipSuccess ||
             hipDeviceGetPCIBusId(bus, sizeof(bus), device) != hipSuccess ||
-            hipMemGetInfo(&free_bytes, &total_bytes) != hipSuccess)
+            OpenMX_GpuMemGetInfo(&free_bytes, &total_bytes) != hipSuccess)
             local_fit = local_serial_fit = local_retryable = 0;
         if (local_fit) {
             int capacity = n;
@@ -591,8 +622,12 @@ static int ClusterCol_GpuDiagFitsOnce(int n, int myworld1, int myid1, int *retry
                                    (ctx->d_tmp != NULL));
                 if (ctx->d_W != NULL) info[1] += (double)ctx->matrix_dim * sizeof(double);
             }
+            /* the GEMMul8 workspace of the forward transform is the capped
+               one: its full workspace (openmx_gemmul8DgemmUnblocked) is taken
+               only when the device has room beyond the solve reserve, and
+               returned right after the transform */
             info[0] = (3.0 * capacity * capacity + 2.0 * n * n + capacity) * sizeof(double)
-                    + reserve + (double)ClusterCol_RefineBytes(n);
+                    + reserve + (double)ClusterCol_RefineBytes(n, maxn);
             if (n >= 2048 && (gemm == NULL || atoi(gemm) != 0))
                 info[0] += (double)openmx_gemmul8DWorkspaceSize(n, n, n);
             if (ozaki == NULL || ozaki[0] == '\0' || atoi(ozaki) != 0) {
@@ -622,12 +657,14 @@ static int ClusterCol_GpuDiagFitsOnce(int n, int myworld1, int myid1, int *retry
         MPI_Allgather(bus, sizeof(bus), MPI_CHAR, buses, sizeof(bus), MPI_CHAR, roots_comm);
         MPI_Allgather(info, 3, MPI_DOUBLE, all_info, 3, MPI_DOUBLE, roots_comm);
         available = (double)free_bytes;
+        ClusterCol_owners_on_device = 0;
         for (r = 0; r < roots; ++r) {
             if (strcmp(bus, buses + r * sizeof(bus)) == 0) {
                 required += all_info[3*r];
                 if (single_required < all_info[3*r]) single_required = all_info[3*r];
                 resident += all_info[3*r+1];
                 if (all_info[3*r+2] < available) available = all_info[3*r+2];
+                ClusterCol_owners_on_device++;
             }
         }
         if (available + resident < required) local_fit = 0;
@@ -640,9 +677,32 @@ static int ClusterCol_GpuDiagFitsOnce(int n, int myworld1, int myid1, int *retry
         MPI_Comm_free(&roots_comm);
     }
     MPI_Comm_free(&node_comm);
+    /* =2: the serialized tier without trying the concurrent one (a testing
+       aid of the NVIDIA version), within the collective verdict */
+    if (serial_env != NULL && atoi(serial_env) == 2 && SpinP_switch == 1) local_fit = 0;
     MPI_Allreduce(&local_fit, &fit, 1, MPI_INT, MPI_MIN, mpi_comm_level1);
     MPI_Allreduce(&local_serial_fit, &serial_fit, 1, MPI_INT, MPI_MIN, mpi_comm_level1);
     MPI_Allreduce(&local_retryable, retryable, 1, MPI_INT, MPI_MIN, mpi_comm_level1);
+    if (fit) {
+        /* the owners reserve their matrices; any failure is everyone's
+           verdict (the serialized tier, or a retry, or ELPA) */
+        int reserved = 1, all_reserved = 1, now = 0;
+
+        if (myid1 == 0) {
+            reserved = ClusterCol_TryEnsureMatrixCapacity(n, &now);
+            *allocated |= now;
+        }
+        MPI_Allreduce(&reserved, &all_reserved, 1, MPI_INT, MPI_MIN, mpi_comm_level1);
+        if (!reserved) {
+            size_t free_bytes = 0, total_bytes = 0;
+
+            (void)OpenMX_GpuMemGetInfo(&free_bytes, &total_bytes);
+            printf("<Cluster_DFT_Col> The dense owner of spin group %d could not allocate its GPU matrices "
+                   "(n=%d; %.0f MiB free of %.0f MiB).\n", myworld1, n, free_bytes / mib, total_bytes / mib);
+            fflush(stdout);
+        }
+        fit = all_reserved;
+    }
     if (!fit && serial_fit && SpinP_switch == 1) {
         if (myid1 == 0 && myworld1 == 0) {
             printf("<Cluster_DFT_Col> Serializing spin roots to fit the shared GPU.\n");
@@ -655,13 +715,14 @@ static int ClusterCol_GpuDiagFitsOnce(int n, int myworld1, int myid1, int *retry
 
 static void ClusterCol_RefineConfigure(void);
 
-static int ClusterCol_GpuDiagFits(int n, int myworld1, int myid1)
+static int ClusterCol_GpuDiagFits(int n, int maxn, int myworld1, int myid1)
 {
     int retryable = 0;
+    int allocated = 0;
     int fit;
 
     ClusterCol_RefineConfigure();
-    fit = ClusterCol_GpuDiagFitsOnce(n, myworld1, myid1, &retryable);
+    fit = ClusterCol_GpuDiagFitsOnce(n, maxn, myworld1, myid1, &retryable, &allocated);
 
     if (fit == 0 && retryable) {
         /* Completed SCF stages may leave library scratch behind. Reclaim
@@ -676,7 +737,21 @@ static int ClusterCol_GpuDiagFits(int n, int myworld1, int myid1)
         (void)openmx_magma_release_z_workspace();
         (void)openmx_hipsolver_release_workspace();
         MPI_Barrier(mpi_comm_level1);
-        fit = ClusterCol_GpuDiagFitsOnce(n, myworld1, myid1, &retryable);
+        fit = ClusterCol_GpuDiagFitsOnce(n, maxn, myworld1, myid1, &retryable, &allocated);
+    }
+    if (fit == 0 && myid1 == 0) {
+        /* what the reservation allocated for this step goes again: a new
+           context entirely (its overlap was never transformed), else the
+           scratch it gave back to a trimmed one */
+        if (allocated & 2) ClusterCol_GpuSolver_FreeMatrices();
+        else if (allocated & 1) {
+            ClusterColGpuSolverCtx *ctx = &ClusterCol_gpusolver_ctx;
+
+            if (ctx->d_H != NULL) wait_hipfunc(hipFree(ctx->d_H));
+            if (ctx->d_tmp != NULL) wait_hipfunc(hipFree(ctx->d_tmp));
+            ctx->d_H = ctx->d_tmp = NULL;
+            ClusterCol_DeviceEvecSpin = -1;
+        }
     }
     if (fit == 0 && myid1 == 0 && myworld1 == 0) {
         printf("<Cluster_DFT_Col> GPU dense buffers do not fit; using ELPA fallback.\n");
@@ -703,38 +778,101 @@ static void ClusterCol_GpuSolver_Init(void)
     ctx->device_id   = current_device;
 }
 
-static void ClusterCol_GpuSolver_EnsureMatrixCapacity(int n)
+static hipError_t ClusterCol_TryDeviceMalloc(void **ptr, size_t bytes);
+
+/* the dense solver's matrices go, the stream and handle stay */
+static void ClusterCol_GpuSolver_FreeMatrices(void)
+{
+    ClusterColGpuSolverCtx *ctx = &ClusterCol_gpusolver_ctx;
+
+    if (ctx->d_S != NULL)    wait_hipfunc(hipFree(ctx->d_S));
+    if (ctx->d_H != NULL)    wait_hipfunc(hipFree(ctx->d_H));
+    if (ctx->d_tmp != NULL)  wait_hipfunc(hipFree(ctx->d_tmp));
+    if (ctx->d_W != NULL)    wait_hipfunc(hipFree(ctx->d_W));
+    ctx->d_S = ctx->d_H = ctx->d_tmp = ctx->d_W = NULL;
+    ctx->matrix_dim = 0;
+    ctx->transformed_s_valid = 0;
+    ctx->transformed_s_dim = 0;
+    ClusterCol_DeviceEvecSpin = -1;   /* d_tmp held the latest eigenvectors */
+}
+
+/* The dense solver's matrices for dimension n: 1 when they are there, 0 when
+   the device has no room for them, with nothing of a partial allocation kept
+   (the caller falls back instead of waiting in wait_hipfunc, ported from the
+   NVIDIA version).  A context whose scratch (d_H, d_tmp) went at an SCF
+   boundary (ClusterCol_TrimScratch) gets it back without losing the
+   transformed overlap.  *allocated (may be NULL) receives 2 when the whole
+   context was allocated anew, 1 when only the scratch was, else 0. */
+static int ClusterCol_TryEnsureMatrixCapacity(int n, int *allocated)
 {
     ClusterColGpuSolverCtx *ctx = &ClusterCol_gpusolver_ctx;
     size_t dense_count;
     size_t matrix_bytes;
     size_t vector_bytes;
 
+    if (allocated != NULL) *allocated = 0;
     if (n<=0){
         ClusterCol_AbortWithMessage("Invalid matrix size in Cluster_DFT_Col.c GPU solver workspace.");
     }
 
     ClusterCol_GpuSolver_Init();
 
-    if (n<=ctx->matrix_dim) return;
+    if (n<=ctx->matrix_dim){
+        if (ctx->d_H!=NULL && ctx->d_tmp!=NULL) return 1;
+        dense_count = ClusterCol_CheckedMulCount((size_t)ctx->matrix_dim,(size_t)ctx->matrix_dim,"dense GPU scratch");
+        matrix_bytes = ClusterCol_CheckedMulCount(dense_count,sizeof(double),"dense GPU scratch bytes");
+        if ((ctx->d_H==NULL && ClusterCol_TryDeviceMalloc((void**)&ctx->d_H,matrix_bytes)!=hipSuccess) ||
+            (ctx->d_tmp==NULL && ClusterCol_TryDeviceMalloc((void**)&ctx->d_tmp,matrix_bytes)!=hipSuccess)){
+            if (ctx->d_H!=NULL) wait_hipfunc(hipFree(ctx->d_H));
+            if (ctx->d_tmp!=NULL) wait_hipfunc(hipFree(ctx->d_tmp));
+            ctx->d_H = ctx->d_tmp = NULL;
+            ClusterCol_DeviceEvecSpin = -1;
+            return 0;
+        }
+        if (allocated != NULL) *allocated = 1;
+        return 1;
+    }
 
-    if (ctx->d_S != NULL)    wait_hipfunc(hipFree(ctx->d_S));
-    if (ctx->d_H != NULL)    wait_hipfunc(hipFree(ctx->d_H));
-    if (ctx->d_tmp != NULL)  wait_hipfunc(hipFree(ctx->d_tmp));
-    if (ctx->d_W != NULL)    wait_hipfunc(hipFree(ctx->d_W));
+    ClusterCol_GpuSolver_FreeMatrices();
 
     dense_count = ClusterCol_CheckedMulCount((size_t)n,(size_t)n,"dense GPU matrix");
     matrix_bytes = ClusterCol_CheckedMulCount(dense_count,sizeof(double),"dense GPU matrix bytes");
     vector_bytes = ClusterCol_CheckedMulCount((size_t)n,sizeof(double),"dense GPU eigenvalue bytes");
 
-    wait_hipfunc(hipMalloc((void**)&ctx->d_S,matrix_bytes));
-    wait_hipfunc(hipMalloc((void**)&ctx->d_H,matrix_bytes));
-    wait_hipfunc(hipMalloc((void**)&ctx->d_tmp,matrix_bytes));
-    wait_hipfunc(hipMalloc((void**)&ctx->d_W,vector_bytes));
+    if (ClusterCol_TryDeviceMalloc((void**)&ctx->d_S,matrix_bytes)   != hipSuccess ||
+        ClusterCol_TryDeviceMalloc((void**)&ctx->d_H,matrix_bytes)   != hipSuccess ||
+        ClusterCol_TryDeviceMalloc((void**)&ctx->d_tmp,matrix_bytes) != hipSuccess ||
+        ClusterCol_TryDeviceMalloc((void**)&ctx->d_W,vector_bytes)   != hipSuccess){
+        /* the partial reservation goes, so that the fallback path and the
+           other ranks see the memory again */
+        ClusterCol_GpuSolver_FreeMatrices();
+        return 0;
+    }
 
     ctx->matrix_dim = n;
-    ctx->transformed_s_valid = 0;
-    ctx->transformed_s_dim = 0;
+    if (allocated != NULL) *allocated = 2;
+    return 1;
+}
+
+/* the same where no fallback is left (the admission of the step reserved
+   the matrices already, or the serialized spin mode allocates them for its
+   turn): a failure ends the run with the reason */
+static void ClusterCol_GpuSolver_EnsureMatrixCapacity(int n)
+{
+    if (!ClusterCol_TryEnsureMatrixCapacity(n,NULL)){
+        size_t free_bytes = 0;
+        size_t total_bytes = 0;
+        char msg[512];
+
+        (void)OpenMX_GpuMemGetInfo(&free_bytes,&total_bytes);
+        snprintf(msg,sizeof(msg),
+                 "Cluster_DFT_Col.c: out of GPU memory for the dense solver matrices of n=%d "
+                 "(%.1f MiB each; %.1f MiB free of %.1f MiB). Reduce the MPI ranks sharing the device "
+                 "or set OPENMX_CLUSTER_GPU_DIAG=0 for the ELPA diagonalization.",
+                 n,(double)n*(double)n*sizeof(double)/(1024.0*1024.0),
+                 (double)free_bytes/(1024.0*1024.0),(double)total_bytes/(1024.0*1024.0));
+        ClusterCol_AbortWithMessage(msg);
+    }
 }
 
 static void ClusterCol_GpuSolver_EigenDevice(double *d_A, int n, int maxn, double *ko, double *detail_slot)
@@ -857,21 +995,76 @@ typedef struct
     int     peer;          /* the other spin's owner in mpi_comm_level1 (spin_mode 1) */
     int     solved[2];     /* this step's solves: refined (1) or not (0), per spin */
     int     persistent;    /* the strongest persistent failure of this step */
+    int     first_all;     /* OPENMX_EIGEN_REFINE_FIRST_ALL of the global root: the first SCF step refines all n */
 } ClusterColRefineStage;
 
-static ClusterColRefineStage ClusterCol_refine = {-1, 0.0, 0, 0, 0, 0, 0, 0, 0, 0, -1, {0, 0}, 0};
+static ClusterColRefineStage ClusterCol_refine = {-1, 0.0, 0, 0, 0, 0, 0, 0, 0, 0, -1, {0, 0}, 0, 0};
 static EigenRefineState      ClusterCol_refine_state[2];
 static double               *ClusterCol_refine_x[2] = {NULL, NULL};   /* the bases, n x n each */
 static int                   ClusterCol_refine_x_n = 0;
+/* the bases parked on the host while the scratch is given back between the
+   SCF steps (ClusterCol_TrimScratch), n x n each; valid while the state's
+   basis is and its device copy is gone */
+static double               *ClusterCol_refine_h[2] = {NULL, NULL};
+static int                   ClusterCol_refine_h_valid[2] = {0, 0};
+
+static void ClusterCol_RefineDropParkedBases(void)
+{
+    for (int spin = 0; spin < 2; spin++) {
+        free(ClusterCol_refine_h[spin]);
+        ClusterCol_refine_h[spin] = NULL;
+        ClusterCol_refine_h_valid[spin] = 0;
+    }
+}
 
 static void ClusterCol_RefineRelease(void)
 {
+    EigenRefineDevice none;
+
     for (int spin = 0; spin < 2; spin++) {
         openmx_eigen_refine_state_release(&ClusterCol_refine_state[spin]);
         if (ClusterCol_refine_x[spin] != NULL) wait_hipfunc(hipFree(ClusterCol_refine_x[spin]));
         ClusterCol_refine_x[spin] = NULL;
     }
     ClusterCol_refine_x_n = 0;
+    ClusterCol_RefineDropParkedBases();
+    /* and the refinement module's hipSOLVER handle, as the band solvers and
+       the NVIDIA version do (created again on demand) */
+    memset(&none, 0, sizeof(none));
+    openmx_eigen_refine_device_release(&none);
+}
+
+/* The run boundary (Cluster_DFT_Col_Release_GPU_Caches, every rank): the
+   stage goes back to its initial state, so that the next -runtest/-runtestL
+   input reads OPENMX_EIGEN_REFINE and the device default again instead of
+   inheriting what a native fallback of the products (iterations 0 for the
+   rest of the run) or a stage of this run left. */
+static void ClusterCol_RefineResetStage(void)
+{
+    static const ClusterColRefineStage initial = {-1, 0.0, 0, 0, 0, 0, 0, 0, 0, 0, -1, {0, 0}, 0, 0};
+
+    ClusterCol_refine = initial;
+}
+
+/* the warm-start bases leave the device with the scratch: those still
+   valid wait on the host for the next refined solve of their spin */
+static void ClusterCol_RefineParkBases(void)
+{
+    size_t const count = (size_t)ClusterCol_refine_x_n * (size_t)ClusterCol_refine_x_n;
+
+    for (int spin = 0; spin < 2; spin++) {
+        if (ClusterCol_refine_x[spin] == NULL) continue;
+        if (ClusterCol_refine_state[spin].basis_valid && ClusterCol_refine_state[spin].basis_n == ClusterCol_refine_x_n) {
+            if (ClusterCol_refine_h[spin] == NULL)
+                ClusterCol_refine_h[spin] = (double *)ClusterCol_MallocArray(count, sizeof(double),
+                                                                             "refined basis host copy");
+            wait_hipfunc(hipMemcpy(ClusterCol_refine_h[spin], ClusterCol_refine_x[spin], count * sizeof(double),
+                                   hipMemcpyDeviceToHost));
+            ClusterCol_refine_h_valid[spin] = 1;
+        }
+        wait_hipfunc(hipFree(ClusterCol_refine_x[spin]));
+        ClusterCol_refine_x[spin] = NULL;
+    }
 }
 
 static hipError_t ClusterCol_TryDeviceMalloc(void **ptr, size_t bytes)
@@ -898,14 +1091,21 @@ static void *ClusterCol_RefineHostMalloc(size_t count, size_t elem, const char *
 static void ClusterCol_RefineConfigure(void)
 {
     ClusterColRefineStage *st = &ClusterCol_refine;
-    int myid, config[2] = {0, 0};
+    int myid, config[3] = {0, 0, 0};
 
     if (0 <= st->iterations) return;
     MPI_Comm_rank(mpi_comm_level1, &myid);
-    if (myid == Host_ID) config[0] = openmx_eigen_refine_configure(0, 0 < level_stdout, &config[1]);
-    MPI_Bcast(config, 2, MPI_INT, Host_ID, mpi_comm_level1);
+    if (myid == Host_ID) {
+        const char *all = getenv("OPENMX_EIGEN_REFINE_FIRST_ALL");
+
+        config[0] = openmx_eigen_refine_configure(0, 0 < level_stdout, &config[1]);
+        /* the states of the first SCF step: the same MaxN on every rank */
+        config[2] = (all != NULL && atoi(all) != 0);
+    }
+    MPI_Bcast(config, 3, MPI_INT, Host_ID, mpi_comm_level1);
     st->iterations = config[0];
     st->defaulted = (0 < config[1]);
+    st->first_all = config[2];
     st->until = openmx_eigen_refine_until();
 }
 
@@ -914,13 +1114,22 @@ static int ClusterCol_RefineIterations(void)
     return (0 < ClusterCol_refine.iterations) ? ClusterCol_refine.iterations : 0;
 }
 
-/* what the refined solve adds to the dense owner's device memory: the basis
-   and the FP32 solver's workspace (the product blocks take d_tmp or a
-   transient buffer) */
-static size_t ClusterCol_RefineBytes(int n)
+/* what the refined solve of maxn wanted states adds to the dense owner's
+   device memory: the basis, the FP32 solver's workspace, and its product
+   blocks where they exceed the room the budget gives the FP64 eigensolver's
+   device work array (two panels, idle while the refined solve replaces the
+   FP64 one; blocks that fit the FP32 scratch d_tmp take no room at all).
+   Nothing when the refinement is off or the problem too small for it. */
+static size_t ClusterCol_RefineBytes(int n, int maxn)
 {
-    if (ClusterCol_RefineIterations() <= 0) return 0;
-    return sizeof(double) * (size_t)n * (size_t)n + openmx_eigen_refine_fp32_work_bytes(0, n);
+    size_t bytes, blocks, fp64_work;
+
+    if (ClusterCol_RefineIterations() <= 0 || !openmx_eigen_refine_size_ok(n)) return 0;
+    bytes = sizeof(double) * (size_t)n * (size_t)n + openmx_eigen_refine_fp32_work_bytes(0, n);
+    blocks = openmx_eigen_refine_product_bytes(0, n, maxn);
+    fp64_work = 2 * sizeof(double) * (size_t)n * (size_t)n;
+    if (fp64_work < blocks) bytes += blocks - fp64_work;
+    return bytes;
 }
 
 /* every rank, at the start of the root dense path of a solve */
@@ -1069,12 +1278,24 @@ static int ClusterCol_RefinedEigenDevice(int spin, int n, int maxn, double *ko_s
             ClusterCol_refine_x[sp] = NULL;
             ClusterCol_refine_state[sp].basis_valid = 0;
         }
+        ClusterCol_RefineDropParkedBases();
         ClusterCol_refine_x_n = n;
     }
     rc = 1;
     if (ctx->d_info == NULL && ClusterCol_TryDeviceMalloc((void **)&ctx->d_info, sizeof(int32_t)) != hipSuccess) rc = 0;
-    if (rc && ClusterCol_refine_x[spin] == NULL &&
-        ClusterCol_TryDeviceMalloc((void **)&ClusterCol_refine_x[spin], nn * sizeof(double)) != hipSuccess) rc = 0;
+    if (rc && ClusterCol_refine_x[spin] == NULL) {
+        if (ClusterCol_TryDeviceMalloc((void **)&ClusterCol_refine_x[spin], nn * sizeof(double)) != hipSuccess) rc = 0;
+        else if (ClusterCol_refine_h_valid[spin] && ClusterCol_refine_state[spin].basis_valid &&
+                 ClusterCol_refine_state[spin].basis_n == n) {
+            /* the basis the scratch trim parked on the host */
+            wait_hipfunc(hipMemcpy(ClusterCol_refine_x[spin], ClusterCol_refine_h[spin], nn * sizeof(double),
+                                   hipMemcpyHostToDevice));
+            ClusterCol_refine_h_valid[spin] = 0;
+        }
+        else {
+            ClusterCol_refine_state[spin].basis_valid = 0;
+        }
+    }
     if (!rc) {
         printf("<Cluster_DFT_Col> no room for the %.1f MiB basis of the refined eigensolver; FP64 eigensolver%s\n",
                (double)(nn * sizeof(double)) / (1024.0 * 1024.0), st->transient ? "" : " for the rest of the SCF cycle");
@@ -1172,8 +1393,120 @@ static int ClusterCol_RefinedEigenDevice(int spin, int n, int maxn, double *ko_s
     return 0;
 }
 
-static void ClusterCol_GpuSolver_SolveHamiltonianDevice(int n, int maxn, double *ko_spin, double *C, int spin)
+/* OPENMX_GEMMUL8_FORWARD_UNBLOCKED (the NVIDIA name and parsing: on unless
+   the value starts with a character other than '1'): the two products of
+   the forward transform take the full GEMMul8 workspace when the device has
+   room for it; 0 restores the capped products of the blocked path. */
+static int ClusterCol_ForwardUnblocked(void)
 {
+    static int cached = -1;
+
+    if (cached < 0) {
+        const char *value = getenv("OPENMX_GEMMUL8_FORWARD_UNBLOCKED");
+
+        cached = (value == NULL || value[0] == '\0' || value[0] == '1') ? 1 : 0;
+    }
+    return cached;
+}
+
+/* OPENMX_CLUSTER_GEMMUL8_TURN_RELEASE (unset: OPENMX_BAND_GEMMUL8_TURN_RELEASE;
+   unset too: 0 on an APU, 1 otherwise, as the turns of Band_DFT_Col): at the
+   end of each root dense solve the owner releases all of its GEMMul8
+   workspaces (1), so that the grid stages of the SCF step find that memory
+   on a GPU shared by many ranks, or only the scratch above the cap of the
+   blocked path (0), keeping the capped workspace for the next solve. */
+static int ClusterCol_GemmWorkspaceTurnRelease(void)
+{
+    const char *value = getenv("OPENMX_CLUSTER_GEMMUL8_TURN_RELEASE");
+
+    if (value == NULL) value = getenv("OPENMX_BAND_GEMMUL8_TURN_RELEASE");
+    if (value == NULL) return openmx_gpu_is_apu() ? 0 : 1;
+    return (atoi(value) != 0);
+}
+
+/* the owner, after the solves of a root dense path (their streams done) */
+static void ClusterCol_GemmWorkspaceTurnEnd(void)
+{
+    const int    release = ClusterCol_GemmWorkspaceTurnRelease();
+    const size_t held = openmx_gemmul8WorkspaceBytes();
+
+    if (release) openmx_gemmul8ReleaseWorkspaces();
+    else openmx_gemmul8TrimWorkspaces();
+    if (ClusterCol_GpuVerbose()) {
+        printf("<Cluster_DFT_Col> end of the dense solve: %s GEMMul8 workspaces, %.1f of %.1f MiB returned "
+               "(OPENMX_CLUSTER_GEMMUL8_TURN_RELEASE=%d)\n", release ? "released the" : "trimmed the",
+               (double)(held - openmx_gemmul8WorkspaceBytes()) / (1024.0 * 1024.0),
+               (double)held / (1024.0 * 1024.0), release);
+        fflush(stdout);
+    }
+}
+
+/* OPENMX_CLUSTER_GPU_RETAIN_SCRATCH, after an SCF solve (mode "scf"; its
+   density matrix is done by then): unset or nonzero keeps the owner's
+   scratch for the next step (the default here: the admission of every step
+   counts it as resident, and Set_Density_Grid_GPU returns only library
+   workspaces under pressure); 0 returns it after every SCF step; "auto"
+   returns it when it is at least 512 MiB and less than half of the device is
+   free (the default of the NVIDIA version).  The scratch is d_H, d_tmp
+   (whose latest eigenvectors the density matrix has used), the refined
+   solve's device workspace, and the warm-start bases, which wait on the
+   host for the next step (ClusterCol_RefineParkBases); the transformed
+   overlap d_S and d_W stay, and the admission of the next step allocates the
+   scratch again (ClusterCol_TryEnsureMatrixCapacity). */
+static void ClusterCol_TrimScratch(void)
+{
+    ClusterColGpuSolverCtx *ctx = &ClusterCol_gpusolver_ctx;
+    const char *retain = getenv("OPENMX_CLUSTER_GPU_RETAIN_SCRATCH");
+    const int automatic = (retain != NULL && strcasecmp(retain, "auto") == 0);
+    size_t panel, bytes, free_bytes = 0, total_bytes = 0;
+    int device = -1;
+
+    if (retain == NULL || retain[0] == '\0' || (!automatic && atoi(retain) != 0)) return;
+    if (!ctx->initialized || ctx->matrix_dim <= 0) return;
+    if (hipGetDevice(&device) != hipSuccess || device != ctx->device_id) return;
+    panel = sizeof(double) * (size_t)ctx->matrix_dim * (size_t)ctx->matrix_dim;
+    bytes = (ctx->d_H != NULL ? panel : 0) + (ctx->d_tmp != NULL ? panel : 0) + ctx->d_work_bytes;
+    for (int spin = 0; spin < 2; spin++) {
+        if (ClusterCol_refine_x[spin] != NULL)
+            bytes += sizeof(double) * (size_t)ClusterCol_refine_x_n * (size_t)ClusterCol_refine_x_n;
+    }
+    if (bytes == 0) return;
+    if (automatic && (bytes < 512ULL * 1024ULL * 1024ULL || OpenMX_GpuMemGetInfo(&free_bytes, &total_bytes) != 0 ||
+                      total_bytes / 2 <= free_bytes)) return;
+
+    wait_hipfunc(hipStreamSynchronize(ctx->stream));
+    ClusterCol_RefineParkBases();
+    if (ctx->d_H != NULL) wait_hipfunc(hipFree(ctx->d_H));
+    if (ctx->d_tmp != NULL) wait_hipfunc(hipFree(ctx->d_tmp));
+    if (ctx->d_work != NULL) wait_hipfunc(hipFree(ctx->d_work));
+    ctx->d_H = ctx->d_tmp = NULL;
+    ctx->d_work = NULL;
+    ctx->d_work_bytes = 0;
+    ClusterCol_DeviceEvecSpin = -1;   /* the density matrix used them already */
+    if (ClusterCol_GpuVerbose()) {
+        printf("<Cluster_DFT_Col> Released %.1f MiB of SCF scratch; retained the transformed overlap (n=%d).\n",
+               (double)bytes / (1024.0 * 1024.0), ctx->matrix_dim);
+        fflush(stdout);
+    }
+}
+
+/* The eigenpairs of the transformed Hamiltonian in d_H and their back
+   transform into C, on the owner.  shared: another dense owner solves on
+   this device at the same time (two spin worlds on one GPU), so the forward
+   transform keeps to the capped GEMMul8 workspace, as the refined solve's
+   products do (EigenRefineDevice.shared). */
+static void ClusterCol_GpuSolver_SolveHamiltonianDevice(int n, int maxn, double *ko_spin, double *C, int spin,
+                                                        int shared)
+{
+    /* OPENMX_CLUSTER_PROFILE=1: besides the CLUSTER_PROFILE line of each SCF
+       step, the cumulative wall time of the phases of this rank's solves,
+       one CLUSTERPROF line per solve in the form of the NVIDIA version
+       (forward transform, eigensolver, back transform, eigenvector download;
+       its error indicator does not exist here and stays 0).  The stream is
+       synchronized around each phase. */
+    static double prof[4] = {0.0, 0.0, 0.0, 0.0};
+    static long prof_solves = 0;
+    const ClusterColDetailTimers before = ClusterCol_detail_timers;
     ClusterColGpuSolverCtx *ctx = &ClusterCol_gpusolver_ctx;
     size_t dense_count = ClusterCol_CheckedMulCount((size_t)n,(size_t)n,"Hamiltonian");
     size_t evec_count = ClusterCol_CheckedMulCount((size_t)n,(size_t)maxn,"eigenvectors");
@@ -1185,6 +1518,17 @@ static void ClusterCol_GpuSolver_SolveHamiltonianDevice(int n, int maxn, double 
     /* Small products do not amortize the INT8 conversion/launch overhead.
        The bridge retains scf.gemmul8.enable and its memory-safe fallback. */
     int use_gemm = n >= 2048 && (gemm_env == NULL || atoi(gemm_env) != 0);
+    /* The forward products take the full GEMMul8 workspace when the device
+       has room for it beyond the solve reserve (openmx_gemmul8DgemmUnblocked,
+       which otherwise takes the capped workspace at the same precision):
+       under the 256 MiB cap every block of a blocked product rescales its
+       operands (in the NVIDIA version the transform went from 810 to 421 ms
+       at n = 13000 on an A100).  The results are those of the capped
+       products bit for bit while the full workspace fits the cap.  The
+       scratch goes right after the transform: the eigensolvers allocate
+       their own workspaces (MAGMA inside its call, rocSOLVER in the refined
+       solve), which the memory admission budgets without it. */
+    int unblocked = use_gemm && !shared && ClusterCol_ForwardUnblocked();
 
     if (!(ctx->transformed_s_valid && ctx->transformed_s_dim==n)){
         ClusterCol_AbortWithMessage("Transformed overlap is not ready in Cluster_DFT_Col.c.");
@@ -1193,10 +1537,20 @@ static void ClusterCol_GpuSolver_SolveHamiltonianDevice(int n, int maxn, double 
     if (ClusterCol_detail_timers.active) dtime(&stime);
     if (use_gemm) {
         wait_hipfunc(ClusterCol_SymmetrizeLower_HIP(n,ctx->d_H,ctx->stream));
-        wait_hipfunc(openmx_gemmul8Dgemm(ctx->hipblas,HIPBLAS_OP_N,HIPBLAS_OP_N,n,n,n,
-                                      &alpha,ctx->d_H,n,ctx->d_S,n,&beta,ctx->d_tmp,n));
-        wait_hipfunc(openmx_gemmul8Dgemm(ctx->hipblas,HIPBLAS_OP_T,HIPBLAS_OP_N,n,n,n,
-                                      &alpha,ctx->d_S,n,ctx->d_tmp,n,&beta,ctx->d_H,n));
+        if (unblocked) {
+            wait_hipfunc(openmx_gemmul8DgemmUnblocked(ctx->hipblas,HIPBLAS_OP_N,HIPBLAS_OP_N,n,n,n,
+                                                      &alpha,ctx->d_H,n,ctx->d_S,n,&beta,ctx->d_tmp,n));
+            wait_hipfunc(openmx_gemmul8DgemmUnblocked(ctx->hipblas,HIPBLAS_OP_T,HIPBLAS_OP_N,n,n,n,
+                                                      &alpha,ctx->d_S,n,ctx->d_tmp,n,&beta,ctx->d_H,n));
+            wait_hipfunc(hipStreamSynchronize(ctx->stream));
+            openmx_gemmul8TrimWorkspaces();
+        }
+        else {
+            wait_hipfunc(openmx_gemmul8Dgemm(ctx->hipblas,HIPBLAS_OP_N,HIPBLAS_OP_N,n,n,n,
+                                             &alpha,ctx->d_H,n,ctx->d_S,n,&beta,ctx->d_tmp,n));
+            wait_hipfunc(openmx_gemmul8Dgemm(ctx->hipblas,HIPBLAS_OP_T,HIPBLAS_OP_N,n,n,n,
+                                             &alpha,ctx->d_S,n,ctx->d_tmp,n,&beta,ctx->d_H,n));
+        }
     }
     else {
         wait_hipfunc(hipblasDsymm(ctx->hipblas,HIPBLAS_SIDE_LEFT,HIPBLAS_FILL_MODE_LOWER,n,n,
@@ -1244,7 +1598,20 @@ static void ClusterCol_GpuSolver_SolveHamiltonianDevice(int n, int maxn, double 
     wait_hipfunc(hipMemcpyAsync(C,ctx->d_tmp,evec_bytes,hipMemcpyDeviceToHost,ctx->stream));
     wait_hipfunc(hipStreamSynchronize(ctx->stream));
     if (ClusterCol_detail_timers.active) {
+        const ClusterColDetailTimers *t = &ClusterCol_detail_timers;
+        int rank;
+
         ClusterCol_DetailTimer_Add(&ClusterCol_detail_timers.evec_copyout, stime);
+        prof[0] += t->h_transform_gemm - before.h_transform_gemm;
+        prof[1] += t->syevdx - before.syevdx;
+        prof[2] += t->backtransform - before.backtransform;
+        prof[3] += t->evec_copyout - before.evec_copyout;
+        prof_solves++;
+        MPI_Comm_rank(mpi_comm_level1,&rank);
+        printf("CLUSTERPROF rank=%d solves=%ld n=%d forward=%.6f eigen=%.6f back=%.6f evec_d2h=%.6f "
+               "indicator=%.6f (s, cumulative)\n",
+               rank,prof_solves,n,prof[0],prof[1],prof[2],prof[3],0.0);
+        fflush(stdout);
     }
 }
 
@@ -1256,7 +1623,7 @@ static void ClusterCol_GpuSolver_SolveHamiltonian(int n, int maxn, const double 
 
     ClusterCol_GpuSolver_EnsureMatrixCapacity(n);
     wait_hipfunc(hipMemcpyAsync(ctx->d_H,H,matrix_bytes,hipMemcpyHostToDevice,ctx->stream));
-    ClusterCol_GpuSolver_SolveHamiltonianDevice(n,maxn,ko_spin,C,-1);
+    ClusterCol_GpuSolver_SolveHamiltonianDevice(n,maxn,ko_spin,C,-1,0);
 }
 
 static void ClusterCol_GEMMul8Dgemm_OpenMP(hipblasOperation_t transa, hipblasOperation_t transb, int m, int n, int k,
@@ -1281,29 +1648,69 @@ static void ClusterCol_GpuSolver_CheckInfo(const char *where, int info)
     }
 }
 
+/* every rank, at the first SCF step of the root dense path: the states it
+   solves.  The FP64 solve takes all n, as it always has; a refined one,
+   whose FP32 solve yields all n eigenvalues anyway, refines the lowest
+   (TZ - system_charge)/2 + max(400, 0.1 n) only -- the margin of the later
+   steps -- which keeps its product blocks within the scratch d_tmp of the
+   later steps instead of two n x n blocks of their own, and its products a
+   fraction of n^3 (as the non-collinear solver does).
+   OPENMX_EIGEN_REFINE_FIRST_ALL=1 (the global root's) refines all n.  The
+   conditions are those of ClusterCol_RefineBeginSolve; serialized: the
+   serialized spin mode, which keeps the FP64 eigensolver.  Collective on
+   mpi_comm_level1: OPENMX_EIGEN_REFINE_MIN_N is read on each rank, so the
+   ranks agree on the largest count, which sets MaxN and the partitions. */
+static int ClusterCol_RefineFirstStepStates(const char *mode, int n, double TZ, int SpinP_switch, int numprocs0,
+                                            int serialized)
+{
+    double lumos = 0.1 * (double)n;
+    int states = n, all_states = n;
+
+    ClusterCol_RefineConfigure();
+    if (!(strcasecmp(mode, "scf") != 0 || Solver != 2 || ClusterCol_RefineIterations() <= 0 ||
+          ClusterCol_refine.force_fp64 || Cnt_switch != 0 || DFTSCF_loop <= 1 || cal_partial_charge ||
+          xanes_calc != 0 || empty_occupation_flag != 0 || empty_states_flag != 0 || serialized ||
+          (SpinP_switch == 1 && numprocs0 == 1) || !openmx_eigen_refine_size_ok(n) ||
+          ClusterCol_refine.first_all)) {
+        if (lumos < 400.0) lumos = 400.0;
+        states = (int)((TZ - system_charge) / 2.0) + (int)lumos;
+        if (n < states) states = n;
+    }
+    MPI_Allreduce(&states, &all_states, 1, MPI_INT, MPI_MAX, mpi_comm_level1);
+    return all_states;
+}
+
+/* the states of a solve of the root dense path: first_states at the first
+   SCF step (ClusterCol_RefineFirstStepStates), the occupied ones and a
+   margin afterwards */
+static int ClusterCol_GpuPathMaxN(int SCF_iter, const char *mode, double TZ, int n, int first_states)
+{
+    double lumos;
+    int maxn;
+
+    if (SCF_iter==1) return first_states;
+
+    if      (strcasecmp(mode,"scf")==0)     lumos = (double)n*0.100;
+    else if (strcasecmp(mode,"dos")==0)     lumos = (double)n*0.200;
+    else if (strcasecmp(mode,"lcaoout")==0) lumos = (double)n*0.200;
+    else if (strcasecmp(mode,"xanes")==0)   lumos = (double)n*0.200;
+    else if (strcasecmp(mode,"diag")==0)    lumos = (double)n*0.200;
+    else                                    lumos = (double)n*0.200;
+
+    if (lumos<400.0) lumos = 400.0;
+    maxn = (int)((TZ-system_charge)/2.0) + (int)lumos;
+    if (n<maxn) maxn = n;
+    if (cal_partial_charge) maxn = n;
+    return maxn;
+}
+
 static void ClusterCol_SetMaxNAndPartitions(int SCF_iter, const char *mode, double TZ, int n, int numprocs1,
-                                            int *MaxN, int *is2, int *ie2)
+                                            int first_states, int *MaxN, int *is2, int *ie2)
 {
     int ID;
     double av_num;
-    double lumos;
 
-    if (SCF_iter==1){
-        *MaxN = n;
-    }
-    else{
-        if      (strcasecmp(mode,"scf")==0)     lumos = (double)n*0.100;
-        else if (strcasecmp(mode,"dos")==0)     lumos = (double)n*0.200;
-        else if (strcasecmp(mode,"lcaoout")==0) lumos = (double)n*0.200;
-        else if (strcasecmp(mode,"xanes")==0)   lumos = (double)n*0.200;
-        else if (strcasecmp(mode,"diag")==0)    lumos = (double)n*0.200;
-        else                                    lumos = (double)n*0.200;
-
-        if (lumos<400.0) lumos = 400.0;
-        *MaxN = (int)((TZ-system_charge)/2.0) + (int)lumos;
-        if (n<*MaxN) *MaxN = n;
-        if (cal_partial_charge) *MaxN = n;
-    }
+    *MaxN = ClusterCol_GpuPathMaxN(SCF_iter,mode,TZ,n,first_states);
 
     if (numprocs1<=*MaxN){
         av_num = (double)(*MaxN)/(double)numprocs1;
@@ -1570,6 +1977,76 @@ static double ClusterCol_CalcDMRootDense_HIP_Path(int myid0, int numprocs0, int 
     return etime - stime;
 }
 
+/* OPENMX_GEMM_SAMPLE_DIR=<existing directory> writes the inputs of the two
+   forward GEMMs, B = H X and X^T B, as raw column-major doubles: the
+   transformed overlap X whenever the root dense path rebuilds it
+   (X_g<geometry>.bin, spin world 0's owner) and the Hamiltonian, as built
+   before the transform, of the SCF steps listed in OPENMX_GEMM_SAMPLE_ITERS
+   (comma separated, default "1"; H_g<geometry>_scf<step>_s<spin>.bin).  The
+   files feed offline precision studies of the forward transform (the
+   NVIDIA version's tests/gemmul8_reuse_probe.cu reads them).  The
+   serialized spin mode samples nothing.  Ported from the NVIDIA version. */
+static int ClusterCol_sample_geometry = 0;
+
+static void ClusterCol_SampleDeviceMatrix(const double *d_A, int n, const char *name)
+{
+    ClusterColGpuSolverCtx *ctx = &ClusterCol_gpusolver_ctx;
+    size_t count = ClusterCol_CheckedMulCount((size_t)n,(size_t)n,"sampled matrix");
+    double *A = (double*)ClusterCol_MallocArray(count,sizeof(double),"sampled matrix");
+    char path[4096];
+    FILE *fp;
+
+    snprintf(path,sizeof(path),"%s/%s",getenv("OPENMX_GEMM_SAMPLE_DIR"),name);
+    wait_hipfunc(hipMemcpyAsync(A,d_A,count*sizeof(double),hipMemcpyDeviceToHost,ctx->stream));
+    wait_hipfunc(hipStreamSynchronize(ctx->stream));
+
+    fp = fopen(path,"wb");
+    if (fp==NULL || fwrite(A,sizeof(double),count,fp)!=count || fclose(fp)!=0){
+        char msg[4200];
+        snprintf(msg,sizeof(msg),"Cluster_DFT_Col.c: could not write the sampled matrix %s",path);
+        ClusterCol_AbortWithMessage(msg);
+    }
+    printf("<Cluster_DFT_Col> sampled %s (n=%d)\n",path,n);
+    fflush(stdout);
+    free(A);
+}
+
+static void ClusterCol_SampleTransformedS(int n, int myworld1)
+{
+    const char *dir = getenv("OPENMX_GEMM_SAMPLE_DIR");
+    char name[64];
+
+    ClusterCol_sample_geometry++;
+    /* both spin worlds hold the same X; one copy is enough */
+    if (dir==NULL || dir[0]=='\0' || myworld1!=0) return;
+
+    snprintf(name,sizeof(name),"X_g%d.bin",ClusterCol_sample_geometry);
+    ClusterCol_SampleDeviceMatrix(ClusterCol_gpusolver_ctx.d_S,n,name);
+}
+
+static void ClusterCol_SampleHamiltonian(int SCF_iter, int spin, int n)
+{
+    const char *dir = getenv("OPENMX_GEMM_SAMPLE_DIR");
+    const char *list = getenv("OPENMX_GEMM_SAMPLE_ITERS");
+    char name[64];
+    int wanted = 0;
+
+    if (dir==NULL || dir[0]=='\0') return;
+    if (list==NULL || list[0]=='\0') list = "1";
+
+    while (*list!='\0' && !wanted){
+        char *end;
+        long step = strtol(list,&end,10);
+        if (end==list) break;
+        wanted = (step==SCF_iter);
+        list = (*end==',') ? end+1 : end;
+    }
+    if (!wanted) return;
+
+    snprintf(name,sizeof(name),"H_g%d_scf%03d_s%d.bin",ClusterCol_sample_geometry,SCF_iter,spin);
+    ClusterCol_SampleDeviceMatrix(ClusterCol_gpusolver_ctx.d_H,n,name);
+}
+
 static void ClusterCol_GpuSolverRootDensePath(int SCF_iter, int SpinP_switch, double **ko,
                                              double *****nh, double ****CntOLP,
                                              int numprocs0, int myid0, int myworld1,
@@ -1585,6 +2062,10 @@ static void ClusterCol_GpuSolverRootDensePath(int SCF_iter, int SpinP_switch, do
     int use_setham_packed_cache =
         (Set_Hamiltonian_GpuSolver_Packed_CacheReady() &&
          Set_Hamiltonian_GpuSolver_Packed_OrderMode() == 0);
+    /* the two spin worlds' owners solve at the same time; on one device
+       (the admission counted them) neither forward transform takes the
+       full GEMMul8 workspace */
+    int shared = (SpinP_switch==1 && numprocs0!=1 && 1<ClusterCol_owners_on_device);
 
     if (SpinP_switch==1 && numprocs0!=1){
         spin_start = myworld1;
@@ -1664,6 +2145,7 @@ static void ClusterCol_GpuSolverRootDensePath(int SCF_iter, int SpinP_switch, do
         }
         if (owns_dense){
             ClusterCol_GpuSolver_PrepareTransformedSDevice(1,n,ko[0]);
+            ClusterCol_SampleTransformedS(n,myworld1);
         }
     }
 
@@ -1685,8 +2167,9 @@ static void ClusterCol_GpuSolverRootDensePath(int SCF_iter, int SpinP_switch, do
                 ClusterCol_BuildDeviceDenseFromPacked(cache_H,dense_index,tnum,n,ClusterCol_gpusolver_ctx.d_H);
                 free(dense_index);
 
+                ClusterCol_SampleHamiltonian(SCF_iter,spin,n);
                 C = (double*)ClusterCol_MallocArray(nmax,sizeof(double),"root dense eigenvectors");
-                ClusterCol_GpuSolver_SolveHamiltonianDevice(n,MaxN,ko[spin],C,spin);
+                ClusterCol_GpuSolver_SolveHamiltonianDevice(n,MaxN,ko[spin],C,spin,shared);
                 ClusterCol_StashGpuSolverDenseEVec(myid1, spin, n, MaxN, &C);
                 free(C);
             }
@@ -1698,13 +2181,18 @@ static void ClusterCol_GpuSolverRootDensePath(int SCF_iter, int SpinP_switch, do
                 size_t nmax = ClusterCol_CheckedMulCount((size_t)n,(size_t)MaxN,"root dense eigenvectors");
                 double *C = NULL;
 
+                ClusterCol_SampleHamiltonian(SCF_iter,spin,n);
                 C = (double*)ClusterCol_MallocArray(nmax,sizeof(double),"root dense eigenvectors");
-                ClusterCol_GpuSolver_SolveHamiltonianDevice(n,MaxN,ko[spin],C,spin);
+                ClusterCol_GpuSolver_SolveHamiltonianDevice(n,MaxN,ko[spin],C,spin,shared);
                 ClusterCol_StashGpuSolverDenseEVec(myid1, spin, n, MaxN, &C);
                 free(C);
             }
         }
     }
+
+    /* the GEMMul8 workspaces of the solves go before the grid stages of the
+       step; the transformed overlap stays on the device */
+    if (owns_dense) ClusterCol_GemmWorkspaceTurnEnd();
 
     ClusterCol_RefineEndSolve();
 
@@ -1823,7 +2311,7 @@ static void ClusterCol_GpuSolverRootDenseSerialPath(
                                                                "serial root eigenvectors");
                     double *evec = (double*)ClusterCol_MallocArray(count, sizeof(double),
                                                                   "serial root eigenvectors");
-                    ClusterCol_GpuSolver_SolveHamiltonianDevice(n, MaxN, ko[spin], evec, -1);
+                    ClusterCol_GpuSolver_SolveHamiltonianDevice(n, MaxN, ko[spin], evec, -1, 0);
                     ClusterCol_StashGpuSolverDenseEVec(myid1, spin, n, MaxN, &evec);
                 }
             }
@@ -2186,10 +2674,18 @@ double Cluster_DFT_Col(
      are refined */
   ClusterCol_refine.last_refined = 0;
   ClusterCol_refine.scf_mode = (strcasecmp(mode,"scf")==0);
-  if (scf_eigen_lib_flag==GPUSOLVER && gpusolver2_flag==0 && Cluster_DFT_Col_GpuSwitchNum()<=n)
-    gpu_diag_mode = ClusterCol_GpuDiagFits(n,myworld1,myid1);
+  if (scf_eigen_lib_flag==GPUSOLVER && gpusolver2_flag==0 && Cluster_DFT_Col_GpuSwitchNum()<=n){
+    /* the states a refined solve of this step would refine: the memory
+       admission counts its product blocks */
+    int refine_maxn = ClusterCol_GpuPathMaxN(SCF_iter,mode,TZ,n,
+                                             ClusterCol_RefineFirstStepStates(mode,n,TZ,SpinP_switch,numprocs0,0));
+    gpu_diag_mode = ClusterCol_GpuDiagFits(n,refine_maxn,myworld1,myid1);
+  }
   if (gpu_diag_mode){
-    ClusterCol_SetMaxNAndPartitions(SCF_iter,mode,TZ,n,numprocs1, &MaxN,is2,ie2);
+    ClusterCol_SetMaxNAndPartitions(SCF_iter,mode,TZ,n,numprocs1,
+                                    ClusterCol_RefineFirstStepStates(mode,n,TZ,SpinP_switch,numprocs0,
+                                                                     gpu_diag_mode==2),
+                                    &MaxN,is2,ie2);
     use_gpusolver_direct_cluster_dm = 1;
     firsttime = 0;
     if (gpu_diag_mode == 2)
@@ -3519,6 +4015,10 @@ double Cluster_DFT_Col(
   free(Num_Snd_EV);
   free(ie1);
   free(is1);
+
+  /* the dense owner's scratch between the SCF steps (opt-in,
+     OPENMX_CLUSTER_GPU_RETAIN_SCRATCH) */
+  if (strcasecmp(mode,"scf")==0) ClusterCol_TrimScratch();
 
   /* for elapsed time */
 
