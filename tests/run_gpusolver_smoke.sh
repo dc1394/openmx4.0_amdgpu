@@ -8,13 +8,14 @@ set -eu
 # sources against the bundled MAGMA and GEMMul8 libraries (built by the
 # OpenMX build) and the system reference LAPACK; nothing in source/ is
 # written.  The wrapper check runs under the solver-policy variables:
-#   default                                   rocSOLVER, MAGMA Ozaki-II, retry on failure
+#   default                                   architecture policy, retry on failure
 #   OPENMX_GPUSOLVER_RETRY_TEST=1             every solve solved again by the next backend
 #   OPENMX_MAGMA_OZAKI2=0 + RETRY_TEST=1      stock MAGMA only
 #   RETRY_TEST=1, 10^6 ranks per device       the retry copies in host memory
 #   OPENMX_MAGMA_OZAKI2_RETRY=0, CACHE_MB=0   no copy and no retry, no cached scratch
 #   OPENMX_GPUSOLVER_PARTIAL_EVD_MIN_N=1      partial requests by the full divide and conquer
 #   OPENMX_GPU_EIGENSOLVER_MAGMA_MIN_N=100000 the MAGMA entry points on rocSOLVER
+#   OPENMX_GPU_EIGENSOLVER=hipsolver|magma   explicit policy through direct dense entries
 # Usage: tests/run_gpusolver_smoke.sh [n of the shim check, default 257]
 # Environment: ROCM (/opt/rocm-7.2.0), MPI_HOME (for mpi.h of openmx_common.h),
 # ARCH (gfx1200), LAPACK_LIBS (-llapack -lblas).
@@ -70,4 +71,8 @@ run OPENMX_GPUSOLVER_RETRY_TEST=1 OPENMX_TEST_RANKS_PER_DEVICE=1000000
 run OPENMX_MAGMA_OZAKI2_RETRY=0 OPENMX_GPUSOLVER_CACHE_MB=0
 run OPENMX_GPUSOLVER_PARTIAL_EVD_MIN_N=1 OPENMX_CUSOLVER_CACHE_MB=1
 run OPENMX_GPU_EIGENSOLVER_MAGMA_MIN_N=100000 OPENMX_TEST_EXPECT_BACKEND=1
+run OPENMX_GPU_EIGENSOLVER=hipsolver OPENMX_TEST_EXPECT_BACKEND=1 OPENMX_GPU_EIGENSOLVER_PROFILE=1
+grep -q 'backend=rocsolver' "$test_tmp/stderr" || { echo "rocSOLVER override was not used" >&2; exit 1; }
+run OPENMX_GPU_EIGENSOLVER=magma OPENMX_TEST_EXPECT_BACKEND=0 OPENMX_GPU_EIGENSOLVER_PROFILE=1
+grep -q 'backend=magma' "$test_tmp/stderr" || { echo "MAGMA override was not used" >&2; exit 1; }
 echo "run_gpusolver_smoke: all runs passed"

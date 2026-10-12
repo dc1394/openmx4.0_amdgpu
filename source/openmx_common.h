@@ -4220,9 +4220,12 @@ int openmx_magma_release_d_workspace(void);
 void openmx_magma_release_fp32_workspace(void);
 void openmx_gpusolver_cache_release(void);
 /* scf.gemmul8.enable: 0 sends every openmx_gemmul8{D,Z}gemm call straight to
-   plain hipBLAS FP64 GEMM (workspace queries then report 0).  Default on;
-   set from Input_std.c on every rank. */
+   plain hipBLAS FP64 GEMM (workspace queries then report 0), 1 requests
+   GEMMul8, -1 chooses the architecture default on first GPU use.  Reset
+   from Input_std.c on every rank and input, without querying the GPU. */
 void openmx_gemmul8SetEnabled(int enabled);
+/* Actual native GEMM calls, including configuration and workspace fallbacks. */
+long long openmx_gemmul8NativeCalls(int is_complex);
 size_t openmx_gemmul8ZWorkspaceSize(int m, int n, int k);
 size_t openmx_gemmul8DWorkspaceSize(int m, int n, int k);
 

@@ -1,6 +1,7 @@
 #include "openmx_stdout_level.h"
 #include <magma_v2.h>
 #include "hip_runtime_compat.h"
+#include "openmx_gpu_arch_policy.h"
 
 #include <hipsolver/hipsolver.h>
 
@@ -157,8 +158,9 @@ int eigensolver_magma_min_n()
     return min_n;
 }
 
-/* the MAGMA entry points hand an order below that minimum to rocSOLVER,
-   unless OPENMX_GPU_EIGENSOLVER forces a backend */
+/* The size override in the automatic policy; explicit backend choices
+   take precedence.  Direct dense entry points must also apply the device
+   policy through openmx_gpu_eigen_backend, not this size override alone. */
 int magma_entry_reroute(int n)
 {
     return eigensolver_env_choice() < 0 && 0 < eigensolver_magma_min_n() && n < eigensolver_magma_min_n();
@@ -388,13 +390,18 @@ extern "C" int openmx_gpu_eigensolver_use_hipsolver(void)
     return cached;
 }
 
+extern "C" int openmx_gpu_is_mi300a(void)
+{
+    return openmx_gpu_device_is_mi300a();
+}
+
 /* Size-aware backend of a dense FP64 eigensolve of order n (maxn wanted
    pairs, complex when cplx): 1 rocSOLVER (openmx_hipsolver_zheevd_gpu), 0
    MAGMA.  The choice above, except that in the automatic mode an n below
    OPENMX_GPU_EIGENSOLVER_MAGMA_MIN_N (default 0: none, today's choice) also
    selects rocSOLVER.  The MAGMA entry points apply the same threshold on
-   their own, so the knob reaches the cluster, DC, DC-LNO and Krylov solvers
-   without changes there. */
+   their own, so both the device policy and the knob reach the cluster, DC,
+   DC-LNO and Krylov solvers without changes there. */
 extern "C" int openmx_gpu_eigen_backend(int n, int maxn, int cplx)
 {
     (void)maxn;
@@ -648,12 +655,15 @@ namespace {
 int rocsolver_evd_locked(int cplx, int n, int maxn, void *d_A, double *w, int *mout_out, int *touched,
                          int preflight)
 {
+    static const int detail = env_flag("OPENMX_GPU_EIGENSOLVER_PROFILE", 0);
     const size_t width = cplx ? sizeof(hipDoubleComplex) : sizeof(double);
     const char  *name = cplx ? "zheevd" : "dsyevd";
     hipsolverStatus_t status;
     size_t       work_bytes;
     int          info = 0;
     int          bad = 0;
+    auto         phase_start = detail ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    double       setup_seconds = 0.0, phase_in_seconds = 0.0, solve_seconds = 0.0, check_seconds = 0.0;
 
     if (ensure_hipsolver_ready(n) != 0) {
         return MAGMA_ERR_HOST_ALLOC;
@@ -701,6 +711,15 @@ int rocsolver_evd_locked(int cplx, int n, int maxn, void *d_A, double *w, int *m
         g_hs_work_bytes = work_bytes;
     }
 
+    /* Only the explicit profiler serializes phase boundaries.  The normal
+       solve retains its existing stream ordering and synchronization. */
+    if (detail) {
+        if (hipDeviceSynchronize() != hipSuccess) return MAGMA_ERR_UNKNOWN;
+        const auto now = std::chrono::steady_clock::now();
+        setup_seconds = std::chrono::duration<double>(now - phase_start).count();
+        phase_start = now;
+    }
+
     *touched = 1;
     if (cplx) {
         (void)hipGetLastError();
@@ -709,6 +728,14 @@ int rocsolver_evd_locked(int cplx, int n, int maxn, void *d_A, double *w, int *m
         if (hipGetLastError() != hipSuccess) {
             return MAGMA_ERR_UNKNOWN;
         }
+    }
+    if (detail) {
+        if (hipDeviceSynchronize() != hipSuccess) return MAGMA_ERR_UNKNOWN;
+        const auto now = std::chrono::steady_clock::now();
+        phase_in_seconds = std::chrono::duration<double>(now - phase_start).count();
+        phase_start = now;
+    }
+    if (cplx) {
         status = hipsolverDnZheevd(g_hs_handle, HIPSOLVER_EIG_MODE_VECTOR, HIPSOLVER_FILL_MODE_LOWER, n,
                                    (hipDoubleComplex *)d_A, n, g_hs_dW, (hipDoubleComplex *)g_hs_work,
                                    g_hs_query_lwork, g_hs_dinfo);
@@ -728,11 +755,21 @@ int rocsolver_evd_locked(int cplx, int n, int maxn, void *d_A, double *w, int *m
     if (info != 0) {
         return info;
     }
+    if (detail) {
+        const auto now = std::chrono::steady_clock::now();
+        solve_seconds = std::chrono::duration<double>(now - phase_start).count();
+        phase_start = now;
+    }
     /* g_hs_dinfo[1] flags a non-finite vector element or eigenvalue */
     if (eigen_check(cplx, cplx, d_A, n, n, g_hs_dW, maxn, g_hs_dinfo + 1, 0) != hipSuccess ||
         hipMemcpy(&bad, g_hs_dinfo + 1, sizeof(int), hipMemcpyDeviceToHost) != hipSuccess) {
         (void)hipGetLastError();
         return MAGMA_ERR_UNKNOWN;
+    }
+    if (detail) {
+        const auto now = std::chrono::steady_clock::now();
+        check_seconds = std::chrono::duration<double>(now - phase_start).count();
+        phase_start = now;
     }
     if (bad) {
         std::fprintf(stderr, "OpenMX: rocSOLVER %s returned non-finite eigenpairs (n=%d)\n", name, n);
@@ -745,6 +782,16 @@ int rocsolver_evd_locked(int cplx, int n, int maxn, void *d_A, double *w, int *m
     }
     std::memcpy(w, g_hs_hW, sizeof(double) * (size_t)maxn);
     hipDeviceSynchronize();
+
+    if (detail) {
+        const double values_seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - phase_start).count();
+
+        std::fprintf(stderr, "GPUEIGENDETAIL rank=%d n=%d maxn=%d type=%s stage=rocsolver "
+                     "setup=%.6f phase_in=%.6f solve=%.6f phase_out_check=%.6f values=%.6f workspace_mib=%.3f\n",
+                     MYID_MPI_COMM_WORLD, n, maxn, cplx ? "complex" : "real", setup_seconds, phase_in_seconds,
+                     solve_seconds, check_seconds, values_seconds, (double)g_hs_work_bytes / 1048576.0);
+        std::fflush(stderr);
+    }
 
     *mout_out = maxn;
     return 0;
@@ -1124,6 +1171,9 @@ int dense_eigen_locked(int cplx, int first_rocsolver, int preflight, int foreign
                        double *w, int *mout_out)
 {
     static int  test_announced = 0;
+    static const int profile = env_flag("OPENMX_GPU_EIGENSOLVER_PROFILE", 0) ||
+                               env_flag("OPENMX_GPU_VERBOSE", 0);
+    static const int detail = env_flag("OPENMX_GPU_EIGENSOLVER_PROFILE", 0);
     const int   policy = eigen_retry_policy();
     const int   ozaki2 = use_magma_ozaki2();
     const size_t abytes = static_cast<size_t>(n) * static_cast<size_t>(n) *
@@ -1145,9 +1195,20 @@ int dense_eigen_locked(int cplx, int first_rocsolver, int preflight, int foreign
     if (ozaki2) attempts[count++] = ATTEMPT_MAGMA;
 
     if (policy != 0 && count > 1) {
+        const auto started = detail ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+
         /* MAGMA's device workspace is about the matrix again (1.5 n^2 real
            words, n^2 complex ones), rocSOLVER's two to three times it */
         have_backup = backup_save(&backup, d_A, abytes, (first_rocsolver ? 4 : 2) * abytes);
+        if (detail) {
+            const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
+
+            std::fprintf(stderr, "GPUEIGENDETAIL rank=%d n=%d maxn=%d type=%s stage=backup_save "
+                         "seconds=%.6f mib=%.3f location=%s cached=%d\n", MYID_MPI_COMM_WORLD, n, maxn,
+                         cplx ? "complex" : "real", seconds, (double)abytes / 1048576.0,
+                         !have_backup ? "none" : (backup.host ? "host" : "device"), have_backup && backup.kept);
+            std::fflush(stderr);
+        }
     }
 
     for (int k = 0; k < count; k++) {
@@ -1185,7 +1246,18 @@ int dense_eigen_locked(int cplx, int first_rocsolver, int preflight, int foreign
             solve = copy;
         }
         if (k > 0 && touched) {
-            if (backup_restore(&backup, solve) != 0) {
+            const auto started = detail ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+            const int restore_info = backup_restore(&backup, solve);
+
+            if (detail) {
+                const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
+
+                std::fprintf(stderr, "GPUEIGENDETAIL rank=%d n=%d maxn=%d type=%s stage=backup_restore "
+                             "seconds=%.6f info=%d\n", MYID_MPI_COMM_WORLD, n, maxn, cplx ? "complex" : "real",
+                             seconds, restore_info);
+                std::fflush(stderr);
+            }
+            if (restore_info != 0) {
                 std::fprintf(stderr, "OpenMX: %s failed (info=%d, n=%d); the input could not be restored.\n",
                              attempt_name(attempts[k - 1], cplx), info, n);
                 std::fflush(stderr);
@@ -1200,9 +1272,20 @@ int dense_eigen_locked(int cplx, int first_rocsolver, int preflight, int foreign
         on_copy = (solve != d_A);
         touched = 0;
         mout = 0;
+        const auto started = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         info = (attempts[k] == ATTEMPT_ROCSOLVER)
                    ? rocsolver_evd_locked(cplx, n, maxn, solve, w, &mout, &touched, preflight)
                    : magma_evdx_locked(cplx, attempts[k] == ATTEMPT_MAGMA_OZAKI2, n, maxn, solve, w, &mout, &touched);
+        if (profile) {
+            const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
+
+            std::fprintf(stderr, "GPUEIGENPROF rank=%d n=%d maxn=%d type=%s backend=%s attempt=%d "
+                         "seconds=%.6f info=%d mout=%d\n", MYID_MPI_COMM_WORLD, n, maxn,
+                         cplx ? "complex" : "real", attempts[k] == ATTEMPT_ROCSOLVER ? "rocsolver" :
+                         (attempts[k] == ATTEMPT_MAGMA_OZAKI2 ? "magma_ozaki2" : "magma"),
+                         k + 1, seconds, info, mout);
+            std::fflush(stderr);
+        }
 
         if (k + 1 == count) break;
         if (info == 0) {
@@ -1255,7 +1338,16 @@ int dense_eigen_locked(int cplx, int first_rocsolver, int preflight, int foreign
         backup_report(&backup, cplx, n, info, attempt_name(attempts[last], cplx));
     }
     if (have_backup) {
+        const auto started = detail ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+
         backup_free(&backup);
+        if (detail) {
+            const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
+
+            std::fprintf(stderr, "GPUEIGENDETAIL rank=%d n=%d maxn=%d type=%s stage=backup_free seconds=%.6f\n",
+                         MYID_MPI_COMM_WORLD, n, maxn, cplx ? "complex" : "real", seconds);
+            std::fflush(stderr);
+        }
     }
     *mout_out = mout;
     return info;
@@ -1372,9 +1464,11 @@ extern "C" void openmx_gpu_zheevd_selftest(const char *label)
    (host, n entries of room).  Returns 0, MAGMA's positive info (no
    convergence) or a negative MAGMA error (MAGMA_ERR_HOST_ALLOC/-112 and
    MAGMA_ERR_DEVICE_ALLOC/-113 when a workspace could not be allocated).
-   A non-converged Ozaki-II solve is solved again with stock MAGMA and an
-   order below OPENMX_GPU_EIGENSOLVER_MAGMA_MIN_N goes to rocSOLVER first
-   (dense_eigen_locked). */
+   A non-converged Ozaki-II solve is solved again with stock MAGMA and a
+   device whose default backend is rocSOLVER, an explicit hipsolver choice,
+   or an order below OPENMX_GPU_EIGENSOLVER_MAGMA_MIN_N goes to rocSOLVER
+   first (dense_eigen_locked).  Despite the historical MAGMA names these
+   are the common dense entry points, including the cluster root solve. */
 extern "C" int openmx_magma_dsyevdx_gpu(int n, int maxn, double *d_A, double *w, int *mout_out)
 {
     std::lock_guard<std::mutex> lock(g_magma_mutex);
@@ -1388,7 +1482,7 @@ extern "C" int openmx_magma_dsyevdx_gpu(int n, int maxn, double *d_A, double *w,
         return MAGMA_ERR_ILLEGAL_VALUE;
     }
     {
-        const int reroute = magma_entry_reroute(n);
+        const int reroute = openmx_gpu_eigen_backend(n, maxn, 0);
 
         info = dense_eigen_locked(0, reroute, reroute, 0, n, maxn, d_A, w, &mout);
     }
@@ -1411,7 +1505,7 @@ extern "C" int openmx_magma_zheevdx_gpu(int n, int maxn, void *d_A, double *w, i
         return MAGMA_ERR_ILLEGAL_VALUE;
     }
     {
-        const int reroute = magma_entry_reroute(n);
+        const int reroute = openmx_gpu_eigen_backend(n, maxn, 1);
 
         info = dense_eigen_locked(1, reroute, reroute, 0, n, maxn, d_A, w, &mout);
     }

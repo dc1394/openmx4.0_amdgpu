@@ -24,6 +24,7 @@ extern hipblasStatus_t openmx_gemmul8DgemmUnblocked(hipblasHandle_t handle, hipb
                                                     const double *B, int ldb, const double *beta, double *C,
                                                     int ldc);
 extern int openmx_gpu_is_apu(void);
+extern int openmx_gpu_is_mi300a(void);
 /* eigen_refine_gpu.cu: device bytes of the product blocks of a refined solve
    of maxn wanted states of an n x n problem */
 extern size_t openmx_eigen_refine_product_bytes(int cplx, int n, int maxn);
@@ -54,6 +55,7 @@ extern void ClusterCol_HIPDetailTimer_Get(double *dense_build_kernel, double *dm
 extern int ClusterCol_SymmetrizeLower_HIP(int n, double *a, hipStream_t stream);
 extern int openmx_magma_dsyevdx_gpu(int n, int maxn, double *d_A, double *w, int *mout);
 extern int openmx_magma_release_z_workspace(void);
+extern int openmx_magma_release_d_workspace(void);
 extern int openmx_hipsolver_release_workspace(void);
 extern void Set_Density_Grid_GPU_Release_Device_Caches(void);
 
@@ -217,7 +219,9 @@ static void ClusterCol_DetailTimer_Begin(int myid1, int SCF_iter, int n, int Max
 
     memset(&ClusterCol_detail_timers, 0, sizeof(ClusterCol_detail_timers));
     const char *profile = getenv("OPENMX_CLUSTER_PROFILE");
-    ClusterCol_detail_timers.active = profile != NULL && atoi(profile) != 0;
+    const char *measure = getenv("OPENMX_CLUSTER_MEASURE_TIME");
+    ClusterCol_detail_timers.active = (profile != NULL && atoi(profile) != 0)
+                                   || (measure != NULL && atoi(measure) != 0);
     ClusterCol_detail_timers.scf_iter = SCF_iter;
     ClusterCol_detail_timers.n = n;
     ClusterCol_detail_timers.maxn = MaxN;
@@ -248,6 +252,38 @@ static void ClusterCol_DetailTimer_Report(int myid0, int myid1)
            t->overlap_eig + t->overlap_scale, t->h_transform_gemm,
            t->syevdx, t->backtransform, t->evec_copyout, t->dm_total);
     fflush(stdout);
+    /* Per-call stage breakdown of the owning rank's dense GPU solve:
+       set OPENMX_CLUSTER_MEASURE_TIME=1.  Diagnostic, default off. */
+    {
+        static int enabled = -1;
+
+        if (enabled < 0) {
+            const char *v = getenv("OPENMX_CLUSTER_MEASURE_TIME");
+            enabled = (v != NULL && atoi(v) != 0);
+        }
+        if (enabled) {
+            double build_kernel = 0.0, dm_kernel = 0.0;
+
+            ClusterCol_HIPDetailTimer_Get(&build_kernel, &dm_kernel);
+            printf("ClusterCol detail myid0=%2d SCF=%2d n=%d maxn=%d "
+                   "dense_build=%.3f (builds=%d kernel=%.3f) overlap_eig=%.3f "
+                   "overlap_scale=%.3f h_transform=%.3f syevdx=%.3f "
+                   "backtransform=%.3f evec_copyout=%.3f dm_total=%.3f (kernel=%.3f)\n",
+                   myid0, ClusterCol_detail_timers.scf_iter,
+                   ClusterCol_detail_timers.n, ClusterCol_detail_timers.maxn,
+                   ClusterCol_detail_timers.dense_build,
+                   ClusterCol_detail_timers.dense_build_count, build_kernel,
+                   ClusterCol_detail_timers.overlap_eig,
+                   ClusterCol_detail_timers.overlap_scale,
+                   ClusterCol_detail_timers.h_transform_gemm,
+                   ClusterCol_detail_timers.syevdx,
+                   ClusterCol_detail_timers.backtransform,
+                   ClusterCol_detail_timers.evec_copyout,
+                   ClusterCol_detail_timers.dm_total, dm_kernel);
+            fflush(stdout);
+        }
+    }
+
     ClusterCol_detail_timers.active = 0;
 }
 
@@ -2239,6 +2275,19 @@ static void ClusterCol_SerialOverlapSave(int n)
     ClusterCol_SerialOverlapN = n;
 }
 
+/* Serial spin turns must return the selected solver's scratch before the
+   next owner is admitted.  On MI300A the MAGMA-named real entry selects
+   rocSOLVER and may retry with real MAGMA, so either library can retain
+   memory.  Keep the existing release behavior on other devices. */
+static void ClusterCol_ReleaseSerialSolverWorkspaces(void)
+{
+    (void)openmx_magma_release_z_workspace();
+    if (openmx_gpu_is_mi300a()) {
+        (void)openmx_hipsolver_release_workspace();
+        (void)openmx_magma_release_d_workspace();
+    }
+}
+
 /* Memory-limited spin case: all ranks assemble the same spin in the same
    order, but only its root allocates dense device matrices. Preserve the
    compact host eigenvectors for DM construction and release device/library
@@ -2258,7 +2307,7 @@ static void ClusterCol_GpuSolverRootDenseSerialPath(
     if (myid1 == 0) {
         ClusterCol_GpuSolver_Destroy();
         openmx_gemmul8ReleaseWorkspaces();
-        (void)openmx_magma_release_z_workspace();
+        ClusterCol_ReleaseSerialSolverWorkspaces();
     }
     MPI_Barrier(mpi_comm_level1);
 
@@ -2325,7 +2374,7 @@ static void ClusterCol_GpuSolverRootDenseSerialPath(
         if (owns_dense) {
             ClusterCol_GpuSolver_Destroy();
             openmx_gemmul8ReleaseWorkspaces();
-            (void)openmx_magma_release_z_workspace();
+            ClusterCol_ReleaseSerialSolverWorkspaces();
         }
         MPI_Barrier(mpi_comm_level1);
     }

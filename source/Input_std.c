@@ -809,11 +809,13 @@ void Input_std(char *file)
 
   /* GEMMul8 on/off for the GPU dense-GEMM bridge, so its contribution can
      be isolated: off routes every openmx_gemmul8{D,Z}gemm call to plain
-     hipBLAS FP64 GEMM.  Absent keyword = on (the production default). */
+     hipBLAS FP64 GEMM.  An absent keyword (-1) chooses native FP64 on
+     MI300A and GEMMul8 elsewhere, lazily on first GPU use.  Do not query
+     the device here: CPU-only inputs must not initialize the HIP runtime. */
   {
     int gemmul8_enable;
 
-    input_logical("scf.gemmul8.enable", &gemmul8_enable, 1);
+    input_logical("scf.gemmul8.enable", &gemmul8_enable, -1);
     openmx_gemmul8SetEnabled(gemmul8_enable);
     if (gemmul8_enable==0 && myid==Host_ID && 2<=level_stdout){
       printf("<Input_std> scf.gemmul8.enable=off: GPU dense GEMMs use plain hipBLAS instead of GEMMul8.\n");

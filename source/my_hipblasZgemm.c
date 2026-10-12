@@ -138,11 +138,13 @@ static hipblasStatus_t OpenMX_ZgemmTryGpu(hipblasHandle_t handle, hipblasOperati
     hipDoubleComplex const alpha = make_hipDoubleComplex(1.0, 0.0);
     hipDoubleComplex const beta = make_hipDoubleComplex(0.0, 0.0);
     hipblasStatus_t status;
+    long long const native_before = openmx_gemmul8NativeCalls(1);
 
     status = openmx_gemmul8Zgemm(handle, transa, transb, m, n, k, &alpha, (hipDoubleComplex const *)A, m,
                                  (hipDoubleComplex const *)B, k, &beta, (hipDoubleComplex *)C, m);
     if (status == HIPBLAS_STATUS_SUCCESS) {
-        OpenMX_ZgemmLogBackendOnce("GEMMul8", m, n, k);
+        OpenMX_ZgemmLogBackendOnce(openmx_gemmul8NativeCalls(1) == native_before ? "GEMMul8" : "native hipBLAS",
+                                   m, n, k);
         return status;
     }
 

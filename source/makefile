@@ -477,7 +477,7 @@ Cluster_DFT_Col.o: Cluster_DFT_Col.c openmx_common.h eigen_refine_gpu.h eigen_re
 	$(CC) -c Cluster_DFT_Col.c
 Cluster_DFT_Col_dm_hip.o: Cluster_DFT_Col_dm_hip.cu
 	$(HIPCC) $(HIPCC_GEMMUL8_FLAGS) -c Cluster_DFT_Col_dm_hip.cu -o Cluster_DFT_Col_dm_hip.o
-magma_openmx.o: magma_openmx.cu openmx_common.h $(MAGMA_LIB) openmx_stdout_level.h
+magma_openmx.o: magma_openmx.cu openmx_common.h $(MAGMA_LIB) openmx_stdout_level.h openmx_gpu_arch_policy.h
 	$(HIPCC) $(HIPCC_MAGMA_FLAGS) -c magma_openmx.cu -o magma_openmx.o
 Cluster_DFT_NonCol.o: Cluster_DFT_NonCol.c openmx_common.h eigen_refine_gpu.h eigen_refine_hooks.h
 	$(CC) -c Cluster_DFT_NonCol.c
@@ -774,7 +774,7 @@ my_hipblasDgemm.o: my_hipblasDgemm.c openmx_common.h
 	$(CC) -c my_hipblasDgemm.c
 my_hipblasZgemm.o: my_hipblasZgemm.c openmx_common.h
 	$(CC) -c my_hipblasZgemm.c
-gemmul8_bridge.o: gemmul8_bridge.cu openmx_common.h $(GEMMUL8_DIR)/include/gemmul8.hpp $(GEMMUL8_LIB) openmx_stdout_level.h
+gemmul8_bridge.o: gemmul8_bridge.cu openmx_common.h $(GEMMUL8_DIR)/include/gemmul8.hpp $(GEMMUL8_LIB) openmx_stdout_level.h openmx_gpu_arch_policy.h
 	$(HIPCC) $(HIPCC_GEMMUL8_FLAGS) -c gemmul8_bridge.cu -o gemmul8_bridge.o
 eigen_refine_gpu.o: eigen_refine_gpu.cu eigen_refine_gpu.h hip_runtime_compat.h hipblas_compat.h openmx_stdout_level.h
 	$(HIPCC) $(HIPCC_GEMMUL8_FLAGS) $(MPI_CFLAGS) -c eigen_refine_gpu.cu -o eigen_refine_gpu.o

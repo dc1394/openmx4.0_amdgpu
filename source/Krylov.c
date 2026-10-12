@@ -46,9 +46,10 @@ static int Krylov_MeasureTime(void)
 static double Krylov_gpu_dgemm_min_flops = KRYLOV_GPU_DGEMM_MIN_FLOPS;
 static int Krylov_gpu_eigen_min = KRYLOV_GPU_EIGEN_MIN;
 static int Krylov_gpu_fused = 1;
-/* the device GEMMs of the projected solve go through openmx_gemmul8Dgemm
-   (INT8 Ozaki-II emulation of FP64, as on the NVIDIA version); 0 =
-   native hipBLAS FP64 (OPENMX_KRYLOV_GEMMUL8) */
+/* The device GEMMs use the common bridge, whose architecture, input and
+   environment policy selects Ozaki-II emulation or native FP64 and may
+   fall back to native FP64 when workspace is unavailable. Setting
+   OPENMX_KRYLOV_GEMMUL8=0 bypasses the bridge for native hipBLAS FP64. */
 static int Krylov_gpu_gemmul8 = 1;
 
 #include "tran_prototypes.h"
@@ -135,6 +136,7 @@ static int Eigen_lapack_x(double **a, double *ko, int n, int EVmax);
 static int Eigen_lapack_d(double **a, double *ko, int n, int EVmax);
 static int Eigen_lapack_r(double **a, double *ko, int n, int EVmax);
 extern int openmx_magma_dsyevdx_gpu(int n, int maxn, double *d_A, double *w, int *mout);
+extern int openmx_gemmul8DgemmEnabled(void);
 
 static int Krylov_GPU_Enabled(void)
 {
@@ -413,7 +415,7 @@ static void Krylov_GPU_GemmFailed(Krylov_GPU_Workspace *ws, hipblasStatus_t stat
   (void)hipGetLastError();
   Krylov_gpu_fits = 0;
   snprintf(reason, sizeof(reason), "%s status %d, m=%d n=%d k=%d",
-           Krylov_gpu_gemmul8 ? "GEMMul8" : "hipBLAS", (int)status, m, n, k);
+           Krylov_gpu_gemmul8 ? "GPU GEMM bridge" : "native hipBLAS FP64", (int)status, m, n, k);
   Krylov_GPU_ReportAllocFailure("DGEMM", 0, reason);
 }
 
@@ -498,12 +500,12 @@ static void Krylov_Eigen2(Krylov_GPU_Workspace *ws, double *a, int csize, double
   if (info != 0 || mout != EVmax){
     if (info != 0){
       if (2 <= level_stdout) {
-          fprintf(stderr,"Krylov: magma_dsyevdx_gpu failed, info=%d; falling back to LAPACK.\n",info);
+          fprintf(stderr,"Krylov: dense GPU eigensolver failed, info=%d; falling back to LAPACK.\n",info);
       }
     }
     else{
       if (2 <= level_stdout) {
-          fprintf(stderr,"Krylov: magma_dsyevdx_gpu returned %d eigenpairs, expected %d; falling back to LAPACK.\n",
+          fprintf(stderr,"Krylov: dense GPU eigensolver returned %d eigenpairs, expected %d; falling back to LAPACK.\n",
                   mout,EVmax);
       }
     }
@@ -737,7 +739,8 @@ static void Krylov_GPU_Preflight(int matomnum, const int *Msize, const int *Msiz
      the pool, grown to the largest product the thread has run, and it is
      allocated inside the GEMM call, where hipBLASLt would terminate the
      process if the memory ran out.  0 when the products are native
-     (OPENMX_KRYLOV_GEMMUL8=0, scf.gemmul8.enable off, GEMMUL8_DISABLE*). */
+     (bridge architecture policy, OPENMX_KRYLOV_GEMMUL8=0,
+     scf.gemmul8.enable off, GEMMUL8_DISABLE*). */
   if (Krylov_gpu_gemmul8){
     size_t per_thread = 0;
 
@@ -829,8 +832,8 @@ static int Krylov_ProjectedSolve_GPU(Krylov_GPU_Workspace *ws,int spin,int Mc_AN
   size_t mm=(size_t)m3*(size_t)m3;
   hipblasStatus_t status;
   /* OPENMX_KRYLOV_GPU_PROFILE: the stage times of the fused path (the
-     KRYFUSE line of the NVIDIA version, plus pack, the compact panel MAGMA
-     reads); with the profile on every stage ends with a stream
+     KRYFUSE line, plus pack, the compact panel the GPU eigensolver reads);
+     with the profile on every stage ends with a stream
      synchronization so that the GPU time lands in its own stage */
   static int profile=-1;
   double t0=0.0,t1=0.0,t2=0.0,t3=0.0,t4=0.0,t5=0.0,t6=0.0,t7=0.0,t8=0.0;
@@ -882,7 +885,7 @@ static int Krylov_ProjectedSolve_GPU(Krylov_GPU_Workspace *ws,int spin,int Mc_AN
      Below Krylov_gpu_eigen_min LAPACK solves it, as in Krylov_Eigen2 (the
      dispatch of the NVIDIA version). */
   if (Krylov_gpu_eigen_min<=m3){
-    /* MAGMA consumes a compact column-major panel. */
+    /* The common GPU eigensolver consumes a compact column-major panel. */
     for (int i=0;i<m3;i++) for (int j=0;j<m3;j++) KU[(size_t)i*(size_t)m3+(size_t)j]=H_DC[(i+1)*(m3+1)+(j+1)];
     wait_hipfunc(hipMemcpyAsync(ws->d_A,KU,sizeof(double)*mm,hipMemcpyHostToDevice,ws->stream));
     wait_hipfunc(hipStreamSynchronize(ws->stream));
@@ -891,9 +894,9 @@ static int Krylov_ProjectedSolve_GPU(Krylov_GPU_Workspace *ws,int spin,int Mc_AN
     eig_on_device=(info==0 && mout==m3);
     if (2<=level_stdout) {
       if (info!=0)
-        fprintf(stderr,"Krylov: magma_dsyevdx_gpu failed, info=%d; falling back to LAPACK.\n",info);
+        fprintf(stderr,"Krylov: dense GPU eigensolver failed, info=%d; falling back to LAPACK.\n",info);
       else if (mout!=m3)
-        fprintf(stderr,"Krylov: magma_dsyevdx_gpu returned %d eigenpairs, expected %d; falling back to LAPACK.\n",
+        fprintf(stderr,"Krylov: dense GPU eigensolver returned %d eigenpairs, expected %d; falling back to LAPACK.\n",
                 mout,m3);
     }
   }
@@ -927,10 +930,14 @@ static int Krylov_ProjectedSolve_GPU(Krylov_GPU_Workspace *ws,int spin,int Mc_AN
   if (profile){
     dtime(&t8);
     if (Mc_AN==1 && spin==0){
+      /* This describes the GEMM policy, not a workspace fallback of an
+         individual product. The common solver reports its actual backend
+         and retries through GPUEIGENPROF. Query only after GPU work ran. */
       printf("KRYFUSE n=%d m3=%d ku=%.4f hup=%.4f g1=%.4f g2=%.4f h33=%.4f pack=%.4f eig=%.4f g3=%.4f tot=%.4f"
-             " gemm=%s eigensolver=%s\n",
+             " gemm_policy=%s eigensolver=%s\n",
              n,m3,t1-t0,t2-t1,t3-t2,t4-t3,t5-t4,t6-t5,t7-t6,t8-t7,t8-t0,
-             Krylov_gpu_gemmul8 ? "gemmul8" : "hipblas",eig_on_device ? "magma" : "lapack");
+             (Krylov_gpu_gemmul8 && openmx_gemmul8DgemmEnabled()) ? "gemmul8" : "native-fp64",
+             eig_on_device ? "gpu-dispatch" : "lapack");
       fflush(stdout);
     }
   }

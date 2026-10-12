@@ -38,6 +38,7 @@ int Set_Nonlocal_Used_GPU(void);
 int Set_ProExpn_VNA_Used_GPU(void);
 double Cluster_DFT_NonCol_ScatterGpuSolverCachedEVec(int n2, int *is2, int *ie2, dcomplex *EVec1);
 extern int BandNonCol_HamiltonianUseHipSolver(void);
+extern int openmx_gpu_is_mi300a(void);
 extern int openmx_magma_release_z_workspace(void);
 extern int openmx_hipsolver_release_workspace(void);
 int Band_DFT_Col_GpuSwitchNum(void);
@@ -935,7 +936,17 @@ double DFT(int MD_iter, int Cnt_Now)
     if (MYID_MPI_COMM_WORLD==Host_ID && 0<level_stdout){
       const char *gpu_solver_label = "";
       if (DFT_GPU_EigensolverActive()) {
-        if (Solver == 3 && SpinP_switch == 3 &&
+        if (Solver == 5 || Solver == 8 || Solver == 11) {
+          /* O(N) paths decide from each local matrix and rank's policy.
+             Enabling GPU dispatch does not imply that a solve uses it. */
+          gpu_solver_label = " (GPU dispatch enabled; local CPU fallback may apply)";
+        }
+        else if (openmx_gpu_is_mi300a()) {
+          /* Device initialization has completed. Actual backends and
+             retries are reported by the common GPU eigensolver. */
+          gpu_solver_label = " (GPU eigensolver dispatch enabled)";
+        }
+        else if (Solver == 3 && SpinP_switch == 3 &&
             openmx_gpu_eigensolver_use_hipsolver() &&
             !BandNonCol_HamiltonianUseHipSolver()) {
           gpu_solver_label = " (GPU-accelerated, hipSOLVER(S)+MAGMA(H))";

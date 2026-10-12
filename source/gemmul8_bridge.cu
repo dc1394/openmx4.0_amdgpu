@@ -13,6 +13,7 @@
 
 #include "gemmul8.hpp"
 #include "openmx_stdout_level.h"
+#include "openmx_gpu_arch_policy.h"
 
 namespace {
 
@@ -50,8 +51,11 @@ std::unordered_map<WorkspaceKey, Workspace, WorkspaceKeyHash> g_workspaces;
 /* scf.gemmul8.enable from the input file; written once per input parse
    (Input_std.c, before any GEMM runs) via openmx_gemmul8SetEnabled().
    0 sends every call straight to plain hipBLAS FP64 GEMM, so the GEMMul8
-   contribution can be isolated without touching the environment. */
-int g_input_enabled = 1;
+   contribution can be isolated without touching the environment.  -1 is
+   automatic: MI300A uses native FP64, other GPUs keep GEMMul8.  Defer that
+   device query until a GPU caller needs the policy; parsing every input of
+   a CPU run or a -runtest suite only stores this setting. */
+int g_input_enabled = -1;
 
 /* calls of openmx_gemmul8{D,Z}gemm that ran in plain hipBLAS FP64 (switched
    off, disabled from the environment, or a workspace fallback): [real,
@@ -145,12 +149,21 @@ size_t env_mib(const char *openmx_env, const char *gemmul8_env, unsigned fallbac
 
 bool gemmul8_disabled(const char *openmx_env, const char *gemmul8_env)
 {
-    bool disabled = env_bool("GEMMUL8_DISABLE", false);
-    disabled      = env_bool("OPENMX_GEMMUL8_DISABLE", disabled);
-    disabled      = env_bool(gemmul8_env, disabled);
-    disabled      = env_bool(openmx_env, disabled);
+    const char *names[] = {"GEMMUL8_DISABLE", "OPENMX_GEMMUL8_DISABLE", gemmul8_env, openmx_env};
+    bool disabled = false, overridden = false;
 
-    return disabled;
+    /* Preserve the existing specificity/alias precedence.  Explicit zero
+       also overrides the MI300A automatic policy; an input-file off still
+       wins over every environment variable at the entry points. */
+    for (const char *name : names) {
+        const char *value = std::getenv(name);
+        if (value != nullptr && value[0] != '\0') {
+            disabled = env_bool(name, false);
+            overridden = true;
+        }
+    }
+    if (overridden) return disabled;
+    return g_input_enabled < 0 && openmx_gpu_device_is_mi300a();
 }
 
 /* GEMMul8 >= 3.3.0 memory-saving mode: the per-GEMM workspace is capped and
@@ -404,9 +417,9 @@ void log_workspace_fallback_once(const WorkspaceReport &report, const char *targ
         return;
     }
 
-    if (std::strcmp(report.reason, "environment disable") == 0) {
+    if (std::strcmp(report.reason, "native FP64 policy") == 0) {
         fprintf(stderr,
-                "openmx_gemmul8%sgemm: GEMMul8 disabled by environment; using %s.\n",
+                "openmx_gemmul8%sgemm: native FP64 selected by the device policy or environment; using %s.\n",
                 is_complex ? "Z" : "D", target);
     }
     else {
@@ -526,7 +539,7 @@ hipblasStatus_t dgemm_capped(hipblasHandle_t handle, hipblasOperation_t transa, 
     }
 
     if (gemmul8_disabled("OPENMX_GEMMUL8_DISABLE_D", "GEMMUL8_DISABLE_D")) {
-        report.reason = "environment disable";
+        report.reason = "native FP64 policy";
         log_workspace_fallback_once<false>(report, "native hipBLAS");
         *native = true;
         return hipblasDgemm(handle, gemmul8_transa, gemmul8_transb, m, n, k, alpha, A, lda, B, ldb, beta, C, ldc);
@@ -568,10 +581,10 @@ extern "C" hipblasStatus_t openmx_gemmul8Dgemm(hipblasHandle_t handle, hipblasOp
     });
 }
 
-/* scf.gemmul8.enable from the input file (Input_std.c); default on */
+/* scf.gemmul8.enable: -1 automatic, 0 off, 1 on; reset at every input. */
 extern "C" void openmx_gemmul8SetEnabled(int enabled)
 {
-    g_input_enabled = (enabled != 0);
+    g_input_enabled = (enabled < 0) ? -1 : (enabled != 0);
 }
 
 extern "C" size_t openmx_gemmul8ZWorkspaceSize(int m, int n, int k)
@@ -646,7 +659,7 @@ hipblasStatus_t zgemm_capped(hipblasHandle_t handle, hipblasOperation_t transa, 
     }
 
     if (gemmul8_disabled("OPENMX_GEMMUL8_DISABLE_Z", "GEMMUL8_DISABLE_Z")) {
-        report.reason = "environment disable";
+        report.reason = "native FP64 policy";
         log_workspace_fallback_once<true>(report, "native hipBLAS");
         *native = true;
         return hipblasZgemm(handle, transa, transb, m, n, k, alpha, A, lda, B, ldb, beta, C, ldc);
@@ -692,9 +705,9 @@ extern "C" hipblasStatus_t openmx_gemmul8Zgemm(hipblasHandle_t handle, hipblasOp
     });
 }
 
-/* 1 when openmx_gemmul8Zgemm takes the GEMMul8 path at all: scf.gemmul8.enable
-   on and the complex products not disabled from the environment (a call can
-   still fall back for want of workspace) */
+/* 1 when openmx_gemmul8Zgemm takes the GEMMul8 path at all: explicit on or
+   the architecture default, and not disabled from the environment (a call
+   can still fall back for want of workspace). */
 extern "C" int openmx_gemmul8ZgemmEnabled(void)
 {
     return g_input_enabled && !gemmul8_disabled("OPENMX_GEMMUL8_DISABLE_Z", "GEMMUL8_DISABLE_Z") ? 1 : 0;

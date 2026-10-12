@@ -39,8 +39,44 @@ The NVIDIA synchronization and regression checks are recorded in [nvidia_sync_20
 With `gpusolver` a cluster calculation (one k-point) diagonalizes on a single GPU. `scf.eigen.lib gpusolver2` (cluster solver only) replaces that diagonalization with [ELPA](https://elpa.mpcdf.mpg.de/) 2026.02 (AMD GPU kernels) + [COSMA](https://github.com/eth-cscs/COSMA) (ROCm backend), engaging every rank and every GPU across nodes. A solve that does not fit in GPU memory falls back to the ELPA CPU kernels / ScaLAPACK; solves below n=256 stay on the CPU kernels. `OPENMX_GS2_ELPA_GPU` and `OPENMX_GS2_GEMM_GPU` (1 = GPU, 0 = CPU, unset = decide from free memory) override the two decisions; on a VRAM-limited card shared by many ranks use `OPENMX_GS2_GEMM_GPU=0`. ELPA, COSMA, COSTA and Tiled-MM are bundled as source archives under `source/third_party/dist/` and built by the first `make` (no network needed; autoconf, automake, libtool, m4 and python3 required). The `elpa1`/`elpa2` paths keep the ELPA 2018.05 embedded in OpenMX.
 
 ## GEMMul8
-The large dense matrix multiplications of the GPU eigensolver path run through [GEMMul8](https://github.com/RIKEN-RCCS/GEMMul8) [v3.5.2](https://github.com/RIKEN-RCCS/GEMMul8/releases/tag/v3.5.2), pinned to commit `603b52363715796a0af5e4aa1ed8d386349b4251`. It emulates FP64 GEMM on the INT8 matrix cores (Ozaki scheme II), supporting consumer GPUs with limited FP64 throughput. `scf.gemmul8.enable off` switches to plain hipBLAS FP64. Its memory-saving mode is on by default with a 256 MiB per-rank workspace cap (`OPENMX_GEMMUL8_MAX_WORKSPACE_MB`; 0 = uncapped).
+The large dense matrix multiplications of the GPU eigensolver path use a bridge to [GEMMul8](https://github.com/RIKEN-RCCS/GEMMul8) [v3.5.2](https://github.com/RIKEN-RCCS/GEMMul8/releases/tag/v3.5.2), pinned to commit `603b52363715796a0af5e4aa1ed8d386349b4251`. It emulates FP64 GEMM on the INT8 matrix cores (Ozaki scheme II), supporting consumer GPUs with limited FP64 throughput. The bridge defaults to native hipBLAS FP64 on MI300A and GEMMul8 on other GPUs. An explicit `scf.gemmul8.enable on` or `off` selects GEMMul8 or native FP64, respectively; the existing environment disable settings still apply. GEMMul8's memory-saving mode is on by default with a 256 MiB per-rank workspace cap (`OPENMX_GEMMUL8_MAX_WORKSPACE_MB`; 0 = uncapped).
 The v3.5.2 build and numerical checks are recorded in [gemmul8_upgrade_20261005.txt](gemmul8_upgrade_20261005.txt).
+
+### MI300A and Radeon defaults
+
+MI300A tuning is selected by the exact `gfx942` architecture and the runtime's integrated-GPU flag. Discrete MI300X and consumer APUs do not inherit it. Device detection is deferred until GPU work is requested; parsing inputs and `OPENMX_GPU=0` do not initialize HIP for this policy.
+
+| Policy | MI300A | Radeon RX 9060 XT |
+|---|---|---|
+| Common FP64 dense eigensolver dispatcher | native hipSOLVER/rocSOLVER | MAGMA |
+| OpenMX GEMM bridge | native hipBLAS FP64 | GEMMul8 INT8 emulation |
+| Automatic SCF refinement | off | two refinement steps, as before |
+| NC cluster density matrix | native FP64 GEMMs | GEMMul8 GEMMs |
+| NC cluster device buffers between SCF steps | retained, subject to memory checks | released, as before |
+
+The direct dense entry points now apply the same architecture and explicit-backend policy as the generic wrappers. Previously, the NC cluster root called a historical MAGMA entry point that bypassed that policy, even when the progress label said hipSOLVER. `OPENMX_GPU_EIGENSOLVER=hipsolver|magma` takes precedence, and a failing native solve still retries from its saved input. The MAGMA fallback retains its Ozaki2 default; `OPENMX_MAGMA_OZAKI2=0` explicitly selects stock MAGMA. This setting is independent of the OpenMX GEMM bridge.
+
+`OPENMX_CLUSTER_NC_DEVICE_KEEP=0|1` and `OPENMX_CLUSTER_GPU_DM_GEMM=0|1` override the NC defaults. `OPENMX_GEMMUL8_DISABLE=0` requests GEMMul8 even on MI300A unless the input explicitly sets `scf.gemmul8.enable off`. Backend diagnostics distinguish native hipBLAS from emulation, including workspace fallbacks.
+
+The NC band path accounts for the selected native solver's full-spectrum workspace on MI300A. Successful workspace-size queries are cached by device and matrix dimension, and `OPENMX_NC_HIPSOLVER_TURN_RELEASE` / `OPENMX_NC_MAGMA_TURN_RELEASE` apply to the libraries actually used, including retries. The memory-limited collinear cluster spin path also releases both native and real MAGMA scratch between owners on MI300A. Other GPU policies retain their previous behavior.
+
+Non-collinear DC-LNO retains its dedicated native full-spectrum solver, including on Radeon; the common dispatcher's backend override does not replace that entry point. On MI300A, its local GPU admission also checks the original overlap and Hamiltonian for Hermitian symmetry. A residual above `1e-8 * max(1, max|Aij|)` sends the complete local problem through the existing CPU path without changing either matrix. This threshold is a compatibility criterion, not an eigenvalue or final-SCF error bound. The check addresses a measured Hubbard-enabled NC DC-LNO case whose input Hamiltonian becomes non-Hermitian after the first SCF step; it does not repair that upstream asymmetry. This guard adds no GPU-detection calls in CPU paths, and Radeon skips its matrix scan. `OPENMX_GPU_VERBOSE=1` reports these CPU fallbacks.
+
+For investigation, `OPENMX_CLUSTER_PROFILE=1` prints cumulative NC stages. `OPENMX_GPU_EIGENSOLVER_PROFILE=1` adds actual backend/attempt timings and separates workspace setup, phase transforms, solve, finite-value checks and retry copies. Detailed profiling adds synchronization and should be disabled for final timing comparisons. `OPENMX_GPU_VERBOSE=1` reports the actual backend without those additional synchronizations.
+
+The architecture split, explicit overrides, repeated-input reset, retry restoration and NC buffer lifetimes have host-only regression checks:
+
+```sh
+python3 tests/run_gpu_eigen_dispatch.py
+python3 tests/run_gemmul8_arch_policy.py
+python3 tests/run_nc_mi300a_policy_cpu.py
+python3 tests/run_band_noncol_mi300a_workspace_cpu.py
+python3 tests/run_cluster_col_serial_workspace_cpu.py
+python3 tests/run_dclno_mi300a_hermitian_guard.py
+python3 tests/run_mi300a_rank_launcher.py
+```
+
+`tools/mi300a_rank_launcher.py` preserves each MPI rank's assigned CPUs before loading OpenMX, supplies explicit OS CPU IDs to `OMP_PLACES`, and records rank/PID/CPU identities in `OPENMX_AFFINITY_DIR`. It requires that the inherited CPU count equal `-nt`. On MI300A, use it inside a scheduler allocation with `HSA_OVERRIDE_CPU_AFFINITY_DEBUG=0` so ROCm helper threads inherit the rank's CPU mask. MPI startup binding reports alone do not establish that the masks remain correct after runtime initialization. The launcher has no GPU detection or solver-policy effects and is only used when explicitly selected.
 
 ## Refined FP32 eigensolver
 The dense eigensolves of the SCF loop (cluster and band, collinear and non-collinear) run in FP32 and are then refined to FP64 accuracy, as in the NVIDIA version: all eigenpairs come from rocSOLVER's FP32 divide and conquer (`hipsolverDnSsyevd`/`Cheevd`), then the wanted ones get two Ogita-Aishima Newton steps whose products go through GEMMul8, and a Rayleigh-Ritz step resolves the nearly degenerate, partially occupied clusters. From the second SCF step on, the previous step's vectors serve as a warm start, so most steps need no FP32 eigensolve at all. A Radeon RX 9060 XT (gfx1200) runs FP64 at about 1/13 of its FP32 rate, so this is on by default on consumer GPUs (RDNA and consumer GCN) and off on CDNA, whose FP64 is fast. `OPENMX_EIGEN_REFINE=K` sets the number of refinement steps, 0 turns it off. Problems with n < `OPENMX_EIGEN_REFINE_MIN_N` (default 1000) keep the FP64 eigensolver, whose fixed costs are lower there.
@@ -73,7 +109,7 @@ The FP64 cluster column already includes a new device-resident non-collinear roo
 | `OPENMX_GEMMUL8_SOLVE_MIN_FREE_AFTER_MB` | 256 | free device memory the products of a dense solve must leave |
 | `OPENMX_BAND_REFINE_BASIS_MB` | 1024 | host memory per rank for the parked bases of the two-pass band solves |
 | `OPENMX_CLUSTER_NC_DEVICE_SOLVE` | 1 | 0 restores the host-staged non-collinear cluster solve |
-| `OPENMX_CLUSTER_NC_DEVICE_KEEP` | 0 | 1 keeps its device buffers between SCF steps instead of parking the basis on the host |
+| `OPENMX_CLUSTER_NC_DEVICE_KEEP` | 1 on MI300A, 0 otherwise | 1 keeps its device buffers between SCF steps instead of parking the basis on the host |
 
 ## Double-float grid integrals and on-the-fly orbitals
 The grid integrals of each SCF step, the matrix elements of dVH + Vxc + VNA (`Set_Hamiltonian`) and the density on the grid (`Set_Density_Grid`), also run on the FP32 units, as in the NVIDIA version. Each product of an FP32 orbital with the FP64 potential or density matrix element (split into two floats) is formed exactly with an FMA, the partial sums are compensated (TwoSum), and they go into FP64 every 128 grid points. The result is FP64-grade: about 1e-15 of the sum of the magnitudes against a long-double reference, and the same SCF energies and forces as FP64 to within a few 1e-12. gfx1200 has no FP64 atomic add (a compare-and-swap loop), so the matrix-element kernel gives every output to one block. It splits the points of a pair, among them the pair of an atom with its own sphere, over up to 32 blocks and adds their partial sums in a fixed order. On the RX 9060 XT the double-float kernels run 3.6 to 6 times faster than the FP64 ones.
@@ -121,7 +157,7 @@ The remaining GPU work of the NVIDIA version is ported as well. Unless stated ot
 
 **DC-LNO.** `OPENMX_DCLNO_PROFILE=1` prints MPI-aggregated stage times and a histogram of the local problem sizes. A local GPU eigensolve that does not converge or runs out of memory is solved again on the CPU, collinear and non-collinear (the non-collinear retry is an AMD addition), and `OPENMX_DCLNO_RETRY_TEST=1` forces that retry for testing. The residue rows of an atom take one allocation. The non-collinear local problems use rocSOLVER `zheevd` with the phase similarity. CG15c-DC-LNO with every local problem forced onto the GPU, and with every one retried on the CPU, gives Utot within 5e-12 Ha of the CPU run.
 
-**Krylov.** The projected-solve GEMMs go through GEMMul8 (`OPENMX_KRYLOV_GEMMUL8=0`: hipBLAS), their workspace counts in the memory preflight, and projected problems below `OPENMX_KRYLOV_GPU_EIGEN_MIN` (300) go to LAPACK; `OPENMX_KRYLOV_GPU_PROFILE=1` prints the stage times. At 16 ranks per GPU the Krylov GPU path stays off by default (`OPENMX_KRYLOV_GPU=1` turns it on).
+**Krylov.** The projected-solve GEMMs use the common bridge (native FP64 by default on MI300A, GEMMul8 on Radeon; `OPENMX_KRYLOV_GEMMUL8=0` bypasses the bridge for hipBLAS), their workspace counts in the memory preflight, and projected problems below `OPENMX_KRYLOV_GPU_EIGEN_MIN` (300) go to LAPACK; `OPENMX_KRYLOV_GPU_PROFILE=1` prints the stage times. At 16 ranks per GPU the Krylov GPU path stays off by default (`OPENMX_KRYLOV_GPU=1` turns it on).
 
 **Dense eigensolvers.** A failed FP64 solve is retried from a copy of its input: MAGMA Ozaki-II with `info > 0` with stock MAGMA, and a rocSOLVER solve that fails or returns non-finite vectors with MAGMA (`OPENMX_MAGMA_OZAKI2_RETRY=0` turns it off, `OPENMX_GPUSOLVER_RETRY_TEST=1` solves everything twice for testing). The generic `gpusolver` wrappers keep a per-thread context, return errors instead of aborting, accept host or device arrays, and solve full spectra by divide and conquer; their callers check `info` before using the result. ROCm 7.2's rocSOLVER has further defects that the retry covers: `zheevd` still returns NaN vectors for exactly diagonal complex matrices and needed a larger dither (1e-100) for two-block matrices, `cheevd` needed 1e-25 instead of 1e-30 in the refined FP32 solve, and `dsyevdx`/`zheevdx` with an index range return no eigenpairs for degenerate diagonal matrices.
 
@@ -156,7 +192,7 @@ The four sidia333 cases of the sections above, ZrB2 2x2 and CG15c-DC-LNO, agains
 | `OPENMX_GPUSOLVER_RETRY_TEST` | 0 | 1 solves every dense eigenproblem again with the next backend (testing) |
 | `OPENMX_GPUSOLVER_CACHE_MB` | 64 | per-thread scratch kept by the generic wrappers and the kept retry copy |
 | `OPENMX_GPU_EIGENSOLVER_MAGMA_MIN_N` | 0 | MAGMA entry points send problems below this size to rocSOLVER (measurement knob) |
-| `OPENMX_CLUSTER_GPU_DM_GEMM` | 1 with GEMMul8 | non-collinear cluster density matrix by GEMMul8 products |
+| `OPENMX_CLUSTER_GPU_DM_GEMM` | 1 on MI300A or with GEMMul8 | non-collinear cluster density matrix by native FP64 or GEMMul8 products |
 | `OPENMX_GEMMUL8_FORWARD_UNBLOCKED` | 1 | collinear cluster forward transform with the full GEMMul8 workspace |
 | `OPENMX_CLUSTER_GEMMUL8_TURN_RELEASE` | 1 (0 on an APU) | GEMMul8 workspaces go back after each cluster dense solve |
 | `OPENMX_CLUSTER_GPU_RETAIN_SCRATCH` | keep | 0 returns the collinear owner's scratch after every SCF step |
@@ -171,11 +207,13 @@ The four sidia333 cases of the sections above, ZrB2 2x2 and CG15c-DC-LNO, agains
 | `OPENMX_GEMMUL8_TIMING` | 0 | 1 reports the bridge GEMMs per rank at the end of the SCF |
 
 ## Multi-GPU parallelization and MPI
-The ranks are split into one group per k-point and each group's eigenproblem is solved on one GPU, so the eigensolver keeps at most as many GPUs busy as there are k-points (`scf.Gpu.Num`, default 30, is only an upper bound). A cluster calculation therefore uses one GPU for the diagonalization however many the node has — give it one GPU and more ranks, or use `gpusolver2`. Hybrid MPI/OpenMP brings no speedup here: use flat MPI with one thread per rank,
+The ranks are split into one group per k-point and each group's eigenproblem is solved on one GPU, so the eigensolver keeps at most as many GPUs busy as there are k-points (`scf.Gpu.Num`, default 30, is only an upper bound). A cluster calculation therefore uses one GPU for the diagonalization however many the node has. Flat MPI with one thread per rank is the measured Radeon configuration below:
 
 ```sh
 mpirun -np 16 ./openmx input.dat -nt 1
 ```
+
+On MI300A, also measure hybrid MPI/OpenMP layouts within the same APU allocation. Fewer MPI ranks leave more CPU resources available during the root-only dense solve and change which shared-GPU grid paths are admitted. See the MI300A benchmark below for the tested 24-core configurations.
 
 ## Sharing one GPU among many ranks
 ROCm needs no MPS-style daemon: the kernels of different processes run concurrently. What limits the rank count on a small card is memory. A rank's HIP/OpenMP context costs about 240 MiB before any physics data (700 MiB with the OpenMP runtime's default device heap, see the previous section), and a hipBLAS handle about 200 MiB more on the ranks that solve. Each GPU stage checks the free device memory before it starts and falls back to the CPU for that stage and SCF iteration when the ranks sharing the device cannot all be accommodated (a ROCm BLAS allocation failing inside a kernel would otherwise terminate the process); the run says so on stderr and stays correct. The knobs:
@@ -538,7 +576,70 @@ Si, `scf.EigenvalueSolver cluster`, `scf.SpinPolarization NC`, n2 = 5616; 6 SCF 
 At 18 ranks the per-rank contexts exhaust the card and the dense solve falls back to the CPU (the GPU still wins the total through the construction stages); at 16 ranks the dense GPU diagonalization engages and the diagonalization drops 10%. An RDNA GPU runs FP64 at 1/32 of its FP32 rate, so the headroom here is modest.
 
 ### AMD Instinct MI300A
-One APU of a 4-APU MI300A node: 24 Zen 4 cores and one CDNA 3 GPU sharing 128 GB of unified HBM3; ROCm 7.2.0, Open MPI 5.0.10 built with the ROCm compilers, AOCL 5.1.0; 24 MPI ranks on the APU, flat MPI, the same binary for every column. GPU columns use the input-file defaults, CPU columns `OPENMX_GPU=0`:
+
+#### Validated one-APU comparison, 2026-10-12
+
+After pulling `d11980386c2ac26372488226280958abf1c7cdbf`, the MI300A fixes were built and tested in one allocation: PBS `44384.pbs`, node `a19`, APU/NUMA 2, physical CPU cores 48–71 and one integrated `gfx942` GPU. The environment was ROCm 7.2.0, Open MPI 5.0.10 and AOCL 5.1.0, with BLAS/MAGMA internal threads set to 1 and `HSA_XNACK=1`. Runs were sequential and used the same final binary, except for the explicitly identified old-binary comparison below. Wall times include MPI startup and final force evaluation.
+
+All CPU references below use 24 MPI × 1 OpenMP and `OPENMX_GPU=0`. The main GPU configurations keep refinement off and use the MI300A native-FP64 GEMM/eigensolver policy; the collinear band row additionally sets `OPENMX_BAND_GPU_TURN_GROUP=4` and `OPENMX_BAND_GPU_CACHED_TURN_GROUP=2`. Every layout uses exactly 24 CPU cores. The recorded SCF count is the same for each CPU/GPU pair.
+
+| Calculation | Input | CPU (s) | GPU enabled (s) | CPU/GPU | GPU MPI × OpenMP | SCF steps |
+|---|---|---:|---:|---:|---:|---:|
+| Non-collinear cluster | [Si216](work/sidia333_nc_cluster/sidia333_nc_cluster.dat) | 360.090 | 117.154 | 3.074 | 8 × 3 | 25 |
+| Collinear cluster | [Si216, derived cluster case](work/sidia333/sidia333.dat) | 91.009 | 83.937 | 1.084 | 8 × 3 | 25 |
+| Collinear band | [Si216](work/sidia333/sidia333.dat) | 313.559 | 84.818 | 3.697 | 8 × 3 | 25 |
+| Non-collinear band | [Si216](work/sidia333_nc/sidia333_nc.dat) | 1777.147 | 305.429 | 5.819 | 8 × 3 | 25 |
+| DC | [DIA216](work/DIA216_DC.dat) | 106.171 | 105.301 | 1.008 | 24 × 1 | 21 |
+| DC-LNO | [CG15c, 650 atoms](work/large_example/CG15c-DC-LNO.dat) | 82.835 | 78.406 | 1.056 | 24 × 1 | 42 |
+| Krylov | [DIA512](work/large_example/DIA512-1.dat) | 100.618 | 91.033 | 1.105 | 24 × 1 | 29 |
+
+Original iteration limits were retained. Only the derived collinear cluster changes `EigenvalueSolver` to `Cluster` and `scf.Kgrid` to `1 1 1`; canonical copies use an absolute `DATA.PATH`. All original input files were preserved. The four cluster/band cases reached their original 25-step limit without meeting the `1e-13` SCF criterion. DC, DC-LNO and Krylov converged within their original limits of 60, 100 and 150. Agreement of the 25-step results does not establish a converged ground state or identical intermediate SCF trajectories.
+
+All seven pairs passed total-energy, every force-component, atomic-position, grid and lattice comparisons. The largest differences were `6.321e-10` Ha in energy and `5.033e-9` Ha/bohr in force, below the respective `1e-7` acceptance limits. For the originally requested NC cluster, the differences were `7.049e-12` Ha and `1.15e-10` Ha/bohr across all 648 force components; its 1987 printed eigenvalues differed by at most `6.84e-10` Ha. DC's overall timing was essentially unchanged. Local eigensolves remained on the CPU in these DC-LNO and Krylov runs, so their timing improvements describe the GPU-enabled application as a whole.
+
+The NC cluster GPU repeat took 112.466 s, giving a measured CPU24/GPU range of 3.074–3.202. Its CPU run at the same 8 × 3 layout took 670.648 s; the table deliberately uses the faster CPU24 reference. The old GPU24 implementation took 625.550 s in the same allocation, compared with 117.154 s for the first new GPU8 × 3 run: 5.340 times faster including the layout change. The old implementation's first attempt aborted inside UCX (`mm_ep.c:458`) at SCF 17; only its successful identical retry enters the comparison, and the failed log is retained.
+
+Additional complete-input measurements support these input-specific options:
+
+| Input and explicit option, 8 MPI × 3 OpenMP | Wall time (s) | CPU24/GPU |
+|---|---:|---:|
+| NC cluster, `OPENMX_EIGEN_REFINE=2` | 102.607 | 3.509 |
+| NC band, `OPENMX_EIGEN_REFINE=2` | 220.398 | 8.063 |
+| NC band, `OPENMX_NC_DEVICE_EIGENVECTOR_DM=1` | 292.415 | 6.077 |
+
+These options passed the same energy/force checks. Refinement and device-DM were measured separately; their combination was not measured. The MI300A refinement default remains off: collinear band with refinement took 96.143 s against 92.023 s with the same default turn settings and native FP64. The explicit initial-turn-4/cached-turn-2 setting in the main table took 84.818 s. Collinear cluster refinement (82.666 s) and its GPU24 layout (86.774 s) offered no clear general advantage over the 83.937 s primary run. Small single-run timing differences should not be treated as universal gains.
+
+Within a scheduler allocation containing one APU and its 24 cores, use explicit per-rank CPU placement. Start from the repository root and enter the input directory so its relative `DATA.PATH` resolves correctly. For the native NC cluster configuration:
+
+```sh
+cd work/sidia333_nc_cluster
+export HSA_XNACK=1 UCX_RCACHE_ENABLE=n LIBOMPTARGET_MEMORY_MANAGER_THRESHOLD=0
+export HSA_OVERRIDE_CPU_AFFINITY_DEBUG=0
+export OPENMX_GPU=1 OPENMX_EIGEN_REFINE=0
+export OPENMX_AFFINITY_DIR="$PWD/rank_affinity_$(date +%Y%m%d_%H%M%S)"
+export BLIS_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MAGMA_NUM_THREADS=1
+mpirun -np 8 --map-by ppr:8:node:PE=3 --bind-to core --report-bindings \
+  python3 ../../tools/mi300a_rank_launcher.py ../openmx sidia333_nc_cluster.dat -nt 3
+```
+
+Use `OPENMX_EIGEN_REFINE=2` for the separately validated refinement option. For the faster CPU reference, retain the environment above and use a fresh identity directory:
+
+```sh
+export OPENMX_GPU=0
+export OPENMX_AFFINITY_DIR="$PWD/rank_affinity_cpu_$(date +%Y%m%d_%H%M%S)"
+mpirun -np 24 --map-by ppr:24:node:PE=1 --bind-to core --report-bindings \
+  python3 ../../tools/mi300a_rank_launcher.py ../openmx sidia333_nc_cluster.dat -nt 1
+```
+
+All 24 final conditions passed validation, including sampled runtime thread masks associated with each rank, disjoint rank CPU masks and their union covering the allocated 24 physical cores. These are sampled observations, not continuous per-thread traces. The tested binary was installed as `work/openmx`, SHA256 `4abd6f847ffc0f210447cb1f390a5f916204fe07c4641d1516d70ffb47cfa148`; the previous executable was backed up and the existing user timing patch was preserved.
+
+The [Japanese final report](work/codex_mi300a_modes_20261012/report_ja.final.txt), [full comparison](work/codex_mi300a_modes_20261012/full.summary.txt), [validation](work/codex_mi300a_modes_20261012/full.validation.json) and [installation record](work/codex_mi300a_modes_20261012/installed_validation.json) contain the settings, hashes, failure history and evidence. Initial implementation/cause-isolation runs remain under `work/codex_mi300a_20261012_66870cjm/`; early runs without the rank launcher are not substituted for this final comparison. The direct MAGMA entry's policy bypass was the main measured bottleneck; native FP64 GEMM, retained NC buffers and execution layout supplied additional improvements. Radeon branches and explicit overrides were checked by policy tests and source review; Radeon hardware was not remeasured in this MI300A investigation.
+
+#### Earlier correctness-suite measurements
+
+The suite tables in this subsection record the implementation before the 2026-10-12 MI300A dispatch and GEMM policy fixes. Their GPU settings are the defaults of that earlier implementation, and their timings do not describe the new defaults.
+
+One APU of a 4-APU MI300A node: 24 Zen 4 cores and one CDNA 3 GPU sharing 128 GB of unified HBM3; ROCm 7.2.0, Open MPI 5.0.10 built with the ROCm compilers, AOCL 5.1.0; 24 MPI ranks on the APU, flat MPI, the same binary for every column. GPU columns use the earlier input-file defaults, CPU columns `OPENMX_GPU=0`:
 
 ```sh
 export HSA_XNACK=1 UCX_RCACHE_ENABLE=n LIBOMPTARGET_MEMORY_MANAGER_THRESHOLD=0
@@ -596,7 +697,7 @@ As on the desktop card these systems sit below the eigensolver switching thresho
 
 All 16 pass in both columns (max diff Utot 2.5e-9 Hartree on the GPU, largest on Pt63 as in the official references; CPU 1.2e-9). With the demoted stages on the CPU the O(N) and band inputs run within a few percent of the CPU reference — the difference there is mostly the fixed cost of keeping the ROCm runtime and `HSA_XNACK=1` active. The remaining gap is concentrated in the collinear cluster inputs (GFRAG, Pt63, Mn12, and the gamma-point-only 5_5_13COb2, which OpenMX reroutes to the cluster solver): their dense solve is collected onto the root rank while the other 23 ranks wait, which loses to 24 cores working in parallel at these sizes.
 
-In short, at 24 ranks per APU these correctness suites run fastest with `OPENMX_GPU=0`. The GPU pays off on an MI300A when a dense diagonalization dominates and at most `OPENMX_BAND_GPU_MAX_DEVICE_RANKS` ranks share the device: for a 333-atom collinear band system (n=2808) at 8 ranks per APU, hipSOLVER runs the full-spectrum dense eigensolve in 0.13–0.18 s where the same rank count on the CPU takes seconds.
+With that earlier implementation, these correctness suites ran fastest with `OPENMX_GPU=0` at 24 ranks per APU. A separate collinear band measurement (n=2808) at 8 ranks per APU used hipSOLVER for the full-spectrum dense eigensolve in 0.13–0.18 s, while the same rank count on the CPU took seconds. This also stays below `OPENMX_BAND_GPU_MAX_DEVICE_RANKS`, whose default is 16.
 
 One practical note on this machine: long 24-rank suite runs occasionally abort in a UCX shared-memory assertion (`mm_ep.c:458`) of the system Open MPI 5.0.10/UCX build, at a random input and independent of the physics; single inputs and reruns pass unchanged.
 

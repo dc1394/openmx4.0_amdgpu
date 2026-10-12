@@ -192,6 +192,7 @@ static hipblasStatus_t hipblasDgemm(hipblasHandle_t h, hipblasOperation_t ta, hi
     return device_gemm(ta, tb, m, n, k, alpha, a, lda, b, ldb, beta, c, ldc);
 }
 static int gemmul8_off;
+static int openmx_gemmul8DgemmEnabled(void) { return !gemmul8_off; }
 static size_t openmx_gemmul8DWorkspaceSize(int m, int n, int k)
 {
     if (gemmul8_off) return 0;

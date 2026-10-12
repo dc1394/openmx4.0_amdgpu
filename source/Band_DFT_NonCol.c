@@ -44,7 +44,9 @@ extern int openmx_magma_release_z_workspace(void);
 extern int openmx_hipsolver_zheevd_gpu(int n, int maxn, void *d_A, double *w, int *mout);
 extern int openmx_hipsolver_release_workspace(void);
 extern int openmx_gpu_eigensolver_use_hipsolver(void);
+extern int openmx_gpu_eigen_backend(int n, int maxn, int cplx);
 extern int openmx_gpu_is_apu(void);
+extern int openmx_gpu_is_mi300a(void);
 
 static int BandNonCol_SolveTimingEnabled(void)
 {
@@ -604,11 +606,51 @@ static int BandNonCol_MagmaWorkspaceTurnRelease(void)
     return (atoi(value)!=0);
 }
 
-/* rocSOLVER's full-spectrum Zheevd is very fast for the overlap matrix, but
-   on MI300A it can return non-finite eigenvectors for the highly degenerate
-   non-collinear spinor Hamiltonian even though its eigenvalues are finite.
-   Keep MAGMA's range-I solver as the safe default for H.  The opt-in exists
-   for diagnosing future ROCm releases without weakening the default. */
+/* The policy wrapper may select native FP64 even when the legacy entry
+   route below is MAGMA-named.  Query that policy for MI300A accounting;
+   explicit OPENMX_GPU_EIGENSOLVER choices remain authoritative. */
+static int BandNonCol_MI300ANativePolicy(int n, int maxn)
+{
+    return openmx_gpu_is_mi300a() && openmx_gpu_eigen_backend(n,maxn,1);
+}
+
+static void BandNonCol_ReleaseSolverTurnWorkspaces(int n, int maxn, int use_hipsolver)
+{
+    if (BandNonCol_MI300ANativePolicy(n,maxn)){
+        /* A native attempt can retry through MAGMA.  Respect each library's
+           release override independently, including scratch left by a
+           successful MAGMA fallback.  In particular a MAGMA-named entry
+           no longer implies that rocSOLVER's workspace is unused. */
+        if (BandNonCol_HipSolverWorkspaceTurnRelease())
+            (void)openmx_hipsolver_release_workspace();
+        if (BandNonCol_MagmaWorkspaceTurnRelease())
+            (void)openmx_magma_release_z_workspace();
+    }
+    else if (use_hipsolver && BandNonCol_HipSolverWorkspaceTurnRelease()){
+        (void)openmx_hipsolver_release_workspace();
+    }
+    else if (!use_hipsolver && BandNonCol_MagmaWorkspaceTurnRelease()){
+        (void)openmx_magma_release_z_workspace();
+    }
+}
+
+static void BandNonCol_ReleaseOverlapWorkspace(int n)
+{
+    if (BandNonCol_MI300ANativePolicy(n,n)){
+        BandNonCol_ReleaseSolverTurnWorkspaces(n,n,openmx_gpu_eigensolver_use_hipsolver());
+    }
+    else if (openmx_gpu_eigensolver_use_hipsolver() && BandNonCol_HipSolverWorkspaceTurnRelease()){
+        /* Preserve the existing non-MI300A / explicit-MAGMA overlap path. */
+        (void)openmx_hipsolver_release_workspace();
+    }
+}
+
+/* Select the legacy explicit-hipSOLVER entry route, also used by host and
+   OpenMP-mapped callers.  This is not the actual backend of the default
+   HIP-owned solve: the MAGMA-named policy wrapper chooses native FP64 on
+   MI300A and retains its memory preflight, phase transform and retry.
+   Keep the route opt-in unchanged rather than passing HIP-owned matrices
+   through the foreign-pointer entry merely to describe that backend. */
 int BandNonCol_HamiltonianUseHipSolver(void)
 {
     const char *value;
@@ -786,7 +828,7 @@ static void BandNonCol_GpuSolver_DenseZheevx_Device(dcomplex *A, double *ko, int
     size_t bytes = sizeof(dcomplex)*nn;
 
     if (n<=0 || maxn<=0 || n<maxn){
-        BandNonCol_AbortWithMessage("Invalid MAGMA eigensolver dimensions in Band_DFT_NonCol.c.");
+        BandNonCol_AbortWithMessage("Invalid GPU eigensolver dimensions in Band_DFT_NonCol.c.");
     }
 
     {
@@ -885,12 +927,7 @@ static void BandNonCol_GpuSolver_DenseZheevx_Device(dcomplex *A, double *ko, int
             MPI_Abort(mpi_comm_level1,1);
         }
 
-        if (use_hipsolver && BandNonCol_HipSolverWorkspaceTurnRelease()){
-            (void)openmx_hipsolver_release_workspace();
-        }
-        else if (!use_hipsolver && BandNonCol_MagmaWorkspaceTurnRelease()){
-            (void)openmx_magma_release_z_workspace();
-        }
+        BandNonCol_ReleaseSolverTurnWorkspaces(n,maxn,use_hipsolver);
 
         for (l=maxn; 1<=l; l--) ko[l] = ko[l-1];
 
@@ -1178,7 +1215,7 @@ static void BandNonCol_GpuSolver_DenseZheevx(dcomplex *A, dcomplex *Z, double *k
     size_t bytes;
 
     if (n<=0 || maxn<=0 || n<maxn){
-        BandNonCol_AbortWithMessage("Invalid MAGMA eigensolver dimensions in Band_DFT_NonCol.c.");
+        BandNonCol_AbortWithMessage("Invalid GPU eigensolver dimensions in Band_DFT_NonCol.c.");
     }
 
     nn = (size_t)n*(size_t)n;
@@ -1244,12 +1281,7 @@ static void BandNonCol_GpuSolver_DenseZheevx(dcomplex *A, dcomplex *Z, double *k
         MPI_Abort(mpi_comm_level1,1);
     }
 
-    if (use_hipsolver && BandNonCol_HipSolverWorkspaceTurnRelease()){
-        (void)openmx_hipsolver_release_workspace();
-    }
-    else if (!use_hipsolver && BandNonCol_MagmaWorkspaceTurnRelease()){
-        (void)openmx_magma_release_z_workspace();
-    }
+    BandNonCol_ReleaseSolverTurnWorkspaces(n,maxn,use_hipsolver);
 
     for (l=maxn; 1<=l; l--) ko[l] = ko[l-1];
 
@@ -1348,6 +1380,16 @@ static size_t BandNonCol_GpuSolverWorkFallbackBytes(int n)
 
 static size_t BandNonCol_QueryGpuSolverWorkBytes(int n, int maxn)
 {
+    /* Native Zheevd solves the full spectrum regardless of maxn.  Keep the
+       two successful overlap/Hamiltonian queries by device and dimension;
+       no matrix data or failed-query fallback is cached across inputs. */
+    static struct {
+        int valid, device, n;
+        size_t bytes;
+    } native_cache[2] = {{0}};
+    static unsigned native_next = 0;
+    const int native = BandNonCol_MI300ANativePolicy(n,maxn);
+    int device = -1;
     hipsolverDnHandle_t handle = NULL;
     hipStream_t stream = NULL;
     hipError_t hip_status;
@@ -1362,6 +1404,13 @@ static size_t BandNonCol_QueryGpuSolverWorkBytes(int n, int maxn)
     size_t h_bytes = 0;
     size_t fallback = BandNonCol_GpuSolverWorkFallbackBytes(n);
 
+    if (native){
+        if (hipGetDevice(&device)!=hipSuccess) return fallback;
+        for (int i=0; i<2; ++i)
+            if (native_cache[i].valid && native_cache[i].device==device && native_cache[i].n==n)
+                return native_cache[i].bytes;
+    }
+
     hip_status = hipStreamCreateWithFlags(&stream,hipStreamNonBlocking);
     if (hip_status!=hipSuccess) return fallback;
 
@@ -1371,9 +1420,20 @@ static size_t BandNonCol_QueryGpuSolverWorkBytes(int n, int maxn)
     }
 
     if (solver_status==HIPSOLVER_STATUS_SUCCESS){
-        solver_status = hipsolverDnXsyevdx_bufferSize(handle,NULL,jobz,range,uplo,n,
+        if (native){
+            int lwork = 0;
+            solver_status = hipsolverDnZheevd_bufferSize(handle,jobz,uplo,
+                                                         n,NULL,n,NULL,&lwork);
+            if (solver_status==HIPSOLVER_STATUS_SUCCESS && 0<lwork){
+                d_bytes = BandNonCol_ArrayBytes((size_t)lwork,sizeof(hipDoubleComplex),
+                                                  "native Zheevd workspace");
+            }
+        }
+        else {
+            solver_status = hipsolverDnXsyevdx_bufferSize(handle,NULL,jobz,range,uplo,n,
                                                      HIP_C_64F,NULL,n,&vl,&vu,1L,maxn,&h_meig,
                                                      HIP_R_64F,NULL,HIP_C_64F,&d_bytes,&h_bytes);
+        }
     }
 
     if (handle!=NULL) hipsolverDnDestroy(handle);
@@ -1381,6 +1441,13 @@ static size_t BandNonCol_QueryGpuSolverWorkBytes(int n, int maxn)
 
     if (solver_status!=HIPSOLVER_STATUS_SUCCESS || d_bytes==0) return fallback;
 
+    if (native){
+        unsigned slot = native_next++ % 2U;
+        native_cache[slot].valid = 1;
+        native_cache[slot].device = device;
+        native_cache[slot].n = n;
+        native_cache[slot].bytes = d_bytes;
+    }
     return d_bytes;
 }
 
@@ -2066,7 +2133,7 @@ static void BandNonCol_DenseGpuEigen(dcomplex *d_A, double *ko, int n, int maxn,
     int l;
 
     if (d_A==NULL || ko==NULL || n<=0 || maxn<=0 || n<maxn){
-        BandNonCol_AbortWithMessage("Invalid MAGMA dense GPU eigensolver arguments in Band_DFT_NonCol.c.");
+        BandNonCol_AbortWithMessage("Invalid dense GPU eigensolver arguments in Band_DFT_NonCol.c.");
     }
 
     {
@@ -2079,6 +2146,8 @@ static void BandNonCol_DenseGpuEigen(dcomplex *d_A, double *ko, int n, int maxn,
             info = openmx_hipsolver_zheevd_gpu(n,maxn,d_A,ko,&mout);
         }
         else {
+            /* HIP-owned storage: keep the policy wrapper's native memory
+               preflight and retry contract, even when it selects rocSOLVER. */
             info = openmx_magma_zheevdx_gpu(n,maxn,d_A,ko,&mout);
         }
 
@@ -3740,13 +3809,9 @@ static void BandNonCol_RootDenseBuildH2(int rebuild_overlap,
     }
     BandNonCol_DenseGpuPrepareOverlap(rebuild_overlap,n,n2,ko,rdw->s_all,cache_buffers);
 
-    /* In the default hybrid path the overlap uses hipSOLVER and H uses
-       MAGMA.  Return the overlap scratch before MAGMA allocates its range-I
-       work arrays. */
-    if (rebuild_overlap && openmx_gpu_eigensolver_use_hipsolver() &&
-        BandNonCol_HipSolverWorkspaceTurnRelease()){
-        (void)openmx_hipsolver_release_workspace();
-    }
+    /* Return requested overlap scratch before assembling H.  The default
+       Hamiltonian policy also selects native FP64 on MI300A. */
+    if (rebuild_overlap) BandNonCol_ReleaseOverlapWorkspace(n);
     BandNonCol_DenseGpu_Ensure(n,n2);
 
     BandNonCol_ConstructDenseMsFromPacked_HIP(0,m_h11,w->d_H11,packed_order_GA,MP,k1,k2,k3,n);
@@ -3818,15 +3883,7 @@ static void BandNonCol_RootDenseCompleteOneK(int n, int n2, int MaxN, int kloop,
     /* The solve above is synchronous.  Return rocSOLVER's large process-wide
        scratch before this rank enters the n2-by-n2 back-transform; otherwise
        completed turns accumulate scratch and squeeze later turns on MI300A. */
-    if (refined){
-        /* nothing of the FP64 solvers was used */
-    }
-    else if (h_use_hipsolver && BandNonCol_HipSolverWorkspaceTurnRelease()){
-        (void)openmx_hipsolver_release_workspace();
-    }
-    else if (!h_use_hipsolver && BandNonCol_MagmaWorkspaceTurnRelease()){
-        (void)openmx_magma_release_z_workspace();
-    }
+    if (!refined) BandNonCol_ReleaseSolverTurnWorkspaces(n2,MaxN,h_use_hipsolver);
 
     if (!need_evec){
         if (!cache_buffers){

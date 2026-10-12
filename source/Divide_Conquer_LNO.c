@@ -21,6 +21,7 @@
 #include "lapack_prototypes.h"
 #include "set_hip_default_device_from_local_rank.h"
 #include <math.h>
+#include <float.h>
 #include <mpi.h>
 #include <omp.h>
 #include <stdio.h>
@@ -30,6 +31,93 @@
 #include <string.h>
 #include <time.h>
 
+/* Preserve the CPU local solve for non-Hermitian inputs on MI300A. */
+extern int openmx_gpu_is_mi300a(void);
+
+typedef struct {
+    double max_abs, max_anti;
+} DCLNO_NCGuardStats;
+
+/* 0: within tolerance, 1: non-Hermitian, 2: invalid/non-finite/unrepresentable.
+   The threshold separates measured assembly roundoff (~1e-9) from the local
+   Hubbard asymmetry (~1e-6).  It is a dispatch compatibility guard, not an
+   eigenpair or final-SCF accuracy guarantee.  Input is tight column-major. */
+static int DCLNO_NCGuardMatrixSlow(const dcomplex *a, int n, DCLNO_NCGuardStats *s)
+{
+    int i, j;
+    s->max_abs = 0.0;
+    s->max_anti = 0.0;
+    if (a == NULL || n <= 0 || (size_t)n > SIZE_MAX/(size_t)n/sizeof(dcomplex)) return 2;
+    for (j = 0; j < n; j++) {
+        for (i = 0; i <= j; i++) {
+            const dcomplex x = a[(size_t)j*n+i], y = a[(size_t)i*n+j];
+            double ax, ay, error;
+            if (!isfinite(x.r) || !isfinite(x.i) || !isfinite(y.r) || !isfinite(y.i)) return 2;
+            ax = hypot(x.r, x.i);
+            ay = hypot(y.r, y.i);
+            error = hypot(x.r-y.r, x.i+y.i);
+            /* Finite components may still overflow a magnitude/difference. */
+            if (!isfinite(ax) || !isfinite(ay) || !isfinite(error)) return 2;
+            if (s->max_abs < ax) s->max_abs = ax;
+            if (s->max_abs < ay) s->max_abs = ay;
+            if (s->max_anti < error) s->max_anti = error;
+        }
+    }
+    return s->max_anti > 1.0e-8*fmax(1.0, s->max_abs) ? 1 : 0;
+}
+
+/* Use squared Euclidean magnitudes for ordinary finite inputs.  The checked
+   component range keeps every square and sum normal and representable.  Keep
+   the robust hypot implementation for extreme inputs and replay it near the
+   dispatch boundary, where a few rounding ulps could change the decision. */
+static int DCLNO_NCGuardMatrix(const dcomplex *a, int n, DCLNO_NCGuardStats *s)
+{
+    double max_abs2 = 0.0, max_anti2 = 0.0, limit;
+    int i, j, k;
+    if (a == NULL || n <= 0 || (size_t)n > SIZE_MAX/(size_t)n/sizeof(dcomplex))
+        return DCLNO_NCGuardMatrixSlow(a, n, s);
+    for (j = 0; j < n; j++) {
+        for (i = 0; i <= j; i++) {
+            const dcomplex x = a[(size_t)j*n+i], y = a[(size_t)i*n+j];
+            const double dr = x.r-y.r, di = x.i+y.i;
+            const double component[6] = {x.r, x.i, y.r, y.i, dr, di};
+            double ax2, ay2, error2;
+            for (k = 0; k < 6; k++) {
+                const double z = fabs(component[k]);
+                if (!isfinite(z) || z > 1.0e150 || (z != 0.0 && z < 1.0e-150))
+                    return DCLNO_NCGuardMatrixSlow(a, n, s);
+            }
+            ax2 = x.r*x.r+x.i*x.i;
+            ay2 = y.r*y.r+y.i*y.i;
+            error2 = dr*dr+di*di;
+            if (max_abs2 < ax2) max_abs2 = ax2;
+            if (max_abs2 < ay2) max_abs2 = ay2;
+            if (max_anti2 < error2) max_anti2 = error2;
+        }
+    }
+    s->max_abs = sqrt(max_abs2);
+    s->max_anti = sqrt(max_anti2);
+    limit = 1.0e-8*fmax(1.0, s->max_abs);
+    if (fabs(s->max_anti-limit) <= 64.0*DBL_EPSILON*fmax(s->max_anti, limit))
+        return DCLNO_NCGuardMatrixSlow(a, n, s);
+    return s->max_anti > limit ? 1 : 0;
+}
+
+
+static int DCLNO_NCGuardProblem(int gpu_task, int ns, const dcomplex *s,
+                                 int nh, const dcomplex *h,
+                                 DCLNO_NCGuardStats *s_stats, DCLNO_NCGuardStats *h_stats)
+{
+    int s_status, h_status;
+    /* CPU/threshold/memory-admission rejection never adds a device query;
+       Radeon never scans matrices and retains its existing solver policy. */
+    if (!gpu_task || !openmx_gpu_is_mi300a()) return 0;
+    s_status = DCLNO_NCGuardMatrix(s, ns, s_stats);
+    if (s_status == 2) return 2;
+    h_status = DCLNO_NCGuardMatrix(h, nh, h_stats);
+    if (h_status == 2) return 2;
+    return s_status || h_status;
+}
 #define measure_time 0
 #define GPU_CPU_SWITCH_NUM2 800
 
@@ -2355,7 +2443,7 @@ static double DC_Col(char * mode, int MD_iter, int SCF_iter, int SucceedReadingD
                         gpu_seconds += gpu_stop - gpu_start;
                         ++gpu_tasks;
                         if (gpu_tasks == 1 || gpu_tasks % 16 == 0) {
-                            printf("DCLNO_GPU rank=%d SCF=%d backend=magma solves=%d n=%d seconds=%.3f\n",
+                            printf("DCLNO_GPU rank=%d SCF=%d route=gpu-dispatch solves=%d n=%d seconds=%.3f\n",
                                    myid0, SCF_iter,
                                    gpu_tasks, NUM, gpu_seconds);
                             fflush(stdout);
@@ -2917,6 +3005,7 @@ static double DC_NonCol(char *mode,
   int Eigen_MPI_flag,bcast_flag;
   int use_gpu_accel_nc,use_gpu_task_nc;
   int gpu_retry_info_nc = 0, gpu_no_memory_nc = 0;
+  int nc_guard_reported = 0;
   double sum1,sum2,sum4;
   int i1s, j1s;
 
@@ -4386,6 +4475,29 @@ static double DC_NonCol(char *mode,
     use_gpu_task_nc = (use_gpu_accel_nc && !gpu_no_memory_nc && Eigen_MPI_flag==0 &&
                        DCLNO_NonColGpuEigenThreshold() <= NUM);
     gpu_retry_info_nc = 0;
+    {
+      DCLNO_NCGuardStats s_stats, h_stats;
+      int guard_status = DCLNO_NCGuardProblem(use_gpu_task_nc, NUMH, BLAS_OLP,
+                                               NUM, BLAS_H, &s_stats, &h_stats);
+      if (guard_status == 2) {
+        DCLNO_AbortWithMessage("Invalid or non-finite matrix in MI300A NC DC-LNO Hermitian guard.");
+      }
+      if (guard_status == 1) {
+        /* Keep the complete existing CPU generalized solve, including its
+           overlap basis and ELPA1 full-matrix handling.  Never symmetrize or
+           otherwise modify the original physical matrices in this guard. */
+        use_gpu_task_nc = 0;
+        const char *guard_verbose = getenv("OPENMX_GPU_VERBOSE");
+        if (!nc_guard_reported && (2 <= level_stdout ||
+                                   (guard_verbose != NULL && atoi(guard_verbose) != 0))) {
+          fprintf(stderr, "DCLNO_NC_GUARD rank=%d scf=%d atom=%d n=%d route=cpu reason=non-Hermitian S_herm=%.17g S_scale=%.17g H_herm=%.17g H_scale=%.17g relative_tolerance=1e-8\n",
+                  myid0, SCF_iter, Gc_AN, NUM, s_stats.max_anti, fmax(1.0,s_stats.max_abs),
+                  h_stats.max_anti, fmax(1.0,h_stats.max_abs));
+          fflush(stderr);
+          nc_guard_reported = 1;
+        }
+      }
+    }
 
     if (use_gpu_task_nc){
 

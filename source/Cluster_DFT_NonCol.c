@@ -59,7 +59,9 @@ extern hipblasStatus_t openmx_gemmul8DgemmSolve(hipblasHandle_t handle, hipblasO
                                                 const double *beta, double *C, int ldc);
 extern void openmx_gemmul8TrimWorkspaces(void);
 extern int openmx_gemmul8ZgemmEnabled(void);
+extern long long openmx_gemmul8NativeCalls(int is_complex);
 extern int openmx_gpu_is_apu(void);
+extern int openmx_gpu_is_mi300a(void);
 extern size_t Set_Hamiltonian_DemoteResidency(void);
 
 static void ClusterNonCol_DeviceSolveRelease(void);
@@ -220,11 +222,11 @@ static void ClusterNonCol_DgemmCPU(hipblasOperation_t transa, hipblasOperation_t
     F77_NAME(dgemm, DGEMM)(&ta, &tb, &mi, &ni, &ki, &alpha, (double *)A, &lda, (double *)B, &ldb, &beta, C, &ldc);
 }
 
-static void ClusterNonCol_LogGemmul8Retry(const char *where, const char *kind, hipblasStatus_t status, int m, int n,
+static void ClusterNonCol_LogGemmRetry(const char *where, const char *kind, hipblasStatus_t status, int m, int n,
                                           int k)
 {
     fprintf(stderr,
-            "<GEMM> rank %d: GEMMul8 failed in %s for %sGEMM(m=%d,n=%d,k=%d): %s (%d). "
+            "<GEMM> rank %d: GPU GEMM bridge failed in %s for %sGEMM(m=%d,n=%d,k=%d): %s (%d). "
             "Retrying with native hipBLAS.\n",
             ClusterNonCol_MpiRankForLog(), where, kind, m, n, k, ClusterNonCol_HipblasStatusName(status),
             (int)status);
@@ -275,8 +277,7 @@ static void ClusterNonCol_LogGemmBackendOnce(const char *kind, const char *backe
     if (*logged) return;
 
     fprintf(stderr,
-            "<GEMM> rank %d: using %s for %sGEMM(m=%d,n=%d,k=%d). "
-            "If it fails, OpenMX retries native hipBLAS and then CPU BLAS.\n",
+            "<GEMM> rank %d: using %s for %sGEMM(m=%d,n=%d,k=%d).\n",
             rank, backend, kind, m, n, k);
     fflush(stderr);
     *logged = 1;
@@ -289,14 +290,16 @@ static hipblasStatus_t ClusterNonCol_TryDeviceDgemm(hipblasHandle_t handle, hipb
     const double alpha = 1.0;
     const double beta = 0.0;
     hipblasStatus_t status;
+    const long long native_before = openmx_gemmul8NativeCalls(0);
 
     status = openmx_gemmul8Dgemm(handle, transa, transb, m, n, k, &alpha, A, m, B, k, &beta, C, m);
     if (status == HIPBLAS_STATUS_SUCCESS) {
-        ClusterNonCol_LogGemmBackendOnce("D", "GEMMul8", m, n, k);
+        ClusterNonCol_LogGemmBackendOnce("D", openmx_gemmul8NativeCalls(0) == native_before ?
+                                       "GEMMul8" : "native hipBLAS", m, n, k);
         return status;
     }
 
-    ClusterNonCol_LogGemmul8Retry(where, "D", status, m, n, k);
+    ClusterNonCol_LogGemmRetry(where, "D", status, m, n, k);
     status = hipblasDgemm(handle, transa, transb, m, n, k, &alpha, A, m, B, k, &beta, C, m);
     if (status == HIPBLAS_STATUS_SUCCESS) {
         ClusterNonCol_LogGemmBackendOnce("D", "native hipBLAS", m, n, k);
@@ -727,8 +730,8 @@ static void ClusterNonCol_StoreEDMBuffer(int myid, int size_H1, int *MP, double 
     }
 }
 
-/* OPENMX_CLUSTER_GPU_DM_GEMM (default 1 when the complex GEMMul8 products
-   are on): the density matrix of the root dense path as products,
+/* OPENMX_CLUSTER_GPU_DM_GEMM (default 1 on MI300A or when the complex
+   GEMMul8 products are on): the density matrix of the root dense path as products,
    P11 = W1^H W1, P12 = W1^H W2 and P22 = W2^H W2 with W = diag(sqrt f) V
    over the occupied states (W1, W2 its spin halves: three n x n x nk complex
    GEMMs through GEMMul8), each followed by a gather of the sparse entries
@@ -741,9 +744,10 @@ static void ClusterNonCol_StoreEDMBuffer(int myid, int size_H1, int *MP, double 
    largest entry off a long-double reference (the sums 3e-16).  Its buffers
    are carved from the solve's arena as far as it has room (all of them with
    the refined eigensolver's arena); a buffer that cannot be had or a failing
-   product leaves the step to the sums.  In plain FP64 the products cost what
-   the sums do (412 against 403 ms), hence the default only with GEMMul8.
-   0 keeps the sums.  The NVIDIA version forms all of P = W^H W, an n2 x n2
+   product leaves the step to the sums.  On that Radeon, plain FP64 products
+   cost what the sums do (412 against 403 ms), hence its default only with GEMMul8.
+   MI300A also uses the products with native FP64 GEMM.  0 keeps the sums.
+   The NVIDIA version forms all of P = W^H W, an n2 x n2
    matrix of its own (2 GiB of GEMMul8 workspace at that shape). */
 static int ClusterNonCol_DmByGemm(void)
 {
@@ -754,7 +758,7 @@ static int ClusterNonCol_DmByGemm(void)
 
         cached = (value != NULL && value[0] != '\0') ? (atoi(value) != 0) : 2;
     }
-    return (cached == 2) ? openmx_gemmul8ZgemmEnabled() : cached;
+    return (cached == 2) ? (openmx_gpu_is_mi300a() || openmx_gemmul8ZgemmEnabled()) : cached;
 }
 
 /* dense_evec: the vectors of the host-staged solve (state k of basis i at
@@ -794,13 +798,16 @@ static double ClusterNonCol_CalcDMRootDense_OpenMP(int myid, int size_H1, int *M
             size_t scratch_bytes = 0;
             void *scratch = (d_evec != NULL) ? ClusterNonCol_DeviceSolveScratch(&scratch_bytes) : NULL;
             int dm_rc = 1, by_gemm = 0;
+            long long native_products = 0;
 
             if (d_evec != NULL && ClusterNonCol_DmByGemm()) {
+                const long long native_before = openmx_gemmul8NativeCalls(1);
                 dm_rc = ClusterNonCol_CalcDMRootDenseGemm_HIP(ClusterNonCol_DeviceSolveHandle(), cache->entry_count,
                                                               size_H1, n, n2, nk_occ, calc_edm, cache->basis0,
                                                               cache->basis1, ws->occ, ws->occ_e,
                                                               (const dcomplex *)d_evec, n2, scratch, scratch_bytes,
                                                               ws->dm_buffer);
+                native_products = openmx_gemmul8NativeCalls(1) - native_before;
                 /* a product's full-size scratch does not outlive the step's
                    solve (the capped one goes at the end of the turn) */
                 openmx_gemmul8TrimWorkspaces();
@@ -823,7 +830,10 @@ static double ClusterNonCol_CalcDMRootDense_OpenMP(int myid, int size_H1, int *M
                 fprintf(stderr,
                         "<Cluster> rank %d: density matrix generation uses %s on the selected rank only "
                         "(entries=%d, occupied states=%d%s).\n",
-                        Host_ID, by_gemm ? "GEMMul8 products and a HIP gather" : "a HIP GPU kernel",
+                        Host_ID, !by_gemm ? "a HIP GPU kernel" :
+                        (native_products == 0 ? "GEMMul8 products and a HIP gather" :
+                         (native_products == (calc_edm ? 6 : 3) ? "native hipBLAS products and a HIP gather" :
+                          "GEMMul8/native hipBLAS products and a HIP gather")),
                         cache->entry_count, nk_occ, calc_edm ? ", with EDM" : "");
                 fflush(stderr);
                 logged_dm_gpu = 1;
@@ -1998,7 +2008,9 @@ static int ClusterNonCol_GemmWorkspaceTurnRelease(void)
    step, since the GPU is shared with the other ranks and the grid stages,
    and the basis waits on the host (h_x, page-locked) for the next step;
    OPENMX_CLUSTER_NC_DEVICE_KEEP=1 keeps them on the device instead, until
-   the forces, the end of a run or a change of the problem.
+   the forces, memory pressure, the end of a run or a change of the problem.
+   This is the default on MI300A, where the device and CPU share ample HBM;
+   other GPUs keep the per-step release default.  Explicit 0/1 overrides it.
    OPENMX_CLUSTER_NC_DEVICE_SOLVE=0 keeps the former host-staged solve. */
 typedef struct
 {
@@ -2197,7 +2209,7 @@ static int ClusterNonCol_DeviceSolveKeep(void)
 
     if (keep < 0) {
         const char *value = getenv("OPENMX_CLUSTER_NC_DEVICE_KEEP");
-        keep = (value != NULL && atoi(value) != 0) ? 1 : 0;
+        keep = (value != NULL) ? (atoi(value) != 0) : openmx_gpu_is_mi300a();
     }
     return keep;
 }
@@ -2437,14 +2449,16 @@ static hipblasStatus_t ClusterNonCol_TryDeviceDgemmSolve(hipblasHandle_t handle,
     const double alpha = 1.0;
     const double beta = 0.0;
     hipblasStatus_t status;
+    const long long native_before = openmx_gemmul8NativeCalls(0);
 
     status = openmx_gemmul8DgemmSolve(handle, transa, transb, m, n, k, &alpha, A, m, B, k, &beta, C, m);
     if (status == HIPBLAS_STATUS_SUCCESS) {
-        ClusterNonCol_LogGemmBackendOnce("D", "GEMMul8", m, n, k);
+        ClusterNonCol_LogGemmBackendOnce("D", openmx_gemmul8NativeCalls(0) == native_before ?
+                                       "GEMMul8" : "native hipBLAS", m, n, k);
         return status;
     }
 
-    ClusterNonCol_LogGemmul8Retry(where, "D", status, m, n, k);
+    ClusterNonCol_LogGemmRetry(where, "D", status, m, n, k);
     status = hipblasDgemm(handle, transa, transb, m, n, k, &alpha, A, m, B, k, &beta, C, m);
     if (status == HIPBLAS_STATUS_SUCCESS) {
         ClusterNonCol_LogGemmBackendOnce("D", "native hipBLAS", m, n, k);
@@ -2552,7 +2566,7 @@ static void ClusterNonCol_GpuSolverRootDensePath(int SCF_iter, double *ko, doubl
 
         if (!logged_root_dense) {
             fprintf(stderr,
-                    "<Cluster> rank %d: MAGMA dense GPU path uses one selected rank for dense matrix generation, "
+                    "<Cluster> rank %d: dense GPU path uses one selected rank for dense matrix generation, "
                     "GEMM, eigensolver, and density-matrix generation (n=%d, n2=%d).\n",
                     Host_ID, n, n2);
             fflush(stderr);
