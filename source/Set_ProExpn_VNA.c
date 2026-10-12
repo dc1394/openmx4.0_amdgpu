@@ -41,6 +41,12 @@ static void SetPro_VNA23_GpuEnd(void);
 static void SetPro_DSVNA_GpuEnd(void);
 /* forward: the OPENMX_SETPRO_VERBOSE diagnostics (defined below the driver) */
 static void SetPro_note(const char *stage, const char *fmt, ...);
+static int SetPro_gpu_used = 0;
+
+int Set_ProExpn_VNA_Used_GPU(void)
+{
+  return SetPro_gpu_used;
+}
 
 #ifdef kcomp
 static void Spherical_Bessel2( double x, int lmax, double *sb, double *dsb );
@@ -54,6 +60,7 @@ double Set_ProExpn_VNA(double ****HVNA, double *****HVNA2, Type_DS_VNA *****DS_V
   double time1,time2,time3;
   int vna23_gpu;
 
+  SetPro_gpu_used = 0;
   SetPro_note("entry","");
 
   /* separable form */
@@ -798,6 +805,7 @@ static void SetPro_HVNA_GpuRun(double ****HVNA)
         }
 
         on_device = hipMemcpy(out,arena+o_out,sizeof(double)*out_c,hipMemcpyDeviceToHost)==hipSuccess;
+        if (on_device && out_c > 0) SetPro_gpu_used = 1;
       }
       (void)hipFree(arena);
     }
@@ -1700,6 +1708,8 @@ static void SetPro_DSVNA_GpuRun(Type_DS_VNA *****DS_VNA, int OneD_Nloop,
 
 #pragma omp target update from(outbuf[0:(size_t)np*4*(size_t)mn_max])
 
+      if (np > 0) SetPro_gpu_used = 1;
+
       /* host: scatter the chunk results into DS_VNA */
 
 #pragma omp parallel for schedule(dynamic)
@@ -2475,6 +2485,8 @@ static void SetPro_VNA23_GpuRun(double *****HVNA23, int mirror, int OneD_Nloop,
       }
 
 #pragma omp target update from(outbuf[0:(size_t)np*4*(size_t)mn_max])
+
+      if (np > 0) SetPro_gpu_used = 1;
 
       /* host: scatter into HVNA2 or HVNA3 */
 

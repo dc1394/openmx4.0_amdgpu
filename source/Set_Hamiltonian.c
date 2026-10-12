@@ -154,6 +154,7 @@ int Set_Hamiltonian_Hip_MatrixElements_Resident(
     const double *vpotbuf, double *hbuf);
 
 static int Set_Hamiltonian_OpenMP_Rank_Selected = 1;
+static int Set_Hamiltonian_MatrixElements_GPU_Used = 0;
 static size_t Set_Hamiltonian_ME_ResidentBytes(void);
 void Set_Hamiltonian_Invalidate_OpenMP_MatrixElements_Cache(void);
 
@@ -1214,11 +1215,6 @@ double Set_Hamiltonian(char * mode, int MD_iter, int SCF_iter, int SCF_iter0, in
     use_base_openmp = Set_Hamiltonian_Base_Use_OpenMP(SCF_iter, myid);
     SETH_PROF_ADD(memok, prof_t0);
 
-    if (myid == Host_ID && mode != NULL && strcasecmp(mode, "stdout") == 0 && 0 < level_stdout) {
-        printf("<Set_Hamiltonian>  Hamiltonian matrix for VNA+dVH+Vxc...\n");
-        fflush(stdout);
-    }
-
     /*****************************************************
                 adding H0+HNL+(HCH) to H
   *****************************************************/
@@ -1372,6 +1368,17 @@ double Set_Hamiltonian(char * mode, int MD_iter, int SCF_iter, int SCF_iter0, in
     SETH_PROF_T0(prof_t0);
     MPI_Barrier(mpi_comm_level1);
     SETH_PROF_ADD(barrier, prof_t0);
+    {
+        int local_gpu = Set_Hamiltonian_MatrixElements_GPU_Used;
+        int any_gpu = 0;
+        if (scf_eigen_lib_flag == GPUSOLVER)
+            MPI_Allreduce(&local_gpu, &any_gpu, 1, MPI_INT, MPI_MAX, mpi_comm_level1);
+        if (myid == Host_ID && mode != NULL && strcasecmp(mode, "stdout") == 0 && 0 < level_stdout) {
+            printf("<Set_Hamiltonian>  Hamiltonian matrix for VNA+dVH+Vxc%s...\n",
+                   any_gpu ? " (GPU-accelerated)" : "");
+            fflush(stdout);
+        }
+    }
     if (measure_time) {
         dtime(&time2);
         printf("myid=%4d Time Barrier=%18.10f\n", myid, time2 - time1);
@@ -2457,6 +2464,7 @@ void Calc_MatrixElements_dVH_Vxc_VNA(int Cnt_kind)
 {
     int myid, use_tables;
 
+    Set_Hamiltonian_MatrixElements_GPU_Used = 0;
     MPI_Comm_rank(mpi_comm_level1, &myid);
 
     /* collective: every rank takes part in the memory test */
@@ -2468,7 +2476,10 @@ void Calc_MatrixElements_dVH_Vxc_VNA(int Cnt_kind)
         Calc_MatrixElements_dVH_Vxc_VNA_OpenMP(Cnt_kind);
         return;
     }
-    if (Calc_MatrixElements_dVH_Vxc_VNA_OnTheFly(Cnt_kind, myid)) return;
+    if (Calc_MatrixElements_dVH_Vxc_VNA_OnTheFly(Cnt_kind, myid)) {
+        if (Matomnum > 0) Set_Hamiltonian_MatrixElements_GPU_Used = 1;
+        return;
+    }
     if (use_tables) {
         Calc_MatrixElements_dVH_Vxc_VNA_OpenMP(Cnt_kind);
     } else {
@@ -2915,6 +2926,8 @@ static void Calc_MatrixElements_dVH_Vxc_VNA_OpenMP_Resident(int Cnt_kind)
         return;
     }
 
+    if (total_h > 0) Set_Hamiltonian_MatrixElements_GPU_Used = 1;
+
     for (pair = 0; pair < pair_count; pair++) {
         const int Mc_AN = pair_Mc_AN[pair];
         const int h_AN = pair_h_AN[pair];
@@ -3150,6 +3163,8 @@ static void Calc_MatrixElements_dVH_Vxc_VNA_OpenMP(int Cnt_kind)
         Calc_MatrixElements_dVH_Vxc_VNA_CPU(Cnt_kind);
         host_done = 1;
     }
+
+    if (!host_done && packed_total_h > 0) Set_Hamiltonian_MatrixElements_GPU_Used = 1;
 
     for (pair = 0; pair < pair_count && !host_done; pair++) {
         int NO0 = pair_NO0[pair];

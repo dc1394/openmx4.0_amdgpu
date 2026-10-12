@@ -34,8 +34,8 @@ int TRAN_SCF_Iter_Band;
 
 static int DFT_GPU_BasisCount(void);
 static int DFT_GPU_DenseSwitchNum(void);
-static int DFT_SetOLPKinUseGPU(void);
-static int DFT_SetProExpnVNAUseGPU(void);
+int Set_Nonlocal_Used_GPU(void);
+int Set_ProExpn_VNA_Used_GPU(void);
 double Cluster_DFT_NonCol_ScatterGpuSolverCachedEVec(int n2, int *is2, int *ie2, dcomplex *EVec1);
 extern int BandNonCol_HamiltonianUseHipSolver(void);
 extern int openmx_magma_release_z_workspace(void);
@@ -45,14 +45,14 @@ int Band_DFT_NonCol_GpuSwitchNum(void);
 int Cluster_DFT_Col_GpuSwitchNum(void);
 int Cluster_DFT_NonCol_GpuSwitchNum(void);
 
-static int DFT_SetOLPKinUseGPU(void)
+/* Report work actually completed on any rank's GPU, including mixed
+   GPU/CPU stages. Every GPU rank participates regardless of stdout level. */
+static const char *DFT_GPU_StageLabel(int local_gpu)
 {
-    return (scf_eigen_lib_flag == GPUSOLVER && omp_get_max_threads() == 1);
-}
-
-static int DFT_SetProExpnVNAUseGPU(void)
-{
-    return 0;
+    int any_gpu = 0;
+    if (scf_eigen_lib_flag == GPUSOLVER)
+        MPI_Allreduce(&local_gpu, &any_gpu, 1, MPI_INT, MPI_MAX, mpi_comm_level1);
+    return any_gpu ? " (GPU-accelerated)" : "";
 }
 
 /* effective GPU/CPU crossover of the global dense eigensolver paths; each
@@ -492,12 +492,14 @@ double DFT(int MD_iter, int Cnt_Now)
 
   time1 = Set_OLP_Kin(OLP,H0);
 
-  if (MYID_MPI_COMM_WORLD==Host_ID && 0<level_stdout){
-    printf("<MD=%2d>  Calculation of the nonlocal matrix\n",MD_iter);
-    fflush(stdout);
-  }
-
   time2 = Set_Nonlocal(HNL,DS_NL);
+  {
+    const char *gpu_label = DFT_GPU_StageLabel(Set_Nonlocal_Used_GPU());
+    if (MYID_MPI_COMM_WORLD==Host_ID && 0<level_stdout){
+      printf("<MD=%2d>  Calculation of the nonlocal matrix%s\n",MD_iter,gpu_label);
+      fflush(stdout);
+    }
+  }
 
   if (core_hole_state_flag==1){
     if (MYID_MPI_COMM_WORLD==Host_ID && 0<level_stdout){
@@ -507,12 +509,14 @@ double DFT(int MD_iter, int Cnt_Now)
   }
 
   if (ProExpn_VNA==1){
-    if (MYID_MPI_COMM_WORLD==Host_ID && 0<level_stdout){
-      printf("<MD=%2d>  Calculation of the VNA projector matrix%s\n",MD_iter,
-             DFT_SetProExpnVNAUseGPU() ? " (GPU-accelerated)" : "");
-      fflush(stdout);
-    }
     time12 = Set_ProExpn_VNA(HVNA, HVNA2, DS_VNA);
+    {
+      const char *gpu_label = DFT_GPU_StageLabel(Set_ProExpn_VNA_Used_GPU());
+      if (MYID_MPI_COMM_WORLD==Host_ID && 0<level_stdout){
+        printf("<MD=%2d>  Calculation of the VNA projector matrix%s\n",MD_iter,gpu_label);
+        fflush(stdout);
+      }
+    }
     {
       extern void openmx_gpu_zheevd_selftest(const char *label);
       const char *selftest_env = getenv("OPENMX_ZHEEVD_SELFTEST");

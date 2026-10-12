@@ -1,7 +1,7 @@
 # openmx4.0_amdgpu
 
 ## What does this code do?
-The AMD GPU (ROCm/HIP) port of [openmx4.0_gpu](https://github.com/dc1394/openmx4.0_gpu), a GPU-accelerated version of [OpenMX](https://www.openmx-square.org/) (first-principles calculations with numerical atomic orbitals). The dense eigensolvers of the band and cluster calculations (collinear and non-collinear), the O(N) solvers (DC, DC-LNO, Krylov) and the heavy construction stages around them (Hamiltonian/overlap assembly, density and orbital grids, forces, charge mixing) run on the GPU. The CUDA/cuBLAS/cuSOLVER code of the NVIDIA version is rewritten on HIP/hipBLAS/hipSOLVER, the OpenACC regions on OpenMP target offloading, and the single-GPU dense eigensolves use [MAGMA](https://icl.utk.edu/magma/) (hipMAGMA). The two trees track each other.
+The AMD GPU (ROCm/HIP) port of [openmx4.0_gpu](https://github.com/dc1394/openmx4.0_gpu), a GPU-accelerated version of [OpenMX](https://www.openmx-square.org/) (first-principles calculations with numerical atomic orbitals). The dense eigensolvers of the band and cluster calculations (collinear and non-collinear), the O(N) solvers (DC, DC-LNO, Krylov) and the heavy construction stages around them (Hamiltonian assembly, nonlocal and VNA projectors, density and orbital grids, forces, charge mixing) run on the GPU. The CUDA/cuBLAS/cuSOLVER code of the NVIDIA version is rewritten on HIP/hipBLAS/hipSOLVER, the OpenACC regions on OpenMP target offloading, and the single-GPU dense eigensolves use [MAGMA](https://icl.utk.edu/magma/) (hipMAGMA). The two trees track each other.
 
 ## Code author
 Hiroyuki Kawai (Niigata Univ.)</br>
@@ -30,6 +30,8 @@ level.of.stdout          2
 | 3 | Also per-SCF/per-k-point refinement and warm-start details, per-rank low-memory diagnostics |
 
 Errors and invalid-setting warnings remain visible. Explicit diagnostic/profile flags such as `OPENMX_GPU_VERBOSE`, `OPENMX_SETHAM_TIMING`, `OPENMX_BAND_PROFILE` and `OPENMX_EIGEN_REFINE_CHECK` retain their output. Changing the output level does not change the precision, GPU admission decisions or MPI participation.
+
+At level 1 or higher, the nonlocal matrix, VNA projector and Hamiltonian progress lines carry `(GPU-accelerated)` when at least one rank successfully computes that stage on the GPU. These lines are printed after the stage so that a failed GPU attempt followed by CPU fallback is reported correctly. The current overlap/kinetic matrix implementation uses CPU OpenMP and does not carry a GPU label.
 
 The NVIDIA synchronization and regression checks are recorded in [nvidia_sync_20261012.txt](nvidia_sync_20261012.txt).
 

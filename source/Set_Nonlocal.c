@@ -248,6 +248,13 @@ static void SetNonlocal_ValidateGlobalState(void)
   }
 }
 
+static int SetNonlocal_gpu_used = 0;
+
+int Set_Nonlocal_Used_GPU(void)
+{
+  return SetNonlocal_gpu_used;
+}
+
 static int SetNonlocalUseOpenMP(void)
 {
   /* opt out with OPENMX_SETNL_OPENMP=0 (falls back to the OpenMP CPU path) */
@@ -1376,6 +1383,7 @@ static int SetNonlocal_CalcDSNL_OpenMP(double ******DS_NL,
   free(NLRF_all);
   free(RF_all);
 
+  if (device_ok && total_rows > 0) SetNonlocal_gpu_used = 1;
   return device_ok;
 }
 
@@ -1385,6 +1393,7 @@ double Set_Nonlocal(double *****HNL, double ******DS_NL)
   double TStime,TEtime;
 
   dtime(&TStime);
+  SetNonlocal_gpu_used = 0;
 
   Nonlocal0(HNL, DS_NL);
 
