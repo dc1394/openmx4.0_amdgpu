@@ -1,3 +1,4 @@
+#include "openmx_stdout_level.h"
 #include <magma_v2.h>
 #include "hip_runtime_compat.h"
 
@@ -1223,9 +1224,11 @@ int dense_eigen_locked(int cplx, int first_rocsolver, int preflight, int foreign
             break;
         }
         if (policy == 0 || !attempt_retryable(attempts[k], info)) break;
-        std::fprintf(stderr, "OpenMX: %s failed (info=%d, n=%d); solving again with %s.\n",
-                     attempt_name(attempts[k], cplx), info, n, attempt_name(attempts[k + 1], cplx));
-        std::fflush(stderr);
+        if (OPENMX_STDOUT_LEVEL(2)) {
+            std::fprintf(stderr, "OpenMX: %s failed (info=%d, n=%d); solving again with %s.\n",
+                         attempt_name(attempts[k], cplx), info, n, attempt_name(attempts[k + 1], cplx));
+            std::fflush(stderr);
+        }
     }
 
     /* MAGMA's eigenvectors, the first maxn columns, into the caller's array
@@ -1243,8 +1246,10 @@ int dense_eigen_locked(int cplx, int first_rocsolver, int preflight, int foreign
         (void)hipFree(solve);
     }
     if (retried && info == 0 && policy != 2) {
-        std::fprintf(stderr, "OpenMX: the %s solve succeeded (n=%d).\n", attempt_name(attempts[last], cplx), n);
-        std::fflush(stderr);
+        if (OPENMX_STDOUT_LEVEL(2)) {
+            std::fprintf(stderr, "OpenMX: the %s solve succeeded (n=%d).\n", attempt_name(attempts[last], cplx), n);
+            std::fflush(stderr);
+        }
     }
     if (retried && info != 0) {
         backup_report(&backup, cplx, n, info, attempt_name(attempts[last], cplx));
@@ -1511,8 +1516,10 @@ int fp32_solve(int cplx, int n, void *d_A, float *w)
             words = 3 * static_cast<size_t>(n) * (static_cast<size_t>(n) / 2 + 1);
         if (hipMemGetInfo(&free_bytes, &total_bytes) != hipSuccess ||
             free_bytes < words * sizeof(float) + (static_cast<size_t>(512) << 20)) {
-            std::printf("<eigen_refine_gpu> MAGMA FP32 solve declined: %.1f MiB free, %.1f MiB needed\n",
-                        free_bytes / 1048576.0, (words * sizeof(float) + (static_cast<size_t>(512) << 20)) / 1048576.0);
+            if (OPENMX_STDOUT_LEVEL(2)) {
+                std::printf("<eigen_refine_gpu> MAGMA FP32 solve declined: %.1f MiB free, %.1f MiB needed\n",
+                            free_bytes / 1048576.0, (words * sizeof(float) + (static_cast<size_t>(512) << 20)) / 1048576.0);
+            }
             std::fflush(stdout);
             return MAGMA_ERR_DEVICE_ALLOC;
         }

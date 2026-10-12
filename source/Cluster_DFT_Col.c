@@ -705,8 +705,10 @@ static int ClusterCol_GpuDiagFitsOnce(int n, int maxn, int myworld1, int myid1, 
     }
     if (!fit && serial_fit && SpinP_switch == 1) {
         if (myid1 == 0 && myworld1 == 0) {
-            printf("<Cluster_DFT_Col> Serializing spin roots to fit the shared GPU.\n");
-            fflush(stdout);
+            if (2 <= level_stdout) {
+                printf("<Cluster_DFT_Col> Serializing spin roots to fit the shared GPU.\n");
+                fflush(stdout);
+            }
         }
         return 2;
     }
@@ -1098,7 +1100,7 @@ static void ClusterCol_RefineConfigure(void)
     if (myid == Host_ID) {
         const char *all = getenv("OPENMX_EIGEN_REFINE_FIRST_ALL");
 
-        config[0] = openmx_eigen_refine_configure(0, 0 < level_stdout, &config[1]);
+        config[0] = openmx_eigen_refine_configure(0, 2 <= level_stdout, &config[1]);
         /* the states of the first SCF step: the same MaxN on every rank */
         config[2] = (all != NULL && atoi(all) != 0);
     }
@@ -1199,7 +1201,7 @@ void Cluster_DFT_Col_RefineAfterMixing(double normrd)
     if (!st->cycle_refined || st->final_stage || st->until <= 0.0 || st->until <= normrd) return;
     st->final_stage = 1;
     MPI_Comm_rank(mpi_comm_level1, &myid);
-    if (myid == Host_ID && 0 < level_stdout) {
+    if (myid == Host_ID && 2 <= level_stdout) {
         printf("<DFT>  eigensolver: NormRD %.3e < %.3e, FP64 eigensolver from the next SCF step\n", normrd,
                st->until);
         fflush(stdout);
@@ -1297,9 +1299,11 @@ static int ClusterCol_RefinedEigenDevice(int spin, int n, int maxn, double *ko_s
         }
     }
     if (!rc) {
-        printf("<Cluster_DFT_Col> no room for the %.1f MiB basis of the refined eigensolver; FP64 eigensolver%s\n",
-               (double)(nn * sizeof(double)) / (1024.0 * 1024.0), st->transient ? "" : " for the rest of the SCF cycle");
-        fflush(stdout);
+        if (2 <= level_stdout) {
+            printf("<Cluster_DFT_Col> no room for the %.1f MiB basis of the refined eigensolver; FP64 eigensolver%s\n",
+                   (double)(nn * sizeof(double)) / (1024.0 * 1024.0), st->transient ? "" : " for the rest of the SCF cycle");
+            fflush(stdout);
+        }
         if (!st->transient && st->persistent < 1) st->persistent = 1;
     }
 
@@ -1335,7 +1339,7 @@ static int ClusterCol_RefinedEigenDevice(int spin, int n, int maxn, double *ko_s
     e0 = (double *)ClusterCol_MallocArray((size_t)n, sizeof(double), "refinement eigenvalues");
     f0 = (double *)ClusterCol_MallocArray((size_t)n, sizeof(double), "refinement occupations");
     if (rc) {
-        if (0 < level_stdout) {
+        if (3 <= level_stdout) {
             printf("<Cluster_DFT_Col> spin %d: %s, %d refinement steps (OPENMX_EIGEN_REFINE)\n", spin,
                    pb.warm ? "warm start from the previous vectors" : "FP32 eigensolver", pb.iterations);
             fflush(stdout);
@@ -1362,9 +1366,11 @@ static int ClusterCol_RefinedEigenDevice(int spin, int n, int maxn, double *ko_s
                          mpi_comm_level1, &mpi_status);
         }
         if (status[0] == 1 && status[1] != 1) {
-            printf("<Cluster_DFT_Col> spin %d: the other spin's solve is not refined this step; FP64 eigensolver\n",
-                   spin);
-            fflush(stdout);
+            if (2 <= level_stdout) {
+                printf("<Cluster_DFT_Col> spin %d: the other spin's solve is not refined this step; FP64 eigensolver\n",
+                       spin);
+                fflush(stdout);
+            }
             openmx_eigen_refine_abandon(&ClusterCol_refine_state[spin]);
             rc = 0;
         }
@@ -1379,7 +1385,7 @@ static int ClusterCol_RefinedEigenDevice(int spin, int n, int maxn, double *ko_s
     free(e_peer);
     if (rc == 1) {
         wait_hipfunc(hipMemcpy(ko_spin + 1, ctx->d_W, sizeof(double) * (size_t)maxn, hipMemcpyDeviceToHost));
-        if (0 < level_stdout) {
+        if (3 <= level_stdout) {
             printf("<Cluster_DFT_Col> spin %d: refinement step %d of %d columns: max |r| %.1e, max |s| %.1e, delta "
                    "%.1e; Rayleigh-Ritz in %d partially occupied clusters (largest %d, chained within %.1e)\n",
                    spin, pb.iterations, rep.columns, rep.max_r, rep.max_s, rep.delta, rep.rr_clusters, rep.rr_largest,

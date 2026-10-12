@@ -428,9 +428,11 @@ static void ClusterNonCol_BackTransformHostStaged(int n, int n2, int maxn, const
 
     if (ClusterNonCol_BackTransformHost_HIP(handle, n, n2, maxn, V, S, dense_evec, ld) == 0) return;
 
-    fprintf(stderr, "<GEMM> rank %d: the host-staged back transform (maxn=%d, n2=%d) has no room on the device; "
-            "CPU BLAS.\n", ClusterNonCol_MpiRankForLog(), maxn, n2);
-    fflush(stderr);
+    if (2 <= level_stdout) {
+        fprintf(stderr, "<GEMM> rank %d: the host-staged back transform (maxn=%d, n2=%d) has no room on the device; "
+                "CPU BLAS.\n", ClusterNonCol_MpiRankForLog(), maxn, n2);
+        fflush(stderr);
+    }
     vt = (dcomplex *)ClusterNonCol_MallocArray(ClusterNonCol_CheckedMulCount((size_t)maxn, (size_t)n2,
                                                                              "back transform panel"),
                                                sizeof(dcomplex), "back transform panel");
@@ -1791,7 +1793,7 @@ static void ClusterNonCol_RefineConfigure(void)
 
     if (0 <= st->iterations) return;
     MPI_Comm_rank(mpi_comm_level1, &myid);
-    if (myid == Host_ID) config[0] = openmx_eigen_refine_configure(1, 0 < level_stdout, &config[1]);
+    if (myid == Host_ID) config[0] = openmx_eigen_refine_configure(1, 2 <= level_stdout, &config[1]);
     MPI_Bcast(config, 2, MPI_INT, Host_ID, mpi_comm_level1);
     st->iterations = config[0];
     st->defaulted = (0 < config[1]);
@@ -1844,7 +1846,7 @@ void Cluster_DFT_NonCol_RefineAfterMixing(double normrd)
     if (!st->cycle_refined || st->final_stage || st->until <= 0.0 || st->until <= normrd) return;
     st->final_stage = 1;
     MPI_Comm_rank(mpi_comm_level1, &myid);
-    if (myid == Host_ID && 0 < level_stdout) {
+    if (myid == Host_ID && 2 <= level_stdout) {
         printf("<DFT>  eigensolver: NormRD %.3e < %.3e, FP64 eigensolver from the next SCF step\n", normrd,
                st->until);
         fflush(stdout);
@@ -2413,7 +2415,7 @@ static int ClusterNonCol_RefinedSolveDevice(int n2, int maxn, double *ko, int tr
     *persistent = rep.persistent;
     if (rc == 1) {
         wait_hipfunc(hipMemcpy(ko + 1, ds->d_w, (size_t)maxn * sizeof(double), hipMemcpyDeviceToHost));
-        if (0 < level_stdout) {
+        if (3 <= level_stdout) {
             printf("<Cluster_DFT_NonCol> refined %d columns: max |r| %.1e, max |s| %.1e, delta %.1e; Rayleigh-Ritz in "
                    "%d partially occupied clusters (largest %d, chained within %.1e)\n",
                    rep.columns, rep.max_r, rep.max_s, rep.delta, rep.rr_clusters, rep.rr_largest, rep.chain);
@@ -2698,7 +2700,7 @@ static void ClusterNonCol_GpuSolverRootDensePath(int SCF_iter, double *ko, doubl
                 else warm = 0;
             }
 
-            if (0 < level_stdout) {
+            if (3 <= level_stdout) {
                 printf("<Cluster_DFT_NonCol> SCF step %d: %s, %d refinement steps%s (OPENMX_EIGEN_REFINE)\n",
                        SCF_iter, warm ? "warm start from the previous vectors" : "FP32 eigensolver",
                        ClusterNonCol_RefineIterations(), MaxN == n2 ? " of all states" : "");

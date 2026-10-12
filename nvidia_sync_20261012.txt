@@ -1,0 +1,194 @@
+NVIDIA GPU synchronization, 2026-10-12
+=====================================
+
+Sources and scope
+-----------------
+AMD baseline: 14aee377fb67008bc8a78426d04b2085f5a7d66d.
+NVIDIA checkout: /home/kawai/openmx4.0_gpu, main at
+3a877ab4 (merge of adaptive-precision).
+Changes adapted from:
+  a5dbeb8ffb41dce006fa62987047320f74cd7688
+    Gate the GPU diagnostics by level.of.stdout
+  18a08151249b664b1c884b09836c118d3f99e1d1
+    Plan the on-the-fly density workspace before the quadrature
+
+The AMD baseline already contains the FP32 eigensolver/FP64 refinement,
+double-float grid integrals, on-the-fly orbitals, O(N) solver GPU paths,
+solver retries and Force4B streaming. These implementations were reviewed
+alongside the NVIDIA changes. Existing HIP/MAGMA routing, gfx1200 solver
+workarounds and admission policies per physical GPU are retained.
+The CPU numerical loops are unchanged.
+
+Output policy
+-------------
+GPU diagnostics now use the input's existing level.of.stdout:
+  1 (default): normal OpenMX progress and GPU suffixes, GPU initialization
+               failure and dense GPU-to-CPU diagonalization notices.
+  2: also workspace/cache plans, precision configuration/transitions,
+     individual-stage fallbacks and solver retries.
+  3: also per-SCF, per-k-point and per-rank refinement, warm-start and
+     low-memory details.
+
+Fatal errors and invalid-setting warnings remain visible. Explicit verbose
+and profile environment settings retain their diagnostics regardless of
+the stdout level. Output guards never enclose numerical state changes or
+collective participation. Once-only notices record a notice only when it
+is actually printed. Tile plans are reported when the batch count changes
+or the workspace changes by more than 1/16, and at every size change at 3.
+
+source/openmx_stdout_level.h is identical to the NVIDIA header. GPU modules
+without openmx_common.h use a weak reference to the same level_stdout;
+standalone harnesses without that variable retain level-3 output. The final
+executable has a strong level_stdout definition from OpenMX. Six object
+rules list the header as a dependency.
+
+Density workspace and fallback
+------------------------------
+The density dispatch now preflights the cached on-the-fly arena against
+free GPU memory minus the same 256 MiB reserve used by runtime allocation.
+The AMD planner batches whole atoms and already enlarges a batch beyond
+the configured bound to accommodate one large atom. NVIDIA's pair-batch
+workspace growth was therefore not copied into the different AMD layout.
+
+Admission counts share the existing preparation allreduce; no additional
+preparation collective or node communicator is created. Ranks with no
+atoms neither veto admission nor inflate fallback counts. If both all-rank
+paths and the single-owner GPU service are unavailable, capable ranks keep
+their local GPU path and only declined ranks run the original CPU loop.
+Runtime GPU failures are counted with a shared nonblocking allreduce,
+completed after density communication. Level 2 reports changes in the
+fallback census; level 3 adds individual workspace shortages. These
+communications do not depend on stdout level or rank-local admission.
+
+Preflight is a memory snapshot. Peer allocations can still cause runtime
+failure; the original locked allocation, partial-result cleanup and CPU
+redo remain authoritative.
+
+Build
+-----
+ROCm 7.2.0, Radeon RX 9060 XT (gfx1200, 16 GiB), Threadripper 3970X.
+Successful initial -j8 and final incremental -j4 builds:
+  make -C source -j4 ARCH=gfx1200 \
+    MPI_HOME=/home/kawai/opt/openmpi-rocmclang \
+    AOCL_HOME=/opt/AMD/aocl/aocl-linux-aocc-5.2.0/aocc \
+    AOCC_LIB=/opt/AMD/aocc-compiler-5.1.0/lib openmx
+
+Final source/openmx SHA256:
+3233a1d1825d9e06f0a3a424a93bb6e4c310e2d892f18aa2270f858c0727d5ec
+Baseline work/codex_nvidia_sync_20261012/openmx.before SHA256:
+2289f3cbb578a420e557988b4ece8ce578a87917b4cb4f32b7b20d473b6c965f
+Only upstream GEMMul8 pragma-unroll compatibility warnings occurred.
+The rebuilt executable is source/openmx; work/openmx was not installed over.
+
+Host regression checks
+----------------------
+All listed harnesses passed; --sanitize was used where supported below.
+  run_grid_precision_state.py: 90 precision/output configurations, levels
+    0..3, undefined weak reference, input warnings, fixed precision state.
+  run_density_prepare_mpi.py: 10 real-MPI rounds on four ranks, mixed
+    CSR/OTF, empty rank, cached/fresh preparation, allocation failure,
+    local mode off, forced CSR, overflow, CPU collective bypass and
+    workspace shortage. Reports match the agreed census, do not count
+    workspace declines twice, print once on change and add no collective.
+  run_setham_otf_plan_cpu.py --sanitize: 60 checks each for page-locked and
+    pageable plans, exact-fit/one-byte-short admission, reserve floor,
+    query failure, ineligible/empty ranks and cached-plan lifetime.
+  run_dclno_solver_retry.py --sanitize: 84 injected failures, 126 numerical
+    checks, maximum error 2.44e-15.
+  run_dclno_noncol_retry.py --sanitize: 1140 injected failures, 949 numerical
+    checks, maximum error 2.66e-15, plus explicit retry-test mode.
+  run_force4b_stream_cpu.py --sanitize: 252 comparisons, max error 2.22e-15.
+  run_force4b_case1_turns_cpu.py --sanitize: 126 comparisons, max 1.22e-15.
+  run_force4b_resident_cpu.py --sanitize: 216 comparisons, max 2.66e-15.
+  run_krylov_gpu_fallback.py: 38 numerical checks, 24 injected failures,
+    maximum error zero.
+  run_nc_host_back_transform_cpu.py --sanitize: 12 shapes, max relative
+    error 8.13e-16.
+  run_setpro_hvna_cpu.py --sanitize: verbose unset/on, maximum error zero.
+  run_band_noncol_refine_flow_cpu.py: 142 state/control-flow checks.
+
+GPU output-level checks
+-----------------------
+Cluster and band, collinear and noncollinear: four configurations at each
+of levels 1, 2 and 3, 12 candidate runs, all passed. Isolated 32-atom Si
+subsets of the existing 216-atom fixtures, three SCF steps, eight MPI ranks,
+-nt 1; test-only GPU/refinement thresholds force the actual GPU paths.
+The source inputs are unchanged. Each output was compared with its own
+pre-change GPU run: identical atoms/positions/grids, finite energy and all
+Cartesian force components, tolerance 1e-7 Ha and 1e-7 Ha/bohr. Observed
+maxima: 9.95e-13 Ha energy, 1.01e-12 Ha/bohr force (rounded upward).
+
+Level 1 contains no refinement/grid/tile diagnostic banner. Refinement
+details occur only at 3; configuration and grid banners occur from 2.
+Legacy OpenMX itself prints large debug tables from level 2 onward; those
+tables and their output policy were not changed.
+
+L3 integration checks
+---------------------
+C60 (DC), CG15c (DC-LNO), GGFF (noncollinear band, 10x10x10 k mesh):
+the original -runtestL3 inputs, their original three-SCF limits, eight MPI
+ranks bound to cores, -nt 1. All three completed on both binaries and
+passed both the bundled references (1e-7 energy/force tolerance) and the
+pre-change outputs (1e-10 energy/force tolerance). Comparison checks every
+Cartesian force component, atom identity/position and grid dimensions;
+the signed sum of force differences is not used as the acceptance test.
+
+Case      Before (s) After (s) abs E(new-ref) max F(new-ref) abs E(new-old) max F(new-old)
+C60            5.25      5.27       4.00e-11       1.70e-11       0.00e+00       1.00e-12
+CG15c        174.79    173.37       1.47e-09       1.31e-09       3.91e-11       3.00e-12
+GGFF         463.53    459.68       4.21e-11       9.30e-11       9.09e-13       1.00e-12
+Energy units: Ha; force units: Ha/bohr. Times are OpenMX elapsed times.
+These single regression observations do not establish an overall speedup.
+
+Minimum available host RAM during candidate L3 runs: 203.04 GiB.
+Maximum job RSS: 45.86 GiB (CG15c). No timeout, memory guard, nonzero exit
+or runtime error occurred. GPU plan/refinement banners seen in the old
+default-level logs are suppressed in the corresponding candidate logs.
+
+CPU regression
+--------------
+C60 and Crys-MnO, original L3 inputs, OPENMX_GPU=0, eight MPI ranks, -nt 1.
+Both completed and passed the bundled references. Candidate versus baseline
+energy and every printed force component are exactly equal: comparison
+passed with zero energy and force tolerance, with identical atoms/grids.
+
+Real mixed density fallback
+---------------------------
+The same 32-Si collinear cluster fixture was run at levels 1, 2 and 3 with
+rank 1's local and legacy OTF density routes disabled. A 32768 MiB admission
+reserve on rank 0 rejects the single-owner service without allocating any
+extra GPU memory. Capable ranks retain their GPU density kernels.
+
+All three runs completed and matched the baseline full-GPU energy/forces:
+maximum energy difference 9.95e-13 Ha, force difference 1.00e-12 Ha/bohr
+(rounded). Explicit OPENMX_BAND_PROFILE=1 produced profiles at every level.
+Each density call had all eight ranks: initially two CPU/six GPU ranks,
+then one CPU/seven GPU ranks in the last call. Levels 2 and 3 each report
+exactly these two census changes; level 1 reports neither. No GPU/MPI
+failure or hang occurred. This validates the actual mixed dispatch and
+its stdout-independent communication, in addition to the host failure tests.
+
+Coverage limits
+---------------
+This validation uses three representative L3 cases, two CPU-only L3 cases
+and the isolated stdout/mixed-density fixtures. It is not a rerun of all
+S/L/L2/L3 inputs. Real GPU tests use one gfx1200 device shared by eight
+ranks; admission of multiple physical GPUs is retained but was not tested
+on multi-GPU hardware. Workspace shortage and device failure cases also
+use host stubs; the real mixed test rejects admission through existing
+environment controls. The three-SCF regression inputs are intentionally
+not convergence benchmarks.
+
+Local evidence
+--------------
+Generated logs and isolated runs are in work/codex_nvidia_sync_20261012/.
+build.log and build-final.log record builds; the named host-test logs record
+the harness results. before-stdout-results.json and after-stdout-results.json
+record the four baseline and twelve candidate logging checks. Command files
+in each case record the binary checksum, input source and test environment.
+before-L3/ and after-L3/ hold the GPU integrations; after-L3-reference.log
+and L3-comparison.log record their strict comparisons. before-cpu-L3/,
+after-cpu-L3/, cpu-comparison.log and cpu-reference.log record CPU checks.
+mixed-density-results.json, mixed-density.log and mixed-density/ record
+the actual mixed GPU/CPU executions and rank overrides.
+These generated artifacts are local evidence and are not vendored into Git.

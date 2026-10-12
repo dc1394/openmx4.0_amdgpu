@@ -11,7 +11,8 @@ point counts, the cumulative offsets inside a batch and across batches), the
 overlap-point lists, the packed H/DM blocks, a second lookup with the same
 key allocating nothing, a new key rebuilding, and the releases freeing every
 host buffer (page-locked or pageable).  Both kinds (0 matrix elements, 1
-density), spin counts 1, 2, 4, and OPENMX_SETHAM_ONTHEFLY_PINNED_MB=0
+density), preflight exact-fit/shortage/reserve/query-failure/ineligible/empty-rank
+conditions, spin counts 1, 2, 4, and OPENMX_SETHAM_ONTHEFLY_PINNED_MB=0
 (pageable only) and its default are run.
 """
 import argparse
@@ -79,7 +80,10 @@ static hipError_t hipGetLastError(void) { return hipSuccess; }
 
 /* the synthetic system: 7 local atoms of 3 species, 2..4 neighbours each */
 #define NA 7
-static int Matomnum = NA;
+static int Matomnum = NA, SpinP_switch=0, otf_possible=1, memory_query_ok=1;
+static size_t free_device_bytes;
+static int Set_Density_Grid_OTF_Possible(int k) { (void)k; return otf_possible; }
+static int OpenMX_GpuMemGetInfo(size_t *f,size_t *t) { *f=*t=free_device_bytes; return memory_query_ok ? hipSuccess : 1; }
 static int M2G[NA + 1], WhatSpecies[NA + 1], GridN_Atom[NA + 1], FNAN[NA + 1];
 static int Spe_Total_NO[3] = {4, 9, 13};
 static int natn[NA + 1][5], ncn[NA + 1][5], NumOLG[NA + 1][5];
@@ -250,6 +254,25 @@ int main(void)
 
       pl = SetH_OTF_GetPlan(kind, spins);
       check_plan(pl, kind, spins, NULL);
+      if(kind==1) {
+        size_t need=0, avail=0;
+        const size_t reserve=(size_t)256*1024*1024;
+        SpinP_switch=spins-1;
+        free_device_bytes=reserve+pl->arena_bytes;
+        check(Set_Density_Grid_OTF_Prepare(0,&need,&avail) && need==pl->arena_bytes && avail==need,"preflight exact fit");
+        free_device_bytes--;
+        check(!Set_Density_Grid_OTF_Prepare(0,&need,&avail) && need>avail,"preflight insufficient memory");
+        free_device_bytes=reserve-1;
+        check(!Set_Density_Grid_OTF_Prepare(0,&need,&avail) && avail==0,"reserve floor");
+        memory_query_ok=0;
+        check(!Set_Density_Grid_OTF_Prepare(0,&need,&avail),"failed memory query");
+        memory_query_ok=1; otf_possible=0;
+        check(!Set_Density_Grid_OTF_Prepare(1,&need,&avail),"ineligible density");
+        otf_possible=1; Matomnum=0;
+        check(Set_Density_Grid_OTF_Prepare(0,&need,&avail) && need==0 && avail==0,"empty partition");
+        Matomnum=NA;
+        checks+=6;
+      }
       checks++;
       SetH_OTF_PackBlocks(pl, blocks);
       check_plan(pl, kind, spins, blocks);
@@ -301,7 +324,7 @@ def build_source():
              "static size_t SetH_OTF_PinnedBytes = 0;"]
     for name in ["Set_Hamiltonian_OTF_BatchSizes", "SetH_OTF_HostAlloc", "SetH_OTF_HostFree", "SetH_OTF_FreePlan",
                  "SetH_OTF_ReleasePlans", "SetH_OTF_EnsureStatic", "SetH_OTF_KindBatchBytes", "SetH_OTF_GetPlan",
-                 "SetH_OTF_PackBlocks", "Set_Hamiltonian_OTF_ReleaseDevice", "Set_Hamiltonian_OTF_Release"]:
+                 "Set_Density_Grid_OTF_Prepare", "SetH_OTF_PackBlocks", "Set_Hamiltonian_OTF_ReleaseDevice", "Set_Hamiltonian_OTF_Release"]:
         parts.append(function(name))
     parts.append(MAIN)
     return "\n".join(parts)

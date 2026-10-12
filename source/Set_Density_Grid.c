@@ -533,6 +533,8 @@ static inline void SDG_accumulate_nc1(int no0, int no1,
 int Set_Density_Grid_GPU_Local_Prepare(int Cnt_kind, int Calc_CntOrbital_ON);
 int Set_Density_Grid_GPU_Local_Run(double *****CDM, double ***Tmp_Den_Grid);
 int Set_Density_Grid_GPU_Local_OnTheFly(void);
+void Set_Density_Grid_GPU_Local_Report(int path, int failed);
+int Set_Density_Grid_OTF_Prepare(int Cnt_kind, size_t *need_bytes, size_t *available_bytes);
 int openmx_grid_precision_df(void);
 
 double Set_Density_Grid(int Cnt_kind, int Calc_CntOrbital_ON, double *****CDM, double **Density_Grid_B0)
@@ -576,6 +578,8 @@ double Set_Density_Grid(int Cnt_kind, int Calc_CntOrbital_ON, double *****CDM, d
   double time0,time1,time2;
   int use_local_gpu = 0;
   int use_otf_gpu = 0;
+  int local_ok = 0, local_any = 0, local_path = 0, local_failed = 0, failed_ranks = 0;
+  MPI_Request failed_request = MPI_REQUEST_NULL;
   double sd_t0,sd_t1,sd_pre=0.0,sd_quad=0.0,sd_a2b=0.0,sd_sup=0.0,sd_b2d=0.0;
   static int sd_prof = -1;
   const char *sd_mode = "cpu";
@@ -648,8 +652,13 @@ double Set_Density_Grid(int Cnt_kind, int Calc_CntOrbital_ON, double *****CDM, d
      mode, the single-owner GPU service and the CPU/OpenMP loop remain as
      fallbacks, in that order. */
   {
-    int local_ok=Set_Density_Grid_GPU_Local_Prepare(Cnt_kind,Calc_CntOrbital_ON);
-    MPI_Allreduce(&local_ok,&use_local_gpu,1,MPI_INT,MPI_MIN,mpi_comm_level1);
+    int flags[2], reduced[2];
+    local_ok=Set_Density_Grid_GPU_Local_Prepare(Cnt_kind,Calc_CntOrbital_ON);
+    flags[0] = local_ok;
+    flags[1] = -local_ok;
+    MPI_Allreduce(flags,reduced,2,MPI_INT,MPI_MIN,mpi_comm_level1);
+    use_local_gpu = reduced[0];
+    local_any = -reduced[1];
 
     /* the first time on: every rank, as use_local_gpu is the agreed value */
     if (use_local_gpu){
@@ -659,7 +668,7 @@ double Set_Density_Grid(int Cnt_kind, int Calc_CntOrbital_ON, double *****CDM, d
         kinds[0] = (0<Matomnum && !Set_Density_Grid_GPU_Local_OnTheFly()) ? 1 : 0;
         kinds[1] = (0<Matomnum && Set_Density_Grid_GPU_Local_OnTheFly()) ? 1 : 0;
         MPI_Reduce(kinds,kinds_sum,2,MPI_INT,MPI_SUM,Host_ID,mpi_comm_level1);
-        if (myid==Host_ID && 0<level_stdout){
+        if (myid==Host_ID && 2 <= level_stdout){
           printf("<Set_Density_Grid> distributed GPU quadrature: every rank integrates its own atoms "
                  "(%d rank(s) on the resident tables, %s kernel; %d with on-the-fly tiles)\n",
                  kinds_sum[0], openmx_grid_precision_df() ? "double-float" : "FP64", kinds_sum[1]);
@@ -673,15 +682,20 @@ double Set_Density_Grid(int Cnt_kind, int Calc_CntOrbital_ON, double *****CDM, d
   /* the orbitals evaluated on the device batch by batch on every rank
      (Set_Hamiltonian.c) rather than the whole density on one owner */
   if (!use_local_gpu){
-    extern int Set_Density_Grid_OTF_Possible(int Cnt_kind);
-    int otf_ok=Set_Density_Grid_OTF_Possible(Cnt_kind);
+    size_t need, available;
+    int otf_ok=Set_Density_Grid_OTF_Prepare(Cnt_kind,&need,&available);
     MPI_Allreduce(&otf_ok,&use_otf_gpu,1,MPI_INT,MPI_MIN,mpi_comm_level1);
   }
 
   if (!use_local_gpu && !use_otf_gpu){
     if (Set_Density_Grid_GPU_Service(Cnt_kind,Calc_CntOrbital_ON,CDM,Density_Grid_B0,&time0)){
+      if (local_any) Set_Density_Grid_GPU_Local_Report(1,0);
       return time0;
     }
+    /* Keep capable ranks on their local GPU path when neither all-rank
+       route nor the single-owner service is available. */
+    use_local_gpu = local_ok;
+    local_path = 2;
   }
 
   /* allocation of arrays */
@@ -951,7 +965,10 @@ double Set_Density_Grid(int Cnt_kind, int Calc_CntOrbital_ON, double *****CDM, d
   /* the distributed GPU quadrature fills Tmp_Den_Grid directly; a run-time
      failure on any rank simply falls back to the CPU loop on that rank */
   if (use_local_gpu){
-    if (!Set_Density_Grid_GPU_Local_Run(CDM,Tmp_Den_Grid)) use_local_gpu=0;
+    if (!Set_Density_Grid_GPU_Local_Run(CDM,Tmp_Den_Grid)) {
+      use_local_gpu=0;
+      local_failed=1;
+    }
     else sd_mode = Set_Density_Grid_GPU_Local_OnTheFly() ? "otf" : "gpu-local";
   }
 
@@ -959,9 +976,13 @@ double Set_Density_Grid(int Cnt_kind, int Calc_CntOrbital_ON, double *****CDM, d
      rank by rank, before the CPU loop */
   {
     extern int Set_Density_Grid_OTF_Run(int Cnt_kind, double *****CDM, double ***Tmp_Den_Grid);
-    if (!use_local_gpu && use_otf_gpu && Set_Density_Grid_OTF_Run(Cnt_kind,CDM,Tmp_Den_Grid)){
-      use_local_gpu=1;
-      sd_mode = "otf";
+    if (!use_local_gpu && use_otf_gpu){
+      if (Set_Density_Grid_OTF_Run(Cnt_kind,CDM,Tmp_Den_Grid)) {
+        use_local_gpu=1;
+        local_failed=0;
+        sd_mode = "otf";
+      }
+      else local_failed=1;
     }
   }
 
@@ -1617,6 +1638,13 @@ double Set_Density_Grid(int Cnt_kind, int Calc_CntOrbital_ON, double *****CDM, d
   }
   sd_quad = time2 - sd_t0; sd_t0 = time2;
 
+  /* Like the NVIDIA path, report runtime fallbacks after communication.
+     Participation is independent of level.of.stdout. */
+  if (local_any){
+    local_failed = Matomnum > 0 && local_failed;
+    MPI_Iallreduce(&local_failed,&failed_ranks,1,MPI_INT,MPI_SUM,mpi_comm_level1,&failed_request);
+  }
+
   /******************************************************
       MPI communication from the partitions A to B 
   ******************************************************/
@@ -1767,6 +1795,11 @@ double Set_Density_Grid(int Cnt_kind, int Calc_CntOrbital_ON, double *****CDM, d
   ******************************************************/
 
   Density_Grid_Copy_B2D(Density_Grid_B0);
+
+  if (local_any){
+    MPI_Wait(&failed_request,MPI_STATUS_IGNORE);
+    Set_Density_Grid_GPU_Local_Report(local_path,failed_ranks);
+  }
 
   /* freeing of arrays */
 

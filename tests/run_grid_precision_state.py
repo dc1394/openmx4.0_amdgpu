@@ -56,6 +56,10 @@ STUBS = r'''
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include "openmx_stdout_level.h"
+#ifdef TEST_STDOUT_DEFINED
+int level_stdout = 3;
+#endif
 typedef int hipError_t;
 enum { hipSuccess = 0, hipErrorNoDevice = 100 };
 struct hipDeviceProp_t { char gcnArchName[256]; };
@@ -77,6 +81,9 @@ HARNESS = r'''
 int main(int argc, char **argv)
 {
     if (argc != 2) return 2;
+#ifdef TEST_STDOUT_DEFINED
+    level_stdout = std::atoi(std::getenv("TEST_STDOUT_LEVEL"));
+#endif
     const int expect_df = std::atoi(argv[1]);
     if (openmx_grid_precision_df() != expect_df) {
         std::fprintf(stderr, "openmx_grid_precision_df() = %d, expected %d\n", openmx_grid_precision_df(), expect_df);
@@ -148,24 +155,29 @@ def main():
     with tempfile.TemporaryDirectory(prefix="openmx-grid-precision-") as tmp:
         cfile, binary = Path(tmp) / "check.cpp", Path(tmp) / "check"
         cfile.write_text(code)
-        subprocess.run(shlex.split(args.cxx) + ["-std=c++17", "-O1", "-Wall", "-Wextra", "-Werror", str(cfile),
-                                                "-o", str(binary)], check=True)
-        for extra, expect_df, expect_out in CASES:
-            run = subprocess.run([str(binary), str(expect_df)], env=env | extra, capture_output=True, text=True)
-            if run.returncode != 0:
-                raise SystemExit(f"FAIL {extra}: {run.stderr.strip()}")
-            if expect_out == "df":
-                ok = run.stdout == DF_BANNER
-            elif expect_out == "note":
-                value = extra["OPENMX_GRID_PRECISION"]
-                ok = run.stdout == (f"<DFT>  grid integrals: OPENMX_GRID_PRECISION={value} is neither df nor fp64; "
-                                    "FP64 kernels\n")
-            else:
-                ok = run.stdout == ""
-            if not ok:
-                raise SystemExit(f"FAIL {extra}: unexpected banner {run.stdout!r}")
-    print(f"PASS: {len(CASES)} grid precision configurations (environment, architecture table, ratio "
-          "override, fixed decision, one banner)")
+        for defined in (False, True):
+            flags = ["-DTEST_STDOUT_DEFINED"] if defined else []
+            subprocess.run(shlex.split(args.cxx) + ["-std=c++17", "-O1", "-Wall", "-Wextra", "-Werror",
+                            "-I", str(ROOT / "source"), *flags, str(cfile), "-o", str(binary)], check=True)
+            for level in ((0, 1, 2, 3) if defined else (3,)):
+                for extra, expect_df, expect_out in CASES:
+                    run = subprocess.run([str(binary), str(expect_df)],
+                                         env=env | extra | {"TEST_STDOUT_LEVEL": str(level)},
+                                         capture_output=True, text=True)
+                    if run.returncode != 0:
+                        raise SystemExit(f"FAIL level={level} {extra}: {run.stderr.strip()}")
+                    if expect_out == "df":
+                        ok = run.stdout == (DF_BANNER if level >= 2 else "")
+                    elif expect_out == "note":
+                        value = extra["OPENMX_GRID_PRECISION"]
+                        ok = run.stdout == (f"<DFT>  grid integrals: OPENMX_GRID_PRECISION={value} is neither df nor fp64; "
+                                            "FP64 kernels\n")
+                    else:
+                        ok = run.stdout == ""
+                    if not ok:
+                        raise SystemExit(f"FAIL level={level} {extra}: unexpected banner {run.stdout!r}")
+    print(f"PASS: {len(CASES) * 5} grid precision/output configurations (levels 0..3, standalone weak "
+          "reference, input warnings at every level, fixed precision decision, one banner)")
 
 
 if __name__ == "__main__":

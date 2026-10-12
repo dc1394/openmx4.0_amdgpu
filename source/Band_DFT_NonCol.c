@@ -1713,11 +1713,13 @@ static int BandNonCol_RootDenseParallelKWorldsFit(int n, int n2, int MaxN, int s
             hip_ok = 1;
         }
         else {
-            fprintf(stderr,
-                    "<Band>  Rank %d failed to query GPU memory for non-collinear dense GPU solver (%s); "
-                    "using serialized k-worlds.\n",
-                    myid0,hipGetErrorString(hip_status));
-            fflush(stderr);
+            if (2 <= level_stdout) {
+                fprintf(stderr,
+                        "<Band>  Rank %d failed to query GPU memory for non-collinear dense GPU solver (%s); "
+                        "using serialized k-worlds.\n",
+                        myid0,hipGetErrorString(hip_status));
+                fflush(stderr);
+            }
             local_fit = 0;
         }
     }
@@ -3261,7 +3263,7 @@ static void BandNonCol_RefineConfigure(void)
     if (myid == Host_ID) {
         int ratio = 0;
 
-        config[0] = (double)openmx_eigen_refine_configure(1, 0 < level_stdout, &ratio);
+        config[0] = (double)openmx_eigen_refine_configure(1, 2 <= level_stdout, &ratio);
         config[1] = (double)ratio;
         config[2] = openmx_eigen_refine_until();
     }
@@ -3398,7 +3400,7 @@ void Band_DFT_NonCol_RefineAfterMixing(double normrd)
     if (!st->cycle_refined || st->final_stage || st->until <= 0.0 || st->until <= normrd) return;
     st->final_stage = 1;
     MPI_Comm_rank(mpi_comm_level1, &myid);
-    if (myid == Host_ID && 0 < level_stdout) {
+    if (myid == Host_ID && 2 <= level_stdout) {
         printf("<DFT>  eigensolver: NormRD %.3e < %.3e, FP64 eigensolver from the next SCF step\n", normrd,
                st->until);
         fflush(stdout);
@@ -3547,10 +3549,12 @@ static int BandNonCol_RefineEnsureBuffers(int n2, int maxn, int kloop, int conde
         BandNonCol_TryDeviceMalloc((void **)&BandNonCol_refine_x, sizeof(dcomplex) * n2n2) == hipSuccess)
         BandNonCol_refine_x_n = n2;
     if (b->d_scratch == NULL || b->d_w == NULL || b->d_info == NULL || BandNonCol_refine_x == NULL) {
-        printf("<Band_DFT_NonCol> k-point %d: no room for the refined eigensolver's %.1f MiB; FP64 eigensolver%s\n",
-               kloop, (double)(scratch + sizeof(dcomplex) * n2n2) / 1048576.0,
-               condemn ? " for the rest of the SCF cycle" : "");
-        fflush(stdout);
+        if (2 <= level_stdout) {
+            printf("<Band_DFT_NonCol> k-point %d: no room for the refined eigensolver's %.1f MiB; FP64 eigensolver%s\n",
+                   kloop, (double)(scratch + sizeof(dcomplex) * n2n2) / 1048576.0,
+                   condemn ? " for the rest of the SCF cycle" : "");
+            fflush(stdout);
+        }
         BandNonCol_RefineDropDevice();
         if (condemn && st->persistent < 1) st->persistent = 1;
         return 0;
@@ -3676,7 +3680,7 @@ static int BandNonCol_RefineFinishH2(int n2, int maxn, int kloop, double *ko, Ba
     else {
         BandNonCol_KRefSlotFree(slot, n2);
     }
-    if (0 < level_stdout) {
+    if (3 <= level_stdout) {
         printf("<Band_DFT_NonCol> k-point %d: %s, %d refinement steps of %d columns: max |r| %.1e, max |s| %.1e, "
                "delta %.1e; Rayleigh-Ritz in %d partially occupied clusters (largest %d)\n",
                kloop, pb->warm ? "warm start" : "FP32 eigensolver", pb->iterations, rep->columns, rep->max_r,
@@ -5431,7 +5435,7 @@ double Band_DFT_NonCol(
 	    if (refine_resident){
 	      static int announced = 0;
 
-	      if (!announced && myid0==Host_ID && 0<level_stdout){
+	      if (!announced && myid0==Host_ID && 2 <= level_stdout){
 	        printf("<Band_DFT_NonCol> refined eigensolver with every k-world owner resident (%d k-worlds, turn "
 	               "group %d): the estimates of all k-points give the chemical potential of the refinement\n",
 	               Num_Comm_World2,root_dense_turn_group);

@@ -477,7 +477,7 @@ Cluster_DFT_Col.o: Cluster_DFT_Col.c openmx_common.h eigen_refine_gpu.h eigen_re
 	$(CC) -c Cluster_DFT_Col.c
 Cluster_DFT_Col_dm_hip.o: Cluster_DFT_Col_dm_hip.cu
 	$(HIPCC) $(HIPCC_GEMMUL8_FLAGS) -c Cluster_DFT_Col_dm_hip.cu -o Cluster_DFT_Col_dm_hip.o
-magma_openmx.o: magma_openmx.cu openmx_common.h $(MAGMA_LIB)
+magma_openmx.o: magma_openmx.cu openmx_common.h $(MAGMA_LIB) openmx_stdout_level.h
 	$(HIPCC) $(HIPCC_MAGMA_FLAGS) -c magma_openmx.cu -o magma_openmx.o
 Cluster_DFT_NonCol.o: Cluster_DFT_NonCol.c openmx_common.h eigen_refine_gpu.h eigen_refine_hooks.h
 	$(CC) -c Cluster_DFT_NonCol.c
@@ -688,7 +688,7 @@ Eigen_lapack.o: Eigen_lapack.c openmx_common.h lapack_prototypes.h
 	$(CC) -c Eigen_lapack.c
 gpusolver_Syevd.o: gpusolver_Syevd.c openmx_common.h set_hip_default_device_from_local_rank.h
 	$(CC) -c gpusolver_Syevd.c
-gpusolver_Syevdx.o: gpusolver_Syevdx.c openmx_common.h
+gpusolver_Syevdx.o: gpusolver_Syevdx.c openmx_common.h openmx_stdout_level.h
 	$(CC) -c gpusolver_Syevdx.c
 set_hip_default_device_from_local_rank.o: set_hip_default_device_from_local_rank.c openmx_common.h set_hip_default_device_from_local_rank.h
 	$(CC) -c set_hip_default_device_from_local_rank.c
@@ -746,7 +746,7 @@ Set_OLP_p.o: Set_OLP_p.c openmx_common.h
 	$(CC) -c Set_OLP_p.c
 Set_Hamiltonian.o: Set_Hamiltonian.c openmx_common.h set_hip_default_device_from_local_rank.h
 	$(CC) $(SETH_CPU_BASELINE_FLAGS) -c Set_Hamiltonian.c
-set_hamiltonian_hip.o: set_hamiltonian_hip.cu
+set_hamiltonian_hip.o: set_hamiltonian_hip.cu openmx_stdout_level.h
 	$(HIPCC) $(HIPCC_GEMMUL8_FLAGS) -c set_hamiltonian_hip.cu -o set_hamiltonian_hip.o
 Set_Vpot.o: Set_Vpot.c openmx_common.h
 	$(CC) -c Set_Vpot.c
@@ -774,9 +774,9 @@ my_hipblasDgemm.o: my_hipblasDgemm.c openmx_common.h
 	$(CC) -c my_hipblasDgemm.c
 my_hipblasZgemm.o: my_hipblasZgemm.c openmx_common.h
 	$(CC) -c my_hipblasZgemm.c
-gemmul8_bridge.o: gemmul8_bridge.cu openmx_common.h $(GEMMUL8_DIR)/include/gemmul8.hpp $(GEMMUL8_LIB)
+gemmul8_bridge.o: gemmul8_bridge.cu openmx_common.h $(GEMMUL8_DIR)/include/gemmul8.hpp $(GEMMUL8_LIB) openmx_stdout_level.h
 	$(HIPCC) $(HIPCC_GEMMUL8_FLAGS) -c gemmul8_bridge.cu -o gemmul8_bridge.o
-eigen_refine_gpu.o: eigen_refine_gpu.cu eigen_refine_gpu.h hip_runtime_compat.h hipblas_compat.h
+eigen_refine_gpu.o: eigen_refine_gpu.cu eigen_refine_gpu.h hip_runtime_compat.h hipblas_compat.h openmx_stdout_level.h
 	$(HIPCC) $(HIPCC_GEMMUL8_FLAGS) $(MPI_CFLAGS) -c eigen_refine_gpu.cu -o eigen_refine_gpu.o
 # double-float arithmetic: no floating-point contraction (-ffp-contract=off in the flags)
 orbs_otf_hip.o: orbs_otf_hip.cu orbs_otf_hip.h
@@ -804,7 +804,7 @@ $(GPUSOLVER2_STAMP): third_party/build_gpusolver2_stack.sh
 gpusolver2-clean:
 	rm -rf "$(GPUSOLVER2_BUILD)" "$(GPUSOLVER2_PREFIX)"
 
-elpa_cosma_bridge.o: elpa_cosma_bridge.c elpa_cosma_bridge.h $(GPUSOLVER2_STAMP)
+elpa_cosma_bridge.o: elpa_cosma_bridge.c elpa_cosma_bridge.h $(GPUSOLVER2_STAMP) openmx_stdout_level.h
 	$(CC_NOACC_O3) -I$(GPUSOLVER2_ELPA_INCLUDE) -c elpa_cosma_bridge.c
 $(GEMMUL8_DIR)/Makefile:
 	mkdir -p $(GEMMUL8_REPO_DIR)

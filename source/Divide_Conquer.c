@@ -412,7 +412,7 @@ static void DCCol_SCache_Prepare(int matomnum, const int *Msize, int scf_iter)
         int myid = -1;
 
         MPI_Comm_rank(mpi_comm_level1, &myid);
-        if (myid == Host_ID) {
+        if (myid == Host_ID && 2 <= level_stdout) {
             printf("<DC> GPU S-cache: rank %d keeps %d of %d cluster overlaps on the device (%.1f MiB)\n",
                    myid, admitted, matomnum, (double)(used * sizeof(double)) / (1024.0 * 1024.0));
             fflush(stdout);

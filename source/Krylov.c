@@ -497,11 +497,15 @@ static void Krylov_Eigen2(Krylov_GPU_Workspace *ws, double *a, int csize, double
   info = openmx_magma_dsyevdx_gpu(n, EVmax, ws->d_A, ko+1, &mout);
   if (info != 0 || mout != EVmax){
     if (info != 0){
-      fprintf(stderr,"Krylov: magma_dsyevdx_gpu failed, info=%d; falling back to LAPACK.\n",info);
+      if (2 <= level_stdout) {
+          fprintf(stderr,"Krylov: magma_dsyevdx_gpu failed, info=%d; falling back to LAPACK.\n",info);
+      }
     }
     else{
-      fprintf(stderr,"Krylov: magma_dsyevdx_gpu returned %d eigenpairs, expected %d; falling back to LAPACK.\n",
-              mout,EVmax);
+      if (2 <= level_stdout) {
+          fprintf(stderr,"Krylov: magma_dsyevdx_gpu returned %d eigenpairs, expected %d; falling back to LAPACK.\n",
+                  mout,EVmax);
+      }
     }
     Eigen_lapack2(a,csize,ko,n,EVmax);
     return;
@@ -637,7 +641,7 @@ static void Krylov_KUCache_Prepare(int matomnum, int nspin, const int *Msize,
   Krylov_kucache.nspin=nspin;
   Krylov_kucache.arena_elems=used;
 
-  if (0<level_stdout && 0<admitted){
+  if (2<=level_stdout && 0<admitted){
     int myid=-1;
     MPI_Comm_rank(mpi_comm_level1,&myid);
     if (myid==Host_ID){
@@ -778,7 +782,7 @@ static void Krylov_GPU_Preflight(int matomnum, const int *Msize, const int *Msiz
        stages need now; a later call that fits rebuilds it from scratch */
     Krylov_Release_GPU_KUCache();
     MPI_Comm_rank(mpi_comm_level1, &myid);
-    if (myid == Host_ID){
+    if (myid == Host_ID && 2 <= level_stdout){
       fprintf(stderr,
               "Krylov: GPU device %d is shared by %d rank(s), has %.3f MiB free "
               "(%.3f MiB total on rank %d), but %.3f MiB is required for the GPU projected "
@@ -885,11 +889,13 @@ static int Krylov_ProjectedSolve_GPU(Krylov_GPU_Workspace *ws,int spin,int Mc_AN
     if (profile) dtime(&t6);
     info=openmx_magma_dsyevdx_gpu(m3,m3,ws->d_A,ko+1,&mout);
     eig_on_device=(info==0 && mout==m3);
-    if (info!=0)
-      fprintf(stderr,"Krylov: magma_dsyevdx_gpu failed, info=%d; falling back to LAPACK.\n",info);
-    else if (mout!=m3)
-      fprintf(stderr,"Krylov: magma_dsyevdx_gpu returned %d eigenpairs, expected %d; falling back to LAPACK.\n",
-              mout,m3);
+    if (2<=level_stdout) {
+      if (info!=0)
+        fprintf(stderr,"Krylov: magma_dsyevdx_gpu failed, info=%d; falling back to LAPACK.\n",info);
+      else if (mout!=m3)
+        fprintf(stderr,"Krylov: magma_dsyevdx_gpu returned %d eigenpairs, expected %d; falling back to LAPACK.\n",
+                mout,m3);
+    }
   }
   else t6=t5;
   if (!eig_on_device){

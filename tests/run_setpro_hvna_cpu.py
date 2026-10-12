@@ -64,6 +64,7 @@ PREFIX = r'''
 #include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
+static int level_stdout=3;
 #include <stdlib.h>
 #include <string.h>
 

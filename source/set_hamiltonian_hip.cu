@@ -1,3 +1,4 @@
+#include "openmx_stdout_level.h"
 #include <hip/hip_runtime.h>
 
 #include <cstddef>
@@ -977,8 +978,10 @@ extern "C" void openmx_grid_precision_announce(void)
     static int announced = 0;
 
     if (announced) return;
+    const int mode = grid_precision_configure();
+    if (mode == 1 && !OPENMX_STDOUT_LEVEL(2)) return;
     announced = 1;
-    if (grid_precision_configure() == 1) {
+    if (mode == 1) {
         std::printf("<DFT>  grid integrals: double-float kernels (FP32 arithmetic with error-free transformations; "
                     "OPENMX_GRID_PRECISION=fp64 restores the FP64 kernels)\n");
     }

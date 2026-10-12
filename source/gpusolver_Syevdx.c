@@ -1,3 +1,4 @@
+#include "openmx_stdout_level.h"
 /*
  * Copyright 2020 NVIDIA Corporation.  All rights reserved.
  *
@@ -381,9 +382,11 @@ static int solver_retry_magma(GpusolverContext *c, const void *src, int n, int m
         }
     }
     else {
-        fprintf(stderr, "OpenMX GPU eigensolver: rocSOLVER %s failed (%d, n=%d, %d pairs); solving again with "
-                "MAGMA.\n", cplx ? "complex" : "real", first, n, maxn);
-        fflush(stderr);
+        if (OPENMX_STDOUT_LEVEL(2)) {
+            fprintf(stderr, "OpenMX GPU eigensolver: rocSOLVER %s failed (%d, n=%d, %d pairs); solving again with "
+                    "MAGMA.\n", cplx ? "complex" : "real", first, n, maxn);
+            fflush(stderr);
+        }
     }
 
     /* MAGMA works on its own queue */
@@ -414,8 +417,10 @@ static int solver_retry_magma(GpusolverContext *c, const void *src, int n, int m
     }
     if (result == 0) {
         if (!forced) {
-            fprintf(stderr, "OpenMX GPU eigensolver: the MAGMA solve succeeded (n=%d).\n", n);
-            fflush(stderr);
+            if (OPENMX_STDOUT_LEVEL(2)) {
+                fprintf(stderr, "OpenMX GPU eigensolver: the MAGMA solve succeeded (n=%d).\n", n);
+                fflush(stderr);
+            }
         }
     }
     else {

@@ -12,6 +12,7 @@
 #include <unordered_map>
 
 #include "gemmul8.hpp"
+#include "openmx_stdout_level.h"
 
 namespace {
 
@@ -394,7 +395,7 @@ void log_workspace_fallback_once(const WorkspaceReport &report, const char *targ
 {
     static bool warned = false;
 
-    if (!verbose_logging_enabled()) {
+    if (!verbose_logging_enabled() && !OPENMX_STDOUT_LEVEL(2)) {
         return;
     }
 

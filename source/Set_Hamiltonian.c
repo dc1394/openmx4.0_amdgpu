@@ -649,13 +649,15 @@ static int Set_Hamiltonian_DeviceMemoryOK(size_t required_bytes, const char *whe
 
     if (group_free < group_required) {
         if (device_rank == 0) {
-            fprintf(stderr,
-                    "Set_Hamiltonian: %s: GPU device %d is shared by %d rank(s), has %.3f MiB free "
-                    "(%.3f MiB total on rank %d), but %.3f MiB is required in total; switching to CPU path.\n",
-                    where, hip_device, device_ranks, (double)group_free / (1024.0 * 1024.0),
-                    (double)total_bytes / (1024.0 * 1024.0), myid,
-                    (double)group_required / (1024.0 * 1024.0));
-            fflush(stderr);
+            if (2 <= level_stdout) {
+                fprintf(stderr,
+                        "Set_Hamiltonian: %s: GPU device %d is shared by %d rank(s), has %.3f MiB free "
+                        "(%.3f MiB total on rank %d), but %.3f MiB is required in total; switching to CPU path.\n",
+                        where, hip_device, device_ranks, (double)group_free / (1024.0 * 1024.0),
+                        (double)total_bytes / (1024.0 * 1024.0), myid,
+                        (double)group_required / (1024.0 * 1024.0));
+                fflush(stderr);
+            }
         }
         return 0;
     }
@@ -2206,23 +2208,29 @@ static int Calc_MatrixElements_dVH_Vxc_VNA_OnTheFly(int Cnt_kind, int myid)
                 t_kernel, t_unpack, t_now - t_start);
     }
 #undef SETH_OTF_TIME
-    if (myid == Host_ID) {
-        static int announced = 0;
-        if (!announced) {
+    if (myid == Host_ID && 2 <= level_stdout) {
+        static size_t last_workspace = 0;
+        static int last_batches = -1;
+        const size_t drift = last_workspace < pl->arena_bytes ? pl->arena_bytes - last_workspace
+                                                              : last_workspace - pl->arena_bytes;
+        if (last_batches != batch_count || last_workspace / 16 < drift || (3 <= level_stdout && drift != 0)) {
             printf("<Set_Hamiltonian> GPU on-the-fly orbital tiles: %d batch(es) of %.1f MiB on rank %d, %s "
                    "evaluation, %s plan\n", batch_count, (double)pl->arena_bytes / (1024.0 * 1024.0), myid,
                    OTF_Orbitals_DoubleFloat() ? "double-float" : "FP64",
                    SetH_OTF_PlanCacheEnabled() ? "cached" : "per-call");
             fflush(stdout);
-            announced = 1;
+            last_workspace = pl->arena_bytes;
+            last_batches = batch_count;
         }
     }
 
 done:
     if (!ok && myid == Host_ID) {
-        fprintf(stderr, "Set_Hamiltonian: rank %d: the on-the-fly matrix elements failed in batch %d of %d; "
-                "the table or CPU path takes over\n", myid, b + 1, batch_count);
-        fflush(stderr);
+        if (2 <= level_stdout) {
+            fprintf(stderr, "Set_Hamiltonian: rank %d: the on-the-fly matrix elements failed in batch %d of %d; "
+                    "the table or CPU path takes over\n", myid, b + 1, batch_count);
+            fflush(stderr);
+        }
     }
     if (arena != NULL) hipFree(arena);   /* d_vgrid lies inside */
     (void)hipGetLastError();
@@ -2260,6 +2268,29 @@ int Set_Density_Grid_OTF_Possible(int Cnt_kind)
        others back (the caller takes the minimum over the ranks) */
     if (Matomnum <= 0) return 1;
     return Set_Orbitals_Grid_OTF_Prepare() && Set_Hamiltonian_OTF_Ensure();
+}
+
+/* Plan before the density dispatch, as in the NVIDIA implementation.  This
+   port batches whole atoms and already allows one atom to exceed the default
+   workspace bound.  Use the very same cached arena size and allocation
+   reserve as Run, rather than the NVIDIA pair-workspace accounting.  This
+   check is rank-local; the locked allocation in Run remains authoritative
+   when peer ranks allocate after this snapshot. */
+int Set_Density_Grid_OTF_Prepare(int Cnt_kind, size_t *need_bytes, size_t *available_bytes)
+{
+    SetHOTFPlan *pl;
+    size_t free_bytes = 0, total_bytes = 0;
+    const size_t reserve = (size_t)256 * 1024 * 1024;
+
+    *need_bytes = *available_bytes = 0;
+    if (!Set_Density_Grid_OTF_Possible(Cnt_kind)) return 0;
+    if (Matomnum <= 0) return 1;
+    pl = SetH_OTF_GetPlan(1, SpinP_switch + 1);
+    if (pl == NULL) return 0;
+    *need_bytes = pl->arena_bytes;
+    if (OpenMX_GpuMemGetInfo(&free_bytes, &total_bytes) != hipSuccess) return 0;
+    *available_bytes = reserve < free_bytes ? free_bytes - reserve : 0;
+    return pl->arena_bytes <= *available_bytes;
 }
 
 int Set_Density_Grid_OTF_Run(int Cnt_kind, double *****CDM, double ***Tmp_Den_Grid)
@@ -2306,7 +2337,7 @@ int Set_Density_Grid_OTF_Run(int Cnt_kind, double *****CDM, double ***Tmp_Den_Gr
     if (arena == NULL) {
         static int warned = 0;
 
-        if (!warned) {
+        if (!warned && 3 <= level_stdout) {
             printf("<Set_Density_Grid> rank %d: no room for the on-the-fly density (%.1f MiB free, %.1f MiB "
                    "needed with the reserve); CPU loop\n", myid, (double)free_bytes / 1048576.0,
                    (double)(pl->arena_bytes + (size_t)256 * 1024 * 1024) / 1048576.0);
@@ -2384,13 +2415,17 @@ int Set_Density_Grid_OTF_Run(int Cnt_kind, double *****CDM, double ***Tmp_Den_Gr
                 t_now - t_start);
     }
 #undef SDG_OTF_TIME
-    if (myid == Host_ID) {
-        static int announced = 0;
-        if (!announced) {
+    if (myid == Host_ID && 2 <= level_stdout) {
+        static size_t last_workspace = 0;
+        static int last_batches = -1;
+        const size_t drift = last_workspace < pl->arena_bytes ? pl->arena_bytes - last_workspace
+                                                              : last_workspace - pl->arena_bytes;
+        if (last_batches != batch_count || last_workspace / 16 < drift || (3 <= level_stdout && drift != 0)) {
             printf("<Set_Density_Grid> GPU on-the-fly orbital tiles: %d batch(es) of %.1f MiB on rank %d\n",
                    batch_count, (double)pl->arena_bytes / (1024.0 * 1024.0), myid);
             fflush(stdout);
-            announced = 1;
+            last_workspace = pl->arena_bytes;
+            last_batches = batch_count;
         }
     }
 
@@ -2405,9 +2440,11 @@ done:
                     memset(Tmp_Den_Grid[sp][Mc_AN], 0, sizeof(double) * (size_t)GridN_Atom[M2G[Mc_AN]]);
         }
         if (arena != NULL && myid == Host_ID) {
-            fprintf(stderr, "Set_Density_Grid: rank %d: the on-the-fly density failed in batch %d of %d; CPU loop\n",
-                    myid, b + 1, batch_count);
-            fflush(stderr);
+            if (3 <= level_stdout) {
+                fprintf(stderr, "Set_Density_Grid: rank %d: the on-the-fly density failed in batch %d of %d; CPU loop\n",
+                        myid, b + 1, batch_count);
+                fflush(stderr);
+            }
         }
     }
     if (arena != NULL) hipFree(arena);

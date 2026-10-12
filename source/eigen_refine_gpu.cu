@@ -49,6 +49,7 @@
    and every loop is a kernel on the stream of the caller's hipBLAS handle.
 */
 #include "eigen_refine_gpu.h"
+#include "openmx_stdout_level.h"
 
 #include <hip/hip_runtime.h>
 #include <hipblas/hipblas.h>
@@ -466,10 +467,12 @@ int refine_blocks_ensure(EigenRefineState *st, EigenRefineDevice *dev, const Eig
     }
     else {
         if (dev->try_malloc(&st->own, (size_t)blocks * block_bytes) != hipSuccess) {
-            printf("<eigen_refine_gpu> no room for the %.1f MiB of refinement products; FP64 eigensolver%s\n",
-                   (double)blocks * (double)block_bytes / (1024.0 * 1024.0),
-                   pb->transient ? "" : " for the rest of the SCF cycle");
-            fflush(stdout);
+            if (OPENMX_STDOUT_LEVEL(2)) {
+                printf("<eigen_refine_gpu> no room for the %.1f MiB of refinement products; FP64 eigensolver%s\n",
+                       (double)blocks * (double)block_bytes / (1024.0 * 1024.0),
+                       pb->transient ? "" : " for the rest of the SCF cycle");
+                fflush(stdout);
+            }
             report->persistent = pb->transient ? 0 : 1;
             return 0;
         }
@@ -560,9 +563,11 @@ int refine_work_ensure(EigenRefineDevice *dev, size_t bytes, const char *what)
             *dev->d_work_bytes = 0;
         }
         if (dev->try_malloc(&grown, bytes) != hipSuccess) {
-            printf("<eigen_refine_gpu> no room for the %.1f MiB %s workspace\n", (double)bytes / (1024.0 * 1024.0),
-                   what);
-            fflush(stdout);
+            if (OPENMX_STDOUT_LEVEL(2)) {
+                printf("<eigen_refine_gpu> no room for the %.1f MiB %s workspace\n", (double)bytes / (1024.0 * 1024.0),
+                       what);
+                fflush(stdout);
+            }
             return 0;
         }
         *dev->d_work = grown;
@@ -582,8 +587,10 @@ int refine_fp32_rocsolver(EigenRefineDevice *dev, hipStream_t stream, int cplx, 
     hipsolverStatus_t         status;
 
     if (solver == nullptr) {
-        printf("<eigen_refine_gpu> no hipSOLVER handle for the FP32 eigensolver\n");
-        fflush(stdout);
+        if (OPENMX_STDOUT_LEVEL(2)) {
+            printf("<eigen_refine_gpu> no hipSOLVER handle for the FP32 eigensolver\n");
+            fflush(stdout);
+        }
         return 0;
     }
     if (cplx)
@@ -593,8 +600,10 @@ int refine_fp32_rocsolver(EigenRefineDevice *dev, hipStream_t stream, int cplx, 
         status = hipsolverDnSsyevd_bufferSize(solver, HIPSOLVER_EIG_MODE_VECTOR, HIPBLAS_FILL_MODE_LOWER, n, af, n,
                                               wf, &lwork);
     if (status != HIPSOLVER_STATUS_SUCCESS) {
-        printf("<eigen_refine_gpu> FP32 eigensolver workspace query failed (status %d)\n", (int)status);
-        fflush(stdout);
+        if (OPENMX_STDOUT_LEVEL(2)) {
+            printf("<eigen_refine_gpu> FP32 eigensolver workspace query failed (status %d)\n", (int)status);
+            fflush(stdout);
+        }
         return 0;
     }
     if (lwork < 1) lwork = 1;
@@ -612,8 +621,10 @@ int refine_fp32_rocsolver(EigenRefineDevice *dev, hipStream_t stream, int cplx, 
                      "download info");
     refine_check(hipStreamSynchronize(stream), "synchronize");
     if (status != HIPSOLVER_STATUS_SUCCESS || info != 0) {
-        printf("<eigen_refine_gpu> FP32 rocSOLVER eigensolver failed (status %d, info %d)\n", (int)status, info);
-        fflush(stdout);
+        if (OPENMX_STDOUT_LEVEL(2)) {
+            printf("<eigen_refine_gpu> FP32 rocSOLVER eigensolver failed (status %d, info %d)\n", (int)status, info);
+            fflush(stdout);
+        }
         return 0;
     }
     {
@@ -631,8 +642,10 @@ int refine_fp32_rocsolver(EigenRefineDevice *dev, hipStream_t stream, int cplx, 
         refine_check(hipStreamSynchronize(stream), "synchronize");
         refine_check(hipFree(flag), "hipFree flag");
         if (!finite) {
-            printf("<eigen_refine_gpu> FP32 rocSOLVER eigensolver returned non-finite eigenpairs\n");
-            fflush(stdout);
+            if (OPENMX_STDOUT_LEVEL(2)) {
+                printf("<eigen_refine_gpu> FP32 rocSOLVER eigensolver returned non-finite eigenpairs\n");
+                fflush(stdout);
+            }
             return 0;
         }
     }
@@ -653,7 +666,7 @@ int refine_fp32_solve(EigenRefineDevice *dev, hipStream_t stream, int cplx, int 
 
     {
         static int announced = 0;
-        if (!announced) {
+        if (!announced && OPENMX_STDOUT_LEVEL(2)) {
             announced = 1;
             printf("<eigen_refine_gpu> FP32 full solve: %s\n",
                    first_magma ? "MAGMA hybrid divide and conquer (OPENMX_EIGEN_FP32_SOLVER=magma)"
@@ -666,8 +679,10 @@ int refine_fp32_solve(EigenRefineDevice *dev, hipStream_t stream, int cplx, int 
         int       ok = 0;
 
         if (attempt == 1) {
-            printf("<eigen_refine_gpu> retrying the FP32 solve with %s\n", use_magma ? "MAGMA" : "rocSOLVER");
-            fflush(stdout);
+            if (OPENMX_STDOUT_LEVEL(2)) {
+                printf("<eigen_refine_gpu> retrying the FP32 solve with %s\n", use_magma ? "MAGMA" : "rocSOLVER");
+                fflush(stdout);
+            }
             /* the room of the other solver's workspace goes to this one (MAGMA
                allocates its own, and a library that cannot allocate ends the
                process) */
@@ -689,8 +704,10 @@ int refine_fp32_solve(EigenRefineDevice *dev, hipStream_t stream, int cplx, int 
                 ok = 1;
             }
             else {
-                printf("<eigen_refine_gpu> FP32 MAGMA eigensolver failed (info %d)\n", info);
-                fflush(stdout);
+                if (OPENMX_STDOUT_LEVEL(2)) {
+                    printf("<eigen_refine_gpu> FP32 MAGMA eigensolver failed (info %d)\n", info);
+                    fflush(stdout);
+                }
             }
             free(w);
         }
@@ -704,14 +721,18 @@ int refine_fp32_solve(EigenRefineDevice *dev, hipStream_t stream, int cplx, int 
         }
         if (ok) {
             if (attempt == 1) {
-                printf("<eigen_refine_gpu> the retried FP32 solve succeeded\n");
-                fflush(stdout);
+                if (OPENMX_STDOUT_LEVEL(2)) {
+                    printf("<eigen_refine_gpu> the retried FP32 solve succeeded\n");
+                    fflush(stdout);
+                }
             }
             return 1;
         }
     }
-    printf("<eigen_refine_gpu> FP32 eigensolver failed; solving in FP64\n");
-    fflush(stdout);
+    if (OPENMX_STDOUT_LEVEL(2)) {
+        printf("<eigen_refine_gpu> FP32 eigensolver failed; solving in FP64\n");
+        fflush(stdout);
+    }
     return 0;
 }
 
@@ -728,8 +749,10 @@ int refine_maxima(const EigenRefineDevice *dev, hipStream_t stream, int cplx, co
     if (blocks > 1024) blocks = 1024;
     if (dev->try_malloc((void **)&partial, (size_t)blocks * 3 * sizeof(double)) != hipSuccess) {
         /* no room even for the check: the caller solves in FP64 */
-        printf("<eigen_refine_gpu> no room for the refinement check\n");
-        fflush(stdout);
+        if (OPENMX_STDOUT_LEVEL(2)) {
+            printf("<eigen_refine_gpu> no room for the refinement check\n");
+            fflush(stdout);
+        }
         return 0;
     }
     hipLaunchKernelGGL(k_maxima, dim3(blocks), dim3(kThreads), 0, stream, b1, b2, n, kc, cplx ? 2 : 1, partial);
@@ -752,8 +775,10 @@ int refine_maxima(const EigenRefineDevice *dev, hipStream_t stream, int cplx, co
 
 int refine_nonfinite(EigenRefineState *st, const EigenRefineProblem *pb, EigenRefineReport *report)
 {
-    printf("<eigen_refine_gpu> invalid refinement values; solving the preserved matrix in FP64\n");
-    fflush(stdout);
+    if (OPENMX_STDOUT_LEVEL(2)) {
+        printf("<eigen_refine_gpu> invalid refinement values; solving the preserved matrix in FP64\n");
+        fflush(stdout);
+    }
     refine_blocks_release(st);
     st->basis_valid = 0;
     report->persistent = pb->transient ? 0 : 1;
@@ -771,8 +796,10 @@ int refine_result_finite(const EigenRefineDevice *dev, hipStream_t stream, int w
 
     if (dev->try_malloc((void **)&flag, sizeof(int)) != hipSuccess) {
         /* no room even for the check: the caller solves in FP64 */
-        printf("<eigen_refine_gpu> no room for the refinement check\n");
-        fflush(stdout);
+        if (OPENMX_STDOUT_LEVEL(2)) {
+            printf("<eigen_refine_gpu> no room for the refinement check\n");
+            fflush(stdout);
+        }
         return 0;
     }
     refine_check(hipMemcpyAsync(flag, &finite, sizeof(int), hipMemcpyHostToDevice, stream), "upload flag");
@@ -1124,9 +1151,11 @@ extern "C" int openmx_eigen_refine_prepare(EigenRefineState *st, EigenRefineDevi
             dev->try_malloc((void **)&st->occ, (size_t)n * sizeof(double)) != hipSuccess) {
             if (st->lam != NULL) refine_check(hipFree(st->lam), "hipFree lam");
             st->lam = NULL;
-            printf("<eigen_refine_gpu> no room for the refinement eigenvalues; FP64 eigensolver%s\n",
-                   pb->transient ? "" : " for the rest of the SCF cycle");
-            fflush(stdout);
+            if (OPENMX_STDOUT_LEVEL(2)) {
+                printf("<eigen_refine_gpu> no room for the refinement eigenvalues; FP64 eigensolver%s\n",
+                       pb->transient ? "" : " for the rest of the SCF cycle");
+                fflush(stdout);
+            }
             report->persistent = pb->transient ? 0 : 1;
             return 0;
         }
@@ -1158,9 +1187,11 @@ extern "C" int openmx_eigen_refine_prepare(EigenRefineState *st, EigenRefineDevi
                           "X^H X1");
         refine_check(hipStreamSynchronize(stream), "synchronize");
         if (pb->defaulted && openmx_gemmul8NativeCalls(cplx) != native0) {
-            printf("<eigen_refine_gpu> the refinement products fell back to plain hipBLAS FP64 (GEMMul8 workspace "
-                   "policy); FP64 eigensolver for the rest of the run\n");
-            fflush(stdout);
+            if (OPENMX_STDOUT_LEVEL(2)) {
+                printf("<eigen_refine_gpu> the refinement products fell back to plain hipBLAS FP64 (GEMMul8 workspace "
+                       "policy); FP64 eigensolver for the rest of the run\n");
+                fflush(stdout);
+            }
             refine_blocks_release(st);
             st->basis_valid = 0;
             report->persistent = 2;
@@ -1168,8 +1199,10 @@ extern "C" int openmx_eigen_refine_prepare(EigenRefineState *st, EigenRefineDevi
         }
         if (!refine_maxima(dev, stream, cplx, b1, b2, n, kc, &max_s, &max_r)) return refine_nonfinite(st, pb, report);
         if (2.0e-5 < max_s || 2.0e-5 < max_r) {
-            printf("<eigen_refine_gpu> warm start: residual %.1e above 2e-5; FP32 eigensolver\n", fmax(max_s, max_r));
-            fflush(stdout);
+            if (OPENMX_STDOUT_LEVEL(3)) {
+                printf("<eigen_refine_gpu> warm start: residual %.1e above 2e-5; FP32 eigensolver\n", fmax(max_s, max_r));
+                fflush(stdout);
+            }
             refine_blocks_release(st);
             return -1;
         }
@@ -1252,9 +1285,11 @@ extern "C" int openmx_eigen_refine_finish(EigenRefineState *st, EigenRefineDevic
         if (pb->defaulted && openmx_gemmul8NativeCalls(cplx) != native0) {
             /* plain FP64 products cost more than the FP64 eigensolver on the
                GPUs this default is for */
-            printf("<eigen_refine_gpu> the refinement products fell back to plain hipBLAS FP64 (GEMMul8 workspace "
-                   "policy); FP64 eigensolver for the rest of the run\n");
-            fflush(stdout);
+            if (OPENMX_STDOUT_LEVEL(2)) {
+                printf("<eigen_refine_gpu> the refinement products fell back to plain hipBLAS FP64 (GEMMul8 workspace "
+                       "policy); FP64 eigensolver for the rest of the run\n");
+                fflush(stdout);
+            }
             refine_blocks_release(st);
             st->basis_valid = 0;
             report->persistent = 2;
@@ -1366,9 +1401,11 @@ extern "C" int openmx_eigen_refine_finish(EigenRefineState *st, EigenRefineDevic
             c0 = c1 + 1;
         }
         if (rr_limit < rr_largest) {
-            printf("<eigen_refine_gpu> a partially occupied cluster of %d states (limit %d) is too large for the "
-                   "refined FP32 eigensolver; FP64 eigensolver for the rest of the SCF cycle\n", rr_largest, rr_limit);
-            fflush(stdout);
+            if (OPENMX_STDOUT_LEVEL(2)) {
+                printf("<eigen_refine_gpu> a partially occupied cluster of %d states (limit %d) is too large for the "
+                       "refined FP32 eigensolver; FP64 eigensolver for the rest of the SCF cycle\n", rr_largest, rr_limit);
+                fflush(stdout);
+            }
             rr_ok = 0;
         }
         for (int c = 0; rr_ok && c < clusters; c++) {
@@ -1378,9 +1415,11 @@ extern "C" int openmx_eigen_refine_finish(EigenRefineState *st, EigenRefineDevic
                 rr_clusters++;
             }
             else {
-                printf("<eigen_refine_gpu> the Rayleigh-Ritz step of a cluster of %d states failed; FP64 eigensolver "
-                       "for the rest of the SCF cycle\n", ms[c]);
-                fflush(stdout);
+                if (OPENMX_STDOUT_LEVEL(2)) {
+                    printf("<eigen_refine_gpu> the Rayleigh-Ritz step of a cluster of %d states failed; FP64 eigensolver "
+                           "for the rest of the SCF cycle\n", ms[c]);
+                    fflush(stdout);
+                }
                 rr_ok = 0;
             }
         }

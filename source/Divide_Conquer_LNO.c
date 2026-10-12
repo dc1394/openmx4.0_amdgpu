@@ -648,6 +648,7 @@ static int DCLNO_RetryTest(void)
 static void DCLNO_ReportGpuRetry(const char *what, int info, int n, int requested)
 {
     static int quiet = 0;
+    if (level_stdout < 2 && !DCLNO_RetryTest()) return;
     if (DCLNO_RetryTest()) {
         /* one line per rank is enough for the test */
         if (quiet) return;
@@ -1004,9 +1005,11 @@ static int DCLNO_NonColGpuCallFailed(const char *what, int status, int n, int re
 
     (void)hipStreamSynchronize(DCLNO_gpusolverz_ctx.stream);
     (void)hipGetLastError();
-    fprintf(stderr, "<DC-LNO> %s failed in the noncollinear GPU solve: status=%d n=%d requested=%d; "
-            "retrying on CPU.\n", what, status, n, requested);
-    fflush(stderr);
+    if (2 <= level_stdout) {
+        fprintf(stderr, "<DC-LNO> %s failed in the noncollinear GPU solve: status=%d n=%d requested=%d; "
+                "retrying on CPU.\n", what, status, n, requested);
+        fflush(stderr);
+    }
     return retry;
 }
 
@@ -3007,7 +3010,7 @@ static double DC_NonCol(char *mode,
     DCLNO_GPUProxy_Init();
   }
 
-  if (firsttime && myid0 == Host_ID && use_gpu_accel_nc && 0 < level_stdout) {
+  if (firsttime && myid0 == Host_ID && use_gpu_accel_nc && 2 <= level_stdout) {
     printf("<DC-LNO> GPUSOLVER direct per-rank dispatch (noncollinear) is enabled for local matrices with dimension >= %d on %d HIP device(s).\n",
            DCLNO_NonColGpuEigenThreshold(), DCLNO_ngpu);
     fflush(stdout);

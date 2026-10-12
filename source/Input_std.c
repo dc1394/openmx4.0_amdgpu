@@ -815,7 +815,7 @@ void Input_std(char *file)
 
     input_logical("scf.gemmul8.enable", &gemmul8_enable, 1);
     openmx_gemmul8SetEnabled(gemmul8_enable);
-    if (gemmul8_enable==0 && myid==Host_ID){
+    if (gemmul8_enable==0 && myid==Host_ID && 2<=level_stdout){
       printf("<Input_std> scf.gemmul8.enable=off: GPU dense GEMMs use plain hipBLAS instead of GEMMul8.\n");
     }
   }

@@ -413,7 +413,13 @@ static int SetPro_HVNA_GpuBegin(Type_DS_VNA *****DS_VNA, int *VNA_List,
                 (double)need/1048576.0,(double)max_need/1048576.0,(double)min_available/1048576.0,
                 admitted,node_ranks,local_turns,fit,global_fit);
     if (!global_fit){
-      if (!fit && node_rank==0){
+      if (!fit && 3<=level_stdout){
+        fprintf(stderr,
+                "Set_ProExpn_VNA HVNA GPU: %.2f GiB free for %d rank(s) but %.2f GiB needed per rank; CPU fallback.\n",
+                (double)free_bytes/(1024.0*1024.0*1024.0),node_ranks,(double)need/(1024.0*1024.0*1024.0));
+        fflush(stderr);
+      }
+      else if (!fit && node_rank==0 && 2<=level_stdout){
         fprintf(stderr,
                 "Set_ProExpn_VNA HVNA GPU: %.3f GiB maximum per rank, %.3f GiB device free; "
                 "insufficient device/host budget or rank turns disabled; CPU fallback.\n",
@@ -427,9 +433,11 @@ static int SetPro_HVNA_GpuBegin(Type_DS_VNA *****DS_VNA, int *VNA_List,
     g->turn = node_rank/admitted;
     MPI_Allreduce(&local_turns,&g->turns,1,MPI_INT,MPI_MAX,mpi_comm_level1);
     if (node_rank==0 && local_turns>1) {
-      fprintf(stderr,"Set_ProExpn_VNA HVNA GPU: %d rank(s) per turn, %d turns, %.3f GiB maximum per rank.\n",
-              admitted,local_turns,(double)max_need/1073741824.0);
-      fflush(stderr);
+      if (2 <= level_stdout) {
+          fprintf(stderr,"Set_ProExpn_VNA HVNA GPU: %d rank(s) per turn, %d turns, %.3f GiB maximum per rank.\n",
+                  admitted,local_turns,(double)max_need/1073741824.0);
+          fflush(stderr);
+      }
     }
   }
   MPI_Comm_free(&node_comm);
@@ -452,11 +460,13 @@ static int SetPro_HVNA_GpuBegin(Type_DS_VNA *****DS_VNA, int *VNA_List,
     MPI_Allreduce(&allocated,&all_allocated,1,MPI_INT,MPI_MIN,mpi_comm_level1);
     if (!all_allocated){
       if (!allocated){
-        fprintf(stderr,"Set_ProExpn_VNA HVNA GPU: the %.3f GiB host archives could not be allocated; "
-                "CPU fallback on every rank.\n",
-                (double)(sizeof(float)*((pos==0 ? 1 : pos) + (g->halo_count==0 ? 1 : g->halo_count)))
-                /1073741824.0);
-        fflush(stderr);
+        if (2 <= level_stdout) {
+            fprintf(stderr,"Set_ProExpn_VNA HVNA GPU: the %.3f GiB host archives could not be allocated; "
+                    "CPU fallback on every rank.\n",
+                    (double)(sizeof(float)*((pos==0 ? 1 : pos) + (g->halo_count==0 ? 1 : g->halo_count)))
+                    /1073741824.0);
+            fflush(stderr);
+        }
       }
       free(g->l2p1);
       free(g->ene);
@@ -794,9 +804,11 @@ static void SetPro_HVNA_GpuRun(double ****HVNA)
 
     if (!on_device){
       (void)hipGetLastError();   /* a failed copy must not linger either */
-      fprintf(stderr,"Set_ProExpn_VNA HVNA GPU: the %.1f MiB device batch could not be staged in this "
-              "rank's turn; contracting on the host.\n",(double)asz/1048576.0);
-      fflush(stderr);
+      if (2 <= level_stdout) {
+          fprintf(stderr,"Set_ProExpn_VNA HVNA GPU: the %.1f MiB device batch could not be staged in this "
+                  "rank's turn; contracting on the host.\n",(double)asz/1048576.0);
+          fflush(stderr);
+      }
 
 #pragma omp parallel for schedule(static)
       for (size_t oe=0; oe<out_c; oe++){
@@ -1235,7 +1247,7 @@ static int SetPro_DSVNA_GpuBegin(int *VNA_List, int *VNA_List2, int Num_RVNA,
 
     if (budget<=need){
 
-      if (node_rank==0){
+      if (node_rank==0 && 2<=level_stdout){
         fprintf(stderr,
                 "Set_ProExpn_VNA DS_VNA GPU: needs %.3f GiB per rank, %d rank(s) share "
                 "this device and only %.3f GiB is free; CPU fallback.\n",
@@ -1250,9 +1262,11 @@ static int SetPro_DSVNA_GpuBegin(int *VNA_List, int *VNA_List2, int Num_RVNA,
       return 0;
     }
     if (node_rank==0 && g->chunk<SETPRO_DSVNA_CHUNK) {
-      fprintf(stderr,"Set_ProExpn_VNA DS_VNA GPU: pair batch %d, %.3f GiB per rank within %.3f GiB budget.\n",
-              g->chunk,(double)need/1073741824.0,(double)budget/1073741824.0);
-      fflush(stderr);
+      if (2 <= level_stdout) {
+          fprintf(stderr,"Set_ProExpn_VNA DS_VNA GPU: pair batch %d, %.3f GiB per rank within %.3f GiB budget.\n",
+                  g->chunk,(double)need/1073741824.0,(double)budget/1073741824.0);
+          fflush(stderr);
+      }
     }
   }
 
@@ -1999,7 +2013,7 @@ static int SetPro_VNA23_GpuBegin(void)
                 (double)reserve/1048576.0,node_ranks,budget<=need ? "CPU fallback" : "admitted");
 
     if (budget<=need){
-      if (node_rank==0){
+      if (node_rank==0 && 2<=level_stdout){
         fprintf(stderr,
                 "Set_ProExpn_VNA HVNA2/HVNA3 GPU: needs %.3f GiB per rank, %d rank(s) share "
                 "this device and only %.3f GiB is free; CPU fallback.\n",
@@ -2011,7 +2025,7 @@ static int SetPro_VNA23_GpuBegin(void)
       SetPro_VNA23_GpuEnd();
       return 0;
     }
-    if (node_rank==0 && g->chunk<SETPRO_VNA23_CHUNK){
+    if (node_rank==0 && g->chunk<SETPRO_VNA23_CHUNK && 2<=level_stdout){
       fprintf(stderr,"Set_ProExpn_VNA HVNA2/HVNA3 GPU: pair batch %d, %.3f GiB per rank within %.3f GiB budget.\n",
               g->chunk,(double)need/1073741824.0,(double)budget/1073741824.0);
       fflush(stderr);

@@ -396,9 +396,11 @@ static int BandCol_GpuPersistentDecide(void)
             if (hipMemGetInfo(&free_bytes, &total_bytes) != hipSuccess) {
                 decided = 0;
             } else if (free_bytes < min_free) {
-                fprintf(stderr,
-                        "Band_DFT_Col: persistent GPU buffers disabled (%.0f MiB free < %.0f MiB threshold).\n",
-                        (double)free_bytes / (1024.0 * 1024.0), (double)min_free / (1024.0 * 1024.0));
+                if (2 <= level_stdout) {
+                    fprintf(stderr,
+                            "Band_DFT_Col: persistent GPU buffers disabled (%.0f MiB free < %.0f MiB threshold).\n",
+                            (double)free_bytes / (1024.0 * 1024.0), (double)min_free / (1024.0 * 1024.0));
+                }
                 decided = 0;
             } else {
                 decided = 1;
@@ -2020,7 +2022,7 @@ static void BandCol_RefineConfigure(void)
     if (myid == Host_ID) {
         int ratio = 0;
 
-        config[0] = (double)openmx_eigen_refine_configure(1, 0 < level_stdout, &ratio);
+        config[0] = (double)openmx_eigen_refine_configure(1, 2 <= level_stdout, &ratio);
         config[1] = (double)ratio;
         config[2] = openmx_eigen_refine_until();
     }
@@ -2159,7 +2161,7 @@ void Band_DFT_Col_RefineAfterMixing(double normrd)
     if (!st->cycle_refined || st->final_stage || st->until <= 0.0 || st->until <= normrd) return;
     st->final_stage = 1;
     MPI_Comm_rank(mpi_comm_level1, &myid);
-    if (myid == Host_ID && 0 < level_stdout) {
+    if (myid == Host_ID && 2 <= level_stdout) {
         printf("<DFT>  eigensolver: NormRD %.3e < %.3e, FP64 eigensolver from the next SCF step\n", normrd,
                st->until);
         fflush(stdout);
@@ -2320,9 +2322,11 @@ static int BandCol_RefineEnsureDeviceBasis(int n)
     if (BandCol_refine_x != NULL && BandCol_refine_x_n != n) BandCol_RefineDropBasis();
     if (BandCol_refine_x == NULL) {
         if (BandCol_TryDeviceMalloc((void **)&BandCol_refine_x, sizeof(dcomplex) * nn) != hipSuccess) {
-            printf("<Band_DFT_Col> no room for the %.1f MiB basis of the refined eigensolver; FP64 eigensolver\n",
-                   (double)(sizeof(dcomplex) * nn) / (1024.0 * 1024.0));
-            fflush(stdout);
+            if (2 <= level_stdout) {
+                printf("<Band_DFT_Col> no room for the %.1f MiB basis of the refined eigensolver; FP64 eigensolver\n",
+                       (double)(sizeof(dcomplex) * nn) / (1024.0 * 1024.0));
+                fflush(stdout);
+            }
             return 0;
         }
         BandCol_refine_x_n = n;
@@ -2481,7 +2485,7 @@ static int BandCol_KDenseRefinedSolve(int n, int maxn, double *ko, BandColKRefin
     else {
         BandCol_KRefSlotFree(slot, n);
     }
-    if (0 < level_stdout) {
+    if (3 <= level_stdout) {
         printf("<Band_DFT_Col> k-point slot %d: %s, %d refinement steps of %d columns: max |r| %.1e, max |s| %.1e, "
                "delta %.1e; Rayleigh-Ritz in %d partially occupied clusters (largest %d)\n",
                (int)(slot - BandCol_kref), pb.warm ? "warm start" : "FP32 eigensolver", pb.iterations, rep.columns,
@@ -2557,10 +2561,12 @@ static dcomplex *BandCol_RefinedFirstHalf(int n, int maxn, const dcomplex *H_in,
     if (BandCol_refine_x != NULL && BandCol_refine_x_n != n) BandCol_RefineDropBasis();
     if (BandCol_refine_x == NULL) {
         if (BandCol_TryDeviceMalloc((void **)&BandCol_refine_x, sizeof(dcomplex) * nn) != hipSuccess) {
-            printf("<Band_DFT_Col> no room for the %.1f MiB basis of the refined eigensolver; FP64 eigensolver%s\n",
-                   (double)(sizeof(dcomplex) * nn) / (1024.0 * 1024.0),
-                   st->transient ? "" : " for the rest of the SCF cycle");
-            fflush(stdout);
+            if (2 <= level_stdout) {
+                printf("<Band_DFT_Col> no room for the %.1f MiB basis of the refined eigensolver; FP64 eigensolver%s\n",
+                       (double)(sizeof(dcomplex) * nn) / (1024.0 * 1024.0),
+                       st->transient ? "" : " for the rest of the SCF cycle");
+                fflush(stdout);
+            }
             if (!st->transient && st->persistent < 1) st->persistent = 1;
             rc = 0;
         }
@@ -2592,7 +2598,7 @@ static dcomplex *BandCol_RefinedFirstHalf(int n, int maxn, const dcomplex *H_in,
         pb->defaulted = st->defaulted;
         pb->occupation = BandCol_RefineFermi;
         pb->occupation_ctx = &BandCol_refine_occ;
-        if (0 < level_stdout) {
+        if (3 <= level_stdout) {
             printf("<Band_DFT_Col> this rank's k-point: %s, %d refinement steps (OPENMX_EIGEN_REFINE)\n",
                    pb->warm ? "warm start from the previous vectors" : "FP32 eigensolver", pb->iterations);
             fflush(stdout);
@@ -2637,7 +2643,7 @@ static dcomplex *BandCol_RefinedSecondHalf(int n, int maxn, double *ko, double m
     if (rc != 1 && st->persistent < rep.persistent) st->persistent = rep.persistent;
     if (rc == 1) {
         wait_hipfunc(hipMemcpy(ko + 1, ctx->d_W, sizeof(double) * (size_t)maxn, hipMemcpyDeviceToHost));
-        if (0 < level_stdout) {
+        if (3 <= level_stdout) {
             printf("<Band_DFT_Col> refinement step %d of %d columns: max |r| %.1e, max |s| %.1e, delta %.1e; "
                    "Rayleigh-Ritz in %d partially occupied clusters (largest %d, chained within %.1e)\n",
                    pb->iterations, rep.columns, rep.max_r, rep.max_s, rep.delta, rep.rr_clusters, rep.rr_largest,
@@ -4466,7 +4472,7 @@ diagonalize1:
         if (BandCol_refine.staged) {
             static int announced = 0;
 
-            if (!announced && myid0 == Host_ID && 0 < level_stdout) {
+            if (!announced && myid0 == Host_ID && 2 <= level_stdout) {
                 printf("<Band_DFT_Col> refined eigensolver in serialized GPU turns (%d owners in groups of %d): pass 1 "
                        "with the previous chemical potential, pass 2 from its basis\n", total_gpu_turns,
                        gpu_turn_group);

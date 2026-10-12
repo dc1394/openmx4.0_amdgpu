@@ -61,6 +61,7 @@ def extract_struct(source: str, name: str) -> str:
 STUBS = r'''
 #define _POSIX_C_SOURCE 200809L
 #include <stdio.h>
+static int level_stdout=3;
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>

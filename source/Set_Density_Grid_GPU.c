@@ -670,6 +670,12 @@ static int SDG_build_cache(int spin_count, int owner, int myid, int numprocs)
   if (myid == owner) {
     cache->cdm_counts = cdm_counts; cdm_counts = NULL;
     cache->cdm_displs = cdm_displs; cdm_displs = NULL;
+    if (2 <= level_stdout) {
+      printf("<Set_Density_Grid> one-rank GPU service cache: owner=%d atoms=%zu atom-grids=%zu terms=%zu device=%.3f GiB\n",
+             owner, total_atoms, total_outputs, total_terms,
+             (double)cache->device_bytes / (1024.0 * 1024.0 * 1024.0));
+      fflush(stdout);
+    }
   }
 
   free(rank_counts);
@@ -963,7 +969,7 @@ int Set_Density_Grid_GPU_Service(int Cnt_kind, int Calc_CntOrbital_ON, double **
     if (hipMemGetInfo(&free_bytes, &total_bytes) != hipSuccess ||
         free_bytes < cache->device_bytes || reserve_bytes > free_bytes - cache->device_bytes) {
       ok = 0;
-      if (0 < level_stdout) {
+      if (2 <= level_stdout) {
         fprintf(stderr,
                 "Set_Density_Grid GPU owner needs %.3f GiB plus %.3f GiB reserve, but only %.3f GiB is free; CPU fallback.\n",
                 (double)cache->device_bytes / (1024.0 * 1024.0 * 1024.0),
@@ -1062,6 +1068,7 @@ extern int Set_Density_Grid_Hip_LocalDensity(size_t output_count, int spin_count
                                              const float *d_o1, double *d_dm, double *d_den);
 /* Set_Hamiltonian.c: the on-the-fly density of a rank (rank-local) */
 extern int Set_Density_Grid_OTF_Possible(int Cnt_kind);
+extern int Set_Density_Grid_OTF_Prepare(int Cnt_kind, size_t *need_bytes, size_t *available_bytes);
 extern int Set_Density_Grid_OTF_Run(int Cnt_kind, double *****CDM, double ***Tmp_Den_Grid);
 
 typedef struct {
@@ -1423,23 +1430,83 @@ static int SDG_local_prepare(int Cnt_kind, int Calc_CntOrbital_ON, int node_rank
    (OpenMX_GpuPhaseNeed_Register; this version's Set_Hamiltonian demotes
    its resident tables on the eigensolvers' memory failures instead of
    reading it). */
+static struct {
+  int atom_ranks, declined, workspace_declined;
+} SDG_census = {0};
+
 int Set_Density_Grid_GPU_Local_Prepare(int Cnt_kind, int Calc_CntOrbital_ON)
 {
-  unsigned long long local_need, group_need = 0ULL;
-  int ok;
+  unsigned long long counts[4], totals[4];
+  size_t need = 0, available = 0;
+  int ok, workspace_declined = 0;
 
   if (scf_eigen_lib_flag != GPUSOLVER) {
     OpenMX_GpuPhaseNeed_Register("density_grid_local", 0);
+    memset(&SDG_census, 0, sizeof(SDG_census));
     return 0;
   }
 
   ok = SDG_local_prepare(Cnt_kind, Calc_CntOrbital_ON, openmx_gpu_ranks_per_device_noncollective());
+  if (ok && Matomnum > 0 && SDG_local.otf) {
+    ok = Set_Density_Grid_OTF_Prepare(Cnt_kind, &need, &available);
+    workspace_declined = !ok && need > available;
+    if (workspace_declined && 3 <= level_stdout) {
+      int myid;
+      MPI_Comm_rank(mpi_comm_level1, &myid);
+      fprintf(stderr, "<Set_Density_Grid> rank %d: %.1f MiB of on-the-fly workspace needed, "
+              "%.1f MiB available; declining distributed GPU quadrature\n",
+              myid, (double)need / 1048576.0, (double)available / 1048576.0);
+      fflush(stderr);
+    }
+  }
 
-  /* ranks without CSR buffers contribute zero */
-  local_need = (SDG_local.ready && !SDG_local.otf) ? (unsigned long long)SDG_local.extra_bytes : 0ULL;
-  MPI_Allreduce(&local_need, &group_need, 1, MPI_UNSIGNED_LONG_LONG, MPI_SUM, mpi_comm_level1);
-  OpenMX_GpuPhaseNeed_Register("density_grid_local", (size_t)group_need);
+  /* The census rides along with the existing phase-need reduction.  All
+     ranks participate regardless of their local path or stdout level. */
+  counts[0] = (SDG_local.ready && !SDG_local.otf) ? (unsigned long long)SDG_local.extra_bytes : 0ULL;
+  counts[1] = Matomnum > 0 ? 1ULL : 0ULL;
+  counts[2] = Matomnum > 0 && !ok ? 1ULL : 0ULL;
+  counts[3] = (unsigned long long)workspace_declined;
+  MPI_Allreduce(counts, totals, 4, MPI_UNSIGNED_LONG_LONG, MPI_SUM, mpi_comm_level1);
+  OpenMX_GpuPhaseNeed_Register("density_grid_local", (size_t)totals[0]);
+  SDG_census.atom_ranks = (int)totals[1];
+  SDG_census.declined = (int)totals[2];
+  SDG_census.workspace_declined = (int)totals[3];
   return ok;
+}
+
+/* No collectives here.  path 1 is the single-owner service; path 2 lets
+   capable ranks use the GPU while declined ranks use the original CPU loop.
+   failed counts runtime GPU failures on ranks with atoms. */
+void Set_Density_Grid_GPU_Local_Report(int path, int failed)
+{
+  static int last_path = -1, last_cpu = -1, last_workspace = -1, last_failed = -1;
+  const int workspace = SDG_census.workspace_declined;
+  const int cpu = (path == 2 ? SDG_census.declined : 0) + failed;
+  int myid;
+
+  if (workspace == 0 && cpu == 0) {
+    last_path = -1;
+    return;
+  }
+  if (level_stdout < 2) return;
+  if (path == last_path && cpu == last_cpu && workspace == last_workspace && failed == last_failed) return;
+  last_path = path;
+  last_cpu = cpu;
+  last_workspace = workspace;
+  last_failed = failed;
+  MPI_Comm_rank(mpi_comm_level1, &myid);
+  if (myid != Host_ID) return;
+
+  if (path == 1) {
+    printf("<Set_Density_Grid> %d of %d rank(s) with atoms lack on-the-fly workspace; "
+           "the one-rank GPU service integrates the density\n", workspace, SDG_census.atom_ranks);
+  }
+  else {
+    printf("<Set_Density_Grid> CPU loop on %d of %d rank(s) with atoms "
+           "(%d declined local GPU preparation, %d lacked on-the-fly workspace, %d failed on the device)\n",
+           cpu, SDG_census.atom_ranks, path == 2 ? SDG_census.declined : 0, workspace, failed);
+  }
+  fflush(stdout);
 }
 
 /* 1 when the last local preparation of this rank chose the on-the-fly
