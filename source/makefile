@@ -105,7 +105,7 @@ MPIF90 ?= $(MPI_HOME)/bin/mpif90
 MPI_CFLAGS  := $(shell $(MPICC) --showme:compile 2>/dev/null)
 MPI_FCFLAGS := $(shell $(MPIF90) --showme:compile 2>/dev/null)
 
-COMMON_INCLUDES = -I. -I$(ROCM)/include -I$(AOCL_INC) -I$(GEMMUL8_DIR)/include -I$(GEMMUL8_DIR)/src -I$(MAGMA_DIR)/include
+COMMON_INCLUDES = -I. -I$(MAGMA_INCLUDE_DIR) -I$(ROCM)/include -I$(AOCL_INC) -I$(GEMMUL8_DIR)/include -I$(GEMMUL8_DIR)/src
 CFLAGS_COMMON = -w -fcommon -Wno-error=implicit-function-declaration -std=c11 -mtune=native -march=native -D__HIP_PLATFORM_AMD__ -DM_PI=3.14159265358979323846264338327950288 $(COMMON_INCLUDES)
 CPPFLAGS_COMMON = -w -fcommon -std=c++20 -mtune=native -march=native -D__HIP_PLATFORM_AMD__ $(COMMON_INCLUDES)
 
@@ -169,15 +169,35 @@ GEMMUL8_DEPFILES = $(GEMMUL8_OPENMX_OBJ:.o=.d) $(GEMMUL8_CONFIG_OBJ:.o=.d)
 GEMMUL8_GPU_ARCH ?= $(ARCH)
 HIPCC_GEMMUL8_FLAGS = -std=c++20 -O3 -fPIC --offload-arch=$(GEMMUL8_GPU_ARCH) -I. -I$(GEMMUL8_DIR)/include -I$(GEMMUL8_DIR)/src -I$(ROCM)/include -D__HIP_PLATFORM_AMD__ -ffp-contract=off -Wno-unused-result -Wno-unused-command-line-argument -Wno-unused-value -DOCML_BASIC_ROUNDED_OPERATIONS -DGPU_ARCH=$(GEMMUL8_GPU_ARCH)
 MAGMA_VERSION ?= 2.10.0
+# bundled: build the patched HIP MAGMA; system: use an installed stock HIP MAGMA.
+# MAGMA_DIR is a disposable source/build tree, NEVER an installation prefix.
+MAGMA_PROVIDER ?= bundled
 MAGMA_DIR ?= third_party/magma
 MAGMA_ARCHIVE_BASENAME ?= magma-$(MAGMA_VERSION).tar.gz
 MAGMA_ARCHIVE ?= $(MAGMA_DIR)/$(MAGMA_ARCHIVE_BASENAME)
-MAGMA_LIB ?= $(MAGMA_DIR)/lib/libmagma.a
 MAGMA_GPU_TARGET ?= $(ARCH)
 MAGMA_MAKE_INC ?= third_party/magma.openmx.make.inc
 MAGMA_STAMP ?= $(MAGMA_DIR)/.openmx-magma-$(MAGMA_VERSION).stamp
 MAGMA_EXTRA_GFXS ?= 1200
-HIPCC_MAGMA_FLAGS = $(HIPCC_GEMMUL8_FLAGS) -I$(MAGMA_DIR)/include -I$(MAGMA_DIR)/control
+ifeq ($(MAGMA_PROVIDER),bundled)
+MAGMA_INCLUDE_DIR ?= $(MAGMA_DIR)/include
+MAGMA_LIB ?= $(MAGMA_DIR)/lib/libmagma.a
+MAGMA_OZAKI2_ENABLED := 1
+MAGMA_LDFLAGS ?=
+else ifeq ($(MAGMA_PROVIDER),system)
+MAGMA_PREFIX ?= /usr
+MAGMA_INCLUDE_DIR ?= $(MAGMA_PREFIX)/include
+# Override explicitly for lib64, multiarch directories, or versioned .so files.
+MAGMA_LIB ?= $(MAGMA_PREFIX)/lib/libmagma.so
+MAGMA_OZAKI2_ENABLED := 0
+MAGMA_LDFLAGS ?= -Wl,-rpath,$(dir $(abspath $(MAGMA_LIB)))
+else
+$(error MAGMA_PROVIDER must be bundled or system)
+endif
+# MAGMA_LIB is ONE filename (also a prerequisite), not -L/-l options.
+MAGMA_EXTRA_LIBS ?=
+HIPCC_MAGMA_FLAGS = -I$(MAGMA_INCLUDE_DIR) $(HIPCC_GEMMUL8_FLAGS) -DOPENMX_MAGMA_HAS_OZAKI2=$(MAGMA_OZAKI2_ENABLED)
+MAGMA_CONFIG = .openmx-magma-config
 
 # ============================================================================
 # gpusolver2 (scf.eigen.lib=gpusolver2): distributed multi-GPU cluster
@@ -324,7 +344,7 @@ UTIL 	= DosMain cohp jx analysis_example esp polB calB Z2FH bandgnu13 bin2txt cu
 # FFTW3
 #
 
-.PHONY: fftw3 fftw3-clean gemmul8-clean magma-clean gpusolver2-stack gpusolver2-clean clean
+.PHONY: fftw3 fftw3-clean gemmul8-clean magma-clean gpusolver2-stack gpusolver2-clean clean magma-config-force
 
 fftw3: $(FFTW3_LIB)
 
@@ -370,9 +390,17 @@ gemmul8-clean:
 	rm -f "$(GEMMUL8_OPENMX_OBJ)" "$(GEMMUL8_CONFIG_OBJ)" "$(GEMMUL8_LIB)" $(GEMMUL8_DEPFILES)
 
 magma-clean:
+ifeq ($(MAGMA_PROVIDER),bundled)
 	if [ -f "$(MAGMA_DIR)/Makefile" ]; then $(MAKE) -C "$(MAGMA_DIR)" clean; fi
 	find "$(MAGMA_DIR)" -mindepth 1 -maxdepth 1 ! -name "$(MAGMA_ARCHIVE_BASENAME)" -exec rm -rf {} +
-	rm -f magma_openmx.o
+endif
+	rm -f magma_openmx.o magma_openmx.d $(MAGMA_CONFIG) $(MAGMA_CONFIG).tmp
+
+# Make does not otherwise notice a provider/header/library change in command
+# line variables. Update the stamp only on a change, including switching back.
+$(MAGMA_CONFIG): magma-config-force
+	@printf '%s\n' "$(MAGMA_PROVIDER)" "$(HIPCC) $(HIPCC_MAGMA_FLAGS)" "$(MAGMA_LIB)" "$(MAGMA_LDFLAGS) $(MAGMA_EXTRA_LIBS)" > $@.tmp
+	@cmp -s $@.tmp $@ && rm -f $@.tmp || mv -f $@.tmp $@
 
 FFTW3_USERS = Poisson.o Stress.o Poisson_ESM.o TRAN_Poisson.o TRAN_CDen_Main.o TRAN_Set_Electrode_Grid.o Cluster_DFT_Col.o
 $(FFTW3_USERS): | $(FFTW3_LIB)
@@ -383,8 +411,8 @@ $(FFTW3_USERS): | $(FFTW3_LIB)
 
 .DEFAULT_GOAL := openmx
 
-openmx:	$(FFTW3_LIB) $(GEMMUL8_LIB) $(MAGMA_LIB) $(OBJS)
-	$(CC) $(OBJS) $(STACK) $(MAGMA_LIB) $(GEMMUL8_LIB) $(LIB) -lm -o openmx
+openmx:	$(FFTW3_LIB) $(GEMMUL8_LIB) $(MAGMA_LIB) $(OBJS) $(MAGMA_CONFIG)
+	$(CC) $(OBJS) $(STACK) $(MAGMA_LDFLAGS) $(MAGMA_LIB) $(GEMMUL8_LIB) $(MAGMA_EXTRA_LIBS) $(LIB) -lm -o openmx
 	
 #
 #
@@ -477,8 +505,10 @@ Cluster_DFT_Col.o: Cluster_DFT_Col.c openmx_common.h eigen_refine_gpu.h eigen_re
 	$(CC) -c Cluster_DFT_Col.c
 Cluster_DFT_Col_dm_hip.o: Cluster_DFT_Col_dm_hip.cu
 	$(HIPCC) $(HIPCC_GEMMUL8_FLAGS) -c Cluster_DFT_Col_dm_hip.cu -o Cluster_DFT_Col_dm_hip.o
-magma_openmx.o: magma_openmx.cu openmx_common.h $(MAGMA_LIB) openmx_stdout_level.h openmx_gpu_arch_policy.h
-	$(HIPCC) $(HIPCC_MAGMA_FLAGS) -c magma_openmx.cu -o magma_openmx.o
+magma_openmx.o: magma_openmx.cu openmx_common.h $(MAGMA_LIB) $(MAGMA_CONFIG) openmx_stdout_level.h openmx_gpu_arch_policy.h
+	$(HIPCC) $(HIPCC_MAGMA_FLAGS) -MMD -MP -c magma_openmx.cu -o magma_openmx.o
+
+-include magma_openmx.d
 Cluster_DFT_NonCol.o: Cluster_DFT_NonCol.c openmx_common.h eigen_refine_gpu.h eigen_refine_hooks.h
 	$(CC) -c Cluster_DFT_NonCol.c
 Cluster_DFT_NonCol_dm_hip.o: Cluster_DFT_NonCol_dm_hip.cu
@@ -822,6 +852,7 @@ $(GEMMUL8_CONFIG_OBJ): $(GEMMUL8_CONFIG_SRC) $(GEMMUL8_DIR)/Makefile makefile
 $(GEMMUL8_LIB): $(GEMMUL8_OPENMX_OBJ) $(GEMMUL8_CONFIG_OBJ)
 	mkdir -p $(GEMMUL8_DIR)/lib
 	ar rcs $(GEMMUL8_LIB) $(GEMMUL8_OPENMX_OBJ) $(GEMMUL8_CONFIG_OBJ)
+ifeq ($(MAGMA_PROVIDER),bundled)
 $(MAGMA_ARCHIVE):
 	@echo "Bundled MAGMA archive was not found: $(MAGMA_ARCHIVE)"
 	@echo "Place magma-$(MAGMA_VERSION).tar.gz from https://icl.utk.edu/magma/ under $(MAGMA_DIR)/, or override MAGMA_ARCHIVE."
@@ -831,7 +862,7 @@ $(MAGMA_MAKE_INC):
 	@echo "OpenMX MAGMA make.inc template was not found: $(MAGMA_MAKE_INC)"
 	@false
 
-$(MAGMA_STAMP): $(MAGMA_ARCHIVE) $(MAGMA_MAKE_INC)
+$(MAGMA_STAMP): $(MAGMA_ARCHIVE) $(MAGMA_MAKE_INC) third_party/magma-ozaki2.patch
 	mkdir -p "$(MAGMA_DIR)"
 	find "$(MAGMA_DIR)" -mindepth 1 -maxdepth 1 ! -name "$(MAGMA_ARCHIVE_BASENAME)" -exec rm -rf {} +
 	tar -xzf "$(MAGMA_ARCHIVE)" -C "$(MAGMA_DIR)" --strip-components=1
@@ -854,6 +885,7 @@ $(MAGMA_DIR)/Makefile $(MAGMA_DIR)/make.inc: $(MAGMA_STAMP)
 
 $(MAGMA_LIB): $(MAGMA_STAMP)
 	$(MAKE) -C "$(MAGMA_DIR)" BACKEND=hip ROCM_PATH="$(ROCM)" GPU_TARGET="$(MAGMA_GPU_TARGET)" lib/libmagma.a
+endif
 Divide_Conquer_Dosout.o: Divide_Conquer_Dosout.c openmx_common.h
 	$(CC) -c Divide_Conquer_Dosout.c
 Krylov.o: Krylov.c openmx_common.h

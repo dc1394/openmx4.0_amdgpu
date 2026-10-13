@@ -269,7 +269,7 @@ static int DCLNO_NonColGpuEigenThreshold(void)
 #define DCLNO_MAGMA_ERR_UNKNOWN       (-116)
 
 extern int openmx_magma_dsyevdx_gpu(int n, int maxn, double *d_A, double *w, int *mout);
-extern void magma_ozaki2_release_workspaces(void);
+extern void openmx_magma_ozaki2_release(void);
 /* magma_openmx.cu: rocSOLVER's full-spectrum zheevd behind a unitary phase
    similarity, with a finiteness check of the vectors (see
    DCLNO_GpuSolverZ_Eigen) */
@@ -2931,7 +2931,7 @@ static double DC_Col(char * mode, int MD_iter, int SCF_iter, int SucceedReadingD
         openmx_gemmul8ReleaseWorkspaces();
         /* Every direct-dispatch rank also owns MAGMA's separate GEMMul8
            cache. Return it before the next SCF memory check and forces. */
-        magma_ozaki2_release_workspaces();
+        openmx_magma_ozaki2_release();
     }
 
     dtime(&TEtime);
@@ -5552,7 +5552,7 @@ static double DC_NonCol(char *mode,
     DCLNO_GpuSolverZ_ReleaseDeviceMemory();
     openmx_gemmul8ReleaseWorkspaces();
     (void)openmx_hipsolver_release_workspace();
-    magma_ozaki2_release_workspaces();
+    openmx_magma_ozaki2_release();
   }
 
   dtime(&TEtime);

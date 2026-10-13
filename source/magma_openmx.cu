@@ -1,4 +1,8 @@
 #include "openmx_stdout_level.h"
+#include <magma_config.h>
+#if !defined(MAGMA_HAVE_HIP) || defined(MAGMA_HAVE_CUDA)
+#error "OpenMX AMDGPU requires MAGMA built with the HIP backend (matching headers and library)."
+#endif
 #include <magma_v2.h>
 #include "hip_runtime_compat.h"
 #include "openmx_gpu_arch_policy.h"
@@ -14,6 +18,13 @@
 #include <cstring>
 #include <mutex>
 #include <strings.h>
+
+/* Keep standalone bundled-MAGMA builds compatible; the Makefile explicitly
+   sets this to 0 for an installed, unpatched MAGMA. */
+#ifndef OPENMX_MAGMA_HAS_OZAKI2
+#define OPENMX_MAGMA_HAS_OZAKI2 1
+#endif
+static_assert(sizeof(magma_int_t) == sizeof(int), "OpenMX requires LP64 MAGMA (32-bit magma_int_t).");
 
 extern "C" int MYID_MPI_COMM_WORLD;
 /* Ranks sharing this rank's GPU (set_hip_default_device_from_local_rank.c).
@@ -69,6 +80,16 @@ int ensure_magma_initialized()
    percent-of-VRAM workspace cap because only the dense root rank solves. */
 int use_magma_ozaki2()
 {
+#if !OPENMX_MAGMA_HAS_OZAKI2
+    static const int use = []() {
+        const char *env = std::getenv("OPENMX_MAGMA_OZAKI2");
+        if (env != nullptr && std::atoi(env) != 0 && MYID_MPI_COMM_WORLD == 0) {
+            std::fprintf(stderr, "OpenMX: OPENMX_MAGMA_OZAKI2 requested, but this build uses stock MAGMA; "
+                                 "using standard MAGMA eigensolvers.\n");
+        }
+        return 0;
+    }();
+#else
     static int use = -1;
 
     if (use < 0) {
@@ -85,6 +106,7 @@ int use_magma_ozaki2()
             setenv("MAGMA_OZAKI2_MIN_FREE_MB", "1024", 0);
         }
     }
+#endif
     return use;
 }
 
@@ -803,6 +825,16 @@ int rocsolver_evd_locked(int cplx, int n, int maxn, void *d_A, double *w, int *m
    once d_A may have changed. */
 int magma_evdx_locked(int cplx, int ozaki2, int n, int maxn, void *d_A, double *w, int *mout_out, int *touched)
 {
+    auto dsyevdx = magma_dsyevdx_gpu;
+    auto zheevdx = magma_zheevdx_gpu;
+#if OPENMX_MAGMA_HAS_OZAKI2
+    if (ozaki2) {
+        dsyevdx = magma_dsyevdx_ozaki2_gpu;
+        zheevdx = magma_zheevdx_ozaki2_gpu;
+    }
+#else
+    (void)ozaki2;
+#endif
     magma_int_t mn = static_cast<magma_int_t>(n);
     magma_int_t mmaxn = static_cast<magma_int_t>(maxn);
     magma_int_t il = 1;
@@ -827,7 +859,7 @@ int magma_evdx_locked(int cplx, int ozaki2, int n, int maxn, void *d_A, double *
             return err;
         }
 
-        ret = (ozaki2 ? magma_dsyevdx_ozaki2_gpu : magma_dsyevdx_gpu)(
+        ret = dsyevdx(
                                         MagmaVec, range, MagmaLower,
                                         mn, reinterpret_cast<magmaDouble_ptr>(d_A), mn,
                                         0.0, 0.0, il, iu, &mout, w,
@@ -857,7 +889,7 @@ int magma_evdx_locked(int cplx, int ozaki2, int n, int maxn, void *d_A, double *
         mout = 0;
         info = 0;
         *touched = 1;
-        ret = (ozaki2 ? magma_dsyevdx_ozaki2_gpu : magma_dsyevdx_gpu)(
+        ret = dsyevdx(
                                 MagmaVec, range, MagmaLower,
                                 mn, reinterpret_cast<magmaDouble_ptr>(d_A), mn,
                                 0.0, 0.0, il, iu, &mout, w,
@@ -874,7 +906,7 @@ int magma_evdx_locked(int cplx, int ozaki2, int n, int maxn, void *d_A, double *
             return err;
         }
 
-        ret = (ozaki2 ? magma_zheevdx_ozaki2_gpu : magma_zheevdx_gpu)(
+        ret = zheevdx(
                                         MagmaVec, range, MagmaLower,
                                         mn, reinterpret_cast<magmaDoubleComplex_ptr>(d_A), mn,
                                         0.0, 0.0, il, iu, &mout, w,
@@ -910,7 +942,7 @@ int magma_evdx_locked(int cplx, int ozaki2, int n, int maxn, void *d_A, double *
         mout = 0;
         info = 0;
         *touched = 1;
-        ret = (ozaki2 ? magma_zheevdx_ozaki2_gpu : magma_zheevdx_gpu)(
+        ret = zheevdx(
                                 MagmaVec, range, MagmaLower,
                                 mn, reinterpret_cast<magmaDoubleComplex_ptr>(d_A), mn,
                                 0.0, 0.0, il, iu, &mout, w,
@@ -1669,10 +1701,12 @@ extern "C" void openmx_magma_release_fp32_workspace(void)
 }
 
 /* Returns the Ozaki-II adapter's per-stream hipBLAS handles and device
-   workspaces; a no-op when nothing was routed. */
+   workspaces; a no-op with stock MAGMA or when nothing was routed. */
 extern "C" void openmx_magma_ozaki2_release(void)
 {
+#if OPENMX_MAGMA_HAS_OZAKI2
     magma_ozaki2_release_workspaces();
+#endif
 }
 
 namespace {
@@ -1695,7 +1729,7 @@ extern "C" int openmx_magma_release_z_workspace(void)
 {
     std::lock_guard<std::mutex> lock(g_magma_mutex);
 
-    magma_ozaki2_release_workspaces();
+    openmx_magma_ozaki2_release();
     release_backup_locked();
     if (g_z_host_matrix != nullptr) magma_free_cpu(g_z_host_matrix);
     if (g_z_work != nullptr)        magma_free_cpu(g_z_work);
@@ -1720,7 +1754,7 @@ extern "C" int openmx_magma_release_d_workspace(void)
 {
     std::lock_guard<std::mutex> lock(g_magma_mutex);
 
-    magma_ozaki2_release_workspaces();
+    openmx_magma_ozaki2_release();
     release_backup_locked();
     if (g_host_matrix != nullptr) magma_free_cpu(g_host_matrix);
     if (g_work != nullptr)        magma_free_cpu(g_work);

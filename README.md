@@ -54,7 +54,7 @@ MI300A tuning is selected by the exact `gfx942` architecture and the runtime's i
 | NC cluster density matrix | native FP64 GEMMs | GEMMul8 GEMMs |
 | NC cluster device buffers between SCF steps | retained, subject to memory checks | released, as before |
 
-The direct dense entry points now apply the same architecture and explicit-backend policy as the generic wrappers. Previously, the NC cluster root called a historical MAGMA entry point that bypassed that policy, even when the progress label said hipSOLVER. `OPENMX_GPU_EIGENSOLVER=hipsolver|magma` takes precedence, and a failing native solve still retries from its saved input. The MAGMA fallback retains its Ozaki2 default; `OPENMX_MAGMA_OZAKI2=0` explicitly selects stock MAGMA. This setting is independent of the OpenMX GEMM bridge.
+The direct dense entry points now apply the same architecture and explicit-backend policy as the generic wrappers. Previously, the NC cluster root called a historical MAGMA entry point that bypassed that policy, even when the progress label said hipSOLVER. `OPENMX_GPU_EIGENSOLVER=hipsolver|magma` takes precedence, and a failing native solve still retries from its saved input. With the bundled MAGMA, the fallback retains its Ozaki2 default; `OPENMX_MAGMA_OZAKI2=0` explicitly selects its stock drivers. A system-MAGMA build always uses the stock MAGMA drivers. This setting is independent of the OpenMX GEMM bridge.
 
 `OPENMX_CLUSTER_NC_DEVICE_KEEP=0|1` and `OPENMX_CLUSTER_GPU_DM_GEMM=0|1` override the NC defaults. `OPENMX_GEMMUL8_DISABLE=0` requests GEMMul8 even on MI300A unless the input explicitly sets `scf.gemmul8.enable off`. Backend diagnostics distinguish native hipBLAS from emulation, including workspace fallbacks.
 
@@ -242,7 +242,83 @@ make -j16 openmx \
   AOCC_LIB=/path/to/aocc/lib
 ```
 
-The Makefile variables above default to one specific machine; override them for yours. For an existing checkout, run `git submodule update --init --recursive` before rebuilding to select the bundled GEMMul8 version. The first `make` also builds hipMAGMA 2.10.0 (bundled archive), GEMMul8 (submodule) and the gpusolver2 stack, which takes a while. Questions are welcome via GitHub issues or [my X account](https://x.com/dc1394) (Japanese is fine there).
+The Makefile variables above default to one specific machine; override them for yours. For an existing checkout, run `git submodule update --init --recursive` before rebuilding to select the bundled GEMMul8 version. By default (`MAGMA_PROVIDER=bundled`), the first `make` also builds hipMAGMA 2.10.0 (bundled archive), GEMMul8 (submodule) and the gpusolver2 stack, which takes a while. Questions are welcome via GitHub issues or [my X account](https://x.com/dc1394) (Japanese is fine there).
+
+### Using an installed MAGMA
+
+Use an **HIP/ROCm build of MAGMA**, with matching installed headers (including
+`magma_config.h`) and library. CUDA MAGMA cannot be substituted. This interface
+targets the stock MAGMA 2.10.0 API and requires LP64 (32-bit `magma_int_t`),
+compatible ROCm/BLAS/LAPACK runtimes and support for the target GPU. Other
+MAGMA versions have not been validated. Merely changing `MAGMA_LIB` in a
+bundled build, or setting the runtime variable `OPENMX_MAGMA_OZAKI2=0`, does
+not remove the references to the patched Ozaki-II symbols.
+
+From `source/`, use the same machine-specific overrides as above, plus:
+
+```sh
+make -j16 openmx MAGMA_PROVIDER=system \
+  MAGMA_INCLUDE_DIR=/path/to/magma/include \
+  MAGMA_LIB=/path/to/magma/lib/libmagma.so \
+  ROCM=/opt/rocm-7.2.0 \
+  MPI_HOME=/path/to/openmpi-rocm-amdflang \
+  AOCL_HOME=/path/to/aocl/gcc-or-aocc \
+  AOCC_LIB=/path/to/aocc/lib
+```
+
+`MAGMA_INCLUDE_DIR` is the directory containing `magma_v2.h` and
+`magma_config.h`; distributions may use `/usr/include/magma`.
+`MAGMA_LIB` is one library filename, including the full path; set it explicitly
+for `lib64` or multiarch layouts (for example,
+`/usr/lib/x86_64-linux-gnu/libmagma.so`). Alternatively, `MAGMA_PREFIX=/opt/magma`
+defaults to its `include/` and `lib/libmagma.so`. Check the package's backend;
+the name `libmagma.so` alone does not identify HIP versus CUDA.
+
+System mode adds the selected library directory to the executable's runtime
+search path via `MAGMA_LDFLAGS`. Override that variable (including an empty
+value for loader-managed installations) as needed. `MAGMA_EXTRA_LIBS` supplies
+additional link dependencies; it does not replace the existing OpenMX BLAS,
+LAPACK or ROCm configuration. The loader must also find MAGMA's transitive
+dependencies. Verify the actual resolved libraries with `ldd ./openmx`.
+
+System mode does not unpack, patch, build or clean MAGMA. Keep `MAGMA_DIR` as
+the bundled disposable build tree; **do not set it to an installation prefix**.
+Use `make MAGMA_PROVIDER=system clean` for a system-mode clean. The provider,
+include/library paths and MAGMA compile/link settings are tracked so changing
+them rebuilds the MAGMA bridge and relinks OpenMX, including when switching
+back to bundled mode. After changing the broader ROCm/MPI/BLAS toolchain, do
+a clean rebuild with consistent settings.
+
+In system mode, `OPENMX_MAGMA_HAS_OZAKI2=0` removes the patched eigensolver
+and workspace-release references at compile time. Real/complex FP64 MAGMA
+solves use `magma_dsyevdx_gpu` / `magma_zheevdx_gpu`, and the FP32 MAGMA
+solves retain the standard `magma_ssyevd_gpu` / `magma_cheevd_gpu` APIs.
+`OPENMX_MAGMA_OZAKI2=1` cannot enable the missing extension and produces a
+rank-0 warning when the dense solver policy is evaluated. MAGMA's Ozaki-II
+cleanup wrapper becomes a no-op; ordinary MAGMA workspace cleanup remains
+active. The architecture-dependent rocSOLVER policy and its stock-MAGMA
+retry remain active. The OpenMX GEMMul8 bridge is independent and remains
+built and available, as does gpusolver2. Performance can differ substantially
+from the bundled Ozaki-II build, especially on Radeon GPUs.
+
+Host-only regression checks (these do **not** validate GPU compilation or
+numerical accuracy):
+
+```sh
+python3 tests/run_system_magma_build.py
+python3 tests/run_gpu_eigen_dispatch.py --magma-provider bundled
+python3 tests/run_gpu_eigen_dispatch.py --magma-provider system
+```
+
+Before using system mode for production, build and link against the actual
+installed HIP MAGMA, confirm its runtime resolution, run real and complex
+full/partial-spectrum and FP32-refinement checks, and compare converged SCF
+energies/forces with CPU and bundled-MAGMA references. Exercise cluster,
+band, DC, DC-LNO and Krylov paths and rocSOLVER retries. The existing
+`tests/run_gpusolver_smoke.sh` supports the same `MAGMA_PROVIDER`,
+`MAGMA_INCLUDE_DIR` and `MAGMA_LIB` environment variables for the GPU checks.
+System-MAGMA GPU build, execution, numerical agreement and performance are
+**not yet validated** by the host-only checks.
 
 ## Benchmarks
 Benchmarks of the NVIDIA version this port derives from: https://journals.jps.jp/doi/10.7566/JPSJ.94.124003

@@ -117,6 +117,7 @@ int main(int argc, char **argv) {
 def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--cxx", default="g++")
+    parser.add_argument("--magma-provider", choices=("bundled", "system"), default="bundled")
     args = parser.parse_args()
     root = Path(__file__).resolve().parent.parent
     source = (root / "source/magma_openmx.cu").read_text()
@@ -126,6 +127,7 @@ def main():
              "attempt_name", "attempt_retryable", "dense_eigen_locked",
              "openmx_magma_dsyevdx_gpu", "openmx_magma_zheevdx_gpu", "openmx_magma_eigen_gpu"]
     program = STUBS + "\n" + "\n\n".join(function(source, name) for name in names) + MAIN
+    has_ozaki2 = int(args.magma_provider == "bundled")
     # Each process has fresh production static policy caches.
     cases = [
         ("mi300a auto", "gfx942:sramecc+:xnack+", 1, {}, "R", 0, 0),
@@ -151,11 +153,14 @@ def main():
     with tempfile.TemporaryDirectory(prefix="openmx-eigen-dispatch-") as tmp:
         cpp, binary = Path(tmp) / "test.cpp", Path(tmp) / "test"
         cpp.write_text(program)
-        subprocess.run([args.cxx, "-std=c++17", "-O2", "-pthread", "-I" + str(root / "source"),
+        subprocess.run([args.cxx, "-std=c++17", "-O2", "-pthread",
+                        f"-DOPENMX_MAGMA_HAS_OZAKI2={has_ozaki2}", "-I" + str(root / "source"),
                         str(cpp), "-o", str(binary)], check=True)
         base_env = {k: v for k, v in os.environ.items()
                     if not k.startswith(("OPENMX_", "MAGMA_OZAKI2_", "TEST_"))}
         for label, arch, integrated, overrides, expected, retry, info in cases:
+            if not has_ozaki2:
+                expected = expected.replace("O", "M").replace("MM", "M")
             for cplx in (0, 1):
                 env = dict(base_env, TEST_ARCH=arch, TEST_INTEGRATED=str(integrated),
                            OPENMX_GPU_EIGENSOLVER_PROFILE="1", **overrides)
@@ -168,6 +173,9 @@ def main():
                     raise AssertionError(f"{label}: diagnostic backend {observed!r} != {expected!r}")
                 if len(expected) > 1 and "stage=backup_restore" not in result.stderr:
                     raise AssertionError(f"{label}: retry restore profiling is missing")
+                if not has_ozaki2 and overrides.get("OPENMX_MAGMA_OZAKI2") == "1":
+                    if "this build uses stock MAGMA" not in result.stderr:
+                        raise AssertionError(f"{label}: missing unsupported-Ozaki-II warning")
             print(f"PASS {label}: {expected}")
         for verbose in ("0", "1"):
             for cplx in (0, 1):
@@ -177,7 +185,7 @@ def main():
                 if "GPUEIGENDETAIL" in result.stderr:
                     raise AssertionError("Detailed profiling must require OPENMX_GPU_EIGENSOLVER_PROFILE")
         print("PASS detailed profiling remains opt-in even with GPU verbose logging")
-    print(f"gpu_eigen_dispatch: {len(cases) * 2 + 4} checks passed")
+    print(f"gpu_eigen_dispatch ({args.magma_provider}): {len(cases) * 2 + 4} checks passed")
 
 
 if __name__ == "__main__":
