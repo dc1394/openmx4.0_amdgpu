@@ -71,6 +71,7 @@ PREFIX = r'''
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "openmx_precision.h"
 
 #define CHECK(condition) do { if (!(condition)) { \
     fprintf(stderr, "FAIL line %d: %s\n", __LINE__, #condition); exit(2); } } while (0)
@@ -346,11 +347,21 @@ int main(void)
 
     /* ---- the configuration: once, from the root, until with it */
     CHECK(BandNonCol_RefineIterations() == 0);
+    openmx_set_fp32_enabled(0);
+    BandNonCol_RefineConfigure();
+    CHECK(configure_calls == 0 && bcast_calls == 0 && BandNonCol_RefineIterations() == 0);
+    openmx_set_fp32_enabled(1);
     BandNonCol_RefineConfigure();
     CHECK(configure_calls == 1 && bcast_calls == 1 && BandNonCol_RefineIterations() == 2);
     CHECK(BandNonCol_refine.defaulted == 1 && BandNonCol_refine.until == 3.0e-9);
     BandNonCol_RefineConfigure();
     CHECK(configure_calls == 1 && bcast_calls == 1);
+    openmx_set_fp32_enabled(0);
+    CHECK(BandNonCol_RefineIterations() == 0);
+    BandNonCol_RefineConfigure();
+    CHECK(configure_calls == 1 && bcast_calls == 1);
+    openmx_set_fp32_enabled(1);
+    CHECK(BandNonCol_RefineIterations() == 2);
 
     /* ---- the memory test: one collective whatever the base, owners only ask */
     allreduce_calls = 0;
@@ -579,6 +590,7 @@ def main():
         binary = Path(directory) / "refine"
         source.write_text(make_harness())
         subprocess.run([*shlex.split(args.cc), *flags, "-std=c11", "-D_DEFAULT_SOURCE", str(source),
+                        "-I", str(ROOT / "source"), str(ROOT / "source/openmx_precision.c"),
                         "-o", str(binary), "-lm"], check=True)
         subprocess.run([str(binary)], check=True, stdout=subprocess.DEVNULL if os.environ.get("QUIET") else None)
 

@@ -20,7 +20,19 @@
 #include <omp.h>
 #include "set_hip_default_device_from_local_rank.h"
 
-#define  measure_time   0
+/* the section timers print when OPENMX_BAND_PROFILE=1 (formerly a
+   compile-time switch) */
+static int TotalEnergy_ProfileEnabled(void)
+{
+  static int cached = -1;
+
+  if (cached < 0){
+    const char *value = getenv("OPENMX_BAND_PROFILE");
+    cached = (value != NULL && atoi(value) != 0);
+  }
+  return cached;
+}
+#define measure_time (TotalEnergy_ProfileEnabled())
 
 #ifdef MAX 
 #undef MAX
@@ -366,10 +378,8 @@ double Calc_Ekin()
   ****************************************************/
 
   /* get Nthrds0 */  
-#pragma omp parallel shared(Nthrds0)
-  {
-    Nthrds0 = omp_get_num_threads();
-  }
+  /* Dynamic teams may grow after a separate probe region. */
+  Nthrds0 = omp_get_max_threads();
 
   /* allocation of array */
   My_Ekin_threads = (double*)malloc(sizeof(double)*Nthrds0);
@@ -427,6 +437,7 @@ double Calc_Ekin()
 	  }
 
 	  dtime(&Etime_atom);
+#pragma omp atomic update
 	  time_per_atom[Gc_AN] += Etime_atom - Stime_atom;
 	}
 
@@ -475,6 +486,7 @@ double Calc_Ekin()
 	}
 
 	dtime(&Etime_atom);
+#pragma omp atomic update
 	time_per_atom[Gc_AN] += Etime_atom - Stime_atom;
       }
 
@@ -528,10 +540,8 @@ double Calc_Ena()
   **********************************************************/
 
   /* get Nthrds0 */  
-#pragma omp parallel shared(Nthrds0)
-  {
-    Nthrds0 = omp_get_num_threads();
-  }
+  /* Dynamic teams may grow after a separate probe region. */
+  Nthrds0 = omp_get_max_threads();
 
   /* allocation of array */
   My_Ena_threads = (double*)malloc(sizeof(double)*Nthrds0);
@@ -594,6 +604,7 @@ double Calc_Ena()
 	  }
 
 	  dtime(&Etime_atom);
+#pragma omp atomic update
 	  time_per_atom[Gc_AN] += Etime_atom - Stime_atom;
 	}
 
@@ -642,6 +653,7 @@ double Calc_Ena()
 	}
 
 	dtime(&Etime_atom);
+#pragma omp atomic update
 	time_per_atom[Gc_AN] += Etime_atom - Stime_atom;
 
       } /* Nloop */
@@ -696,10 +708,8 @@ double Calc_Enl()
   *******************************************************************/
 
   /* get Nthrds0 */  
-#pragma omp parallel shared(Nthrds0)
-  {
-    Nthrds0 = omp_get_num_threads();
-  }
+  /* Dynamic teams may grow after a separate probe region. */
+  Nthrds0 = omp_get_max_threads();
 
   /* allocation of array */
   My_Enl_threads = (double*)malloc(sizeof(double)*Nthrds0);
@@ -761,6 +771,7 @@ double Calc_Enl()
 	  }
 
 	  dtime(&Etime_atom);
+#pragma omp atomic update
 	  time_per_atom[Gc_AN] += Etime_atom - Stime_atom;
 
 	} /* Nloop */
@@ -818,6 +829,7 @@ double Calc_Enl()
 	}
 
 	dtime(&Etime_atom);
+#pragma omp atomic update
 	time_per_atom[Gc_AN] += Etime_atom - Stime_atom;
 
       } /* Nloop */
@@ -868,10 +880,8 @@ double Calc_ECH()
   *******************************************************************/
 
   /* get Nthrds0 */  
-#pragma omp parallel shared(Nthrds0)
-  {
-    Nthrds0 = omp_get_num_threads();
-  }
+  /* Dynamic teams may grow after a separate probe region. */
+  Nthrds0 = omp_get_max_threads();
 
   /* allocation of array */
   My_ECH_threads = (double*)malloc(sizeof(double)*Nthrds0);
@@ -918,6 +928,7 @@ double Calc_ECH()
 	  }
 
 	  dtime(&Etime_atom);
+#pragma omp atomic update
 	  time_per_atom[Gc_AN] += Etime_atom - Stime_atom;
 
 	} /* Nloop */
@@ -975,6 +986,7 @@ double Calc_ECH()
 	}
 
 	dtime(&Etime_atom);
+#pragma omp atomic update
 	time_per_atom[Gc_AN] += Etime_atom - Stime_atom;
 
       } /* Nloop */
@@ -1030,10 +1042,8 @@ double Calc_Ecore()
   }
 
   /* get Nthrds0 */  
-#pragma omp parallel shared(Nthrds0)
-  {
-    Nthrds0 = omp_get_num_threads();
-  }
+  /* Dynamic teams may grow after a separate probe region. */
+  Nthrds0 = omp_get_max_threads();
 
   /* allocation of array */
   My_Ecore_threads = (double*)malloc(sizeof(double)*Nthrds0);
@@ -1511,10 +1521,8 @@ double Calc_EH0(int MD_iter)
   else{
 
     /* get Nthrds0 */
-#pragma omp parallel shared(Nthrds0)
-    {
-      Nthrds0 = omp_get_num_threads();
-    }
+    /* Dynamic teams may grow after a separate probe region. */
+    Nthrds0 = omp_get_max_threads();
 
     /* allocation of array */
     My_EH0_threads = (double*)malloc(sizeof(double)*Nthrds0);
@@ -2054,10 +2062,8 @@ void Calc_EXC_EH1(double ECE[])
     Set_Lebedev_Grid(Num_Leb_Grid,Leb_Grid_XYZW);
 
     /* get Nthrds0 */  
-#pragma omp parallel shared(Nthrds0)
-    {
-      Nthrds0 = omp_get_num_threads();
-    }
+    /* Dynamic teams may grow after a separate probe region. */
+    Nthrds0 = omp_get_max_threads();
 
     /* initialize the temporal array storing the force contribution */
 
@@ -2661,10 +2667,8 @@ void EH0_TwoCenter_at_Cutoff(int wan1, int wan2, double VH0ij[4])
   rcut = Spe_Atom_Cut1[wan1] + Spe_Atom_Cut1[wan2];
 
   /* get Nthrds0 */  
-#pragma omp parallel shared(Nthrds0)
-  {
-    Nthrds0 = omp_get_num_threads();
-  }
+  /* Dynamic teams may grow after a separate probe region. */
+  Nthrds0 = omp_get_max_threads();
 
   /* allocation of array */
   my_sum_threads = (double*)malloc(sizeof(double)*Nthrds0);

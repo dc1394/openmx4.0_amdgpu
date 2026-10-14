@@ -16,6 +16,7 @@
 #include "set_hip_default_device_from_local_rank.h"
 #include "elpa_cosma_bridge.h"
 #include "eigen_refine_gpu.h"
+#include "openmx_precision.h"
 #include "eigen_refine_hooks.h"
 #include <limits.h>
 #include <math.h>
@@ -1801,6 +1802,8 @@ static void ClusterNonCol_RefineConfigure(void)
     ClusterNonColRefineStage *st = &ClusterNonCol_refine;
     int myid, config[2] = {0, 0};   /* iterations, FP32:FP64 ratio when defaulted on */
 
+    /* The input veto must not become a cached policy for later inputs. */
+    if (!openmx_fp32_enabled()) return;
     if (0 <= st->iterations) return;
     MPI_Comm_rank(mpi_comm_level1, &myid);
     if (myid == Host_ID) config[0] = openmx_eigen_refine_configure(1, 2 <= level_stdout, &config[1]);
@@ -1813,7 +1816,7 @@ static void ClusterNonCol_RefineConfigure(void)
 /* the steps of the refinement, 0 when it is off or not configured yet */
 static int ClusterNonCol_RefineIterations(void)
 {
-    return (0 < ClusterNonCol_refine.iterations) ? ClusterNonCol_refine.iterations : 0;
+    return (openmx_fp32_enabled() && 0 < ClusterNonCol_refine.iterations) ? ClusterNonCol_refine.iterations : 0;
 }
 
 /* every rank, before each root dense solve: a new SCF cycle starts refined.

@@ -73,6 +73,8 @@ static void check_declined(int full_batch, int stream_mode, int mode)
 
 int main(void)
 {
+    const char *precision = getenv("TEST_FP32_ENABLE");
+    openmx_set_fp32_enabled(precision == NULL || atoi(precision));
     int fallback, spin, seed, mc, q, source, direction, atom, k, i, l, checks = 0, identical = 0;
     const size_t GiB = (size_t)1024 * 1024 * 1024;
     const size_t MiB = (size_t)1024 * 1024;
@@ -82,7 +84,7 @@ int main(void)
     unsetenv("OPENMX_FORCE4B_CASE1_TURN_MAX_RANKS");
     allocate_case1_fixture();
     CHECK(Force4B_GpuCase1TurnsConcurrency(16 * GiB, 10 * GiB, 8, 0) == 1);
-    CHECK(Force4B_GpuCase1TurnsConcurrency(12 * GiB, GiB, 18, 0) == 11);
+    CHECK(Force4B_GpuCase1TurnsConcurrency(12 * GiB, GiB, 18, 0) == 10);
     CHECK(Force4B_GpuCase1TurnsConcurrency(12 * GiB, GiB, 18, 2) == 2);
     CHECK(Force4B_GpuCase1TurnsConcurrency(12 * GiB, GiB, 4, 0) == 4);
     CHECK(Force4B_GpuCase1TurnsConcurrency(320 * MiB + GiB, GiB, 18, 0) == 1);

@@ -25,7 +25,7 @@
 // Build (from the repository root):
 //   /opt/rocm-7.2.0/bin/hipcc -std=c++20 -O3 --offload-arch=gfx1200 -ffp-contract=off \
 //       -DOCML_BASIC_ROUNDED_OPERATIONS -Isource tools/check_orbs_otf_hip.cu source/orbs_otf_hip.cu \
-//       -o check_orbs_otf_hip
+//       source/openmx_precision.c -o check_orbs_otf_hip
 // Baseline (B: a directory with the other orbs_otf_hip.cu/.h):
 //   R="-DOTF_Orbitals_Upload=baseline_OTF_Orbitals_Upload -DOTF_Orbitals_Eval=baseline_OTF_Orbitals_Eval
 //      -DOTF_Orbitals_Release=baseline_OTF_Orbitals_Release -DOTF_Orbitals_Ready=baseline_OTF_Orbitals_Ready
@@ -34,7 +34,7 @@
 //   hipcc <flags above> $R -I$B -c $B/orbs_otf_hip.cu -o baseline.o
 //   hipcc <flags above> -DOTF_BASELINE -Isource -c tools/check_orbs_otf_hip.cu -o check.o
 //   hipcc <flags above> -Isource -c source/orbs_otf_hip.cu -o orbs_otf_hip.o
-//   hipcc --offload-arch=gfx1200 check.o orbs_otf_hip.o baseline.o -o check_orbs_otf_hip
+//   hipcc --offload-arch=gfx1200 check.o orbs_otf_hip.o baseline.o source/openmx_precision.c -o check_orbs_otf_hip
 // Run: ./check_orbs_otf_hip [atoms] [spacing] [repetitions]   (defaults 6 0.20 3; < 1 GiB of device memory)
 #include <hip/hip_runtime.h>
 

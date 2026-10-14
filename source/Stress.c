@@ -14,6 +14,7 @@
 #include <math.h>
 #include <time.h>
 #include "openmx_common.h"
+#include "openmx_precision.h"
 #include "mpi.h"
 #include <omp.h>
 #include <fftw3.h>
@@ -709,10 +710,8 @@ double Stress(double *****H0,
     /* begin(yshiihara) */ 
 
     /* get Nthrds0 */  
-#pragma omp parallel shared(Nthrds0)
-    {
-      Nthrds0 = omp_get_num_threads();
-    }
+    /* Dynamic teams may grow after a separate probe region. */
+    Nthrds0 = omp_get_max_threads();
 
     My_Stress_threads=(double**)malloc(sizeof(double*)*(Nthrds0));
     for (i=0; i<Nthrds0; i++){
@@ -1051,10 +1050,8 @@ double Stress(double *****H0,
     Set_Lebedev_Grid(Num_Leb_Grid,Leb_Grid_XYZW);
 
     /* get Nthrds0 */  
-#pragma omp parallel shared(Nthrds0)
-    {
-      Nthrds0 = omp_get_num_threads();
-    }
+    /* Dynamic teams may grow after a separate probe region. */
+    Nthrds0 = omp_get_max_threads();
 
     /* initialize the temporal array storing the force contribution */
 
@@ -1129,7 +1126,7 @@ double Stress(double *****H0,
 	  }
 	}
 	
-#pragma omp parallel shared(Leb_Grid_XYZW,Num_Leb_Grid,Spe_Atomic_Den2,Spe_PAO_XV,Spe_Num_Mesh_PAO,My_sumr,My_sumrx,My_sumry,My_sumrz,My_Stress,My_Stress_threads,Dr,Sr,CoarseGL_Abscissae,CoarseGL_Weight,Gxyz,Gc_AN,FNAN,natn,ncn,WhatSpecies,atv,F_Vxc_flag,Cwan,PCC_switch) private(OMPID,Nthrds,Nprocs,ir,ia,r,w,sumt,sumtx,sumty,sumtz,x,x0,y0,z0,h_AN,Gh_AN,Rn,Hwan,x1,y1,z1,dx,dy,dz,r1,den,den0,gden0,dx1,dy1,dz1,exc0,vxc0,sumt1)
+#pragma omp parallel shared(Leb_Grid_XYZW,Num_Leb_Grid,Spe_Atomic_Den2,Spe_PAO_XV,Spe_Num_Mesh_PAO,My_sumr,My_sumrx,My_sumry,My_sumrz,My_Stress,My_Stress_threads,Dr,Sr,CoarseGL_Abscissae,CoarseGL_Weight,Gxyz,Gc_AN,FNAN,natn,ncn,WhatSpecies,atv,F_Vxc_flag,Cwan,PCC_switch) private(OMPID,Nthrds,Nprocs,ir,ia,r,w,sumt,sumtx,sumty,sumtz,x,x0,y0,z0,h_AN,Gh_AN,Rn,Hwan,x1,y1,z1,dx,dy,dz,r1,den,den0,gden0,dx1,dy1,dz1,exc0,vxc0,sumt1,i)
 	{
 
 	  double dx2,dy2,dz2;
@@ -1389,10 +1386,8 @@ double Stress(double *****H0,
     printf("  Stress calculation #2\n");fflush(stdout);
   }
   
-#pragma omp parallel shared(Nthrds0)
-  {
-    Nthrds0 = omp_get_num_threads();
-  }
+  /* Dynamic teams may grow after a separate probe region. */
+  Nthrds0 = omp_get_max_threads();
 
   /* begin(yshiihara) */ 
   My_Stress_threads=(double**)malloc(sizeof(double*)*(Nthrds0));
@@ -1874,10 +1869,8 @@ double Stress(double *****H0,
 
   /* begin(yshiihara) */
 
-#pragma omp parallel shared(Nthrds0)
-  {
-    Nthrds0 = omp_get_num_threads();
-  }
+  /* Dynamic teams may grow after a separate probe region. */
+  Nthrds0 = omp_get_max_threads();
 
   My_Stress_threads=(double**)malloc(sizeof(double*)*(Nthrds0));
   for (i=0; i<Nthrds0; i++){
@@ -3054,10 +3047,8 @@ void Stress4B(double *****CDM0)
   VNA_List2 = (int*)malloc(sizeof(int)*(List_YOUSO[34]*(List_YOUSO[35] + 1)+2) );
 
   /* get Nthrds0 */  
-#pragma omp parallel shared(Nthrds0)
-  {
-    Nthrds0 = omp_get_num_threads();
-  }
+  /* Dynamic teams may grow after a separate probe region. */
+  Nthrds0 = omp_get_max_threads();
 
   My_Stress_threads=(double**)malloc(sizeof(double*)*(Nthrds0));
   for (i=0; i<Nthrds0; i++){
@@ -3913,10 +3904,8 @@ void Stress_core()
   MPI_Comm_rank(mpi_comm_level1,&myid);
 
   /* get Nthrds0 */  
-#pragma omp parallel shared(Nthrds0)
-  {
-    Nthrds0 = omp_get_num_threads();
-  }
+  /* Dynamic teams may grow after a separate probe region. */
+  Nthrds0 = omp_get_max_threads();
   
   /* allocation of array */
   /* begin(yshiihara) */ 
@@ -4274,10 +4263,8 @@ void Stress_H0()
   dtime(&stime);
 
   /* get Nthrds0 */
-#pragma omp parallel shared(Nthrds0)
-  {
-    Nthrds0 = omp_get_num_threads();
-  }
+  /* Dynamic teams may grow after a separate probe region. */
+  Nthrds0 = omp_get_max_threads();
 
   /* allocation of array */
   /* begin(yshiihara) */
@@ -4661,10 +4648,8 @@ void Stress_HNL(double *****CDM0, double *****iDM0)
   Rcv_DS_NL_Size = (int*)malloc(sizeof(int)*numprocs);
 
   /* get Nthrds0 */  
-#pragma omp parallel shared(Nthrds0)
-  {
-    Nthrds0 = omp_get_num_threads();
-  }
+  /* Dynamic teams may grow after a separate probe region. */
+  Nthrds0 = omp_get_max_threads();
 
   My_Stress_threads=(double**)malloc(sizeof(double*)*(Nthrds0));
   for (i=0; i<Nthrds0; i++){
@@ -5881,10 +5866,8 @@ void Stress_plus_U_dual(double *****CDM0)
 
   /* get Nthrds0 */
 
-#pragma omp parallel shared(Nthrds0)
-  {
-    Nthrds0 = omp_get_num_threads();
-  }
+  /* Dynamic teams may grow after a separate probe region. */
+  Nthrds0 = omp_get_max_threads();
 
   /* allocation of array */
 
@@ -6042,6 +6025,7 @@ void dHVNA(int where_flag, int Mc_AN, int h_AN, int q_AN,
            double **Hx, double **Hy, double **Hz, 
            double ****H_sts)
 {
+  const int fp32 = openmx_fp32_enabled();
   int i,j,k,m,n,l,kg,kan,so,deri_kind;
   int ig,ian,jg,jan,kl,kl1,kl2,Rni,Rnj,Rnk;
   int wakg,l1,l2,l3,Gc_AN,Mi_AN,Mj_AN,Mj_AN2,num_projectors;
@@ -6206,9 +6190,12 @@ void dHVNA(int where_flag, int Mc_AN, int h_AN, int q_AN,
 	      sumz = 0.0;
 
 	      for (l=0; l<num_projectors; l++){
-		sumx += DS_VNA1[1][Mc_AN][k][m][l]*DS_VNA1[0][Mj_AN2][kl][n][l];
-		sumy += DS_VNA1[2][Mc_AN][k][m][l]*DS_VNA1[0][Mj_AN2][kl][n][l];
-		sumz += DS_VNA1[3][Mc_AN][k][m][l]*DS_VNA1[0][Mj_AN2][kl][n][l];
+		sumx += fp32 ? (double)(DS_VNA1[1][Mc_AN][k][m][l] * DS_VNA1[0][Mj_AN2][kl][n][l])
+		                 : (double)DS_VNA1[1][Mc_AN][k][m][l] * (double)DS_VNA1[0][Mj_AN2][kl][n][l];
+		sumy += fp32 ? (double)(DS_VNA1[2][Mc_AN][k][m][l] * DS_VNA1[0][Mj_AN2][kl][n][l])
+		                 : (double)DS_VNA1[2][Mc_AN][k][m][l] * (double)DS_VNA1[0][Mj_AN2][kl][n][l];
+		sumz += fp32 ? (double)(DS_VNA1[3][Mc_AN][k][m][l] * DS_VNA1[0][Mj_AN2][kl][n][l])
+		                 : (double)DS_VNA1[3][Mc_AN][k][m][l] * (double)DS_VNA1[0][Mj_AN2][kl][n][l];
 	      }
 
               /* for forces */
@@ -6312,9 +6299,12 @@ void dHVNA(int where_flag, int Mc_AN, int h_AN, int q_AN,
             }
 
 	    for (l=0; l<num_projectors; l++){
-	      sumx -= DS_VNA1[0][Mc_AN][0][m][l]*DS_VNA1[1][Mj_AN2][kl][n][l];
-	      sumy -= DS_VNA1[0][Mc_AN][0][m][l]*DS_VNA1[2][Mj_AN2][kl][n][l];
-	      sumz -= DS_VNA1[0][Mc_AN][0][m][l]*DS_VNA1[3][Mj_AN2][kl][n][l];
+	      sumx -= fp32 ? (double)(DS_VNA1[0][Mc_AN][0][m][l] * DS_VNA1[1][Mj_AN2][kl][n][l])
+	                       : (double)DS_VNA1[0][Mc_AN][0][m][l] * (double)DS_VNA1[1][Mj_AN2][kl][n][l];
+	      sumy -= fp32 ? (double)(DS_VNA1[0][Mc_AN][0][m][l] * DS_VNA1[2][Mj_AN2][kl][n][l])
+	                       : (double)DS_VNA1[0][Mc_AN][0][m][l] * (double)DS_VNA1[2][Mj_AN2][kl][n][l];
+	      sumz -= fp32 ? (double)(DS_VNA1[0][Mc_AN][0][m][l] * DS_VNA1[3][Mj_AN2][kl][n][l])
+	                       : (double)DS_VNA1[0][Mc_AN][0][m][l] * (double)DS_VNA1[3][Mj_AN2][kl][n][l];
 	    }
 
 	    Hx[m][n] += sumx;
@@ -6351,9 +6341,12 @@ void dHVNA(int where_flag, int Mc_AN, int h_AN, int q_AN,
 	  sumz = 0.0;
 
           for (l=0; l<num_projectors; l++){
-	    sumx -= DS_VNA1[1][Matomnum+1][kl1][m][l]*DS_VNA1[0][Matomnum+1][kl2][n][l];
-	    sumy -= DS_VNA1[2][Matomnum+1][kl1][m][l]*DS_VNA1[0][Matomnum+1][kl2][n][l];
-	    sumz -= DS_VNA1[3][Matomnum+1][kl1][m][l]*DS_VNA1[0][Matomnum+1][kl2][n][l];
+	    sumx -= fp32 ? (double)(DS_VNA1[1][Matomnum+1][kl1][m][l] * DS_VNA1[0][Matomnum+1][kl2][n][l])
+	                     : (double)DS_VNA1[1][Matomnum+1][kl1][m][l] * (double)DS_VNA1[0][Matomnum+1][kl2][n][l];
+	    sumy -= fp32 ? (double)(DS_VNA1[2][Matomnum+1][kl1][m][l] * DS_VNA1[0][Matomnum+1][kl2][n][l])
+	                     : (double)DS_VNA1[2][Matomnum+1][kl1][m][l] * (double)DS_VNA1[0][Matomnum+1][kl2][n][l];
+	    sumz -= fp32 ? (double)(DS_VNA1[3][Matomnum+1][kl1][m][l] * DS_VNA1[0][Matomnum+1][kl2][n][l])
+	                     : (double)DS_VNA1[3][Matomnum+1][kl1][m][l] * (double)DS_VNA1[0][Matomnum+1][kl2][n][l];
 	  }
 
 	  Hx[m][n] = sumx;
@@ -6385,9 +6378,12 @@ void dHVNA(int where_flag, int Mc_AN, int h_AN, int q_AN,
 	    sumz = 0.0;
 
 	    for (l=0; l<num_projectors; l++){
-	      sumx -= DS_VNA1[0][Matomnum+1][kl1][m][l]*DS_VNA1[1][Matomnum+1][kl2][n][l];
-	      sumy -= DS_VNA1[0][Matomnum+1][kl1][m][l]*DS_VNA1[2][Matomnum+1][kl2][n][l];
-	      sumz -= DS_VNA1[0][Matomnum+1][kl1][m][l]*DS_VNA1[3][Matomnum+1][kl2][n][l];
+	      sumx -= fp32 ? (double)(DS_VNA1[0][Matomnum+1][kl1][m][l] * DS_VNA1[1][Matomnum+1][kl2][n][l])
+	                       : (double)DS_VNA1[0][Matomnum+1][kl1][m][l] * (double)DS_VNA1[1][Matomnum+1][kl2][n][l];
+	      sumy -= fp32 ? (double)(DS_VNA1[0][Matomnum+1][kl1][m][l] * DS_VNA1[2][Matomnum+1][kl2][n][l])
+	                       : (double)DS_VNA1[0][Matomnum+1][kl1][m][l] * (double)DS_VNA1[2][Matomnum+1][kl2][n][l];
+	      sumz -= fp32 ? (double)(DS_VNA1[0][Matomnum+1][kl1][m][l] * DS_VNA1[3][Matomnum+1][kl2][n][l])
+	                       : (double)DS_VNA1[0][Matomnum+1][kl1][m][l] * (double)DS_VNA1[3][Matomnum+1][kl2][n][l];
 	    }
 
 	    Hx[m][n] += sumx;
@@ -8719,10 +8715,8 @@ void EH0_TwoCenter_at_Cutoff(int wan1, int wan2, double VH0ij[4])
   rcut = Spe_Atom_Cut1[wan1] + Spe_Atom_Cut1[wan2];
 
   /* get Nthrds0 */  
-#pragma omp parallel shared(Nthrds0)
-  {
-    Nthrds0 = omp_get_num_threads();
-  }
+  /* Dynamic teams may grow after a separate probe region. */
+  Nthrds0 = omp_get_max_threads();
 
   /* allocation of array */
   my_sum_threads = (double*)malloc(sizeof(double)*Nthrds0);

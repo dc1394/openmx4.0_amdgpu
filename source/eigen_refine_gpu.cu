@@ -49,6 +49,7 @@
    and every loop is a kernel on the stream of the caller's hipBLAS handle.
 */
 #include "eigen_refine_gpu.h"
+#include "openmx_precision.h"
 #include "openmx_stdout_level.h"
 
 #include <hip/hip_runtime.h>
@@ -968,6 +969,7 @@ extern "C" int openmx_eigen_refine_configure(int cplx, int verbose, int *ratio)
     int         iterations = 0;
 
     *ratio = 0;
+    if (!openmx_fp32_enabled()) return 0;
     if (value != NULL && value[0] != '\0') {
         iterations = (0 < atoi(value)) ? atoi(value) : 0;
         if (verbose) {
@@ -1131,10 +1133,16 @@ extern "C" int openmx_eigen_refine_prepare(EigenRefineState *st, EigenRefineDevi
     double      *a = (double *)pb->a;
     double      *x = (double *)pb->x;
     float       *af = (float *)pb->fp32;
-    float       *wf = af + (cplx ? 2 * nn : nn);
-    hipStream_t  stream = refine_stream(dev);
+    float       *wf;
+    hipStream_t  stream;
 
     memset(report, 0, sizeof(*report));
+    if (!openmx_fp32_enabled()) {
+        st->basis_valid = 0;
+        return 0;
+    }
+    wf = af + (cplx ? 2 * nn : nn);
+    stream = refine_stream(dev);
     st->cplx = cplx;
 
     /* the caller's products that built a may still run on other streams */

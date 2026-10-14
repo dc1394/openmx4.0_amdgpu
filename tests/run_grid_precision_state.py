@@ -57,6 +57,7 @@ STUBS = r'''
 #include <cstdlib>
 #include <cstring>
 #include "openmx_stdout_level.h"
+#include "openmx_precision.h"
 #ifdef TEST_STDOUT_DEFINED
 int level_stdout = 3;
 #endif
@@ -85,6 +86,11 @@ int main(int argc, char **argv)
     level_stdout = std::atoi(std::getenv("TEST_STDOUT_LEVEL"));
 #endif
     const int expect_df = std::atoi(argv[1]);
+    /* A disabled first input must not cache its veto or consume the banner. */
+    openmx_set_fp32_enabled(0);
+    if (openmx_grid_precision_df() != 0 || queries != 0) return 11;
+    openmx_grid_precision_announce();
+    openmx_set_fp32_enabled(1);
     if (openmx_grid_precision_df() != expect_df) {
         std::fprintf(stderr, "openmx_grid_precision_df() = %d, expected %d\n", openmx_grid_precision_df(), expect_df);
         return 1;
@@ -100,6 +106,12 @@ int main(int argc, char **argv)
         std::fprintf(stderr, "the device was queried %d times\n", queries);
         return 1;
     }
+    /* Repeated inputs override the cached environment in both directions. */
+    openmx_set_fp32_enabled(0);
+    if (openmx_grid_precision_df() != 0 || grid_precision_df()) return 12;
+    openmx_grid_precision_announce();
+    openmx_set_fp32_enabled(1);
+    if (openmx_grid_precision_df() != expect_df) return 13;
     openmx_grid_precision_announce();
     openmx_grid_precision_announce();
     return 0;
@@ -158,7 +170,8 @@ def main():
         for defined in (False, True):
             flags = ["-DTEST_STDOUT_DEFINED"] if defined else []
             subprocess.run(shlex.split(args.cxx) + ["-std=c++17", "-O1", "-Wall", "-Wextra", "-Werror",
-                            "-I", str(ROOT / "source"), *flags, str(cfile), "-o", str(binary)], check=True)
+                            "-I", str(ROOT / "source"), *flags, str(cfile),
+                            str(ROOT / "source/openmx_precision.c"), "-o", str(binary)], check=True)
             for level in ((0, 1, 2, 3) if defined else (3,)):
                 for extra, expect_df, expect_out in CASES:
                     run = subprocess.run([str(binary), str(expect_df)],
@@ -177,7 +190,7 @@ def main():
                     if not ok:
                         raise SystemExit(f"FAIL level={level} {extra}: unexpected banner {run.stdout!r}")
     print(f"PASS: {len(CASES) * 5} grid precision/output configurations (levels 0..3, standalone weak "
-          "reference, input warnings at every level, fixed precision decision, one banner)")
+          "reference, input warnings at every level, per-input FP32 veto/reset, one banner)")
 
 
 if __name__ == "__main__":

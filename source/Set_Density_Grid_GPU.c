@@ -1299,14 +1299,16 @@ static int SDG_local_build(int Cnt_kind, int spin_count)
 /* Device bytes this call would stage on top of what is already resident. */
 static size_t SDG_local_call_bytes(const SDGLocalContext *c)
 {
+  /* Unlike the CUDA implementation, the HIP double-float kernel splits
+     the existing device DM in place, so no precision image is added. */
   size_t bytes = c->d_out_ptr != NULL ? 0 : c->extra_bytes;
 
-  if (!c->t.orbs0_resident) (void)SDG_add_bytes(&bytes, c->t.total_orbs0, sizeof(Type_Orbs_Grid));
-  if (!c->t.orbs1_resident) (void)SDG_add_bytes(&bytes, c->t.total_orbs1, sizeof(Type_Orbs_Grid));
-  if (!c->t.nolg_resident) (void)SDG_add_bytes(&bytes, c->t.total_nolg, sizeof(int));
+  if (!c->t.orbs0_resident && !SDG_add_bytes(&bytes, c->t.total_orbs0, sizeof(Type_Orbs_Grid))) return SIZE_MAX;
+  if (!c->t.orbs1_resident && !SDG_add_bytes(&bytes, c->t.total_orbs1, sizeof(Type_Orbs_Grid))) return SIZE_MAX;
+  if (!c->t.nolg_resident && !SDG_add_bytes(&bytes, c->t.total_nolg, sizeof(int))) return SIZE_MAX;
   if (!c->t.meta_resident) {
-    (void)SDG_add_bytes(&bytes, (size_t)c->t.pair_count * 2, sizeof(int));
-    (void)SDG_add_bytes(&bytes, (size_t)c->t.pair_count * 4, sizeof(size_t));
+    if (!SDG_add_bytes(&bytes, (size_t)c->t.pair_count, 2 * sizeof(int)) ||
+        !SDG_add_bytes(&bytes, (size_t)c->t.pair_count, 4 * sizeof(size_t))) return SIZE_MAX;
   }
   return bytes;
 }
@@ -1319,6 +1321,9 @@ static int SDG_local_prepare(int Cnt_kind, int Calc_CntOrbital_ON, int node_rank
 {
   SDGLocalContext *c = &SDG_local;
   int spin_count = SpinP_switch + 1;
+  /* Without orbital optimization, the final density (Cnt_kind 1) uses
+     the same primitive orbitals and resident tables as the SCF density. */
+  const int table_kind = (Cnt_switch == 0) ? 0 : Cnt_kind;
   int enabled, mode = 1, my_ready;
   size_t reserve_bytes, need;
   size_t free_bytes = 0, total_bytes = 0;
@@ -1354,10 +1359,10 @@ static int SDG_local_prepare(int Cnt_kind, int Calc_CntOrbital_ON, int node_rank
   /* Ride on the tables Set_Hamiltonian has already built: probe for
      them without building (Set_Hamiltonian_MatrixElementsTables_Ready),
      then for their residency. */
-  my_ready = Set_Hamiltonian_MatrixElementsTables_Ready(Cnt_kind);
+  my_ready = Set_Hamiltonian_MatrixElementsTables_Ready(table_kind);
   if (my_ready) {
     SetHamiltonianMETables probe;
-    if (!Set_Hamiltonian_GetMatrixElementsTables(Cnt_kind, &probe) ||
+    if (!Set_Hamiltonian_GetMatrixElementsTables(table_kind, &probe) ||
         !(probe.orbs0_resident && probe.orbs1_resident && probe.nolg_resident && probe.meta_resident))
       my_ready = 0;
   }
@@ -1367,29 +1372,29 @@ static int SDG_local_prepare(int Cnt_kind, int Calc_CntOrbital_ON, int node_rank
        keeps its gates (the matrix-elements GPU path, at most
        OPENMX_BAND_GPU_MAX_DEVICE_RANKS ranks per device,
        OPENMX_DENSITY_GRID_ONTHEFLY) */
-    if (mode != 1 || !Set_Density_Grid_OTF_Possible(Cnt_kind)) return 0;
+    if (mode != 1 || !Set_Density_Grid_OTF_Possible(table_kind)) return 0;
     if (!c->otf) {
       SDG_local_free();
       c->otf = 1;
     }
     c->spin_count = spin_count;
-    c->cnt_kind = Cnt_kind;
+    c->cnt_kind = table_kind;
     return 1;
   }
 
   if (c->otf) SDG_local_free(); /* back from the on-the-fly mode to the CSR */
   if (c->unavailable) return 0;
 
-  if (c->ready && (c->spin_count != spin_count || c->cnt_kind != Cnt_kind)) {
+  if (c->ready && (c->spin_count != spin_count || c->cnt_kind != table_kind)) {
     SDG_local_free();
   }
   if (!c->ready) {
-    if (!SDG_local_build(Cnt_kind, spin_count)) return 0;
+    if (!SDG_local_build(table_kind, spin_count)) return 0;
   }
 
   /* refresh the shared-table view: the pointers and the residency flags may
      have changed since the epoch was built */
-  if (!Set_Hamiltonian_GetMatrixElementsTables(Cnt_kind, &c->t) ||
+  if (!Set_Hamiltonian_GetMatrixElementsTables(table_kind, &c->t) ||
       c->t.total_nolg != c->term_count || c->t.total_h != c->dm_count) {
     SDG_local_free();
     SDG_local.unavailable = 1;
@@ -1448,7 +1453,7 @@ int Set_Density_Grid_GPU_Local_Prepare(int Cnt_kind, int Calc_CntOrbital_ON)
 
   ok = SDG_local_prepare(Cnt_kind, Calc_CntOrbital_ON, openmx_gpu_ranks_per_device_noncollective());
   if (ok && Matomnum > 0 && SDG_local.otf) {
-    ok = Set_Density_Grid_OTF_Prepare(Cnt_kind, &need, &available);
+    ok = Set_Density_Grid_OTF_Prepare(SDG_local.cnt_kind, &need, &available);
     workspace_declined = !ok && need > available;
     if (workspace_declined && 3 <= level_stdout) {
       int myid;

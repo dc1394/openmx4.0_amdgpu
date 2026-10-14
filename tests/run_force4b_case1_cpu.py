@@ -220,6 +220,8 @@ static void check_size_limits(void)
 
 int main(void)
 {
+    const char *precision = getenv("TEST_FP32_ENABLE");
+    openmx_set_fp32_enabled(precision == NULL || atoi(precision));
     int chunked, spin, seed, mc, q, source, direction, atom, k, i, l, checks = 0;
     double max_error = 0.0;
     unsetenv("OPENMX_FORCE4B_GPU");
@@ -346,7 +348,7 @@ int main(void)
 def make_harness(source: str) -> str:
     parts = [common.STUBS, GLOBALS, common.extract_struct(source, "Force4BGpuItem")]
     for name in (
-        "Force_gpu_arena_off", "Force_host_arena_alloc", "Force_host_arena_free",
+        "Force_gpu_node_reserve", "Force_gpu_arena_off", "Force_host_arena_alloc", "Force_host_arena_free",
         "Force4B_case1_trace_fused_rows", "Force4B_case1_trace_fused", "Force4B_GpuCase1Kernel",
         "Force4B_GpuCase1Accumulate",
     ):

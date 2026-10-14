@@ -147,6 +147,7 @@ CXX_TEST = r'''
 #include <vector>
 
 #include "orbs_otf_hip.cu"
+#include "openmx_precision.h"
 
 #define CHECK(condition) do { if (!(condition)) { \
     fprintf(stderr, "FAIL line %d: %s\n", __LINE__, #condition); exit(2); \
@@ -877,6 +878,19 @@ int main(void)
 
     /* 1: on the double-float upload (it holds both tables) */
     radial = radial_checks();
+
+    /* The input switch takes effect even with live DF tables and wins
+       over an explicit DF upload request. Re-enabling restores DF. */
+    openmx_set_fp32_enabled(0);
+    CHECK(!OTF_Orbitals_DoubleFloat());
+    CHECK(memcmp(run(P, OTF_Orbitals_Eval).data(), p64.data(), p64.size() * sizeof(float)) == 0);
+    CHECK(memcmp(run(Q, OTF_Orbitals_Eval).data(), q64.data(), q64.size() * sizeof(float)) == 0);
+    CHECK(OTF_Orbitals_Upload(&t, 1) == 1 && !OTF_Orbitals_DoubleFloat());
+    CHECK(!g_dev.rwd && !g_dev.mcd && !g_dev.spl);
+    CHECK(memcmp(run(P, OTF_Orbitals_Eval).data(), p64.data(), p64.size() * sizeof(float)) == 0);
+    openmx_set_fp32_enabled(1);
+    CHECK(OTF_Orbitals_Upload(&t, 1) == 1 && OTF_Orbitals_DoubleFloat());
+    CHECK(memcmp(run(P, OTF_Orbitals_Eval).data(), pdf.data(), pdf.size() * sizeof(float)) == 0);
     OTF_Orbitals_Release();
     CHECK(stub_live == 0);
   }
@@ -923,6 +937,7 @@ typedef float Type_Orbs_Grid;
 typedef int MPI_Comm;
 MPI_Comm mpi_comm_level1;
 int SpeciesNum, TCpyCell, Ngrid2, Ngrid3, Matomnum, Host_ID;
+int level_stdout = 3;
 int *Spe_MaxL_Basis, *Spe_Num_Mesh_PAO, **Spe_Num_Basis, *Spe_Total_NO;
 int *M2G, *WhatSpecies, *G2ID, *GridN_Atom, *FNAN, **natn, **ncn, **NumOLG, ***GListTAtoms1;
 int **GridListAtom, **CellListAtom;
@@ -1163,8 +1178,19 @@ int run_prepare_tests(int *checks)
   fp_ratio = 16;
   CHECK(Set_Orbitals_Grid_OTF_Prepare() == 1 && OTF_Orbitals_DoubleFloat());
   Set_Orbitals_Grid_OTF_Release();
+  setenv("OPENMX_ORBS_EVAL_PRECISION", "df", 1);
+  for (k = 0; k < 4; k++) {
+    int calls = upload_calls;
+    openmx_set_fp32_enabled(k % 2);
+    CHECK(Set_Orbitals_Grid_OTF_Prepare() == 1);
+    CHECK(OTF_Orbitals_DoubleFloat() == k % 2 && upload_calls == calls + 1);
+    CHECK(Set_Orbitals_Grid_OTF_Prepare() == 1 && upload_calls == calls + 1);
+    CHECK(tables_match());
+  }
+  unsetenv("OPENMX_ORBS_EVAL_PRECISION");
+  Set_Orbitals_Grid_OTF_Release();
   CHECK(c_live == 0 && test_device_live() == 0);
-  *checks += 15;
+  *checks += 31;
   return 0;
 }
 
@@ -1370,7 +1396,7 @@ int run_table_tests(int *checks)
 
 
 def c_harness(sog):
-    parts = [C_PREFIX,
+    parts = [C_PREFIX, '#include "openmx_precision.h"',
              line(sog, r"^#define\s+SOG_L0MAX\b.*$"),
              line(sog, r"^#define\s+SOG_MULMAX\b.*$"),
              line(sog, r"^int Set_Orbitals_Grid_OTF_Prepare\(void\);$"),
@@ -1381,6 +1407,7 @@ def c_harness(sog):
              function(sog, "Set_Orbitals_Grid_GPU"),
              line(sog, r"^extern int openmx_gpu_fp32_fp64_ratio\(void\);$"),
              line(sog, r"^static int SOG_otf_unavailable = 0;$"),
+             line(sog, r"^static int SOG_otf_fp32_enabled = -1;$"),
              function(sog, "SOG_otf_double_float"),
              function(sog, "Set_Orbitals_Grid_OTF_Release"),
              function(sog, "Set_Orbitals_Grid_OTF_Prepare"),
@@ -1439,12 +1466,15 @@ def main():
         (work / "orbs_otf_hip.h").write_text(sources["orbs_otf_hip.h"])
         (work / "otf_test.cpp").write_text(CXX_TEST)
         (work / "prepare_test.c").write_text(c_harness(sources["Set_Orbitals_Grid.c"]))
-        include = ["-I" + str(work)]
+        include = ["-I" + str(work), "-I" + str(root / "source")]
         subprocess.run([*shlex.split(args.cc), *flags, "-std=c11", *include, "-c", str(work / "prepare_test.c"),
                         "-o", str(work / "prepare_test.o")], check=True)
         subprocess.run([*shlex.split(cxx), *flags, "-std=c++17", "-Wno-unknown-pragmas", *include, "-c",
                         str(work / "otf_test.cpp"), "-o", str(work / "otf_test.o")], check=True)
-        subprocess.run([*shlex.split(cxx), *flags, str(work / "otf_test.o"), str(work / "prepare_test.o"), "-lm",
+        subprocess.run([*shlex.split(args.cc), *flags, "-std=c11", *include, "-c",
+                        str(root / "source/openmx_precision.c"), "-o", str(work / "precision.o")], check=True)
+        subprocess.run([*shlex.split(cxx), *flags, str(work / "otf_test.o"), str(work / "prepare_test.o"),
+                        str(work / "precision.o"), "-lm",
                         "-o", str(work / "check")], check=True)
         env = os.environ.copy()
         for name in ("OPENMX_ORBS_GRID_GPU", "OPENMX_ORBS_EVAL_PRECISION"):

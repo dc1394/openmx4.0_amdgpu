@@ -427,7 +427,7 @@ int main(void)
 
 
 def make_harness(source: str, gpu: bool) -> str:
-    parts = [PREFIX, HIP_DEVICE if gpu else HOST_DEVICE,
+    parts = [PREFIX, '#include "openmx_precision.h"', HIP_DEVICE if gpu else HOST_DEVICE,
              extract_struct(source, "SetProGpuContext"),
              "static SetProGpuContext SetPro_gpu = { 0 };\n"]
     for name in ("SetPro_gpu_abort", "SetPro_checked_malloc", "SetPro_collective_env_flag",
@@ -465,7 +465,7 @@ def main() -> int:
             src = Path(directory) / "hvna.c"
             exe = Path(directory) / "hvna"
             src.write_text(harness)
-            subprocess.run([*command, "-std=c11", "-Wno-unused-function", str(src), "-lm", "-o", str(exe)],
+            subprocess.run([*command, "-std=c11", "-Wno-unused-function", "-I", str(ROOT / "source"), str(src), str(ROOT / "source/openmx_precision.c"), "-lm", "-o", str(exe)],
                            check=True)
             status = 0
             for verbose in ("", "1"):

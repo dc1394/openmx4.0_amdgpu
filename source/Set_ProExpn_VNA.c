@@ -25,6 +25,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #include "openmx_common.h"
+#include "openmx_precision.h"
 #include "set_hip_default_device_from_local_rank.h"
 #include "mpi.h"
 #include <omp.h>
@@ -275,8 +276,9 @@ static void *SetPro_device_try(size_t bytes)
 }
 
 /* One HVNA output element in the exact CPU accumulation order (k outermost,
-   then the radial groups, then the 2*L+1 members with the float product cast
-   to double); shared by the device kernel and its host fallback. */
+   then the radial groups, then the 2*L+1 members).  Preserve legacy FP32
+   product rounding when enabled; promote operands before multiplying when
+   scf.fp32.enable is off. Shared by the device kernel and host fallback. */
 static double SetPro_HVNA_element(size_t oe, int num_proj, int num_rvna,
                                   const float *flat, const float *halo,
                                   const int *out_item, const int *item_koff,
@@ -284,7 +286,7 @@ static double SetPro_HVNA_element(size_t oe, int num_proj, int num_rvna,
                                   const size_t *item_out, const size_t *krowA,
                                   const size_t *krowB, const int *krow_halo,
                                   const int *krow_ene, const double *ene,
-                                  const int *l2p1)
+                                  const int *l2p1, int fp32)
 {
   const int pp = out_item[oe];
   const int tnoH = item_tnoH[pp];
@@ -309,7 +311,7 @@ static double SetPro_HVNA_element(size_t oe, int num_proj, int num_rvna,
       double tmp0 = 0.0;
 
       for (int l3=0; l3<g1; l3++){
-        tmp0 += (double)(a[L]*b[L]);
+        tmp0 += fp32 ? (double)(a[L]*b[L]) : (double)a[L]*(double)b[L];
         L++;
       }
       sum += el[L1]*tmp0;
@@ -622,6 +624,7 @@ static void SetPro_HVNA_GpuArchiveHalo(Type_DS_VNA *****DS_VNA, int Original_Mc_
 /* the unified batch over every (local atom, neighbour) pair */
 static void SetPro_HVNA_GpuRun(double ****HVNA)
 {
+  const int fp32 = openmx_fp32_enabled();
   SetProGpuContext *g = &SetPro_gpu;
   const int num_proj = g->num_proj;
   const int num_rvna = g->num_rvna;
@@ -796,12 +799,13 @@ static void SetPro_HVNA_GpuRun(double ****HVNA)
         double *out_d = (double*)(void*)(arena+o_out);
 
 #pragma omp target teams distribute parallel for thread_limit(256) \
+        firstprivate(fp32) \
         is_device_ptr(flat_d, halo_d, koff_d, kn_d, tnoH_d, iout_d, oitem_d, \
                       krowA_d, krowB_d, khalo_d, kene_d, ene_d, l2p1_d, out_d)
         for (size_t oe=0; oe<out_c; oe++){
           out_d[oe] = SetPro_HVNA_element(oe,num_proj,num_rvna,flat_d,halo_d,oitem_d,
                                           koff_d,kn_d,tnoH_d,iout_d,krowA_d,krowB_d,
-                                          khalo_d,kene_d,ene_d,l2p1_d);
+                                          khalo_d,kene_d,ene_d,l2p1_d,fp32);
         }
 
         on_device = hipMemcpy(out,arena+o_out,sizeof(double)*out_c,hipMemcpyDeviceToHost)==hipSuccess;
@@ -822,7 +826,7 @@ static void SetPro_HVNA_GpuRun(double ****HVNA)
       for (size_t oe=0; oe<out_c; oe++){
         out[oe] = SetPro_HVNA_element(oe,num_proj,num_rvna,flat,halo,out_item,
                                       item_koff,item_kn,item_tnoH,item_out,krowA,krowB,
-                                      krow_halo,krow_ene,ene,l2p1);
+                                      krow_halo,krow_ene,ene,l2p1,fp32);
       }
     }
   }
@@ -2533,6 +2537,7 @@ static void SetPro_VNA23_GpuRun(double *****HVNA23, int mirror, int OneD_Nloop,
 
 double Set_ProExpn(double ****HVNA, Type_DS_VNA *****DS_VNA)
 {
+  const int fp32 = openmx_fp32_enabled();
   /****************************************************
    evaluate matrix elements of neutral atom potential
    in the KB or Blochl separable form in momentum space.
@@ -3612,7 +3617,8 @@ double Set_ProExpn(double ****HVNA, Type_DS_VNA *****DS_VNA)
 
 			for (L3=0; L3<=L2; L3++){
 
-			  tmp0 += DS_VNA[0][Mc_AN][k][m][L]*DS_VNA[0][Matomnum+1][kl][n][L];
+			  tmp0 += fp32 ? (double)(DS_VNA[0][Mc_AN][k][m][L] * DS_VNA[0][Matomnum+1][kl][n][L])
+			                   : (double)DS_VNA[0][Mc_AN][k][m][L] * (double)DS_VNA[0][Matomnum+1][kl][n][L];
 
 			  L++;
 			}
@@ -3780,7 +3786,8 @@ double Set_ProExpn(double ****HVNA, Type_DS_VNA *****DS_VNA)
 		    tmp0 = 0.0;
 
 		    for (L3=0; L3<=L2; L3++){
-		      tmp0 += DS_VNA[0][Mc_AN][k][m][L]*DS_VNA[0][Mj_AN][kl][n][L]; 
+		      tmp0 += fp32 ? (double)(DS_VNA[0][Mc_AN][k][m][L] * DS_VNA[0][Mj_AN][kl][n][L])
+		                       : (double)DS_VNA[0][Mc_AN][k][m][L] * (double)DS_VNA[0][Mj_AN][kl][n][L];
 		      L++;
 		    }
 

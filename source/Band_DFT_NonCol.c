@@ -16,6 +16,7 @@
 #include "mpi.h"
 #include "openmx_common.h"
 #include "eigen_refine_gpu.h"
+#include "openmx_precision.h"
 #include "eigen_refine_hooks.h"
 #include "lapack_prototypes.h"
 #include "tran_variables.h"
@@ -3327,6 +3328,8 @@ static void BandNonCol_RefineConfigure(void)
     double config[3] = {0.0, 0.0, 0.0};
     int    myid;
 
+    /* The input veto must not become a cached policy for later inputs. */
+    if (!openmx_fp32_enabled()) return;
     if (0 <= st->iterations) return;
     MPI_Comm_rank(mpi_comm_level1, &myid);
     if (myid == Host_ID) {
@@ -3344,7 +3347,7 @@ static void BandNonCol_RefineConfigure(void)
 
 static int BandNonCol_RefineIterations(void)
 {
-    return (0 < BandNonCol_refine.iterations) ? BandNonCol_refine.iterations : 0;
+    return (openmx_fp32_enabled() && 0 < BandNonCol_refine.iterations) ? BandNonCol_refine.iterations : 0;
 }
 
 /* the FP32 scratch of a refined solve: the FP32 matrix and eigenvalues, and

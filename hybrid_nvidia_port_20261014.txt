@@ -1,0 +1,105 @@
+NVIDIA hybrid/OpenMP updates ported to OpenMX 4.0 AMDGPU
+2026-10-14
+
+Source provenance
+  AMD base: c1f1db79788366fbecabe371b848e3dffa37a778
+  NVIDIA reference: 475566134142d6b5653efe769f360dd0152c9618
+  Ported updates after 4fd80f11: c12d98f1 (FP64 input policy),
+  bbc023bf (host OpenMP/hybrid), 47556613 (orbital/density correctness).
+  Tested AMD binary SHA256: 60b556908efab2654b3e5c33db1a05fc09b9cf265499cd2e20041f90b24bea4e
+
+Implementation
+  - Per-worker overlap/kinetic Bessel caches; atomic per-atom timing.
+  - Received nonlocal products and CPU cluster density-matrix assembly
+    parallelized over independent atoms; no MPI calls in the new workers.
+  - Dynamic-team scratch sizing in energy/stress, XC stress loop-counter fix.
+  - Radial spline endpoint and out-of-support handling, contracted halo indices.
+  - Final density reuses normal SCF resident orbital/CSR tables; overflow-safe
+    density memory estimates. Existing AMD GPU density-matrix assembly remains.
+  - scf.fp32.enable (default on) controls arithmetic independently of GEMMul8.
+    Off overrides FP32 refinement and DF orbital/grid requests and promotes
+    projector contractions to FP64; existing float storage is unchanged.
+  - Additional review fixes: nested radial loop's grid index is local to its
+    worker; collinear band refinement config/cycle reset precedes admission.
+  - Optional host profiling, hybrid --threads/--mpirun suite-runner options.
+  AMD HIP/MAGMA and MI300A policies retained. CUDA kernel-stack scanning and
+  NVHPC build settings are backend-specific and were not transplanted.
+
+Build
+  taskset -c 0-15 make -C source -j16 ARCH=gfx1200 ROCM=/opt/rocm-7.2.0 \
+    MPI_HOME=/home/kawai/opt/openmpi-rocmclang \
+    AOCL_HOME=/opt/AMD/aocl/aocl-linux-aocc-5.2.0/aocc \
+    AOCC_LIB=/opt/AMD/aocc-compiler-5.1.0/lib openmx
+  Build/link succeeded; ldd has no unresolved libraries. GEMMul8 emitted its
+  existing pragma-unroll CUDA-compatibility warnings, with no build errors.
+  Only source/openmx rebuilt; work/openmx was not installed/replaced.
+
+Runtime validation (Radeon RX 9060 XT, gfx1200, ROCm 7.2.0)
+  One MPI job at a time. 4 ranks x 4 threads and 8 ranks x 2 threads use
+  16 physical CPU cores. BLAS threads=1, OMP_DYNAMIC=FALSE, max active levels=1.
+  Rank-launcher identities establish nonoverlapping placement for every case;
+  live /proc task snapshots confirm all runtime/helper threads remain within
+  each rank's mask, total CPU union 0-15, on CPU 4x4 and GPU 4x4/8x2.
+
+  Post-port jobs/cases:
+    CPU 4x4, -runtest:                          14/14
+    GPU 4x4, -runtest:                          14/14
+    GPU 8x2, -runtest:                          14/14
+    GPU forced dense 32-Si fixtures, 4x4/8x2:     8/8
+    FP64 input, CPU/GPU 4x4, same four solvers:   8/8
+    GPU -runtestL3, four cases at both layouts:   8/8
+    Forced GPU Cr2 with SOC, both layouts:       2/2
+  Total: 68 completed post-port calculations, 11 jobs, no missing or failed
+  case. Four FP64 CPU runs supply new same-policy references; the other
+  64 are numerical comparisons to CPU results or bundled L3 references.
+  A further four pre-port forced GPU checks also agree with CPU references.
+  Reference/self comparisons are excluded from numerical regression counts.
+
+  -runtestL3 cases: SialicAcid, Pt63, C60, Crys-MnO (not the full L3 suite).
+  The 32-Si fixtures cover cluster/band x collinear/noncollinear, three SCF
+  steps plus forces, including refined FP32 and explicit FP64 modes.
+  scf.fp32.enable off wins over explicit OPENMX_EIGEN_REFINE=2,
+  OPENMX_GRID_PRECISION=df and OPENMX_ORBS_EVAL_PRECISION=df.
+
+  Acceptance compares finite energies, every force component, atom identities,
+  coordinates and integration grids. Energy/force tolerances: 1e-7 Ha and
+  1e-7 Ha/bohr. Max post-port differences: 2.966e-9 Ha and 5.01e-10 Ha/bohr.
+  Required GPU H diagonalizations are verified from successful profiles:
+  real n=416 (cluster collinear), complex n=416 (band collinear), complex
+  n=832 (noncollinear fixtures), complex n=40 (Cr2). Overlap-only GPU work
+  is insufficient. Cr2 has 21 successful complex GPU solves at each layout;
+  max Cr2 force difference from CPU is 7.7e-11 Ha/bohr.
+  Ordinary small-input CPU diagonalization thresholds remain in force.
+  No host-memory interruption; minimum logged MemAvailable was 237.7 GiB.
+
+  Illustrative -runtest totals (sum of OpenMX elapsed times, one sample):
+    current CPU 4x4: 86.41 s
+    current GPU 4x4: 78.68 s
+    current GPU 8x2: 77.56 s
+  These are validation timings, not a repeated benchmark or an isolated
+  measurement of the port's speedup. Pre-port CPU baselines used 4x1, so
+  their timing ratios must not be attributed solely to source changes.
+
+Host regressions
+  All passed, including production-code extraction tests for:
+  integral caches/nested loops; orbital endpoint/halo/zero support;
+  projector precision; grid/input precision reset; four refinement wrappers
+  and band cycle reset; cluster density-matrix partitions; scalar/SIMD
+  density fallback; density memory overflow; real 4-rank MPI preparation;
+  Force4B streaming/turns/residency; stress XC and dynamic energy/stress teams.
+  ASan/UBSan checks passed for orbital, force, stress, energy and refined
+  band-flow harnesses. Negative controls reproduce the two review fixes.
+  Existing MI300A dispatch/workspace, GEMMul8 policy, Hermitian guard and
+  rank-launcher checks also passed. MI300A hardware was not available;
+  architecture policy validation is host-based, not a MI300A performance claim.
+
+Reproducible records
+  work/codex_hybrid_20261014_bwj2hco4/
+    baseline.json, build.json, make.log, make-final.log, ldd.log
+    after-jobs.json, */command.json, */results.json, */*/run.log
+    validation.json, validation-summary.json, validation.log
+    live-affinity.jsonl, */*/affinity/rank.*.json
+    host-regressions.json, orbital-regressions.json,
+    density-regressions.json, mi300-policy-regressions.json
+  Strict final audit: python3 work/codex_hybrid_20261014_bwj2hco4/validate.py
+  GPU inputs and original reference data were not modified. No commit/push.

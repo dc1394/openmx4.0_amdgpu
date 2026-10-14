@@ -16,6 +16,7 @@
 #include "set_hip_default_device_from_local_rank.h"
 #include "tran_variables.h"
 #include "eigen_refine_gpu.h"
+#include "openmx_precision.h"
 #include "eigen_refine_hooks.h"
 #include <limits.h>
 #include <math.h>
@@ -2017,6 +2018,8 @@ static void BandCol_RefineConfigure(void)
     double config[3] = {0.0, 0.0, 0.0};
     int    myid;
 
+    /* The input veto must not become a cached policy for later inputs. */
+    if (!openmx_fp32_enabled()) return;
     if (0 <= st->iterations) return;
     MPI_Comm_rank(mpi_comm_level1, &myid);
     if (myid == Host_ID) {
@@ -2034,7 +2037,7 @@ static void BandCol_RefineConfigure(void)
 
 static int BandCol_RefineIterations(void)
 {
-    return (0 < BandCol_refine.iterations) ? BandCol_refine.iterations : 0;
+    return (openmx_fp32_enabled() && 0 < BandCol_refine.iterations) ? BandCol_refine.iterations : 0;
 }
 
 /* every rank: whether a dense owner's device has room for what a refined
@@ -2082,9 +2085,7 @@ static int BandCol_RefineFits(int base, int n, int maxn, int turns, int owns_den
 static void BandCol_RefineBeginStep(int SCF_iter, int possible, int possible_kdense, int possible_staged)
 {
     BandColRefineState *st = &BandCol_refine;
-    int const          common = (0 < BandCol_RefineIterations() && !st->final_stage && !st->force_fp64 &&
-                                 Cnt_switch == 0 && SCF_iter < DFTSCF_loop && xanes_calc == 0 &&
-                                 empty_occupation_flag == 0 && empty_states_flag == 0);
+    int common;
 
     BandCol_RefineConfigure();
     if (SCF_iter == 1) {
@@ -2101,11 +2102,15 @@ static void BandCol_RefineBeginStep(int SCF_iter, int possible, int possible_kde
     /* the occupations of the refinement are the plain Fermi function of one
        chemical potential: XANES and emptied orbitals or states keep the
        FP64 eigensolver */
-    st->last_refined = (possible && common && !st->final_stage);
+    /* Configure and reset a new cycle before consulting its stage flags. */
+    common = (0 < BandCol_RefineIterations() && !st->final_stage && !st->force_fp64 &&
+              Cnt_switch == 0 && SCF_iter < DFTSCF_loop && xanes_calc == 0 &&
+              empty_occupation_flag == 0 && empty_states_flag == 0);
+    st->last_refined = (possible && common);
     /* the two-pass solves gate their first pass with the previous step's
        chemical potential, so they start at the second step */
-    st->kdense = (possible_kdense && 2 <= SCF_iter && common && !st->final_stage);
-    st->staged = (possible_staged && 2 <= SCF_iter && common && !st->final_stage);
+    st->kdense = (possible_kdense && 2 <= SCF_iter && common);
+    st->staged = (possible_staged && 2 <= SCF_iter && common);
     if (BandCol_kref != NULL) {
         for (int slot = 0; slot < BandCol_kref_slots; slot++) BandCol_kref[slot].refined = 0;
     }

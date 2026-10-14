@@ -16,6 +16,7 @@
 #include "elpa_cosma_bridge.h"
 #include "eigen_refine_gpu.h"
 #include "eigen_refine_hooks.h"
+#include "openmx_precision.h"
 extern void openmx_gemmul8TrimWorkspaces(void);
 extern size_t openmx_gemmul8WorkspaceBytes(void);
 extern hipblasStatus_t openmx_gemmul8DgemmUnblocked(hipblasHandle_t handle, hipblasOperation_t transa,
@@ -1131,6 +1132,8 @@ static void ClusterCol_RefineConfigure(void)
     ClusterColRefineStage *st = &ClusterCol_refine;
     int myid, config[3] = {0, 0, 0};
 
+    /* Input files in -runtest share a process; do not cache an input veto. */
+    if (!openmx_fp32_enabled()) return;
     if (0 <= st->iterations) return;
     MPI_Comm_rank(mpi_comm_level1, &myid);
     if (myid == Host_ID) {
@@ -1149,7 +1152,7 @@ static void ClusterCol_RefineConfigure(void)
 
 static int ClusterCol_RefineIterations(void)
 {
-    return (0 < ClusterCol_refine.iterations) ? ClusterCol_refine.iterations : 0;
+    return (openmx_fp32_enabled() && 0 < ClusterCol_refine.iterations) ? ClusterCol_refine.iterations : 0;
 }
 
 /* what the refined solve of maxn wanted states adds to the dense owner's
@@ -4087,6 +4090,72 @@ double Cluster_DFT_Col(
 
 
 
+/* The local eigenvector panel already stores each basis row contiguously.
+   Read it directly instead of duplicating both atoms' rows in every OpenMP
+   thread.  size_t row offsets also cover panels larger than INT_MAX entries. */
+static void ClusterCol_AccumulateDM_CPU(int size_H1, int nk, int *MP,
+                                        const double *occ, const double *eig, const double *docc,
+                                        const double *evec, double *DM1, double *EDM1, double *PDM1)
+{
+    size_t *atom_p;
+    size_t pcount = 0;
+    const int with_pdm = (docc!=NULL && PDM1!=NULL);
+
+    /* Empty state partitions contribute only the caller's zeroed arrays. */
+    if (nk<=0) return;
+
+    atom_p = (size_t*)ClusterCol_MallocArray((size_t)atomnum+1,sizeof(size_t),"CPU DM atom offsets");
+    for (int GA_AN=1; GA_AN<=atomnum; GA_AN++){
+        const int tnoA = Spe_Total_CNO[WhatSpecies[GA_AN]];
+        atom_p[GA_AN] = pcount;
+        for (int LB_AN=0; LB_AN<=FNAN[GA_AN]; LB_AN++){
+            const int GB_AN = natn[GA_AN][LB_AN];
+            pcount += (size_t)tnoA*(size_t)Spe_Total_CNO[WhatSpecies[GB_AN]];
+        }
+    }
+    if (pcount!=(size_t)size_H1){
+        free(atom_p);
+        ClusterCol_AbortWithMessage("CPU DM entry count mismatch in Cluster_DFT_Col.c.");
+    }
+
+    /* One atom per task also uses several threads for small heavy-atom systems. */
+#pragma omp parallel for schedule(dynamic,1)
+    for (int GA_AN=1; GA_AN<=atomnum; GA_AN++){
+        const int tnoA = Spe_Total_CNO[WhatSpecies[GA_AN]];
+        const size_t arow = (size_t)(MP[GA_AN]-1);
+        size_t p = atom_p[GA_AN];
+
+        for (int LB_AN=0; LB_AN<=FNAN[GA_AN]; LB_AN++){
+            const int GB_AN = natn[GA_AN][LB_AN];
+            const int tnoB = Spe_Total_CNO[WhatSpecies[GB_AN]];
+            const size_t brow = (size_t)(MP[GB_AN]-1);
+
+            for (int i=0; i<tnoA; i++){
+                const double *e0 = evec+(arow+(size_t)i)*(size_t)nk;
+                for (int j=0; j<tnoB; j++){
+                    const double *e1 = evec+(brow+(size_t)j)*(size_t)nk;
+                    double sum1 = 0.0, sum2 = 0.0;
+
+                    for (int k=0; k<nk; k++){
+                        const double dum = occ[k]*e0[k]*e1[k];
+                        sum1 += dum;
+                        sum2 += dum*eig[k];
+                    }
+                    DM1[p] = sum1;
+                    EDM1[p] = sum2;
+                    if (with_pdm){
+                        sum1 = 0.0;
+                        for (int k=0; k<nk; k++) sum1 += docc[k]*e0[k]*e1[k];
+                        PDM1[p] = sum1;
+                    }
+                    p++;
+                }
+            }
+        }
+    }
+    free(atom_p);
+}
+
 double Calc_DM_Cluster_collinear(
     int myid0,
     int numprocs0,
@@ -4120,7 +4189,6 @@ double Calc_DM_Cluster_collinear(
   MPI_Status stat;
   MPI_Request request;
   double *FF,*dFF;
-  double **TmpEVec0,**TmpEVec1;
 
   dtime(&stime);
 
@@ -4131,16 +4199,6 @@ double Calc_DM_Cluster_collinear(
 
   FF = (double*)malloc(sizeof(double)*(n+1));
   dFF = (double*)malloc(sizeof(double)*(n+1));
-
-  TmpEVec0 = (double**)malloc(sizeof(double*)*List_YOUSO[7]);
-  for (i=0; i<List_YOUSO[7]; i++){
-    TmpEVec0[i] = (double*)malloc(sizeof(double)*(kmax-kmin+1));
-  }
-
-  TmpEVec1 = (double**)malloc(sizeof(double*)*List_YOUSO[7]);
-  for (i=0; i<List_YOUSO[7]; i++){
-    TmpEVec1[i] = (double*)malloc(sizeof(double)*(kmax-kmin+1));
-  }
 
   /* spin=myworld1 */
 
@@ -4190,75 +4248,14 @@ double Calc_DM_Cluster_collinear(
     }
   }
 
-  /* calculation of DM1 */ 
-
-  p = 0;
-  for (GA_AN=1; GA_AN<=atomnum; GA_AN++){
-
-    wanA = WhatSpecies[GA_AN];
-    tnoA = Spe_Total_CNO[wanA];
-    Anum = MP[GA_AN];
-
-    /* store EVec1 to a temporal array */
-
-    for (i=0; i<tnoA; i++){
-      i0 = (Anum + i - 1)*(ie2[myid1]-is2[myid1]+1) - is2[myid1];
-      for (k=kmin; k<=kmax; k++){
-        TmpEVec0[i][k-kmin] = EVec1[spin][i0+k];
-      }        
-    }
-
-    /* loop for LB_AN */
-
-    for (LB_AN=0; LB_AN<=FNAN[GA_AN]; LB_AN++){
-
-      GB_AN = natn[GA_AN][LB_AN];
-      wanB = WhatSpecies[GB_AN];
-      tnoB = Spe_Total_CNO[wanB];
-      Bnum = MP[GB_AN];
-
-      /* store EVec1 to a temporal array */
-
-      for (j=0; j<tnoB; j++){
-        j0 = (Bnum + j - 1)*(ie2[myid1]-is2[myid1]+1) - is2[myid1];
-	for (k=kmin; k<=kmax; k++){
-	  TmpEVec1[j][k-kmin] = EVec1[spin][j0+k];
-	}        
-      }
-
-      /* loops for i and j */
-
-      for (i=0; i<tnoA; i++){
-	for (j=0; j<tnoB; j++){
-
-          sum1 = 0.0;
-          sum2 = 0.0;
-
-	  for (k=kmin; k<=kmax; k++){
-	    dum = FF[k]*TmpEVec0[i][k-kmin]*TmpEVec1[j][k-kmin];
-	    sum1 += dum;
-	    sum2 += dum*ko[spin][k];
-	  }
-
-	  DM1[p]  = sum1;
-	  EDM1[p] = sum2;
-
-	  if (cal_partial_charge){
-
-            sum1 = 0.0;
-	    for (k=kmin; k<=kmax; k++){
-	      sum1 += dFF[k]*TmpEVec0[i][k-kmin]*TmpEVec1[j][k-kmin];
-	    }
-            PDM1[p] = sum1;
-	  }
-
-	  /* increment of p */
-	  p++;  
-
-	}
-      }
-    }
-  } /* GA_AN */
+  /* The HIP root-dense path accumulates all states on its owner GPU.
+     Distributed CPU eigenvectors, including a GPU-solver fallback, use
+     independent atoms as OpenMP tasks without duplicating eigenvectors. */
+  if (kmin<=kmax){
+    ClusterCol_AccumulateDM_CPU(size_H1,kmax-kmin+1,MP,FF+kmin,ko[spin]+kmin,
+                               cal_partial_charge ? dFF+kmin : NULL,EVec1[spin],
+                               DM1,EDM1,cal_partial_charge ? PDM1 : NULL);
+  }
 
   /* MPI_Allreduce */
 
@@ -4441,16 +4438,6 @@ double Calc_DM_Cluster_collinear(
 
   free(dFF);
   free(FF);
-
-  for (i=0; i<List_YOUSO[7]; i++){
-    free(TmpEVec0[i]);
-  }
-  free(TmpEVec0);
-
-  for (i=0; i<List_YOUSO[7]; i++){
-    free(TmpEVec1[i]);
-  }
-  free(TmpEVec1);
 
   dtime(&etime);
   return (etime-stime);

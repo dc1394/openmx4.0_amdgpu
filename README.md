@@ -78,6 +78,21 @@ python3 tests/run_mi300a_rank_launcher.py
 
 `tools/mi300a_rank_launcher.py` preserves each MPI rank's assigned CPUs before loading OpenMX, supplies explicit OS CPU IDs to `OMP_PLACES`, and records rank/PID/CPU identities in `OPENMX_AFFINITY_DIR`. It requires that the inherited CPU count equal `-nt`. On MI300A, use it inside a scheduler allocation with `HSA_OVERRIDE_CPU_AFFINITY_DEBUG=0` so ROCm helper threads inherit the rank's CPU mask. MPI startup binding reports alone do not establish that the masks remain correct after runtime initialization. The launcher has no GPU detection or solver-policy effects and is only used when explicitly selected.
 
+## Arithmetic precision input
+
+`scf.fp32.enable` defaults to `on`, preserving the device-specific precision
+policies. Set it to `off` to disable FP32 eigenvector refinement and
+double-float grid/orbital arithmetic, and to perform the VNA projector, force
+and stress contractions in FP64. This input setting takes precedence over
+the environment's FP32/DF requests and is reset for every input, including
+successive `-runtest` cases. Existing float storage formats are unchanged.
+GEMMul8 and MAGMA's Ozaki2 setting remain independent:
+
+```text
+scf.fp32.enable     off
+scf.gemmul8.enable  on
+```
+
 ## Refined FP32 eigensolver
 The dense eigensolves of the SCF loop (cluster and band, collinear and non-collinear) run in FP32 and are then refined to FP64 accuracy, as in the NVIDIA version: all eigenpairs come from rocSOLVER's FP32 divide and conquer (`hipsolverDnSsyevd`/`Cheevd`), then the wanted ones get two Ogita-Aishima Newton steps whose products go through GEMMul8, and a Rayleigh-Ritz step resolves the nearly degenerate, partially occupied clusters. From the second SCF step on, the previous step's vectors serve as a warm start, so most steps need no FP32 eigensolve at all. A Radeon RX 9060 XT (gfx1200) runs FP64 at about 1/13 of its FP32 rate, so this is on by default on consumer GPUs (RDNA and consumer GCN) and off on CDNA, whose FP64 is fast. `OPENMX_EIGEN_REFINE=K` sets the number of refinement steps, 0 turns it off. Problems with n < `OPENMX_EIGEN_REFINE_MIN_N` (default 1000) keep the FP64 eigensolver, whose fixed costs are lower there.
 
@@ -214,6 +229,34 @@ mpirun -np 16 ./openmx input.dat -nt 1
 ```
 
 On MI300A, also measure hybrid MPI/OpenMP layouts within the same APU allocation. Fewer MPI ranks leave more CPU resources available during the root-only dense solve and change which shared-GPU grid paths are admitted. See the MI300A benchmark below for the tested 24-core configurations.
+
+The NVIDIA hybrid updates through `47556613` are also applied to the AMD
+host phases: per-thread Bessel caches in `Set_OLP_Kin`, atom-parallel
+received nonlocal products and cluster CPU density-matrix fallback, and
+correct scratch sizing for dynamic OpenMP teams in energy/stress routines.
+Orbital spline endpoints and the stress XC loop's shared-counter race are
+fixed. The AMD cluster path retains its existing GPU density-matrix
+assembly; the final density now reuses the SCF's resident GPU tables.
+`OPENMX_BAND_PROFILE=1` enables extra host-phase timing diagnostics.
+
+For 16 allocated physical CPU cores, use disjoint rank bindings and keep
+BLAS threading at one to avoid nested oversubscription:
+
+```sh
+export OMP_NUM_THREADS=4 OMP_DYNAMIC=FALSE OMP_PROC_BIND=close OMP_PLACES=cores
+export OPENBLAS_NUM_THREADS=1 BLIS_NUM_THREADS=1 MKL_NUM_THREADS=1
+export HSA_OVERRIDE_CPU_AFFINITY_DEBUG=0
+mpirun -np 4 --map-by slot:PE=4 --bind-to core ./openmx input.dat -nt 4
+# Alternative: OMP_NUM_THREADS=2, -np 8, slot:PE=2, and -nt 2.
+```
+
+`tools/run_runtest_l3.py --threads N` sets both `OMP_NUM_THREADS` and `-nt N`,
+and defaults to `slot:PE=N` binding for hybrid runs. Explicit `--map-by`
+and `--mpirun` settings remain available. GPU kernels do not gain OpenMP
+workers; any speedup depends on the proportion of host work and the
+memory available per rank. OpenMP reductions can change rounding order.
+The 4x4/8x2 build, numerical and placement checks are recorded in
+[hybrid_nvidia_port_20261014.txt](hybrid_nvidia_port_20261014.txt).
 
 ## Sharing one GPU among many ranks
 ROCm needs no MPS-style daemon: the kernels of different processes run concurrently. What limits the rank count on a small card is memory. A rank's HIP/OpenMP context costs about 240 MiB before any physics data (700 MiB with the OpenMP runtime's default device heap, see the previous section), and a hipBLAS handle about 200 MiB more on the ranks that solve. Each GPU stage checks the free device memory before it starts and falls back to the CPU for that stage and SCF iteration when the ranks sharing the device cannot all be accommodated (a ROCm BLAS allocation failing inside a kernel would otherwise terminate the process); the run says so on stderr and stays correct. The knobs:

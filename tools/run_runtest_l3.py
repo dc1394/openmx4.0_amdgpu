@@ -71,14 +71,17 @@ def main():
     parser.add_argument('--suite', choices=('S', 'L', 'L2', 'L3'), default='L3',
                         help='built-in suite (S means -runtest; default: L3)')
     parser.add_argument('--ranks', type=int, default=8)
+    parser.add_argument('--threads', type=int, default=1,
+                        help='OpenMP threads per MPI rank (also passed as -nt)')
+    parser.add_argument('--mpirun', default='mpirun', help='MPI launcher matching the binary')
     parser.add_argument('--map-by', help='optional Open MPI mapping policy')
     parser.add_argument('--cases', nargs='+')
     parser.add_argument('--min-available-gib', type=float, default=16)
     parser.add_argument('--timeout', type=float, default=3600, help='seconds per input')
     parser.add_argument('--env', action='append', default=[], metavar='NAME=VALUE')
     args = parser.parse_args()
-    if args.ranks < 1 or args.timeout <= 0 or args.min_available_gib < 0:
-        parser.error('ranks and timeout must be positive; memory reserve must be nonnegative')
+    if args.ranks < 1 or args.threads < 1 or args.timeout <= 0 or args.min_available_gib < 0:
+        parser.error('ranks, threads and timeout must be positive; memory reserve must be nonnegative')
     repo = Path(__file__).resolve().parents[1]
     input_directory = {'S': 'input_example', 'L': 'large_example',
                        'L2': 'large2_example', 'L3': 'large3_example'}[args.suite]
@@ -97,20 +100,25 @@ def main():
     shutil.copy2(binary, output / 'openmx')
     binary = output / 'openmx'
     env = os.environ.copy()
-    env.update(OMP_NUM_THREADS='1', OPENBLAS_NUM_THREADS='1', BLIS_NUM_THREADS='1')
+    env.update(OMP_NUM_THREADS=str(args.threads), OMP_DYNAMIC='FALSE',
+               OPENBLAS_NUM_THREADS='1', BLIS_NUM_THREADS='1', MKL_NUM_THREADS='1')
     for item in args.env:
+        if '=' not in item or not item.split('=', 1)[0]:
+            parser.error('--env requires NAME=VALUE')
         name, value = item.split('=', 1)
         env[name] = value
     results = []
-    command = ['mpirun', '-np', str(args.ranks), '--bind-to', 'core']
+    command = [args.mpirun, '-np', str(args.ranks), '--bind-to', 'core']
     if args.map_by:
         command += ['--map-by', args.map_by]
-    command += [str(binary), test_option, '-nt', '1']
+    elif args.threads > 1:
+        command += ['--map-by', f'slot:PE={args.threads}']
+    command += [str(binary), test_option, '-nt', str(args.threads)]
     (output / 'command.json').write_text(json.dumps(dict(
         command=command, suite=args.suite, input_directory=input_directory,
         env=args.env, binary_sha256=hashlib.sha256(binary.read_bytes()).hexdigest(),
         environment={k: v for k, v in env.items() if k.startswith((
-            'OPENMX_', 'OMP_', 'BLIS_', 'OPENBLAS_', 'MAGMA_', 'GEMMUL8_',
+            'OPENMX_', 'OMP_', 'BLIS_', 'OPENBLAS_', 'MKL_', 'MAGMA_', 'GEMMUL8_',
             'HSA_', 'HIP_', 'ROCR_', 'LIBOMPTARGET_', 'GPU_MAX_HW_QUEUES'))},
         min_available_gib=args.min_available_gib, timeout=args.timeout), indent=2))
     for inp in cases:

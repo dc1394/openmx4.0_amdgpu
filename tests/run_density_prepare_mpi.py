@@ -13,7 +13,8 @@ veto the others, as the NVIDIA version's Matomnum == 0 gate allows).  The
 steps add a fresh CSR among cached ones, an allocation failure, a rank
 with the local mode off, the forced-CSR mode (OTF -> CSR switch, and a
 rank without resident tables declining), an offset overflow, a CPU
-eigensolver, an on-the-fly-ineligible rank and a workspace shortage.
+eigensolver, an on-the-fly-ineligible rank, a workspace shortage, final density
+table reuse (fresh and cached CSR/OTF), and optimized-orbital rejection.
 Checked: every rank enters
 exactly one collective (an MPI_Allreduce) per GPU step and none in the CPU
 step, never MPI_Comm_split_type (the budget's denominator is the ranks per
@@ -78,7 +79,7 @@ static int rank_id, tables=1, resident=1, otf_possible=1, device_usable=1, fail_
 static int otf_calls;
 static int level_stdout=3, Host_ID=0, workspace_ok=1;
 static int Set_Density_Grid_OTF_Prepare(int k,size_t *need,size_t *avail) {
-  (void)k; *need=1024; *avail=workspace_ok ? 2048 : 512; return workspace_ok;
+  *need=1024; *avail=workspace_ok ? 2048 : 512; return k==0 && workspace_ok;
 }
 static size_t registered_need = 12345;
 static int split_calls, reduce_calls;
@@ -98,8 +99,8 @@ static int gpu_rank_device_usable(void) { return device_usable; }
 static int openmx_gpu_ranks_per_device_noncollective(void) { return 4; }
 static int OpenMX_GpuMemGetInfo(size_t *f,size_t *t) { *f=*t=(size_t)16*1024*1024*1024; return 0; }
 static void OpenMX_GpuPhaseNeed_Register(const char *n,size_t b) { (void)n; registered_need=b; }
-static int Set_Hamiltonian_MatrixElementsTables_Ready(int k) { (void)k; return tables; }
-static int Set_Density_Grid_OTF_Possible(int k) { (void)k; otf_calls++; return otf_possible; }
+static int Set_Hamiltonian_MatrixElementsTables_Ready(int k) { return k==0 && tables; }
+static int Set_Density_Grid_OTF_Possible(int k) { otf_calls++; return k==0 && otf_possible; }
 static void check(int ok,const char *what) {
   if (!ok) { fprintf(stderr,"rank %d: %s\n",rank_id,what); MPI_Abort(mpi_comm_level1,1); }
 }
@@ -114,7 +115,7 @@ static int Set_Hamiltonian_GetMatrixElementsTables(int k,SetHamiltonianMETables 
   static int one[1]={1}, two[1]={2}, nc[2]={0,1};
   static size_t zero[1]={0};
   static float orbs[2]={1,2};
-  (void)k;
+  check(k==0,"final density requested different orbital tables");
   memset(t,0,sizeof(*t));
   if (!tables) return 0;
   t->pair_count=1; t->total_h=1; t->total_nolg=2; t->total_orbs0=t->total_orbs1=2;
@@ -145,12 +146,13 @@ static void roles(void) {
 int main(int argc,char **argv) {
   int n, ok, all_ok, rounds=0;
   /* expected agreed result and this rank's result per step */
-  const int expect_all[10]   = {1,1,0,0,1,0,0,0,0,0};
+  const int expect_all[16]   = {1,1,0,0,1,0,0,0,0,0,1,1,1,0,0,0};
   MPI_Init(&argc,&argv); mpi_comm_level1=MPI_COMM_WORLD;
   MPI_Comm_rank(mpi_comm_level1,&rank_id); MPI_Comm_size(mpi_comm_level1,&n);
   check(n==4,"run with 4 ranks");
-  for(int step=0;step<10;step++) {
-    int expect_ok = 1;
+  for(int step=0;step<16;step++) {
+    int expect_ok = 1, cnt_kind = 0;
+    Cnt_switch=0; workspace_ok=1;
     const int otf_before = otf_calls;
     scf_eigen_lib_flag=GPUSOLVER;
     setenv("OPENMX_DENSITY_GRID_GPU_LOCAL","1",1);
@@ -181,11 +183,17 @@ int main(int argc,char **argv) {
       if(rank_id==1) { otf_possible=0; expect_ok=0; }                   /* neither tables nor OTF */
     }
     if(step==9 && rank_id==1) { workspace_ok=0; expect_ok=0; }
+    if(step==10) { cnt_kind=1; if(rank_id==3) SDG_local_free(); }
+    if(step==11) { cnt_kind=1; resident=1; }
+    if(step==12) { cnt_kind=1; resident=1; fail_alloc=1; }
+    if(step==13) { cnt_kind=1; Cnt_switch=1; expect_ok=0; }
+    if(step==14) { cnt_kind=2; expect_ok=0; }
+    if(step==15) { cnt_kind=1; scf_eigen_lib_flag=0; expect_ok=0; }
     level_stdout=step%4;
     const int splits_before=split_calls, reductions_before=reduce_calls;
-    ok=Set_Density_Grid_GPU_Local_Prepare(0,0);
+    ok=Set_Density_Grid_GPU_Local_Prepare(cnt_kind,0);
     check(split_calls==splits_before,"no MPI_Comm_split_type");
-    if(step==7) {
+    if(step==7 || step==15) {
       check(reduce_calls==reductions_before,"CPU path entered a collective");
       check(registered_need==0,"CPU path kept a GPU phase need");
     }
@@ -212,7 +220,12 @@ int main(int argc,char **argv) {
       Set_Density_Grid_GPU_Local_Report(2,0);
       check(reduce_calls==before,"reporting entered a collective");
     }
-    if(rank_id==2) check(ok==(step!=7),"the empty partition vetoed the others");
+    if(rank_id==2) check(ok==(step!=7 && step<13),"wrong empty-partition eligibility");
+    if(ok && Matomnum>0) check(SDG_local.cnt_kind==0,"wrong cached orbital kind");
+    if(step>=10 && step<=12 && Matomnum>0) {
+      if(rank_id==1 && step==10) check(SDG_local.otf,"final OTF density missing");
+      else check(SDG_local.ready && !SDG_local.otf,"final CSR density missing");
+    }
     if(step==0 || step==1 || step==4) {
       const int csr = !(rank_id==1 && step!=4) && rank_id!=2;
       if(csr) {
@@ -236,7 +249,7 @@ int main(int argc,char **argv) {
     rounds++;
   }
   SDG_local_free();
-  if(rank_id==0) printf("PASS: %d real-MPI rounds: mixed CSR/OTF, empty rank without a device, cached and fresh CSR, allocation failure, local mode off, forced CSR (switch and decline), offset overflow, CPU collective bypass, ineligible rank, workspace admission and census at stdout levels 0..3\n",rounds);
+  if(rank_id==0) printf("PASS: %d real-MPI rounds: mixed CSR/OTF, empty rank without a device, cached and fresh CSR, allocation failure, local mode off, forced CSR (switch and decline), offset overflow, CPU collective bypass, ineligible rank, workspace admission and census at stdout levels 0..3, final density table reuse and optimized-orbital rejection\n",rounds);
   MPI_Finalize(); return 0;
 }
 '''

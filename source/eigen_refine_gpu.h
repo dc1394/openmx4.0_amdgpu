@@ -95,7 +95,8 @@ typedef struct {
    consumer GCN and RDNA 16; measured 12.5 for GEMMs on an RX 9060 XT). */
 int openmx_gpu_fp32_fp64_ratio(void);
 
-/* K of OPENMX_EIGEN_REFINE, or the device default (2 on GPUs whose FP32:FP64
+/* Returns 0 when scf.fp32.enable is off, even with an environment override.
+   Otherwise K of OPENMX_EIGEN_REFINE, or the device default (2 on GPUs whose FP32:FP64
    throughput ratio is at least 8 when the GEMMul8 products of the type are
    on); *ratio receives the ratio when the default applied, else 0; reports
    the decision on stdout when verbose.  Called on the root rank only. */

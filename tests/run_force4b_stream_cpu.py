@@ -67,6 +67,7 @@ static int level_stdout=3;
 #include <math.h>
 #include <stdint.h>
 #include <limits.h>
+#include "openmx_precision.h"
 
 typedef float Type_DS_VNA;
 typedef int MPI_Comm;
@@ -307,6 +308,8 @@ static void check_ordern_policy(void)
 
 int main(void)
 {
+    const char *precision = getenv("TEST_FP32_ENABLE");
+    openmx_set_fp32_enabled(precision == NULL || atoi(precision));
     int mc, direction, k, i, j, l, spin, solver, seed, checks = 0;
     const int solvers[] = {3, 5, 8, 11};
     double max_error = 0.0;
@@ -426,7 +429,7 @@ int main(void)
 
 def make_harness(source: str) -> str:
     parts = [STUBS, extract_struct(source, "Force4BGpuItem")]
-    for name in ("Force_gpu_arena_off", "Force_host_arena_alloc", "Force_host_arena_free",
+    for name in ("Force_gpu_node_reserve", "Force_gpu_arena_off", "Force_host_arena_alloc", "Force_host_arena_free",
                  "Force4B_GpuOrderNLegacy", "Force4B_case2_trace_fused", "Force4B_GpuCase2Kernel"):
         parts.append(extract_function(source, name))
     parts.extend(extract_struct(source, name) for name in ("Force4BCase2Plan", "Force4BCase2Stream"))
@@ -460,17 +463,20 @@ def build_and_run(harness: str, name: str, argv=None) -> int:
         source.write_text(harness)
         subprocess.run(
             [*compiler, *flags, "-std=c11", "-Wall", "-Wno-unknown-pragmas", "-Wno-unused-function", "-Wno-unused-variable",
-             str(source), "-lm", "-o", str(binary)],
+             "-I", str(ROOT / "source"), str(source),
+             str(ROOT / "source/openmx_precision.c"), "-lm", "-o", str(binary)],
             check=True,
         )
         env = dict(os.environ)
         env.setdefault("ASAN_OPTIONS", "detect_leaks=1")
-        result = subprocess.run([str(binary)], text=True, capture_output=True, env=env)
-        if result.returncode:
-            sys.stderr.write(result.stderr)
-            sys.stdout.write(result.stdout)
-            return 1
-        sys.stdout.write(result.stdout)
+        for enabled in ("1", "0"):
+            env["TEST_FP32_ENABLE"] = enabled
+            result = subprocess.run([str(binary)], text=True, capture_output=True, env=env)
+            if result.returncode:
+                sys.stderr.write(result.stderr)
+                sys.stdout.write(result.stdout)
+                return 1
+            sys.stdout.write(f"scf.fp32.enable={enabled}: {result.stdout}")
     return 0
 
 

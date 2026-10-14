@@ -1,4 +1,5 @@
 #include "openmx_stdout_level.h"
+#include "openmx_precision.h"
 #include <hip/hip_runtime.h>
 
 #include <cstddef>
@@ -278,6 +279,8 @@ char grid_precision_unrecognized[64] = "";
 
 int grid_precision_configure()
 {
+    /* Keep the cached device/environment preference for subsequent inputs. */
+    if (!openmx_fp32_enabled()) return 0;
     if (grid_precision_mode < 0) {
         const char *value = std::getenv("OPENMX_GRID_PRECISION");
         if (value != nullptr && value[0] != '\0') {
@@ -977,7 +980,7 @@ extern "C" void openmx_grid_precision_announce(void)
 {
     static int announced = 0;
 
-    if (announced) return;
+    if (announced || !openmx_fp32_enabled()) return;
     const int mode = grid_precision_configure();
     if (mode == 1 && !OPENMX_STDOUT_LEVEL(2)) return;
     announced = 1;

@@ -21,6 +21,7 @@
 #include <vector>
 
 #include "orbs_otf_hip.h"
+#include "openmx_precision.h"
 
 #pragma clang fp contract(off)
 
@@ -65,10 +66,9 @@ struct TablesArg {
    tables Orbs_Grid / Orbs_Grid_FNAN are built with it too
    (OTF_Orbitals_Eval_FP64), so the FP64 tiles equal them bit for bit.
    The end intervals m = 1 and m = mesh - 1 take the substitutes of the
-   host loops (h1 = -(h2 + h3), f1 = f4; h3 = -(h1 + h2), f4 = f1) before
-   any load and in the spline weights dum1..dum4, as the double-float
-   tables do; the host loops read rv[-1] / rv[mesh] there and build the
-   weights from the uncorrected h1 / h3.  Each (L0, Mul0) is written as
+   host loops (reflected endpoint samples for h1/f1 and h3/f4) before
+   any load and before forming the spline weights dum1..dum4, as the
+   double-float tables do.  Each (L0, Mul0) is written as
    it is computed: locally indexed arrays would live in scratch memory.
    --------------------------------------------------------------------- */
 
@@ -117,11 +117,11 @@ __device__ inline Spline64 spline64(const double *rv, int mesh, double R)
     s.h2 = rv[m] - rv[m - 1];
     if (m == 1) {
       h3 = rv[m + 1] - rv[m];
-      h1 = -(s.h2 + h3);
+      h1 = rv[m - 1] - rv[m + 1];
     }
     else if (m == mesh - 1) {
       h1 = rv[m - 1] - rv[m - 2];
-      h3 = -(h1 + s.h2);
+      h3 = rv[m - 2] - rv[m];
     }
     else {
       h1 = rv[m - 1] - rv[m - 2];
@@ -739,7 +739,7 @@ extern "C" int OTF_Orbitals_Ready(void)
 
 extern "C" int OTF_Orbitals_DoubleFloat(void)
 {
-  return g_dev.ready && g_dev.double_float;
+  return g_dev.ready && g_dev.double_float && openmx_fp32_enabled();
 }
 
 extern "C" size_t OTF_Orbitals_Bytes(void)
@@ -756,6 +756,7 @@ extern "C" int OTF_Orbitals_Upload(const OTF_HostTables *t, int double_float)
   size_t pos = 0, o_rv, o_rwf, o_rvo, o_rwb, o_spm, o_spx, o_spb, o_atv, o_rwd = 0, o_mcd = 0, o_spl = 0;
   unsigned char *arena = nullptr;
 
+  double_float = double_float && openmx_fp32_enabled();
   OTF_Orbitals_Release();
   if (species <= 0) return -1;
   for (int w = 0; w < species; w++) {
@@ -800,8 +801,8 @@ extern "C" int OTF_Orbitals_Upload(const OTF_HostTables *t, int double_float)
         h2 = rvw[m] - rvw[m - 1];
         h1 = (2 <= m) ? rvw[m - 1] - rvw[m - 2] : 0.0;
         h3 = (m <= mesh - 2) ? rvw[m + 1] - rvw[m] : 0.0;
-        if (m == 1) h1 = -(h2 + h3);
-        if (m == mesh - 1) h3 = -(h1 + h2);
+        if (m == 1) h1 = rvw[m - 1] - rvw[m + 1];
+        if (m == mesh - 1) h3 = rvw[m - 2] - rvw[m];
         v[1] = h2;
         dum = h1 + h2;
         v[2] = h1 / h2 / dum;
@@ -888,7 +889,7 @@ extern "C" int OTF_Orbitals_Eval(void *stream, int count, int max_npts, const OT
                                  const size_t *idx_off, const size_t *out_off, const size_t *sph_off, const int *idx,
                                  const int *gla, const int *cla, float *out)
 {
-  return otf_launch(g_dev.double_float != 0, stream, count, max_npts, atoms, npts, idx_off, out_off, sph_off, idx,
+  return otf_launch(g_dev.double_float != 0 && openmx_fp32_enabled(), stream, count, max_npts, atoms, npts, idx_off, out_off, sph_off, idx,
                     gla, cla, out);
 }
 
