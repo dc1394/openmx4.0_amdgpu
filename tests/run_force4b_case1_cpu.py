@@ -352,7 +352,7 @@ def make_harness(source: str) -> str:
         "Force4B_case1_trace_fused_rows", "Force4B_case1_trace_fused", "Force4B_GpuCase1Kernel",
         "Force4B_GpuCase1Accumulate",
     ):
-        parts.append(common.extract_function(source, name))
+        parts.append(common.extract_function(source, name+"_Single" if name in ("Force4B_GpuCase1Kernel","Force4B_GpuCase2Kernel") else name).replace(name+"_Single",name))
     for name in ("Force4BCase1Plan", "Force4BCase1Stream"):
         parts.append(common.extract_struct(source, name))
     parts.append("static Force4BCase1Stream F4B_stream1 = { 0 };\n")
@@ -363,7 +363,7 @@ def make_harness(source: str) -> str:
         "Force4B_GpuCase1PlanAdd", "Force4B_GpuCase1StreamBegin", "Force4B_GpuCase1StreamSource",
         "Force4B_GpuCase1StreamAccumulate",
     ):
-        parts.append(common.extract_function(source, name))
+        parts.append(common.extract_function(source, name+"_Single" if name in ("Force4B_GpuCase1Kernel","Force4B_GpuCase2Kernel") else name).replace(name+"_Single",name))
     # the shared fixture without the case-2 main()
     parts.append(common.FIXTURE.split("/* AMD auto policy", 1)[0])
     parts.append(CASE1_FIXTURE)

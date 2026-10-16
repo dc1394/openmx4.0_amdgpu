@@ -1,4 +1,5 @@
 #include "openmx_common.h"
+#include "openmx_gpu_workers.h"
 #include "set_openmp_device_from_local_rank.h"
 #include "set_hip_default_device_from_local_rank.h"
 #include <omp.h>
@@ -37,6 +38,8 @@ int set_openmp_nvidia_device_from_local_rank(void)
 
 int set_openmp_device_from_local_rank_noncollective(void)
 {
+    const int worker=openmx_gpu_worker_device();
+    if (worker>=0) { omp_set_default_device(worker); return worker; }
     int ndev = omp_get_num_devices();
     int dev  = -1;
 

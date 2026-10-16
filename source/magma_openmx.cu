@@ -2,6 +2,9 @@
 #include <magma_v2.h>
 #include "hip_runtime_compat.h"
 #include "openmx_gpu_arch_policy.h"
+#include "openmx_magma_lock.h"
+#include "openmx_mgpu_runtime.h"
+#include <vector>
 
 #include <hipsolver/hipsolver.h>
 
@@ -24,7 +27,7 @@ extern "C" __attribute__((weak)) int openmx_gpu_ranks_per_device_noncollective(v
 namespace {
 
 std::once_flag g_magma_once;
-std::mutex     g_magma_mutex;
+std::mutex    &g_magma_mutex = openmx_magma_runtime_mutex();
 int            g_magma_init_info = MAGMA_SUCCESS;
 
 double      *g_host_matrix = nullptr;
@@ -1469,7 +1472,7 @@ extern "C" void openmx_gpu_zheevd_selftest(const char *label)
    or an order below OPENMX_GPU_EIGENSOLVER_MAGMA_MIN_N goes to rocSOLVER
    first (dense_eigen_locked).  Despite the historical MAGMA names these
    are the common dense entry points, including the cluster root solve. */
-extern "C" int openmx_magma_dsyevdx_gpu(int n, int maxn, double *d_A, double *w, int *mout_out)
+static int openmx_magma_dsyevdx_gpu_single(int n, int maxn, double *d_A, double *w, int *mout_out)
 {
     std::lock_guard<std::mutex> lock(g_magma_mutex);
     int mout = 0;
@@ -1492,7 +1495,7 @@ extern "C" int openmx_magma_dsyevdx_gpu(int n, int maxn, double *d_A, double *w,
     return info;
 }
 
-extern "C" int openmx_magma_zheevdx_gpu(int n, int maxn, void *d_A, double *w, int *mout_out)
+static int openmx_magma_zheevdx_gpu_single(int n, int maxn, void *d_A, double *w, int *mout_out)
 {
     std::lock_guard<std::mutex> lock(g_magma_mutex);
     int mout = 0;
@@ -1514,6 +1517,36 @@ extern "C" int openmx_magma_zheevdx_gpu(int n, int maxn, void *d_A, double *w, i
     }
     return info;
 }
+
+namespace {
+struct OpenMXMagmaNativeCall {
+    int complex_matrix,n,nev; void *a; double *w; int mout;
+    static int run(void *opaque,double *output) {
+        auto *c=static_cast<OpenMXMagmaNativeCall*>(opaque);
+        int result=c->complex_matrix?
+            openmx_magma_zheevdx_gpu_single(c->n,c->nev,c->a,output,&c->mout):
+            openmx_magma_dsyevdx_gpu_single(c->n,c->nev,(double*)c->a,output,&c->mout);
+        return result==0 && c->mout!=c->nev ? MAGMA_ERR_ILLEGAL_VALUE : result;
+    }
+};
+int openmx_magma_dense_dispatch(int complex_matrix,int n,int nev,void *a,double *w,int *mout)
+{
+    /* No extra allocation in the normal single-GPU path. The runtime hook
+       performs the GPU count and mode checks before allocating its scratch. */
+    OpenMXMagmaNativeCall call{complex_matrix,n,nev,a,w,0};
+    int result;
+    if (openmx_mgpu_solve_host_result_try &&
+        openmx_mgpu_solve_host_result_try(complex_matrix,n,nev,a,w,mout,
+            OpenMXMagmaNativeCall::run,&call,&result)) return result;
+    result=OpenMXMagmaNativeCall::run(&call,w);
+    if (mout) *mout=call.mout;
+    return result;
+}
+}
+extern "C" int openmx_magma_dsyevdx_gpu(int n,int nev,double *a,double *w,int *mout)
+{ return openmx_magma_dense_dispatch(0,n,nev,a,w,mout); }
+extern "C" int openmx_magma_zheevdx_gpu(int n,int nev,void *a,double *w,int *mout)
+{ return openmx_magma_dense_dispatch(1,n,nev,a,w,mout); }
 
 /* The MAGMA chain alone (no rocSOLVER first, whatever the size): the retry
    of the generic wrappers' rocSOLVER solves (gpusolver_Syevdx.c). */

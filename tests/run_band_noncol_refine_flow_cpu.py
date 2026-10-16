@@ -66,6 +66,7 @@ def block(source, first, last):
 
 
 PREFIX = r'''
+static int BandNonCol_mgpu_host_dense=0;
 #include <math.h>
 #include <stdint.h>
 #include <stdio.h>

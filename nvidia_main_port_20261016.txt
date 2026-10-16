@@ -1,0 +1,152 @@
+NVIDIA main から AMD GPU 版への機能移植 (2026-10-16)
+更新: 2026-10-16T21:42:06.092113+09:00
+
+比較元と対象
+  AMD: 1ee275a5fa007a22eb4c0a9962dd272c3009fbd2
+  NVIDIA の既取り込み基準: 475566134142d6b5653efe769f360dd0152c9618
+  今回の ../openmx4.0_gpu main: d90882e929478e7bbaa737db097957c07ff65b8a
+  対象コミット: 512e7c74, 7f6f487e, 590d52c3, 43d05a07, d90882e9
+  NVIDIA 側のブランチ・ソースは変更していない。
+
+実装
+  * Cluster/Band のホスト格納 MAGMA、協調 GEMM、Band の k 点別 GPU グループ。
+  * HIP の行列構築・加算・転置・スケーリング・Hermitian 化・spinor 構築を協調処理へ接続。
+  * scf.eigen.lib=gpusolver3、scf.mgpu.enable、GPU 可視範囲と個数上限。
+  * Cluster の容量不足時の MAGMA -> ELPA/COSMA -> CPU 経路とホストメモリー見積り。
+  * 密度行列、Hamiltonian、軌道・XC グリッド、重なりグリッド、projector/radial、
+    力、全エネルギー、mixing の範囲分割と local GPU / remote MPI / CPU 回復。
+  * GPU UUID によるプロセス間排他、準備・実行・結果取得・解放の分離、
+    HIP と OpenMP のデバイス割当復元、通信パケットと CPU 作業領域の上限制御。
+  * hipMAGMA 2.10.0 の論理デバイス写像を versioned patch で追加。
+    既存 Ozaki-II patch を保持し、単一 GPU/MGPU アダプターの mutex を共有。
+
+AMD 固有の統合
+  * CUDA/cuBLAS/OpenACC を HIP/hipBLAS/OpenMP target に置換。
+  * NVIDIA openmx_cusolver_compat.c の hook は AMD magma_openmx.cu の既存入口へ接続。
+  * NVIDIA orbs_grid_gpu.h / set_hamiltonian_gpu.cu の容量回復は AMD の
+    Set_Orbitals_Grid.c / Set_Hamiltonian.c と既存 HIP カーネルへ統合。
+  * MI300A の native FP64、workspace 再利用、APU の force/projector 既定値を保持。
+    Radeon の GEMMul8、refinement、Force4B の streaming/rank turns も保持。
+  * 性能目的の分割は OPENMX_MGPU_SOLVER=auto/magma、OPENMX_MGPU_GEMM=auto/1、
+    OPENMX_GPU_WORKERS=1 で選択。通常は owner の既存経路を優先する。
+    Instinct の判定と XGMI トポロジー判定を AMD 用に実装。
+  * DC/DC-LNO/Krylov の既存投影固有値ソルバーを保ち、共通処理の回復を適用。
+
+ビルド・テスト
+  production: make -C source -j12 ARCH=gfx942 GPUSOLVER2_JOBS=12 openmx
+  ROCm 7.2.0 / Open MPI 5.0.10 (ROCm amdflang) / AOCL 5.1.0
+  production build: PASS (build.transforms2.log, build.transforms.final.log, build.spinfix.log)
+  executable SHA256: f8de47bde095c9af00850d5fc5d1d7fcff8cc56589ed7b46fcb2e9514ca2408c
+  gfx1200: 変更ソース 41 件のコンパイル PASS
+  ホスト側 34 スイート: 34 PASS
+  ASan/UBSan、実 BLAS/LAPACK、実 MPI と模擬ノード、2/4 GPU の模擬カーネル、
+  allocation/transfer failure、GPU 制限、phase rollback、物理デバイス写像を検査。
+  HIP GPU 用の GEMM、Band group、MAGMA、dense workers、task/MPI fixture もビルド。
+
+MI300A 実機
+  PBS: 1 node / ngpus=1 / ncpus=24 / mem=124 GiB。可視 GPU は1台。
+  全 OpenMX 計算: 8 MPI x 3 OpenMP、BLAS/MAGMA 各1 thread。
+  rank launcher と実行中の /proc 検査で24コア内の排他的 rank 配置を確認。
+  許容誤差: |dE| <= 1e-7 Hartree、max|dF| <= 1e-7 Hartree/bohr。
+  正常終了文字列、有限値、全原子・全力成分、グリッド、SCF回数も検査。
+  PBS 45661: 最終版のCluster/Band 4種類の3-SCF GPU計算。CPU参照は PBS 45643 の移植途中版。
+  DC/DC-LNO/KrylovはPBS 45649の実機比較結果を採用。その後の変更はdense経路のみ。
+    バイナリー・ソース対応と再利用範囲はreused_on_results.jsonに記録。
+    この7種類は途中版同士、および1つ前のビルド(PBS 45649)でも一致を確認済み。
+  PBS 45651: 小規模Cluster/NC Cluster/Collinear BandのCPU/recovery/workers/host比較。
+  PBS 45660: 元NC Cluster入力25-SCFのGPU/CPU同一バイナリー比較。
+    このバイナリーから最終版への差はCollinear spin-union fallbackの初回状態数修正のみ。
+  PBS 45661: 小規模NC Bandの残り条件、4種類のgpusolver3+可視GPU1台の制約、
+    スピンなし/スピン分極/NCの分散ELPA/COSMA強制切り替えを確認。
+  PBS 45683: 中断した小規模NC Bandの容量不足強制回復を再実行。
+    最終版と同一SHA256の実行ファイルでCPU参照も新規計算。1 APU / 24コア。
+    recovery/workers は回復処理を強制する試験で、速度評価には用いない。
+  25-SCF入力は DATA.PATH を絶対パス化。元の scf.maxIter=25 / MD.maxIter=1。
+  3-SCFの結果は短縮試験であり、SCF収束を意味しない。
+  元入力も25回上限でSCF収束基準に達しない場合、同一反復数での一致として評価。
+
+結果 (GPU秒 / CPU秒 / |dE| / max|dF| / SCF回数)
+  release3_small_cluster_recovery: 40.431 / 6.291 / 0 / 1.45e-10 / 3  PASS
+  release3_small_cluster_workers: 45.535 / 6.291 / 0 / 1.45e-10 / 3  PASS
+  release3_small_cluster_host: 6.408 / 6.291 / 0 / 1e-12 / 3  PASS
+  release3_small_nc_cluster_recovery: 247.472 / 9.612 / 6.03e-12 / 3.92e-10 / 3  PASS
+  release3_small_nc_cluster_workers: 163.962 / 9.612 / 4.01e-12 / 3.92e-10 / 3  PASS
+  release3_small_nc_cluster_host: 7.444 / 9.612 / 3.01e-12 / 3.11e-10 / 3  PASS
+  release3_small_col_band_recovery: 139.182 / 7.488 / 9.95e-13 / 2.57e-10 / 3  PASS
+  release3_small_col_band_workers: 51.604 / 7.488 / 9.95e-13 / 2.57e-10 / 3  PASS
+  release3_small_col_band_host: 6.439 / 7.488 / 3.01e-12 / 1e-12 / 3  PASS
+  release4_nc_cluster_full_gpu: 109.111 / 691.238 / 1.71e-10 / 1.09e-10 / 25  PASS
+  release5_gs2check_small_cluster_gs2: 7.407 / 5.242 / 0 / 1e-12 / 3  PASS
+  release5_gs2check_small_spin_cluster_gs2: 7.423 / 5.256 / 0 / 1e-12 / 3  PASS
+  release5_gs2check_small_nc_cluster_gs2: 9.641 / 8.564 / 5.4e-11 / 1.81e-10 / 3  PASS
+  release5_nc_cluster_gpu: 57.691 / 158.249 / 1.51e-09 / 1.25e-10 / 3  PASS
+  release5_col_cluster_gpu: 45.125 / 73.902 / 9.3e-11 / 1.63e-10 / 3  PASS
+  release5_col_band_gpu: 50.121 / 137.109 / 4.2e-11 / 6.4e-11 / 3  PASS
+  release5_nc_band_gpu: 79.419 / 562.882 / 6.03e-10 / 3e-11 / 3  PASS
+  release5_small_cluster_limit: 6.375 / 6.291 / 0 / 1e-12 / 3  PASS
+  release5_small_nc_cluster_limit: 7.540 / 9.612 / 6.03e-12 / 2.32e-10 / 3  PASS
+  release5_small_col_band_limit: 6.434 / 7.488 / 4.01e-12 / 1e-12 / 3  PASS
+  release5_small_nc_band_limit: 7.408 / 8.574 / 2.98e-12 / 4.7e-10 / 3  PASS
+  release5_small_nc_band_workers: 217.576 / 8.574 / 3e-11 / 4.1e-10 / 3  PASS
+  release5_small_nc_band_host: 8.514 / 8.574 / 3.1e-11 / 4.69e-10 / 3  PASS
+  release6_small_nc_band_recovery: 345.522 / 15.764 / 6.1e-11 / 2.28e-10 / 3  PASS
+  release2_dc_gpu: 60.114 / 68.525 / 3.65e-10 / 9.1e-11 / 3  PASS
+  release2_dclno_gpu: 27.810 / 44.527 / 1.71e-10 / 1e-12 / 3  PASS
+  release2_krylov_gpu: 58.529 / 74.164 / 8.54e-10 / 5.97e-09 / 3  PASS
+
+完了件数: 36/36; 比較: 27; failures: []
+未完了: なし
+
+単一GPU実機 fault injection (PBS 45652):
+  PASS mode=0 (owner/local/remote/CPU/occupied-owner/GPU-cap/failed-owner-init/late-OOM)
+  PASS mode=3 (owner/local/remote/CPU/occupied-owner/GPU-cap/failed-owner-init/late-OOM)
+  PASS mode=5 (owner/local/remote/CPU/occupied-owner/GPU-cap/failed-owner-init/late-OOM)
+  PASS mode=7 (owner/local/remote/CPU/occupied-owner/GPU-cap/failed-owner-init/late-OOM)
+  exit code: 0
+
+配置済み実行ファイル
+  /work/GPU2026/dc1394/openmx4.0_amdgpu/work/openmx
+  SHA256: f8de47bde095c9af00850d5fc5d1d7fcff8cc56589ed7b46fcb2e9514ca2408c
+  配置時刻: 2026-10-16T16:29:03.705639+09:00
+  旧バイナリー: /work/GPU2026/dc1394/openmx4.0_amdgpu/work/codex_nvidia_port_20261016/before.work.openmx
+
+指定終了時刻と再開の履歴
+  16:30終了期限での記録: 利用者指定の16:30停止に備え、検証ジョブは16:28:30の全体期限で終了（exit 124）。NC Band容量不足強制条件はSCF 3回を終えたが力計算中で未完了。正常終了・最終全エネルギー・全力成分は未確認。他34条件、26数値比較はPASS。残存PBSジョブなし。
+  利用者が新しい強制終了時刻を23:00 JSTに指定したため、21:29に再開。
+  再開後はソース508件とsource/openmx・work/openmx・検証用実行ファイルのSHA256を再確認。
+  PBS 45683の回復試験は1200秒上限、ジョブ全体は22:58:00までに停止する設定。
+  現在の未完了: なし
+
+制約・未検証
+  * 複数GPU/複数ノードの実機動作・性能は未検証。模擬GPUと実MPI試験で確認。
+  * Radeon実機は未使用。gfx1200の変更ソースのコンパイル確認まで。
+  * MAGMAは1行列2～8GPU、LP64行列次数32766以下。Band groupは単一ノード。
+  * gpusolver3は通常のCluster/Bandに限定。非コリニアClusterのMO/XANES/
+    部分電荷/DOS出力など未対応組合せは入力で拒否。
+  * 単一CPU範囲の確保も不可能なホストメモリー不足は診断を出して停止する。
+
+監査・再現ファイル
+  work/codex_nvidia_port_20261016/ 内:
+    baseline.json, baseline.tracked.tar: 作業開始時点
+    release2.source_hashes.json ～ release6.source_hashes.json: ソースhash
+    release2_results.json ～ release6_results.json, final_comparison.json
+    release*.allocation.txt, release*.environment.txt, release*.cpu_affinity.json
+    runs/*/{input.dat,settings.json,command.json,timing.json,stdout.log,stderr.log}
+    suite.*.json / suite.*.log, gfx1200_results.json, build.*.log
+    reused_on_results.json: DC/DC-LNO/Krylovの検証済みソース範囲
+    compare_final.py: 正常終了・配置・数値結果・実際の切り替え診断の検査
+
+除外した試験
+  途中版の小規模テスト4件はDATA.PATH不足で未計算のため比較から除外。
+  最終版のH2O初回は元入力のMD最適化100stepが残っていたため停止し、
+  MD.Type=nomd / MD.maxIter=1として最初から再計算。
+  NC Bandの強制回復は初回300秒上限、次は600秒上限で再試験したが全体停止期限で中断。
+  これらの途中結果は採用せず、再開後のrelease6で同じ条件を最初から検証した。
+  PBS 45659は実行ファイル固定前の投入により計算開始前に終了。結果に含めない。
+  PBS 45657で検出したスピン分極GS2初回状態数0の不具合を修正し、48条件の
+  dispatch回帰試験とPBS 45661の数値比較で再確認。修正前の比較は採用しない。
+  ELPA小行列CPU切り替えの未初期化診断表示も修正し、MPI回帰試験で確認。
+  旧Codexの重複ジョブおよび途中で中止したバイナリーの結果も採用していない。
+
+旧接続先のCodex app-server、関連host/updater/CLIを強制終了し、
+このスレッドで作業を継続した。既存のvendor生成物・利用者の出力は保持した。

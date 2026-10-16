@@ -1,3 +1,4 @@
+#include "openmx_target.h"
 /**********************************************************************
   Set_ProExpn_VNA.c:
 
@@ -25,6 +26,10 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #include "openmx_common.h"
+#include "openmx_gpu_workers.h"
+#include "openmx_gpu_views.h"
+#include "openmx_gpu_task.h"
+#include "openmx_host_memory.h"
 #include "openmx_precision.h"
 #include "set_hip_default_device_from_local_rank.h"
 #include "mpi.h"
@@ -279,6 +284,7 @@ static void *SetPro_device_try(size_t bytes)
    then the radial groups, then the 2*L+1 members).  Preserve legacy FP32
    product rounding when enabled; promote operands before multiplying when
    scf.fp32.enable is off. Shared by the device kernel and host fallback. */
+#pragma omp declare target
 static double SetPro_HVNA_element(size_t oe, int num_proj, int num_rvna,
                                   const float *flat, const float *halo,
                                   const int *out_item, const int *item_koff,
@@ -322,6 +328,7 @@ static double SetPro_HVNA_element(size_t oe, int num_proj, int num_rvna,
 
   return nlh;
 }
+#pragma omp end declare target
 
 static int SetPro_HVNA_GpuBegin(Type_DS_VNA *****DS_VNA, int *VNA_List,
                                 int *VNA_List2, int Num_RVNA)
@@ -870,7 +877,761 @@ static void SetPro_HVNA_GpuRun(double ****HVNA)
   SetPro_note("HVNA GPU batch end","%.2f s",hvna_t1-hvna_t0);
 }
 
-/* ------------------------------------------------------------------ */
+typedef struct {
+  int enabled;
+  int turn, turns, host_archive;
+  int num_proj;
+  int num_rvna;
+
+  /* Local direction-0 DS_VNA rows. Keep them only on the device when all
+     local ranks fit; otherwise archive on the host for capacity shards. */
+  float *flat_dev;
+  float *flat_host;       /* used when the complete archive does not fit */
+  size_t flat_count;
+  size_t *mck_off;
+  int *mck_base;
+
+  /* Halo archive of the received direction-0 blocks, with the same policy. */
+  float *halo_dev;
+  float *halo_host;
+  size_t halo_count;
+  size_t *halo_off;
+  int *halo_base;
+
+  /* one-slot host staging for uploads into the two archives */
+  float *bounce;
+  size_t bounce_count;
+
+  /* per-species group energies and the group lengths */
+  double *ene;
+  int *l2p1;
+} SetProCapacityGpuContext;
+
+static SetProCapacityGpuContext SetProCapacity_gpu = { 0 };
+static int SetProCapacity_worker_rank = 0;
+
+static void SetProCapacity_gpu_abort(const char *message)
+{
+  fprintf(stderr,"%s\n",message);
+  fflush(stderr);
+  if (openmx_gpu_worker_device()>=0) exit(EXIT_FAILURE);
+  MPI_Abort(mpi_comm_level1,1);
+}
+
+static void *SetProCapacity_checked_malloc(size_t size)
+{
+  void *ptr;
+
+  if (size==0) size = 1;
+  ptr = malloc(size);
+  if (ptr==NULL){
+    SetProCapacity_gpu_abort("Set_ProExpn_VNA: malloc failed for the GPU batch.");
+  }
+  return ptr;
+}
+
+static int SetProCapacity_collective_env_flag(const char *name, int default_value)
+{
+  int myid,value = default_value;
+  const char *env;
+
+  MPI_Comm_rank(mpi_comm_level1,&myid);
+  if (myid==0){
+    env = getenv(name);
+    if (env!=NULL && env[0]!='\0') value = (atoi(env)!=0);
+  }
+  MPI_Bcast(&value,1,MPI_INT,0,mpi_comm_level1);
+
+  return value;
+}
+
+/* OPENMX_SETPRO_VERBOSE=1: every rank reports each device stage of this
+   file (the admission figures, the batch sizes, the elapsed time) together
+   with the device memory free at that moment, on stderr */
+static int SetProCapacity_verbose(void)
+{
+  static int verbose = -1;
+
+  if (verbose<0){
+    const char *env = getenv("OPENMX_SETPRO_VERBOSE");
+    verbose = (env!=NULL && env[0]!='\0' && atoi(env)!=0) ? 1 : 0;
+  }
+  return verbose;
+}
+
+static double SetProCapacity_free_mib(void)
+{
+  size_t free_bytes = 0,total_bytes = 0;
+
+  /* a CPU run must not create a CUDA context for a diagnostic */
+  if (scf_eigen_lib_flag!=GPUSOLVER) return -1.0;
+  if (OpenMX_GpuMemGetInfo(&free_bytes,&total_bytes)!=hipSuccess) return -1.0;
+  return (double)free_bytes/1048576.0;
+}
+
+/* kept out of line: nvc 26.9 miscompiles the inlined copies (an undefined
+   value for the formatted buffer in its LLVM IR) */
+static void SetProCapacity_note(const char *stage, const char *fmt, ...) __attribute__((noinline));
+static void SetProCapacity_note(const char *stage, const char *fmt, ...)
+{
+  char detail[512];
+  va_list ap;
+  int myid;
+
+  if (!SetProCapacity_verbose()) return;
+  va_start(ap,fmt);
+  vsnprintf(detail,sizeof(detail),fmt,ap);
+  va_end(ap);
+  if (openmx_gpu_worker_device()>=0) myid=SetProCapacity_worker_rank;
+  else MPI_Comm_rank(mpi_comm_level1,&myid);
+  {
+    const double mib = SetProCapacity_free_mib();
+
+    if (mib<0.0) fprintf(stderr,"<Set_ProExpn_VNA> rank %d %s: %s\n",myid,stage,detail);
+    else fprintf(stderr,"<Set_ProExpn_VNA> rank %d %s: %s; device free %.0f MiB\n",myid,stage,detail,mib);
+  }
+  fflush(stderr);
+}
+
+static int SetProCapacity_HVNA_GpuBegin(Type_DS_VNA *****DS_VNA, int *VNA_List,
+                                int *VNA_List2, int Num_RVNA)
+{
+  SetProCapacityGpuContext *g = &SetProCapacity_gpu;
+  int Mc_AN,k,spe,L1,node_ranks = 1,node_rank = 0;
+  size_t pos = 0,slots = 0,halo_slots = 0;
+  size_t free_bytes = 0,total_bytes = 0;
+  MPI_Comm node_comm = MPI_COMM_NULL;
+  int requested = scf_eigen_lib_flag==GPUSOLVER;
+
+  memset(g,0,sizeof(*g));
+  g->num_proj = (List_YOUSO[35]+1)*(List_YOUSO[35]+1)*List_YOUSO[34];
+  g->num_rvna = Num_RVNA;
+
+  MPI_Allreduce(MPI_IN_PLACE,&requested,1,MPI_INT,MPI_MIN,mpi_comm_level1);
+  if (!requested || !SetPro_gpu_stage_enabled("OPENMX_SETPRO_HVNA_GPU")) return 0;
+
+  MPI_Comm_split_type(mpi_comm_level1,MPI_COMM_TYPE_SHARED,0,MPI_INFO_NULL,&node_comm);
+  MPI_Comm_size(node_comm,&node_ranks);
+  MPI_Comm_rank(node_comm,&node_rank);
+  if (node_ranks<1) node_ranks = 1;
+  if (gpu_rank_device_usable()) openmx_target_wait();
+  if (gpu_rank_device_usable() && hipDeviceSynchronize()==hipSuccess){
+    openmx_target_clear_freelists();
+  }
+  MPI_Barrier(node_comm);
+
+  /* sizes of the flat local table and the halo archive */
+
+  for (Mc_AN=1; Mc_AN<=Matomnum; Mc_AN++){
+    int Gc_AN = M2G[Mc_AN];
+    int tno = Spe_Total_NO[WhatSpecies[Gc_AN]];
+
+    slots += (size_t)(FNAN[Gc_AN]+1);
+    pos += (size_t)(FNAN[Gc_AN]+1)*(size_t)tno*(size_t)g->num_proj;
+  }
+
+  for (Mc_AN=Matomnum+1; Mc_AN<=Matomnum+MatomnumF; Mc_AN++){
+    int Gc_AN = F_M2G[Mc_AN];
+    int tno = Spe_Total_NO[WhatSpecies[Gc_AN]];
+
+    halo_slots += (size_t)(FNAN[Gc_AN]+1);
+    g->halo_count += (size_t)(FNAN[Gc_AN]+1)*(size_t)tno*(size_t)g->num_proj;
+  }
+
+  g->flat_count = pos==0 ? 1 : pos;
+  if (OpenMX_GpuMemGetInfo(&free_bytes,&total_bytes)!=hipSuccess) free_bytes = 0;
+  {
+    const size_t reserve = (size_t)256*1024*1024;
+    size_t items = 0, kslots = 0, outputs = 0;
+    unsigned long long need, max_need, available = free_bytes, min_available;
+    int admitted = 0, fit, global_fit;
+
+    /* AMD's rank-turn admission, with the actual OpenMP transient arrays.
+       Counting all neighbours also covers large halos that exceeded the
+       old fixed 192 MiB allowance. Node-wide grouping is conservative when
+       a node has several GPUs, as in the previous admission policy. */
+    for (Mc_AN=1; Mc_AN<=Matomnum; ++Mc_AN){
+      int gc = M2G[Mc_AN];
+      int tno = Spe_Total_NO[WhatSpecies[gc]];
+      for (int j=0; j<=FNAN[gc]; ++j){
+        ++items;
+        outputs += (size_t)tno*Spe_Total_NO[WhatSpecies[natn[gc][j]]];
+        for (int kk=0; kk<=FNAN[gc]; ++kk)
+          if (0<=RMI1[Mc_AN][j][kk]) ++kslots;
+      }
+    }
+    if (kslots==0) kslots = 1;
+    need = (g->flat_count + (g->halo_count==0 ? 1 : g->halo_count))*sizeof(float)
+         + items*(4*sizeof(int) + sizeof(size_t)) + outputs*sizeof(double)
+         + kslots*(2*sizeof(size_t) + 2*sizeof(int))
+         + (size_t)SpeciesNum*Num_RVNA*sizeof(double) + (size_t)Num_RVNA*sizeof(int)
+         + (size_t)64*1024*1024;
+    MPI_Allreduce(&need,&max_need,1,MPI_UNSIGNED_LONG_LONG,MPI_MAX,node_comm);
+    MPI_Allreduce(&available,&min_available,1,MPI_UNSIGNED_LONG_LONG,MPI_MIN,node_comm);
+    if (min_available>reserve){
+      unsigned long long count = (min_available-reserve)/max_need;
+      admitted = count<(unsigned)node_ranks ? (int)count : node_ranks;
+    }
+    /* Preserve the resident owner path when every local rank fits. All
+       other ranks keep host archives and pack only the projector blocks
+       needed by each capacity shard; no full archive is re-uploaded. */
+    g->host_archive=openmx_gpu_capacity_test_recovery() || admitted<node_ranks || !gpu_rank_device_usable();
+    unsigned long long host_available=openmx_host_mem_available(),min_host,total_need;
+    unsigned long long host_need=g->host_archive?need:0;
+    MPI_Allreduce(&host_available,&min_host,1,MPI_UNSIGNED_LONG_LONG,MPI_MIN,node_comm);
+    MPI_Allreduce(&host_need,&total_need,1,MPI_UNSIGNED_LONG_LONG,MPI_SUM,node_comm);
+    fit=!min_host || total_need<=min_host/2;
+    MPI_Allreduce(&fit,&global_fit,1,MPI_INT,MPI_MIN,mpi_comm_level1);
+    if (!global_fit) {MPI_Comm_free(&node_comm);memset(g,0,sizeof(*g));return 0;}
+    g->turn=0;g->turns=1;
+  }
+  MPI_Comm_free(&node_comm);
+
+  g->mck_base = (int*)SetProCapacity_checked_malloc(sizeof(int)*(size_t)(Matomnum+2));
+  g->mck_off = (size_t*)SetProCapacity_checked_malloc(sizeof(size_t)*(slots==0 ? 1 : slots));
+  g->halo_base = (int*)SetProCapacity_checked_malloc(sizeof(int)*(size_t)(MatomnumF+2));
+  g->halo_off = (size_t*)SetProCapacity_checked_malloc(sizeof(size_t)*(halo_slots==0 ? 1 : halo_slots));
+  g->ene = (double*)SetProCapacity_checked_malloc(sizeof(double)*(size_t)SpeciesNum*(size_t)Num_RVNA);
+  g->l2p1 = (int*)SetProCapacity_checked_malloc(sizeof(int)*(size_t)Num_RVNA);
+
+  /* Keep the original device-only archive when all ranks fit. Rank turns
+     use host archives with the RAM budget checked above. Rows are staged
+     through one bounce slot sized for the largest (atom,neighbour) block. */
+  if (g->host_archive){
+    g->flat_host = (float*)malloc(sizeof(float)*g->flat_count);
+    g->halo_host = (float*)malloc(sizeof(float)*(g->halo_count==0 ? 1 : g->halo_count));
+  }
+  else{
+    g->flat_dev = (float*)openmx_target_alloc(sizeof(float)*g->flat_count);
+    g->halo_dev = (float*)openmx_target_alloc(sizeof(float)*(g->halo_count==0 ? 1 : g->halo_count));
+  }
+  {
+    size_t bounce_count = 1;
+
+    for (spe=0; spe<SpeciesNum; spe++){
+      size_t cnt = (size_t)Spe_Total_NO[spe]*(size_t)g->num_proj;
+      if (bounce_count<cnt) bounce_count = cnt;
+    }
+    g->bounce_count = bounce_count;
+    g->bounce = (float*)SetProCapacity_checked_malloc(sizeof(float)*bounce_count);
+  }
+  {
+    if (!g->host_archive && (!g->flat_dev || !g->halo_dev)) {
+      if(g->flat_dev)openmx_target_free(g->flat_dev);if(g->halo_dev)openmx_target_free(g->halo_dev);
+      g->flat_dev=g->halo_dev=NULL;g->host_archive=1;
+      unsigned long long room=openmx_host_mem_available();
+      size_t need=(g->flat_count+(g->halo_count?g->halo_count:1))*sizeof(float);
+      if (!room || need<=room/(2ULL*node_ranks)) {
+        g->flat_host=malloc(g->flat_count*sizeof(float));g->halo_host=malloc((g->halo_count?g->halo_count:1)*sizeof(float));
+      }
+    }
+    int allocated = g->host_archive ? g->flat_host && g->halo_host : g->flat_dev && g->halo_dev;
+    int all_allocated;
+    MPI_Allreduce(&allocated,&all_allocated,1,MPI_INT,MPI_MIN,mpi_comm_level1);
+    if (!all_allocated){
+      if (g->flat_dev!=NULL) openmx_target_free(g->flat_dev);
+      if (g->halo_dev!=NULL) openmx_target_free(g->halo_dev);
+      openmx_target_clear_freelists();
+      free(g->flat_host);
+      free(g->halo_host);
+      free(g->bounce);
+      free(g->l2p1);
+      free(g->ene);
+      free(g->halo_off);
+      free(g->halo_base);
+      free(g->mck_off);
+      free(g->mck_base);
+      memset(g,0,sizeof(*g));
+      return 0;
+    }
+  }
+
+  for (L1=0; L1<Num_RVNA; L1++){
+    g->l2p1[L1] = 2*VNA_List[L1] + 1;
+  }
+  for (spe=0; spe<SpeciesNum; spe++){
+    for (L1=0; L1<Num_RVNA; L1++){
+      g->ene[(size_t)spe*Num_RVNA + L1] = VNA_proj_ene[spe][VNA_List[L1]][VNA_List2[L1]];
+    }
+  }
+
+  {
+    pos = 0;
+    slots = 0;
+    for (Mc_AN=1; Mc_AN<=Matomnum; Mc_AN++){
+      int Gc_AN = M2G[Mc_AN];
+      int tno = Spe_Total_NO[WhatSpecies[Gc_AN]];
+
+      g->mck_base[Mc_AN] = (int)slots;
+      for (k=0; k<=FNAN[Gc_AN]; k++){
+        g->mck_off[slots] = pos;
+        pos += (size_t)tno*(size_t)g->num_proj;
+        slots++;
+      }
+    }
+
+    halo_slots = 0;
+    pos = 0;
+    for (Mc_AN=Matomnum+1; Mc_AN<=Matomnum+MatomnumF; Mc_AN++){
+      int Gc_AN = F_M2G[Mc_AN];
+      int tno = Spe_Total_NO[WhatSpecies[Gc_AN]];
+
+      g->halo_base[Mc_AN-Matomnum] = (int)halo_slots;
+      for (k=0; k<=FNAN[Gc_AN]; k++){
+        g->halo_off[halo_slots] = pos;
+        pos += (size_t)tno*(size_t)g->num_proj;
+        halo_slots++;
+      }
+    }
+
+    /* flatten the local direction-0 rows straight into the device archive,
+       one (atom,neighbour) block at a time through the bounce slot */
+
+    for (Mc_AN=1; Mc_AN<=Matomnum; Mc_AN++){
+      int Gc_AN = M2G[Mc_AN];
+      int tno = Spe_Total_NO[WhatSpecies[Gc_AN]];
+      int k2,i;
+
+      for (k2=0; k2<=FNAN[Gc_AN]; k2++){
+        size_t base = g->mck_off[g->mck_base[Mc_AN]+k2];
+
+        for (i=0; i<tno; i++){
+          memcpy(g->bounce + (size_t)i*(size_t)g->num_proj,
+                 DS_VNA[0][Mc_AN][k2][i],
+                 sizeof(float)*(size_t)g->num_proj);
+        }
+        if (g->host_archive)
+          memcpy(g->flat_host + base, g->bounce,sizeof(float)*(size_t)tno*(size_t)g->num_proj);
+        else
+          openmx_target_upload(g->flat_dev + base, g->bounce,
+                               sizeof(float)*(size_t)tno*(size_t)g->num_proj);
+      }
+    }
+  }
+
+  SetProCapacity_note("HVNA GPU archives","local archive %.0f MiB, halo archive %.0f MiB on the %s",
+              (double)g->flat_count*sizeof(float)/1048576.0,
+              (double)g->halo_count*sizeof(float)/1048576.0,
+              g->host_archive ? "host (capacity recovery)" : "device");
+
+  g->enabled = 1;
+  return 1;
+}
+
+static void SetProCapacity_HVNA_GpuEnd(void)
+{
+  SetProCapacityGpuContext *g = &SetProCapacity_gpu;
+
+  if (!g->enabled) return;
+
+  if (g->flat_dev!=NULL) openmx_target_free(g->flat_dev);
+  if (g->halo_dev!=NULL) openmx_target_free(g->halo_dev);
+  openmx_target_clear_freelists();
+
+  free(g->flat_host);
+  free(g->halo_host);
+  free(g->bounce);
+  free(g->l2p1);
+  free(g->ene);
+  free(g->halo_off);
+  free(g->halo_base);
+  free(g->mck_off);
+  free(g->mck_base);
+  memset(g,0,sizeof(*g));
+}
+
+/* archive the direction-0 block of the halo atom just received */
+static void SetProCapacity_HVNA_GpuArchiveHalo(Type_DS_VNA *****DS_VNA, int Original_Mc_AN,
+                                       int Gc_AN)
+{
+  SetProCapacityGpuContext *g = &SetProCapacity_gpu;
+  int tno = Spe_Total_NO[WhatSpecies[Gc_AN]];
+  int halo_idx = Original_Mc_AN - Matomnum;
+  int k;
+
+  if (halo_idx<1 || MatomnumF<halo_idx){
+    SetProCapacity_gpu_abort("Set_ProExpn_VNA GPU: halo index out of range.");
+  }
+
+  /* serial: the rows go through the shared bounce slot into the device
+     archive, and openmx_target_upload is not called from inside an OpenMP
+     region anywhere else in this file either */
+  for (k=0; k<=FNAN[Gc_AN]; k++){
+    size_t base = g->halo_off[g->halo_base[halo_idx]+k];
+    int i;
+
+    for (i=0; i<tno; i++){
+      memcpy(g->bounce + (size_t)i*(size_t)g->num_proj,
+             DS_VNA[0][Matomnum+1][k][i],
+             sizeof(float)*(size_t)g->num_proj);
+    }
+    if (g->host_archive)
+      memcpy(g->halo_host + base, g->bounce,sizeof(float)*(size_t)tno*(size_t)g->num_proj);
+    else
+      openmx_target_upload(g->halo_dev + base, g->bounce,
+                           sizeof(float)*(size_t)tno*(size_t)g->num_proj);
+  }
+}
+
+/* the unified batch over every (local atom, neighbour) pair */
+static int SetProCapacity_HVNA_GpuRun_Part(int first,int last,SetProCapacityGpuContext *g,double ****HVNA)
+{
+  const int fp32 = openmx_fp32_enabled();
+  const int num_proj = g->num_proj;
+  const int num_rvna = g->num_rvna;
+  int Mc_AN,j,k;
+  int nitems = 0,kslots = 0;
+  size_t out_count = 0;
+  int *item_atom,*item_j,*item_koff,*item_kn,*item_tnoC,*item_tnoH;
+  size_t *item_out;
+  size_t *krowA,*krowB;
+  int *krow_halo,*krow_ene;
+  double *out;
+  int p;
+  size_t opos = 0;
+  int kpos = 0, ok = 0;
+  void *arena = NULL, *device_out = NULL;
+
+  /* count */
+  for (Mc_AN=first; Mc_AN<last; Mc_AN++){
+    int Gc_AN = M2G[Mc_AN];
+    int tnoC = Spe_Total_NO[WhatSpecies[Gc_AN]];
+
+    for (j=0; j<=FNAN[Gc_AN]; j++){
+      int tnoH = Spe_Total_NO[WhatSpecies[natn[Gc_AN][j]]];
+
+      nitems++;
+      out_count += (size_t)tnoC*(size_t)tnoH;
+      for (k=0; k<=FNAN[Gc_AN]; k++){
+        if (0<=RMI1[Mc_AN][j][k]) kslots++;
+      }
+    }
+  }
+
+  if (nitems==0) return 1;
+
+  double hvna_t0;
+  dtime(&hvna_t0);
+  SetProCapacity_note("HVNA GPU batch begin","%d (atom,neighbour) items, %d k slots, %.0f MiB of outputs",
+              nitems,kslots,(double)out_count*sizeof(double)/1048576.0);
+
+  item_atom = (int*)SetProCapacity_checked_malloc(sizeof(int)*(size_t)nitems);
+  item_j = (int*)SetProCapacity_checked_malloc(sizeof(int)*(size_t)nitems);
+  item_koff = (int*)SetProCapacity_checked_malloc(sizeof(int)*(size_t)nitems);
+  item_kn = (int*)SetProCapacity_checked_malloc(sizeof(int)*(size_t)nitems);
+  item_tnoC = (int*)SetProCapacity_checked_malloc(sizeof(int)*(size_t)nitems);
+  item_tnoH = (int*)SetProCapacity_checked_malloc(sizeof(int)*(size_t)nitems);
+  item_out = (size_t*)SetProCapacity_checked_malloc(sizeof(size_t)*(size_t)nitems);
+  krowA = (size_t*)SetProCapacity_checked_malloc(sizeof(size_t)*(size_t)(kslots==0 ? 1 : kslots));
+  krowB = (size_t*)SetProCapacity_checked_malloc(sizeof(size_t)*(size_t)(kslots==0 ? 1 : kslots));
+  krow_halo = (int*)SetProCapacity_checked_malloc(sizeof(int)*(size_t)(kslots==0 ? 1 : kslots));
+  krow_ene = (int*)SetProCapacity_checked_malloc(sizeof(int)*(size_t)(kslots==0 ? 1 : kslots));
+  out = (double*)SetProCapacity_checked_malloc(sizeof(double)*(out_count==0 ? 1 : out_count));
+
+  /* build */
+  p = 0;
+  for (Mc_AN=first; Mc_AN<last; Mc_AN++){
+    int Gc_AN = M2G[Mc_AN];
+    int tnoC = Spe_Total_NO[WhatSpecies[Gc_AN]];
+
+    for (j=0; j<=FNAN[Gc_AN]; j++){
+      int jg = natn[Gc_AN][j];
+      int Mj_AN = F_G2M[jg];
+      int tnoH = Spe_Total_NO[WhatSpecies[jg]];
+
+      item_atom[p] = Mc_AN;
+      item_j[p] = j;
+      item_koff[p] = kpos;
+      item_tnoC[p] = tnoC;
+      item_tnoH[p] = tnoH;
+      item_out[p] = opos;
+      opos += (size_t)tnoC*(size_t)tnoH;
+
+      for (k=0; k<=FNAN[Gc_AN]; k++){
+        int kl = RMI1[Mc_AN][j][k];
+
+        if (kl<0) continue;
+        krowA[kpos] = g->mck_off[g->mck_base[Mc_AN]+k];
+        krow_ene[kpos] = WhatSpecies[natn[Gc_AN][k]]*num_rvna;
+        if (Mj_AN<=Matomnum){
+          krowB[kpos] = g->mck_off[g->mck_base[Mj_AN]+kl];
+          krow_halo[kpos] = 0;
+        }
+        else{
+          krowB[kpos] = g->halo_off[g->halo_base[Mj_AN-Matomnum]+kl];
+          krow_halo[kpos] = 1;
+        }
+        kpos++;
+      }
+      item_kn[p] = kpos - item_koff[p];
+      p++;
+    }
+  }
+
+  if (p!=nitems || kpos!=kslots || opos!=out_count){
+    SetProCapacity_gpu_abort("Set_ProExpn_VNA GPU: inconsistent batch.");
+  }
+
+  {
+    const float *flat = g->flat_dev;
+    const float *halo = g->halo_dev;
+    double *ene = g->ene;
+    int *l2p1 = g->l2p1;
+    size_t ene_len = (size_t)SpeciesNum*(size_t)num_rvna;
+    const int nitems_c = nitems;
+    const size_t kslots_c = (size_t)(kslots==0 ? 1 : kslots);
+    const size_t out_c = out_count;
+
+    /* Explicit allocation permits a capacity retry if other ranks consume
+       memory after archive admission. No result is published before success. */
+    size_t length[]={(nitems_c)*sizeof(int),(nitems_c)*sizeof(int),(nitems_c)*sizeof(int),(nitems_c)*sizeof(int),(nitems_c)*sizeof(size_t),(kslots_c)*sizeof(size_t),(kslots_c)*sizeof(size_t),(kslots_c)*sizeof(int),(kslots_c)*sizeof(int),(ene_len)*sizeof(double),(num_rvna)*sizeof(int),(out_c)*sizeof(double)};
+    const void *host[]={item_koff,item_kn,item_tnoC,item_tnoH,item_out,krowA,krowB,krow_halo,krow_ene,ene,l2p1,out};
+    size_t off[12],bytes=0;void *dev[12];
+    for(int i=0;i<12;i++){off[i]=bytes;bytes+=(length[i]+15)&~(size_t)15;}
+    if(hipMalloc(&arena,bytes)!=hipSuccess) goto hvna_cleanup;
+    for(int i=0;i<12;i++)dev[i]=(char*)arena+off[i];
+    device_out=dev[11];
+    for(int i=0;i<11;i++)if(hipMemcpy(dev[i],host[i],length[i],hipMemcpyHostToDevice)!=hipSuccess)goto hvna_cleanup;
+    {
+      int *item_koff=(int*)dev[0];
+      int *item_kn=(int*)dev[1];
+      int *item_tnoC=(int*)dev[2];
+      int *item_tnoH=(int*)dev[3];
+      size_t *item_out=(size_t*)dev[4];
+      size_t *krowA=(size_t*)dev[5];
+      size_t *krowB=(size_t*)dev[6];
+      int *krow_halo=(int*)dev[7];
+      int *krow_ene=(int*)dev[8];
+      double *ene=(double*)dev[9];
+      int *l2p1=(int*)dev[10];
+      double *out=(double*)dev[11];
+#pragma omp target teams distribute parallel for thread_limit(128) firstprivate(fp32) is_device_ptr(flat,halo,item_koff,item_kn,item_tnoC,item_tnoH,item_out,krowA,krowB,krow_halo,krow_ene,ene,l2p1,out)
+      for (int pp=0; pp<nitems_c; pp++){
+        const int tnoC = item_tnoC[pp];
+        const int tnoH = item_tnoH[pp];
+        const int k_off = item_koff[pp];
+        const int k_n = item_kn[pp];
+        const size_t out_off = item_out[pp];
+        const int mn = tnoC*tnoH;
+
+
+        for (int idx=0; idx<mn; idx++){
+          const int m = idx/tnoH;
+          const int n = idx - m*tnoH;
+          double nlh = 0.0;
+
+          for (int kk=0; kk<k_n; kk++){
+            const float *a = flat + krowA[k_off+kk] + (size_t)m*(size_t)num_proj;
+            const float *b = (krow_halo[k_off+kk]
+                              ? (halo + krowB[k_off+kk])
+                              : (flat + krowB[k_off+kk])) + (size_t)n*(size_t)num_proj;
+            const double *el = ene + krow_ene[k_off+kk];
+            double sum = 0.0;
+            int L = 0;
+
+            for (int L1=0; L1<num_rvna; L1++){
+              const int g1 = l2p1[L1];
+              double tmp0 = 0.0;
+
+              for (int l3=0; l3<g1; l3++){
+                tmp0 += fp32 ? (double)(a[L]*b[L]) : (double)a[L]*(double)b[L];
+                L++;
+              }
+              sum += el[L1]*tmp0;
+            }
+
+            nlh += sum;
+          }
+
+          out[out_off + (size_t)idx] = nlh;
+        }
+      }
+    }
+  }
+
+  if(hipMemcpy(out,device_out,out_count*sizeof(double),hipMemcpyDeviceToHost)!=hipSuccess)goto hvna_cleanup;
+
+  /* damping and store, exactly as the host loops do */
+
+  for (p=0; p<nitems; p++){
+    int mc = item_atom[p];
+    int j2 = item_j[p];
+    int Gc_AN = M2G[mc];
+    int jg = natn[Gc_AN][j2];
+    int tnoC = item_tnoC[p];
+    int tnoH = item_tnoH[p];
+    size_t out_off = item_out[p];
+    double rcut = Spe_Atom_Cut1[WhatSpecies[Gc_AN]] + Spe_Atom_Cut1[WhatSpecies[jg]];
+    double dmp = dampingF(rcut,Dis[Gc_AN][j2]);
+    int m,n;
+
+    for (m=0; m<tnoC; m++){
+      for (n=0; n<tnoH; n++){
+        HVNA[mc][j2][m][n] = dmp*out[out_off + (size_t)m*tnoH + n];
+      }
+    }
+  }
+
+  ok=1;
+hvna_cleanup:
+  if(arena)hipFree(arena);
+  (void)hipGetLastError();
+  free(out);
+  free(krow_ene);
+  free(krow_halo);
+  free(krowB);
+  free(krowA);
+  free(item_out);
+  free(item_tnoH);
+  free(item_tnoC);
+  free(item_kn);
+  free(item_koff);
+  free(item_j);
+  free(item_atom);
+  {
+    double t1;
+    dtime(&t1);
+    SetProCapacity_note("HVNA GPU batch end","%.2f s",t1-hvna_t0);
+  }
+  return ok;
+}
+
+typedef struct {int num_proj,num_rvna,fp32;} SetProCapacityHVNACapacityParameters;
+static void SetProCapacity_HVNA_capacity_kernel(size_t first,size_t count,const void *parameters,void *const v[],int gpu)
+{
+  const SetProCapacityHVNACapacityParameters *p=parameters;
+  const int np=p->num_proj,nr=p->num_rvna,fp32=p->fp32;
+  const size_t *offset=v[0];
+  const float *a=openmx_gpu_task_ragged_data(v[0],count);
+  const float *b=openmx_gpu_task_ragged_data(v[1],count);
+  const size_t *species_offset=v[2];
+  const int *species=openmx_gpu_task_ragged_data(v[2],count);
+  const double *ene=v[3],*damp=v[5];const int *length=v[4];double *out=v[6];
+  (void)first;
+/* Each vector lane owns a complete output row. Keeping the projector
+     loops sequential also preserves the cumulative l index across radial
+     channels; auto-vectorizing the inner loop changes that index's live-out
+     value for long projector lists. */
+#pragma omp target teams distribute parallel for is_device_ptr(offset,a,b,species_offset,species,ene,length,damp,out) if(gpu)
+  for(size_t row=0;row<count;row++){
+    double total=0;size_t pos=offset[row];
+
+    for(size_t k=species_offset[row];k<species_offset[row+1];k++,pos+=np){
+      double sum=0;int l=0;
+
+      for(int r=0;r<nr;r++){
+        double term=0;
+
+        for(int m=0;m<length[r];m++,l++)
+          term+=fp32?(double)(a[pos+l]*b[pos+l]):(double)a[pos+l]*(double)b[pos+l];
+        sum+=ene[(size_t)species[k]*nr+r]*term;
+      }
+      total+=sum;
+    }
+    out[row]=damp[row]*total;
+  }
+}
+
+static void SetProCapacity_HVNA_archive_row(float *dest,const float *host,const float *device,size_t offset,int n)
+{
+  if(host)memcpy(dest,host+offset,(size_t)n*sizeof(float));
+  else if(hipMemcpy(dest,device+offset,(size_t)n*sizeof(float),hipMemcpyDeviceToHost)!=hipSuccess)
+    SetProCapacity_gpu_abort("Set_ProExpn_VNA: cannot recover an existing projector archive.");
+}
+
+static void SetProCapacity_HVNA_GpuRun(double ****HVNA)
+{
+  SetProCapacityGpuContext *g=&SetProCapacity_gpu;
+  int done=!g->host_archive && SetProCapacity_HVNA_GpuRun_Part(1,Matomnum+1,g,HVNA);
+  int mc=done?Matomnum+1:1,j=0;size_t row=0;
+  SetProCapacityHVNACapacityParameters p={g->num_proj,g->num_rvna,openmx_fp32_enabled()};
+  /* Only recovery duplicates projector rows, and at most one bounded tile.
+     Device archives can be read row-wise after a late transient OOM. */
+  for(;;){
+    int remaining=mc<=Matomnum,any;
+    MPI_Allreduce(&remaining,&any,1,MPI_INT,MPI_MAX,mpi_comm_level1);
+    if(!any)break;
+    size_t n=0,kn=0,*offset=NULL,*species_offset=NULL;
+    float *a=NULL,*b=NULL;int *species=NULL;double *damp=NULL,*out=NULL;
+    int gc=0,nh=0,mj=0;
+    if(remaining){
+      gc=M2G[mc];int jg=natn[gc][j];mj=F_G2M[jg];nh=Spe_Total_NO[WhatSpecies[jg]];
+      for(int k=0;k<=FNAN[gc];k++)if(RMI1[mc][j][k]>=0)kn++;
+      size_t total=(size_t)Spe_Total_NO[WhatSpecies[gc]]*nh;
+      size_t per=kn*(2*(size_t)p.num_proj*sizeof(float)+sizeof(int))+2*sizeof(size_t)+2*sizeof(double);
+      size_t limit=67108864,available=openmx_host_mem_available();
+      int ranks=openmx_gpu_local_size_noncollective();if(ranks<1)ranks=1;
+      if(available && available/(4ULL*ranks)<limit)limit=available/(4ULL*ranks);
+      n=total-row;if(n>2048)n=2048;if(per && n>limit/per)n=limit/per;if(!n)n=1;
+      for(;;){
+        offset=malloc((n+1)*sizeof(size_t));species_offset=malloc((n+1)*sizeof(size_t));
+        a=malloc((n*kn*p.num_proj?n*kn*p.num_proj:1)*sizeof(float));b=malloc((n*kn*p.num_proj?n*kn*p.num_proj:1)*sizeof(float));
+        species=malloc((n*kn?n*kn:1)*sizeof(int));damp=malloc(n*sizeof(double));out=malloc(n*sizeof(double));
+        if(offset && species_offset && a && b && species && damp && out)break;
+        free(offset);free(species_offset);free(a);free(b);free(species);free(damp);free(out);
+        if(n==1)SetProCapacity_gpu_abort("Set_ProExpn_VNA: no host memory for one projector row.");
+        n=(n+1)/2;
+      }
+      double damping=dampingF(Spe_Atom_Cut1[WhatSpecies[gc]]+Spe_Atom_Cut1[WhatSpecies[jg]],Dis[gc][j]);
+      for(size_t i=0;i<=n;i++){offset[i]=i*kn*p.num_proj;species_offset[i]=i*kn;}
+      for(size_t i=0;i<n;i++){
+        int m=(row+i)/nh,q=(row+i)%nh;size_t kpos=0;damp[i]=damping;
+        for(int k=0;k<=FNAN[gc];k++){
+          int kl=RMI1[mc][j][k];if(kl<0)continue;
+          size_t ao=g->mck_off[g->mck_base[mc]+k]+(size_t)m*p.num_proj;
+          SetProCapacity_HVNA_archive_row(a+(i*kn+kpos)*p.num_proj,g->flat_host,g->flat_dev,ao,p.num_proj);
+          size_t bo=(mj<=Matomnum?g->mck_off[g->mck_base[mj]+kl]:g->halo_off[g->halo_base[mj-Matomnum]+kl])+(size_t)q*p.num_proj;
+          SetProCapacity_HVNA_archive_row(b+(i*kn+kpos)*p.num_proj,mj<=Matomnum?g->flat_host:g->halo_host,mj<=Matomnum?g->flat_dev:g->halo_dev,bo,p.num_proj);
+          species[i*kn+kpos++]=WhatSpecies[natn[gc][k]];
+        }
+      }
+    }
+    OpenMXGpuTask task={0};task.count=n;task.parameters=&p;task.parameter_bytes=sizeof(p);task.inputs=6;task.outputs=1;task.kernel=SetProCapacity_HVNA_capacity_kernel;
+    task.view[0]=(OpenMXGpuTaskView){a,0,0,offset,sizeof(float)};
+    task.view[1]=(OpenMXGpuTaskView){b,0,0,offset,sizeof(float)};
+    task.view[2]=(OpenMXGpuTaskView){species,0,0,species_offset,sizeof(int)};
+    task.view[3]=(OpenMXGpuTaskView){g->ene,(size_t)SpeciesNum*p.num_rvna*sizeof(double),0};
+    task.view[4]=(OpenMXGpuTaskView){g->l2p1,(size_t)p.num_rvna*sizeof(int),0};
+    task.view[5]=(OpenMXGpuTaskView){damp,0,sizeof(double)};task.view[6]=(OpenMXGpuTaskView){out,0,sizeof(double)};
+    openmx_gpu_task_execute(mpi_comm_level1,&task,1,"VNA-contraction-capacity");
+    for(size_t i=0;i<n;i++)HVNA[mc][j][(row+i)/nh][(row+i)%nh]=out[i];
+    free(offset);free(species_offset);free(a);free(b);free(species);free(damp);free(out);
+    if(remaining){
+      row+=n;
+      if(row==(size_t)Spe_Total_NO[WhatSpecies[gc]]*nh){row=0;if(++j>FNAN[gc]){j=0;mc++;}}
+    }
+  }
+}
+
+
+static int SetPro_hvna_native=0;
+static int SetPro_HVNA_DispatchBegin(Type_DS_VNA *****v,int *a,int *b,int n)
+{
+    SetPro_hvna_native=0;
+    if(!openmx_gpu_capacity_test_recovery() && !openmx_gpu_workers_requested())SetPro_hvna_native=SetPro_HVNA_GpuBegin(v,a,b,n);
+    if(SetPro_hvna_native)return 1;
+    return SetProCapacity_HVNA_GpuBegin(v,a,b,n);
+}
+static void SetPro_HVNA_DispatchArchive(Type_DS_VNA *****v,int m,int g)
+{
+    if(SetPro_hvna_native)SetPro_HVNA_GpuArchiveHalo(v,m,g);
+    else SetProCapacity_HVNA_GpuArchiveHalo(v,m,g);
+}
+static void SetPro_HVNA_DispatchRun(double ****h)
+{
+    if(SetPro_hvna_native){
+        for(int turn=0;turn<SetPro_gpu.turns;turn++){
+            if(turn==SetPro_gpu.turn)SetPro_HVNA_GpuRun(h);
+            if(SetPro_gpu.turns>1)MPI_Barrier(mpi_comm_level1);
+        }
+        SetPro_HVNA_GpuEnd();
+    }else{
+        SetProCapacity_HVNA_GpuRun(h);
+        SetProCapacity_HVNA_GpuEnd();
+    }
+    SetPro_hvna_native=0;
+}
+
 /* Batched device construction of DS_VNA (the <chi0|P> expansion and
    its derivatives).
 
@@ -965,7 +1726,8 @@ static void SetPro_Spherical_Bessel2_dev(double x, int lmax, double *sb, double 
 
   else {
 
-    for ( n=0; n<=lmax; n++ ){
+    /* dsb[lmax] also reads sb[lmax+1], including at x == 0. */
+    for ( n=0; n<=lmax+1; n++ ){
       sb[n] = 0.0;
     }
     sb[0] = 1.0;
@@ -1065,7 +1827,9 @@ static int SetPro_DSVNA_GpuBegin(int *VNA_List, int *VNA_List2, int Num_RVNA,
 
   memset(g,0,sizeof(*g));
 
-  if (scf_eigen_lib_flag!=GPUSOLVER) return 0;
+  int requested=scf_eigen_lib_flag==GPUSOLVER;
+  MPI_Allreduce(MPI_IN_PLACE,&requested,1,MPI_INT,MPI_MIN,mpi_comm_level1);
+  if (!requested) return 0;
   if (!SetPro_gpu_stage_enabled("OPENMX_SETPRO_DSVNA_GPU")) return 0;
 
   MPI_Comm_split_type(mpi_comm_level1,MPI_COMM_TYPE_SHARED,0,MPI_INFO_NULL,&node_comm);
@@ -1073,11 +1837,6 @@ static int SetPro_DSVNA_GpuBegin(int *VNA_List, int *VNA_List2, int Num_RVNA,
   MPI_Comm_rank(node_comm,&node_rank);
   if (node_ranks<1) node_ranks = 1;
   MPI_Comm_free(&node_comm);
-
-  /* Cheap gate only.  The real device-memory decision cannot be made here --
-     every extent the omp target data region is sized from is still unknown --
-     so it happens at the end of this function, once the tables are built. */
-  if (OpenMX_GpuMemGetInfo(&free_bytes,&total_bytes)!=hipSuccess) return 0;
 
   g->num_proj = (List_YOUSO[35]+1)*(List_YOUSO[35]+1)*List_YOUSO[34];
   g->num_rvna = Num_RVNA;
@@ -1227,61 +1986,9 @@ static int SetPro_DSVNA_GpuBegin(int *VNA_List, int *VNA_List2, int Num_RVNA,
     }
   }
 
-  /* Device-memory decision.  It has to be here rather than on entry: cmb_max,
-     lfi_max, mn_max, num_rvna and c2r_off are only settled by the tables built
-     above, and the omp target data region in SetPro_DSVNA_GpuRun is sized
-     entirely from them.  The check this replaces ran on entry against a flat
-     1 GiB placeholder, so a large run could walk into a multi-GiB device
-     mapping and the OpenMP runtime aborted every rank -- there is no way to
-     catch that failure once the region is entered, which is why the estimate
-     has to be right rather than merely present.
-     Divided by node_ranks because every rank on this node shares the one GPU;
-     concurrent ranks do not pool their memory. */
-  {
-    const size_t reserve = (size_t)256*1024*1024;
-    size_t need, budget = 0;
-    g->chunk = SETPRO_DSVNA_CHUNK;
-    if (OpenMX_GpuMemGetInfo(&free_bytes,&total_bytes)==hipSuccess && free_bytes>reserve)
-      budget = (free_bytes - reserve)/(size_t)node_ranks;
-    need = SetPro_DSVNA_DeviceBytes(g);
-    /* Every pair is independent. Reduce transient buffers before rejecting
-       the device path just because the fixed 256-pair batch is too large. */
-    while (g->chunk>1 && budget<=need) {
-      g->chunk /= 2;
-      need = SetPro_DSVNA_DeviceBytes(g);
-    }
-
-    SetPro_note("DS_VNA GPU admission",
-                "need %.0f MiB at pair batch %d, budget %.0f MiB (free %.0f MiB less %.0f MiB reserve "
-                "over %d rank(s)): %s",
-                (double)need/1048576.0,g->chunk,(double)budget/1048576.0,(double)free_bytes/1048576.0,
-                (double)reserve/1048576.0,node_ranks,budget<=need ? "CPU fallback" : "admitted");
-
-    if (budget<=need){
-
-      if (node_rank==0 && 2<=level_stdout){
-        fprintf(stderr,
-                "Set_ProExpn_VNA DS_VNA GPU: needs %.3f GiB per rank, %d rank(s) share "
-                "this device and only %.3f GiB is free; CPU fallback.\n",
-                (double)need/1073741824.0,node_ranks,
-                (double)free_bytes/1073741824.0);
-        fflush(stderr);
-      }
-
-      /* GpuEnd early-returns unless enabled, so flag it to release the tables. */
-      g->enabled = 1;
-      SetPro_DSVNA_GpuEnd();
-      return 0;
-    }
-    if (node_rank==0 && g->chunk<SETPRO_DSVNA_CHUNK) {
-      if (2 <= level_stdout) {
-          fprintf(stderr,"Set_ProExpn_VNA DS_VNA GPU: pair batch %d, %.3f GiB per rank within %.3f GiB budget.\n",
-                  g->chunk,(double)need/1073741824.0,(double)budget/1073741824.0);
-          fflush(stderr);
-      }
-    }
-  }
-
+  /* The common task allocator selects owner, local peers, remote nodes,
+     then CPU from the exact batch footprint. Keep host lookup tables. */
+  g->chunk = SETPRO_DSVNA_CHUNK;
   g->enabled = 1;
   return 1;
 }
@@ -1308,164 +2015,59 @@ static void SetPro_DSVNA_GpuEnd(void)
 }
 
 /* run the whole (Mc_AN,h_AN) list in chunks and store into DS_VNA */
-static void SetPro_DSVNA_GpuRun(Type_DS_VNA *****DS_VNA, int OneD_Nloop,
-                                int *OneD2Mc_AN, int *OneD2h_AN)
+typedef struct {int mesh,num_proj,num_rvna,lfi_max,cmb_max,blk_max,l0max_all,l1max,mn_max;} SetProDSVNACapacityParameters;
+static void SetPro_DSVNA_capacity_kernel(size_t first,size_t count,const void *parameters,void *const v[],int gpu)
 {
-  SetProGpu2Context *g = &SetPro_gpu2;
-  const int num_proj = g->num_proj;
-  const int num_rvna = g->num_rvna;
-  const int lfi_max = g->lfi_max;
-  const int cmb_max = g->cmb_max;
-  const int blk_max = g->blk_max;
-  const int l0max_all = g->l0max_all;
-  const int l1max = g->l1max;
-  const int nM0 = 2*l0max_all + 1;
-  const int nM1 = 2*l1max + 1;
-  const int nLL = lfi_max + 1;
-  const int nm = 2*lfi_max + 1;
-  const int nsh = (lfi_max+1)*(lfi_max+1);
-  const int mn_max = g->mn_max;
-  /* Same batch size used by the device-memory preflight. */
-  const int CHUNK = g->chunk;
-  int chunk_start;
+ (void)first;const SetProDSVNACapacityParameters *p=parameters;const int np=(int)count;
+ const int num_proj=p->num_proj;
+ const int num_rvna=p->num_rvna;
+ const int lfi_max=p->lfi_max;
+ const int cmb_max=p->cmb_max;
+ const int blk_max=p->blk_max;
+ const int l0max_all=p->l0max_all;
+ const int l1max=p->l1max;
+ const int mn_max=p->mn_max;
+ const int mesh=p->mesh;
+ const int nM0=2*l0max_all+1,nM1=2*l1max+1,nLL=lfi_max+1,nm=2*lfi_max+1,nsh=(lfi_max+1)*(lfi_max+1);
+ const size_t elem_per_pair=(size_t)cmb_max*nM0*num_rvna*nM1;
+ double *pro00=v[0];
+ double *pro01=v[1];
+ double *vnab=v[2];
+ double *gnt=v[3];
+ double *c2r=v[4];
+ int *c2r_off=v[5];
+ int *sp_lfi=v[6];
+ int *sp_ncmb=v[7];
+ int *cmb_L0=v[8];
+ int *cmb_num0=v[9];
+ int *vna_L1=v[10];
+ int *vna_num1=v[11];
+ double *GL_NormK=v[12];
+ double *pr_r=v[13];
+ double *pr_siT=v[14];
+ double *pr_coT=v[15];
+ double *pr_siP=v[16];
+ double *pr_coP=v[17];
+ int *pr_spe=v[18];
+ int *pr_hwan=v[19];
+ int *pr_h0=v[20];
+ int *pr_tno=v[21];
+ double *sh_tab=v[22];
+ float *outbuf=v[23];
+ double *sphb=v[24];
+ double *sphbp=v[25];
+ double *sum0=v[26];
+ double *sumr0=v[27];
+ double *tmpnl=v[28];
 
-  double *pr_r,*pr_siT,*pr_coT,*pr_siP,*pr_coP;
-  int *pr_spe,*pr_hwan,*pr_h0,*pr_tno;
-  double *sh_tab;
-  double *sphb,*sphbp;
-  double *sum0,*sumr0;
-  double *tmpnl;
-  float *outbuf;
-
-  const size_t sphb_len = (size_t)CHUNK*nLL*GL_Mesh;
-  const size_t sum_len = (size_t)CHUNK*nLL*cmb_max*num_rvna;
-  const size_t elem_per_pair = (size_t)cmb_max*nM0*num_rvna*nM1;
-  const size_t tmpnl_len = (size_t)CHUNK*elem_per_pair*8; /* 4 arrays x complex */
-  const size_t out_len = (size_t)CHUNK*4*(size_t)g->mn_max;
-
-  if (!g->enabled || OneD_Nloop<=0) return;
-
-  pr_r = (double*)SetPro_checked_malloc(sizeof(double)*CHUNK);
-  pr_siT = (double*)SetPro_checked_malloc(sizeof(double)*CHUNK);
-  pr_coT = (double*)SetPro_checked_malloc(sizeof(double)*CHUNK);
-  pr_siP = (double*)SetPro_checked_malloc(sizeof(double)*CHUNK);
-  pr_coP = (double*)SetPro_checked_malloc(sizeof(double)*CHUNK);
-  pr_spe = (int*)SetPro_checked_malloc(sizeof(int)*CHUNK);
-  pr_hwan = (int*)SetPro_checked_malloc(sizeof(int)*CHUNK);
-  pr_h0 = (int*)SetPro_checked_malloc(sizeof(int)*CHUNK);
-  pr_tno = (int*)SetPro_checked_malloc(sizeof(int)*CHUNK);
-  sh_tab = (double*)SetPro_checked_malloc(sizeof(double)*(size_t)CHUNK*nsh*6);
-  sphb = (double*)SetPro_checked_malloc(sizeof(double)*sphb_len);
-  sphbp = (double*)SetPro_checked_malloc(sizeof(double)*sphb_len);
-  sum0 = (double*)SetPro_checked_malloc(sizeof(double)*sum_len);
-  sumr0 = (double*)SetPro_checked_malloc(sizeof(double)*sum_len);
-  tmpnl = (double*)SetPro_checked_malloc(sizeof(double)*tmpnl_len);
-  outbuf = (float*)SetPro_checked_malloc(sizeof(float)*out_len);
-
-  {
-    double *pro00 = g->pro00;
-    double *pro01 = g->pro01;
-    double *vnab = g->vnab;
-    double *gnt = g->gnt;
-    double *c2r = g->c2r;
-    int *c2r_off = g->c2r_off;
-    int *sp_lfi = g->sp_lfi;
-    int *sp_ncmb = g->sp_ncmb;
-    int *cmb_L0 = g->cmb_L0;
-    int *cmb_num0 = g->cmb_num0;
-    int *vna_L1 = g->vna_L1;
-    int *vna_num1 = g->vna_num1;
-    const size_t pro_len = (size_t)SpeciesNum*cmb_max*GL_Mesh;
-    const size_t vnab_len = (size_t)SpeciesNum*num_rvna*GL_Mesh;
-    const size_t gnt_len = (size_t)(l0max_all+1)*nM0*(l1max+1)*nM1*nLL*nm;
-    const size_t c2r_len = 2*(size_t)c2r_off[((l0max_all<l1max)?l1max:l0max_all)+1];
-    const int lc_max = (l0max_all<l1max) ? l1max : l0max_all;
-    double dsvna_t0,dsvna_t1;
-
-    dtime(&dsvna_t0);
-    SetPro_note("DS_VNA GPU batch begin","%d pairs in batches of %d, estimated %.0f MiB on the device",
-                OneD_Nloop,CHUNK,(double)SetPro_DSVNA_DeviceBytes(g)/1048576.0);
-
-#pragma omp target data map(to:pro00[0:pro_len], pro01[0:pro_len], vnab[0:vnab_len], \
-                        gnt[0:gnt_len], c2r[0:c2r_len], c2r_off[0:lc_max+2], \
-                        sp_lfi[0:SpeciesNum], sp_ncmb[0:SpeciesNum], \
-                        cmb_L0[0:SpeciesNum*cmb_max], cmb_num0[0:SpeciesNum*cmb_max], \
-                        vna_L1[0:num_rvna], vna_num1[0:num_rvna], \
-                        GL_NormK[0:GL_Mesh]) \
-                 map(alloc:sphb[0:sphb_len], sphbp[0:sphb_len], \
-                        sum0[0:sum_len], sumr0[0:sum_len], tmpnl[0:tmpnl_len], \
-                        outbuf[0:out_len], \
-                        pr_r[0:CHUNK], pr_siT[0:CHUNK], pr_coT[0:CHUNK], \
-                        pr_siP[0:CHUNK], pr_coP[0:CHUNK], pr_spe[0:CHUNK], \
-                        pr_hwan[0:CHUNK], pr_h0[0:CHUNK], pr_tno[0:CHUNK], \
-                        sh_tab[0:(size_t)CHUNK*nsh*6])
-    for (chunk_start=0; chunk_start<OneD_Nloop; chunk_start+=CHUNK){
-
-      const int np = ((OneD_Nloop-chunk_start)<CHUNK) ? (OneD_Nloop-chunk_start) : CHUNK;
-      int pp,LLh,mh;
-
-      if (chunk_start==0) SetPro_note("DS_VNA GPU batch","device arrays mapped");
-
-      /* host: pair geometry and the spherical harmonics of every pair */
-
-#pragma omp parallel for schedule(dynamic) private(LLh,mh)
-      for (pp=0; pp<np; pp++){
-        int Mc_AN = OneD2Mc_AN[chunk_start+pp];
-        int h_AN = OneD2h_AN[chunk_start+pp];
-        int Gc_AN = M2G[Mc_AN];
-        int Cwan = WhatSpecies[Gc_AN];
-        int Gh_AN = natn[Gc_AN][h_AN];
-        int Rnh = ncn[Gc_AN][h_AN];
-        double S_co[3];
-        double dx,dy,dz,r,theta,phi;
-        double SH[2],dSHt[2],dSHp[2];
-
-        dx = Gxyz[Gh_AN][1] + atv[Rnh][1] - Gxyz[Gc_AN][1];
-        dy = Gxyz[Gh_AN][2] + atv[Rnh][2] - Gxyz[Gc_AN][2];
-        dz = Gxyz[Gh_AN][3] + atv[Rnh][3] - Gxyz[Gc_AN][3];
-
-        xyz2spherical(dx,dy,dz,0.0,0.0,0.0,S_co);
-        r = S_co[0];
-        theta = S_co[1];
-        phi = S_co[2];
-        if (r<1.0e-10) r = 1.0e-10;
-
-        pr_r[pp] = r;
-        pr_siT[pp] = sin(theta);
-        pr_coT[pp] = cos(theta);
-        pr_siP[pp] = sin(phi);
-        pr_coP[pp] = cos(phi);
-        pr_spe[pp] = Cwan;
-        pr_hwan[pp] = WhatSpecies[Gh_AN];
-        pr_h0[pp] = (h_AN==0);
-        pr_tno[pp] = Spe_Total_NO[Cwan];
-
-        for (LLh=0; LLh<=sp_lfi[Cwan]; LLh++){
-          for (mh=-LLh; mh<=LLh; mh++){
-            size_t off = ((size_t)pp*nsh + (size_t)LLh*LLh + (mh+LLh))*6;
-
-            ComplexSH(LLh,mh,theta,phi,SH,dSHt,dSHp);
-            sh_tab[off+0] = SH[0];
-            sh_tab[off+1] = -SH[1];
-            sh_tab[off+2] = dSHt[0];
-            sh_tab[off+3] = -dSHt[1];
-            sh_tab[off+4] = dSHp[0];
-            sh_tab[off+5] = -dSHp[1];
-          }
-        }
-      }
-
-#pragma omp target update to(pr_r[0:np], pr_siT[0:np], pr_coT[0:np], \
-                          pr_siP[0:np], pr_coP[0:np], pr_spe[0:np], \
-                          pr_hwan[0:np], pr_h0[0:np], pr_tno[0:np], \
-                          sh_tab[0:(size_t)np*nsh*6])
-
+#pragma omp target teams distribute parallel for is_device_ptr(outbuf) if(gpu)
+ for(size_t i=0;i<(size_t)np*4*mn_max;i++)outbuf[i]=0;
       /* K0: spherical Bessel tables of every (pair, GL point) */
 
-#pragma omp target teams distribute parallel for
-      for (int pt=0; pt<np*GL_Mesh; pt++){
-        const int pp2 = pt/GL_Mesh;
-        const int i = pt - pp2*GL_Mesh;
+#pragma omp target teams distribute parallel for thread_limit(128) is_device_ptr(pr_r,pr_spe,sp_lfi,GL_NormK,sphb,sphbp) if(gpu)
+      for (int pt=0; pt<np*mesh; pt++){
+        const int pp2 = pt/mesh;
+        const int i = pt - pp2*mesh;
         const int lfi = sp_lfi[pr_spe[pp2]];
         double tb[SETPRO_BES_LMAX];
         double tbp[SETPRO_BES_LMAX];
@@ -1473,14 +2075,14 @@ static void SetPro_DSVNA_GpuRun(Type_DS_VNA *****DS_VNA, int OneD_Nloop,
 
         SetPro_Spherical_Bessel2_dev(GL_NormK[i]*pr_r[pp2],lfi,tb,tbp);
         for (LL=0; LL<=lfi; LL++){
-          sphb [((size_t)pp2*nLL + LL)*GL_Mesh + i] = tb[LL];
-          sphbp[((size_t)pp2*nLL + LL)*GL_Mesh + i] = tbp[LL];
+          sphb [((size_t)pp2*nLL + LL)*mesh + i] = tb[LL];
+          sphbp[((size_t)pp2*nLL + LL)*mesh + i] = tbp[LL];
         }
       }
 
       /* K1: Gauss-Legendre quadrature sums */
 
-#pragma omp target teams distribute parallel for
+#pragma omp target teams distribute parallel for thread_limit(128) is_device_ptr(pr_spe,pr_hwan,pr_h0,sp_lfi,sp_ncmb,pro00,pro01,vnab,sphb,sphbp,sum0,sumr0) if(gpu)
       for (size_t q=0; q<(size_t)np*nLL*cmb_max*num_rvna; q++){
         const int Lq = (int)(q % num_rvna);
         const int cq = (int)((q/num_rvna) % cmb_max);
@@ -1489,15 +2091,15 @@ static void SetPro_DSVNA_GpuRun(Type_DS_VNA *****DS_VNA, int OneD_Nloop,
         const int spe = pr_spe[pp2];
 
         if (LLq<=sp_lfi[spe] && cq<sp_ncmb[spe]){
-          const double *p00 = pro00 + ((size_t)spe*cmb_max+cq)*GL_Mesh;
-          const double *p01 = pro01 + ((size_t)spe*cmb_max+cq)*GL_Mesh;
-          const double *vb = vnab + ((size_t)pr_hwan[pp2]*num_rvna+Lq)*GL_Mesh;
-          const double *sb = sphb + ((size_t)pp2*nLL + LLq)*GL_Mesh;
-          const double *sbp = sphbp + ((size_t)pp2*nLL + LLq)*GL_Mesh;
+          const double *p00 = pro00 + ((size_t)spe*cmb_max+cq)*mesh;
+          const double *p01 = pro01 + ((size_t)spe*cmb_max+cq)*mesh;
+          const double *vb = vnab + ((size_t)pr_hwan[pp2]*num_rvna+Lq)*mesh;
+          const double *sb = sphb + ((size_t)pp2*nLL + LLq)*mesh;
+          const double *sbp = sphbp + ((size_t)pp2*nLL + LLq)*mesh;
           double tmp1 = 0.0,tmp2 = 0.0;
           int i;
 
-          for (i=0; i<GL_Mesh; i++){
+          for (i=0; i<mesh; i++){
             tmp1 += (p00[i]*sb[i])*vb[i];
             tmp2 += (p01[i]*sbp[i])*vb[i];
           }
@@ -1513,7 +2115,7 @@ static void SetPro_DSVNA_GpuRun(Type_DS_VNA *****DS_VNA, int OneD_Nloop,
 
       /* K2: assemble TmpNL (the LL,m sums with Gaunt x Y_lm weights) */
 
-#pragma omp target teams distribute parallel for
+#pragma omp target teams distribute parallel for thread_limit(128) is_device_ptr(pr_spe,sp_lfi,sp_ncmb,cmb_L0,vna_L1,gnt,sh_tab,sum0,sumr0,tmpnl) if(gpu)
       for (size_t e=0; e<(size_t)np*elem_per_pair; e++){
         const int M1i = (int)(e % nM1);
         const int Lq = (int)((e/nM1) % num_rvna);
@@ -1599,7 +2201,7 @@ static void SetPro_DSVNA_GpuRun(Type_DS_VNA *****DS_VNA, int OneD_Nloop,
 
       /* K3: complex-to-real transforms and the DS_VNA elements */
 
-#pragma omp target teams distribute parallel for
+#pragma omp target teams distribute parallel for thread_limit(128) is_device_ptr(pr_spe,pr_h0,pr_r,pr_siT,pr_coT,pr_siP,pr_coP,pr_tno,sp_ncmb,cmb_L0,cmb_num0,vna_L1,vna_num1,c2r,c2r_off,tmpnl,outbuf) if(gpu)
       for (size_t e=0; e<(size_t)np*elem_per_pair; e++){
         const int M1i = (int)(e % nM1);
         const int Lq = (int)((e/nM1) % num_rvna);
@@ -1710,13 +2312,182 @@ static void SetPro_DSVNA_GpuRun(Type_DS_VNA *****DS_VNA, int OneD_Nloop,
         }
       }
 
-#pragma omp target update from(outbuf[0:(size_t)np*4*(size_t)mn_max])
+}
 
-      if (np > 0) SetPro_gpu_used = 1;
+static void SetPro_DSVNA_GpuRun_Part(Type_DS_VNA *****DS_VNA, int OneD_Nloop, int *OneD2Mc_AN, int *OneD2h_AN, SetProGpu2Context *g)
+{
+  const int num_proj = g->num_proj;
+  const int num_rvna = g->num_rvna;
+  const int lfi_max = g->lfi_max;
+  const int cmb_max = g->cmb_max;
+  const int blk_max = g->blk_max;
+  const int l0max_all = g->l0max_all;
+  const int l1max = g->l1max;
+  const int nM0 = 2*l0max_all + 1;
+  const int nM1 = 2*l1max + 1;
+  const int nLL = lfi_max + 1;
+  const int nm = 2*lfi_max + 1;
+  const int nsh = (lfi_max+1)*(lfi_max+1);
+  const int mn_max = g->mn_max;
+  /* same constant SetPro_DSVNA_DeviceBytes sized the pre-flight check with */
+  const int CHUNK = g->chunk;
+  int chunk_start;
+
+  double *pr_r,*pr_siT,*pr_coT,*pr_siP,*pr_coP;
+  int *pr_spe,*pr_hwan,*pr_h0,*pr_tno;
+  double *sh_tab;
+  double *sphb,*sphbp;
+  double *sum0,*sumr0;
+  double *tmpnl;
+  float *outbuf;
+
+  const size_t sphb_len = (size_t)CHUNK*nLL*GL_Mesh;
+  const size_t sum_len = (size_t)CHUNK*nLL*cmb_max*num_rvna;
+  const size_t elem_per_pair = (size_t)cmb_max*nM0*num_rvna*nM1;
+  const size_t tmpnl_len = (size_t)CHUNK*elem_per_pair*8; /* 4 arrays x complex */
+  const size_t out_len = (size_t)CHUNK*4*(size_t)g->mn_max;
+
+  if (!g->enabled) return;
+  int all_pairs=OneD_Nloop;
+  MPI_Allreduce(MPI_IN_PLACE,&all_pairs,1,MPI_INT,MPI_MAX,mpi_comm_level1);
+
+  pr_r = (double*)SetPro_checked_malloc(sizeof(double)*CHUNK);
+  pr_siT = (double*)SetPro_checked_malloc(sizeof(double)*CHUNK);
+  pr_coT = (double*)SetPro_checked_malloc(sizeof(double)*CHUNK);
+  pr_siP = (double*)SetPro_checked_malloc(sizeof(double)*CHUNK);
+  pr_coP = (double*)SetPro_checked_malloc(sizeof(double)*CHUNK);
+  pr_spe = (int*)SetPro_checked_malloc(sizeof(int)*CHUNK);
+  pr_hwan = (int*)SetPro_checked_malloc(sizeof(int)*CHUNK);
+  pr_h0 = (int*)SetPro_checked_malloc(sizeof(int)*CHUNK);
+  pr_tno = (int*)SetPro_checked_malloc(sizeof(int)*CHUNK);
+  sh_tab = (double*)SetPro_checked_malloc(sizeof(double)*(size_t)CHUNK*nsh*6);
+  sphb = NULL;
+  sphbp = NULL;
+  sum0 = NULL;
+  sumr0 = NULL;
+  tmpnl = NULL;
+  outbuf = (float*)SetPro_checked_malloc(sizeof(float)*out_len);
+
+  {
+    double *pro00 = g->pro00;
+    double *pro01 = g->pro01;
+    double *vnab = g->vnab;
+    double *gnt = g->gnt;
+    double *c2r = g->c2r;
+    int *c2r_off = g->c2r_off;
+    int *sp_lfi = g->sp_lfi;
+    int *sp_ncmb = g->sp_ncmb;
+    int *cmb_L0 = g->cmb_L0;
+    int *cmb_num0 = g->cmb_num0;
+    int *vna_L1 = g->vna_L1;
+    int *vna_num1 = g->vna_num1;
+    const size_t pro_len = (size_t)SpeciesNum*cmb_max*GL_Mesh;
+    const size_t vnab_len = (size_t)SpeciesNum*num_rvna*GL_Mesh;
+    const size_t gnt_len = (size_t)(l0max_all+1)*nM0*(l1max+1)*nM1*nLL*nm;
+    const size_t c2r_len = 2*(size_t)c2r_off[((l0max_all<l1max)?l1max:l0max_all)+1];
+    const int lc_max = (l0max_all<l1max) ? l1max : l0max_all;
+
+    double dsvna_t0;
+    dtime(&dsvna_t0);
+    SetPro_note("DS_VNA GPU batch begin","%d pairs in batches of %d, estimated %.0f MiB on the device",
+                OneD_Nloop,CHUNK,(double)SetPro_DSVNA_DeviceBytes(g)/1048576.0);
+
+    for (chunk_start=0; chunk_start<all_pairs; chunk_start+=CHUNK){
+
+      const int np = chunk_start>=OneD_Nloop?0:((OneD_Nloop-chunk_start)<CHUNK ? OneD_Nloop-chunk_start : CHUNK);
+      int pp,LLh,mh;
+
+      if (chunk_start==0) SetPro_note("DS_VNA GPU batch","device arrays mapped");
+
+      memset(sh_tab,0,(size_t)np*nsh*6*sizeof(double));
+
+      /* host: pair geometry and the spherical harmonics of every pair */
+
+#pragma omp parallel for if(!omp_in_parallel()) schedule(dynamic) private(LLh,mh)
+      for (pp=0; pp<np; pp++){
+        int Mc_AN = OneD2Mc_AN[chunk_start+pp];
+        int h_AN = OneD2h_AN[chunk_start+pp];
+        int Gc_AN = M2G[Mc_AN];
+        int Cwan = WhatSpecies[Gc_AN];
+        int Gh_AN = natn[Gc_AN][h_AN];
+        int Rnh = ncn[Gc_AN][h_AN];
+        double S_co[3];
+        double dx,dy,dz,r,theta,phi;
+        double SH[2],dSHt[2],dSHp[2];
+
+        dx = Gxyz[Gh_AN][1] + atv[Rnh][1] - Gxyz[Gc_AN][1];
+        dy = Gxyz[Gh_AN][2] + atv[Rnh][2] - Gxyz[Gc_AN][2];
+        dz = Gxyz[Gh_AN][3] + atv[Rnh][3] - Gxyz[Gc_AN][3];
+
+        xyz2spherical(dx,dy,dz,0.0,0.0,0.0,S_co);
+        r = S_co[0];
+        theta = S_co[1];
+        phi = S_co[2];
+        if (r<1.0e-10) r = 1.0e-10;
+
+        pr_r[pp] = r;
+        pr_siT[pp] = sin(theta);
+        pr_coT[pp] = cos(theta);
+        pr_siP[pp] = sin(phi);
+        pr_coP[pp] = cos(phi);
+        pr_spe[pp] = Cwan;
+        pr_hwan[pp] = WhatSpecies[Gh_AN];
+        pr_h0[pp] = (h_AN==0);
+        pr_tno[pp] = Spe_Total_NO[Cwan];
+
+        for (LLh=0; LLh<=sp_lfi[Cwan]; LLh++){
+          for (mh=-LLh; mh<=LLh; mh++){
+            size_t off = ((size_t)pp*nsh + (size_t)LLh*LLh + (mh+LLh))*6;
+
+            ComplexSH(LLh,mh,theta,phi,SH,dSHt,dSHp);
+            sh_tab[off+0] = SH[0];
+            sh_tab[off+1] = -SH[1];
+            sh_tab[off+2] = dSHt[0];
+            sh_tab[off+3] = -dSHt[1];
+            sh_tab[off+4] = dSHp[0];
+            sh_tab[off+5] = -dSHp[1];
+          }
+        }
+      }
+
+      SetProDSVNACapacityParameters parameters={GL_Mesh,g->num_proj,g->num_rvna,g->lfi_max,g->cmb_max,g->blk_max,g->l0max_all,g->l1max,g->mn_max};
+      OpenMXGpuTask task={0};task.count=np;task.inputs=23;task.outputs=1;task.scratch=5;
+      task.parameters=&parameters;task.parameter_bytes=sizeof(parameters);task.kernel=SetPro_DSVNA_capacity_kernel;
+      task.view[0]=(OpenMXGpuTaskView){pro00,(pro_len)*sizeof(double),0};
+      task.view[1]=(OpenMXGpuTaskView){pro01,(pro_len)*sizeof(double),0};
+      task.view[2]=(OpenMXGpuTaskView){vnab,(vnab_len)*sizeof(double),0};
+      task.view[3]=(OpenMXGpuTaskView){gnt,(gnt_len)*sizeof(double),0};
+      task.view[4]=(OpenMXGpuTaskView){c2r,(c2r_len)*sizeof(double),0};
+      task.view[5]=(OpenMXGpuTaskView){c2r_off,(lc_max+2)*sizeof(int),0};
+      task.view[6]=(OpenMXGpuTaskView){sp_lfi,(SpeciesNum)*sizeof(int),0};
+      task.view[7]=(OpenMXGpuTaskView){sp_ncmb,(SpeciesNum)*sizeof(int),0};
+      task.view[8]=(OpenMXGpuTaskView){cmb_L0,((size_t)SpeciesNum*cmb_max)*sizeof(int),0};
+      task.view[9]=(OpenMXGpuTaskView){cmb_num0,((size_t)SpeciesNum*cmb_max)*sizeof(int),0};
+      task.view[10]=(OpenMXGpuTaskView){vna_L1,(num_rvna)*sizeof(int),0};
+      task.view[11]=(OpenMXGpuTaskView){vna_num1,(num_rvna)*sizeof(int),0};
+      task.view[12]=(OpenMXGpuTaskView){GL_NormK,(GL_Mesh)*sizeof(double),0};
+      task.view[13]=(OpenMXGpuTaskView){pr_r,0,(1)*sizeof(double)};
+      task.view[14]=(OpenMXGpuTaskView){pr_siT,0,(1)*sizeof(double)};
+      task.view[15]=(OpenMXGpuTaskView){pr_coT,0,(1)*sizeof(double)};
+      task.view[16]=(OpenMXGpuTaskView){pr_siP,0,(1)*sizeof(double)};
+      task.view[17]=(OpenMXGpuTaskView){pr_coP,0,(1)*sizeof(double)};
+      task.view[18]=(OpenMXGpuTaskView){pr_spe,0,(1)*sizeof(int)};
+      task.view[19]=(OpenMXGpuTaskView){pr_hwan,0,(1)*sizeof(int)};
+      task.view[20]=(OpenMXGpuTaskView){pr_h0,0,(1)*sizeof(int)};
+      task.view[21]=(OpenMXGpuTaskView){pr_tno,0,(1)*sizeof(int)};
+      task.view[22]=(OpenMXGpuTaskView){sh_tab,0,((size_t)nsh*6)*sizeof(double)};
+      task.view[23]=(OpenMXGpuTaskView){outbuf,0,4*(size_t)mn_max*sizeof(float)};
+      task.view[24]=(OpenMXGpuTaskView){NULL,0,((size_t)nLL*GL_Mesh)*sizeof(double)};
+      task.view[25]=(OpenMXGpuTaskView){NULL,0,((size_t)nLL*GL_Mesh)*sizeof(double)};
+      task.view[26]=(OpenMXGpuTaskView){NULL,0,((size_t)nLL*cmb_max*num_rvna)*sizeof(double)};
+      task.view[27]=(OpenMXGpuTaskView){NULL,0,((size_t)nLL*cmb_max*num_rvna)*sizeof(double)};
+      task.view[28]=(OpenMXGpuTaskView){NULL,0,(elem_per_pair*8)*sizeof(double)};
+      openmx_gpu_task_execute(mpi_comm_level1,&task,1,"SetPro_DSVNA");
+
 
       /* host: scatter the chunk results into DS_VNA */
 
-#pragma omp parallel for schedule(dynamic)
+#pragma omp parallel for if(!omp_in_parallel()) schedule(dynamic)
       for (pp=0; pp<np; pp++){
         int Mc_AN = OneD2Mc_AN[chunk_start+pp];
         int h_AN = OneD2h_AN[chunk_start+pp];
@@ -1735,8 +2506,11 @@ static void SetPro_DSVNA_GpuRun(Type_DS_VNA *****DS_VNA, int OneD_Nloop,
 
     } /* chunk_start */
 
-    dtime(&dsvna_t1);
-    SetPro_note("DS_VNA GPU batch end","%.2f s",dsvna_t1-dsvna_t0);
+    {
+      double t1;
+      dtime(&t1);
+      SetPro_note("DS_VNA GPU batch end","%.2f s",t1-dsvna_t0);
+    }
   }
 
   free(outbuf);
@@ -1756,6 +2530,9 @@ static void SetPro_DSVNA_GpuRun(Type_DS_VNA *****DS_VNA, int OneD_Nloop,
   free(pr_siT);
   free(pr_r);
 }
+static void SetPro_DSVNA_GpuRun(Type_DS_VNA *****matrix,int count,int *mc,int *h)
+{SetPro_DSVNA_GpuRun_Part(matrix,count,mc,h,&SetPro_gpu2);}
+
 
 /* ------------------------------------------------------------------ */
 /* Batched device construction of HVNA2 / HVNA3 (the one-centre PAO
@@ -1841,7 +2618,9 @@ static int SetPro_VNA23_GpuBegin(void)
   memset(g,0,sizeof(*g));
   g->chunk = SETPRO_VNA23_CHUNK;
 
-  if (scf_eigen_lib_flag!=GPUSOLVER) return 0;
+  int requested=scf_eigen_lib_flag==GPUSOLVER;
+  MPI_Allreduce(MPI_IN_PLACE,&requested,1,MPI_INT,MPI_MIN,mpi_comm_level1);
+  if (!requested) return 0;
   if (!SetPro_gpu_stage_enabled("OPENMX_SETPRO_VNA23_GPU")) return 0;
 
   MPI_Comm_split_type(mpi_comm_level1,MPI_COMM_TYPE_SHARED,0,MPI_INFO_NULL,&node_comm);
@@ -1849,21 +2628,6 @@ static int SetPro_VNA23_GpuBegin(void)
   MPI_Comm_rank(node_comm,&node_rank);
   if (node_ranks<1) node_ranks = 1;
   MPI_Comm_free(&node_comm);
-
-  /* Cheap gate only: the footprint is known once the tables below exist,
-     so the real decision follows them.  Per rank, no collective. */
-  if (OpenMX_GpuMemGetInfo(&free_bytes,&total_bytes)!=hipSuccess) return 0;
-  {
-    const size_t reserve = (size_t)256*1024*1024;
-    const size_t floor_bytes = (size_t)64*1024*1024;
-    const int admitted = !(free_bytes<=reserve || (free_bytes - reserve)/(size_t)node_ranks<=floor_bytes);
-
-    SetPro_note("HVNA2/3 GPU gate","(free %.0f MiB less %.0f MiB reserve) over %d rank(s) against a "
-                "%.0f MiB floor: %s",
-                (double)free_bytes/1048576.0,(double)reserve/1048576.0,node_ranks,
-                (double)floor_bytes/1048576.0,admitted ? "building the tables" : "CPU fallback");
-    if (!admitted) return 0;
-  }
 
   g->sp_lfi = (int*)SetPro_checked_malloc(sizeof(int)*SpeciesNum);
   g->sp_ncmb = (int*)SetPro_checked_malloc(sizeof(int)*SpeciesNum);
@@ -2004,48 +2768,9 @@ static int SetPro_VNA23_GpuBegin(void)
     }
   }
 
-  /* The real decision, as for the DS_VNA batch: the footprint of the data
-     region against this rank's share of the free memory, the pair batch
-     halved before the device is abandoned.  Every large term of the region
-     scales with the batch; the tables are a few MiB. */
-  {
-    const size_t reserve = (size_t)256*1024*1024;
-    size_t need,budget = 0;
-
-    if (OpenMX_GpuMemGetInfo(&free_bytes,&total_bytes)==hipSuccess && free_bytes>reserve)
-      budget = (free_bytes - reserve)/(size_t)node_ranks;
-    need = SetPro_VNA23_DeviceBytes(g);
-    while (g->chunk>1 && budget<=need){
-      g->chunk /= 2;
-      need = SetPro_VNA23_DeviceBytes(g);
-    }
-
-    SetPro_note("HVNA2/3 GPU admission",
-                "need %.0f MiB at pair batch %d, budget %.0f MiB (free %.0f MiB less %.0f MiB reserve "
-                "over %d rank(s)): %s",
-                (double)need/1048576.0,g->chunk,(double)budget/1048576.0,(double)free_bytes/1048576.0,
-                (double)reserve/1048576.0,node_ranks,budget<=need ? "CPU fallback" : "admitted");
-
-    if (budget<=need){
-      if (node_rank==0 && 2<=level_stdout){
-        fprintf(stderr,
-                "Set_ProExpn_VNA HVNA2/HVNA3 GPU: needs %.3f GiB per rank, %d rank(s) share "
-                "this device and only %.3f GiB is free; CPU fallback.\n",
-                (double)need/1073741824.0,node_ranks,(double)free_bytes/1073741824.0);
-        fflush(stderr);
-      }
-      /* GpuEnd early-returns unless enabled, so flag it to release the tables. */
-      g->enabled = 1;
-      SetPro_VNA23_GpuEnd();
-      return 0;
-    }
-    if (node_rank==0 && g->chunk<SETPRO_VNA23_CHUNK && 2<=level_stdout){
-      fprintf(stderr,"Set_ProExpn_VNA HVNA2/HVNA3 GPU: pair batch %d, %.3f GiB per rank within %.3f GiB budget.\n",
-              g->chunk,(double)need/1073741824.0,(double)budget/1073741824.0);
-      fflush(stderr);
-    }
-  }
-
+  /* The common task allocator selects owner, local peers, remote nodes,
+     then CPU from the exact batch footprint. Keep host lookup tables. */
+  g->chunk = SETPRO_VNA23_CHUNK;
   g->enabled = 1;
   return 1;
 }
@@ -2070,156 +2795,54 @@ static void SetPro_VNA23_GpuEnd(void)
 }
 
 /* run VNA2 (mirror==0) or VNA3 (mirror==1) in pair chunks */
-static void SetPro_VNA23_GpuRun(double *****HVNA23, int mirror, int OneD_Nloop,
-                                int *OneD2Mc_AN, int *OneD2h_AN)
+typedef struct {int mesh,l0max,lfi_max,cmb_max,mn_max,tno_max;double Dk;} SetProVNA23CapacityParameters;
+static void SetPro_VNA23_capacity_kernel(size_t first,size_t count,const void *parameters,void *const v[],int gpu)
 {
-  SetProGpu3Context *g = &SetPro_gpu3;
-  const int l0max = g->l0max;
-  const int lfi_max = g->lfi_max;
-  const int cmb_max = g->cmb_max;
-  const int mn_max = g->mn_max;
-  const int tno_max = g->tno_max;
-  const int nM = 2*l0max + 1;
-  const int nLL = lfi_max + 1;
-  const int nsh = (lfi_max+1)*(lfi_max+1);
-  const int CHUNK = g->chunk;   /* the admitted batch SetPro_VNA23_GpuBegin sized the region with */
-  const double Dk = PAO_Nkmax - Radial_kmin;
-  int chunk_start;
-  double vna23_t0,vna23_t1;
+ (void)first;const SetProVNA23CapacityParameters *p=parameters;const int np=(int)count;
+ const int l0max=p->l0max;
+ const int lfi_max=p->lfi_max;
+ const int cmb_max=p->cmb_max;
+ const int mn_max=p->mn_max;
+ const int tno_max=p->tno_max;
+ const int mesh=p->mesh;
+ const int nM=2*l0max+1,nLL=lfi_max+1,nsh=(lfi_max+1)*(lfi_max+1);
+ const size_t elem_per_pair=(size_t)cmb_max*nM*cmb_max*nM;
+ const double Dk=p->Dk;
+ double *crude=v[0];
+ double *prod=v[1];
+ double *gnt2=v[2];
+ double *c2r=v[3];
+ int *c2r_off=v[4];
+ int *sp_lfi=v[5];
+ int *sp_ncmb=v[6];
+ int *cmb_L0=v[7];
+ int *cmb_num0=v[8];
+ double *GL_NormK=v[9];
+ double *GL_Weight=v[10];
+ double *pr_r=v[11];
+ double *pr_siT=v[12];
+ double *pr_coT=v[13];
+ double *pr_siP=v[14];
+ double *pr_coP=v[15];
+ int *pr_spe=v[16];
+ int *pr_vspe=v[17];
+ int *pr_h0=v[18];
+ double *sh_tab=v[19];
+ double *outbuf=v[20];
+ double *sphb=v[21];
+ double *sphbp=v[22];
+ double *sum0=v[23];
+ double *sumr0=v[24];
+ double *tmpnl=v[25];
 
-  double *pr_r,*pr_siT,*pr_coT,*pr_siP,*pr_coP;
-  int *pr_spe,*pr_vspe,*pr_h0;
-  double *sh_tab;
-  double *sphb,*sphbp;
-  double *sum0,*sumr0;
-  double *tmpnl;
-  double *outbuf;
-
-  const size_t sphb_len = (size_t)CHUNK*nLL*GL_Mesh;
-  const size_t sum_len = (size_t)CHUNK*nLL*cmb_max*cmb_max;
-  const size_t elem_per_pair = (size_t)cmb_max*nM*cmb_max*nM;
-  const size_t tmpnl_len = (size_t)CHUNK*elem_per_pair*8;
-  const size_t out_len = (size_t)CHUNK*4*(size_t)mn_max;
-
-  if (!g->enabled || OneD_Nloop<=0) return;
-
-  dtime(&vna23_t0);
-  SetPro_note("HVNA2/3 GPU batch begin","HVNA%d: %d pairs in batches of %d",mirror ? 3 : 2,OneD_Nloop,CHUNK);
-
-  pr_r = (double*)SetPro_checked_malloc(sizeof(double)*CHUNK);
-  pr_siT = (double*)SetPro_checked_malloc(sizeof(double)*CHUNK);
-  pr_coT = (double*)SetPro_checked_malloc(sizeof(double)*CHUNK);
-  pr_siP = (double*)SetPro_checked_malloc(sizeof(double)*CHUNK);
-  pr_coP = (double*)SetPro_checked_malloc(sizeof(double)*CHUNK);
-  pr_spe = (int*)SetPro_checked_malloc(sizeof(int)*CHUNK);
-  pr_vspe = (int*)SetPro_checked_malloc(sizeof(int)*CHUNK);
-  pr_h0 = (int*)SetPro_checked_malloc(sizeof(int)*CHUNK);
-  sh_tab = (double*)SetPro_checked_malloc(sizeof(double)*(size_t)CHUNK*nsh*6);
-  sphb = (double*)SetPro_checked_malloc(sizeof(double)*sphb_len);
-  sphbp = (double*)SetPro_checked_malloc(sizeof(double)*sphb_len);
-  sum0 = (double*)SetPro_checked_malloc(sizeof(double)*sum_len);
-  sumr0 = (double*)SetPro_checked_malloc(sizeof(double)*sum_len);
-  tmpnl = (double*)SetPro_checked_malloc(sizeof(double)*tmpnl_len);
-  outbuf = (double*)SetPro_checked_malloc(sizeof(double)*out_len);
-
-  {
-    double *crude = g->crude;
-    double *prod = g->prod;
-    double *gnt2 = g->gnt2;
-    double *c2r = g->c2r;
-    int *c2r_off = g->c2r_off;
-    int *sp_lfi = g->sp_lfi;
-    int *sp_ncmb = g->sp_ncmb;
-    int *cmb_L0 = g->cmb_L0;
-    int *cmb_num0 = g->cmb_num0;
-    const size_t crude_len = (size_t)SpeciesNum*GL_Mesh;
-    const size_t prod_len = (size_t)SpeciesNum*cmb_max*cmb_max*nLL*GL_Mesh;
-    const size_t gnt2_len = (size_t)(l0max+1)*nM*(l0max+1)*nM*nLL;
-    const size_t c2r_len = 2*(size_t)c2r_off[l0max+1];
-
-#pragma omp target data map(to:crude[0:crude_len], prod[0:prod_len], gnt2[0:gnt2_len], \
-                        c2r[0:c2r_len], c2r_off[0:l0max+2], \
-                        sp_lfi[0:SpeciesNum], sp_ncmb[0:SpeciesNum], \
-                        cmb_L0[0:SpeciesNum*cmb_max], cmb_num0[0:SpeciesNum*cmb_max], \
-                        GL_NormK[0:GL_Mesh], GL_Weight[0:GL_Mesh]) \
-                 map(alloc:sphb[0:sphb_len], sphbp[0:sphb_len], \
-                        sum0[0:sum_len], sumr0[0:sum_len], tmpnl[0:tmpnl_len], \
-                        outbuf[0:out_len], \
-                        pr_r[0:CHUNK], pr_siT[0:CHUNK], pr_coT[0:CHUNK], \
-                        pr_siP[0:CHUNK], pr_coP[0:CHUNK], pr_spe[0:CHUNK], \
-                        pr_vspe[0:CHUNK], pr_h0[0:CHUNK], sh_tab[0:(size_t)CHUNK*nsh*6])
-    for (chunk_start=0; chunk_start<OneD_Nloop; chunk_start+=CHUNK){
-
-      const int np = ((OneD_Nloop-chunk_start)<CHUNK) ? (OneD_Nloop-chunk_start) : CHUNK;
-      int pp,LLh,mh;
-
-#pragma omp parallel for schedule(dynamic) private(LLh,mh)
-      for (pp=0; pp<np; pp++){
-        int Mc_AN = OneD2Mc_AN[chunk_start+pp];
-        int h_AN = OneD2h_AN[chunk_start+pp];
-        int Gc_AN = M2G[Mc_AN];
-        int Gh_AN = natn[Gc_AN][h_AN];
-        int Rnh = ncn[Gc_AN][h_AN];
-        int spe_pao,spe_vna;
-        double S_co[3];
-        double dx,dy,dz,r,theta,phi;
-        double SH[2],dSHt[2],dSHp[2];
-
-        if (mirror==0){
-          spe_pao = WhatSpecies[Gc_AN];
-          spe_vna = WhatSpecies[Gh_AN];
-          dx = Gxyz[Gh_AN][1] + atv[Rnh][1] - Gxyz[Gc_AN][1];
-          dy = Gxyz[Gh_AN][2] + atv[Rnh][2] - Gxyz[Gc_AN][2];
-          dz = Gxyz[Gh_AN][3] + atv[Rnh][3] - Gxyz[Gc_AN][3];
-        }
-        else{
-          spe_pao = WhatSpecies[Gh_AN];
-          spe_vna = WhatSpecies[Gc_AN];
-          dx = Gxyz[Gc_AN][1] - Gxyz[Gh_AN][1] - atv[Rnh][1];
-          dy = Gxyz[Gc_AN][2] - Gxyz[Gh_AN][2] - atv[Rnh][2];
-          dz = Gxyz[Gc_AN][3] - Gxyz[Gh_AN][3] - atv[Rnh][3];
-        }
-
-        xyz2spherical(dx,dy,dz,0.0,0.0,0.0,S_co);
-        r = S_co[0];
-        theta = S_co[1];
-        phi = S_co[2];
-        if (r<1.0e-10) r = 1.0e-10;
-
-        pr_r[pp] = r;
-        pr_siT[pp] = sin(theta);
-        pr_coT[pp] = cos(theta);
-        pr_siP[pp] = sin(phi);
-        pr_coP[pp] = cos(phi);
-        pr_spe[pp] = spe_pao;
-        pr_vspe[pp] = spe_vna;
-        pr_h0[pp] = (h_AN==0);
-
-        for (LLh=0; LLh<=sp_lfi[spe_pao]; LLh++){
-          for (mh=-LLh; mh<=LLh; mh++){
-            size_t off = ((size_t)pp*nsh + (size_t)LLh*LLh + (mh+LLh))*6;
-
-            ComplexSH(LLh,mh,theta,phi,SH,dSHt,dSHp);
-            sh_tab[off+0] = SH[0];
-            sh_tab[off+1] = SH[1];
-            sh_tab[off+2] = dSHt[0];
-            sh_tab[off+3] = dSHt[1];
-            sh_tab[off+4] = dSHp[0];
-            sh_tab[off+5] = dSHp[1];
-          }
-        }
-      }
-
-#pragma omp target update to(pr_r[0:np], pr_siT[0:np], pr_coT[0:np], \
-                          pr_siP[0:np], pr_coP[0:np], pr_spe[0:np], \
-                          pr_vspe[0:np], pr_h0[0:np], sh_tab[0:(size_t)np*nsh*6])
-
+#pragma omp target teams distribute parallel for is_device_ptr(outbuf) if(gpu)
+ for(size_t i=0;i<(size_t)np*4*mn_max;i++)outbuf[i]=0;
       /* K0: spherical Bessel tables */
 
-#pragma omp target teams distribute parallel for
-      for (int pt=0; pt<np*GL_Mesh; pt++){
-        const int pp2 = pt/GL_Mesh;
-        const int i = pt - pp2*GL_Mesh;
+#pragma omp target teams distribute parallel for thread_limit(128) is_device_ptr(pr_r,pr_spe,sp_lfi,GL_NormK,sphb,sphbp) if(gpu)
+      for (int pt=0; pt<np*mesh; pt++){
+        const int pp2 = pt/mesh;
+        const int i = pt - pp2*mesh;
         const int lfi = sp_lfi[pr_spe[pp2]];
         double tb[SETPRO_BES_LMAX];
         double tbp[SETPRO_BES_LMAX];
@@ -2227,14 +2850,14 @@ static void SetPro_VNA23_GpuRun(double *****HVNA23, int mirror, int OneD_Nloop,
 
         SetPro_Spherical_Bessel2_dev(GL_NormK[i]*pr_r[pp2],lfi,tb,tbp);
         for (LL=0; LL<=lfi; LL++){
-          sphb [((size_t)pp2*nLL + LL)*GL_Mesh + i] = tb[LL];
-          sphbp[((size_t)pp2*nLL + LL)*GL_Mesh + i] = tbp[LL];
+          sphb [((size_t)pp2*nLL + LL)*mesh + i] = tb[LL];
+          sphbp[((size_t)pp2*nLL + LL)*mesh + i] = tbp[LL];
         }
       }
 
       /* K1: quadrature sums for every (pair, LL, c0<=c1) block */
 
-#pragma omp target teams distribute parallel for
+#pragma omp target teams distribute parallel for thread_limit(128) is_device_ptr(pr_spe,pr_vspe,sp_lfi,sp_ncmb,cmb_L0,crude,prod,GL_NormK,GL_Weight,sphb,sphbp,sum0,sumr0) if(gpu)
       for (size_t q=0; q<(size_t)np*nLL*cmb_max*cmb_max; q++){
         const int cb = (int)(q % cmb_max);
         const int ca = (int)((q/cmb_max) % cmb_max);
@@ -2248,13 +2871,13 @@ static void SetPro_VNA23_GpuRun(double *****HVNA23, int mirror, int OneD_Nloop,
         if (L0>=0 && L1>=0 && L0<=L1 && LLq<=2*L1 &&
             __builtin_abs(L1-LLq)<=L0 && L0<=(L1+LLq)){
 
-          const double *cru = crude + (size_t)pr_vspe[pp2]*GL_Mesh;
-          const double *pr2 = prod + ((((size_t)spe*cmb_max+ca)*cmb_max+cb)*nLL+LLq)*GL_Mesh;
-          const double *sb = sphb + ((size_t)pp2*nLL + LLq)*GL_Mesh;
-          const double *sbp = sphbp + ((size_t)pp2*nLL + LLq)*GL_Mesh;
+          const double *cru = crude + (size_t)pr_vspe[pp2]*mesh;
+          const double *pr2 = prod + ((((size_t)spe*cmb_max+ca)*cmb_max+cb)*nLL+LLq)*mesh;
+          const double *sb = sphb + ((size_t)pp2*nLL + LLq)*mesh;
+          const double *sbp = sphbp + ((size_t)pp2*nLL + LLq)*mesh;
           int i;
 
-          for (i=0; i<GL_Mesh; i++){
+          for (i=0; i<mesh; i++){
             const double Normk = GL_NormK[i];
             const double tmp10 = 0.50*Dk*cru[i]*pr2[i]*GL_Weight[i]*Normk*Normk;
 
@@ -2269,7 +2892,7 @@ static void SetPro_VNA23_GpuRun(double *****HVNA23, int mirror, int OneD_Nloop,
 
       /* K2a: assemble the upper (L0<=L1) TmpHNA elements */
 
-#pragma omp target teams distribute parallel for
+#pragma omp target teams distribute parallel for thread_limit(128) is_device_ptr(pr_spe,sp_lfi,sp_ncmb,cmb_L0,gnt2,sh_tab,sum0,sumr0,tmpnl) if(gpu)
       for (size_t e=0; e<(size_t)np*elem_per_pair; e++){
         const int M1i = (int)(e % nM);
         const int cb = (int)((e/nM) % cmb_max);
@@ -2340,7 +2963,7 @@ static void SetPro_VNA23_GpuRun(double *****HVNA23, int mirror, int OneD_Nloop,
 
       /* K2b: conjugate copy of the upper part to the lower part */
 
-#pragma omp target teams distribute parallel for
+#pragma omp target teams distribute parallel for thread_limit(128) is_device_ptr(pr_spe,sp_ncmb,cmb_L0,tmpnl) if(gpu)
       for (size_t e=0; e<(size_t)np*elem_per_pair; e++){
         const int M1i = (int)(e % nM);
         const int cb = (int)((e/nM) % cmb_max);
@@ -2381,7 +3004,7 @@ static void SetPro_VNA23_GpuRun(double *****HVNA23, int mirror, int OneD_Nloop,
 
       /* K3: complex-to-real transforms and the HVNA2/3 elements */
 
-#pragma omp target teams distribute parallel for
+#pragma omp target teams distribute parallel for thread_limit(128) is_device_ptr(pr_spe,pr_h0,pr_r,pr_siT,pr_coT,pr_siP,pr_coP,sp_ncmb,cmb_L0,cmb_num0,c2r,c2r_off,tmpnl,outbuf) if(gpu)
       for (size_t e=0; e<(size_t)np*elem_per_pair; e++){
         const int M1i = (int)(e % nM);
         const int cb = (int)((e/nM) % cmb_max);
@@ -2488,13 +3111,175 @@ static void SetPro_VNA23_GpuRun(double *****HVNA23, int mirror, int OneD_Nloop,
         }
       }
 
-#pragma omp target update from(outbuf[0:(size_t)np*4*(size_t)mn_max])
+}
+
+static void SetPro_VNA23_GpuRun_Part(double *****HVNA23, int mirror, int OneD_Nloop, int *OneD2Mc_AN, int *OneD2h_AN, SetProGpu3Context *g)
+{
+  const int l0max = g->l0max;
+  const int lfi_max = g->lfi_max;
+  const int cmb_max = g->cmb_max;
+  const int mn_max = g->mn_max;
+  const int tno_max = g->tno_max;
+  const int nM = 2*l0max + 1;
+  const int nLL = lfi_max + 1;
+  const int nsh = (lfi_max+1)*(lfi_max+1);
+  const int CHUNK = g->chunk;   /* the admitted batch SetPro_VNA23_GpuBegin sized the region with */
+  const double Dk = PAO_Nkmax - Radial_kmin;
+  int chunk_start;
+  double vna23_t0, vna23_t1;
+
+  double *pr_r,*pr_siT,*pr_coT,*pr_siP,*pr_coP;
+  int *pr_spe,*pr_vspe,*pr_h0;
+  double *sh_tab;
+  double *sphb,*sphbp;
+  double *sum0,*sumr0;
+  double *tmpnl;
+  double *outbuf;
+
+  const size_t sphb_len = (size_t)CHUNK*nLL*GL_Mesh;
+  const size_t sum_len = (size_t)CHUNK*nLL*cmb_max*cmb_max;
+  const size_t elem_per_pair = (size_t)cmb_max*nM*cmb_max*nM;
+  const size_t tmpnl_len = (size_t)CHUNK*elem_per_pair*8;
+  const size_t out_len = (size_t)CHUNK*4*(size_t)mn_max;
+
+  if (!g->enabled) return;
+  int all_pairs=OneD_Nloop;
+  MPI_Allreduce(MPI_IN_PLACE,&all_pairs,1,MPI_INT,MPI_MAX,mpi_comm_level1);
+
+  dtime(&vna23_t0);
+  SetPro_note("HVNA2/3 GPU batch begin","HVNA%d: %d pairs in batches of %d",mirror ? 3 : 2,OneD_Nloop,CHUNK);
+
+  pr_r = (double*)SetPro_checked_malloc(sizeof(double)*CHUNK);
+  pr_siT = (double*)SetPro_checked_malloc(sizeof(double)*CHUNK);
+  pr_coT = (double*)SetPro_checked_malloc(sizeof(double)*CHUNK);
+  pr_siP = (double*)SetPro_checked_malloc(sizeof(double)*CHUNK);
+  pr_coP = (double*)SetPro_checked_malloc(sizeof(double)*CHUNK);
+  pr_spe = (int*)SetPro_checked_malloc(sizeof(int)*CHUNK);
+  pr_vspe = (int*)SetPro_checked_malloc(sizeof(int)*CHUNK);
+  pr_h0 = (int*)SetPro_checked_malloc(sizeof(int)*CHUNK);
+  sh_tab = (double*)SetPro_checked_malloc(sizeof(double)*(size_t)CHUNK*nsh*6);
+  sphb = NULL;
+  sphbp = NULL;
+  sum0 = NULL;
+  sumr0 = NULL;
+  tmpnl = NULL;
+  outbuf = (double*)SetPro_checked_malloc(sizeof(double)*out_len);
+
+  {
+    double *crude = g->crude;
+    double *prod = g->prod;
+    double *gnt2 = g->gnt2;
+    double *c2r = g->c2r;
+    int *c2r_off = g->c2r_off;
+    int *sp_lfi = g->sp_lfi;
+    int *sp_ncmb = g->sp_ncmb;
+    int *cmb_L0 = g->cmb_L0;
+    int *cmb_num0 = g->cmb_num0;
+    const size_t crude_len = (size_t)SpeciesNum*GL_Mesh;
+    const size_t prod_len = (size_t)SpeciesNum*cmb_max*cmb_max*nLL*GL_Mesh;
+    const size_t gnt2_len = (size_t)(l0max+1)*nM*(l0max+1)*nM*nLL;
+    const size_t c2r_len = 2*(size_t)c2r_off[l0max+1];
+
+    for (chunk_start=0; chunk_start<all_pairs; chunk_start+=CHUNK){
+
+      const int np = chunk_start>=OneD_Nloop?0:((OneD_Nloop-chunk_start)<CHUNK ? OneD_Nloop-chunk_start : CHUNK);
+      int pp,LLh,mh;
+      memset(sh_tab,0,(size_t)np*nsh*6*sizeof(double));
+
+#pragma omp parallel for if(!omp_in_parallel()) schedule(dynamic) private(LLh,mh)
+      for (pp=0; pp<np; pp++){
+        int Mc_AN = OneD2Mc_AN[chunk_start+pp];
+        int h_AN = OneD2h_AN[chunk_start+pp];
+        int Gc_AN = M2G[Mc_AN];
+        int Gh_AN = natn[Gc_AN][h_AN];
+        int Rnh = ncn[Gc_AN][h_AN];
+        int spe_pao,spe_vna;
+        double S_co[3];
+        double dx,dy,dz,r,theta,phi;
+        double SH[2],dSHt[2],dSHp[2];
+
+        if (mirror==0){
+          spe_pao = WhatSpecies[Gc_AN];
+          spe_vna = WhatSpecies[Gh_AN];
+          dx = Gxyz[Gh_AN][1] + atv[Rnh][1] - Gxyz[Gc_AN][1];
+          dy = Gxyz[Gh_AN][2] + atv[Rnh][2] - Gxyz[Gc_AN][2];
+          dz = Gxyz[Gh_AN][3] + atv[Rnh][3] - Gxyz[Gc_AN][3];
+        }
+        else{
+          spe_pao = WhatSpecies[Gh_AN];
+          spe_vna = WhatSpecies[Gc_AN];
+          dx = Gxyz[Gc_AN][1] - Gxyz[Gh_AN][1] - atv[Rnh][1];
+          dy = Gxyz[Gc_AN][2] - Gxyz[Gh_AN][2] - atv[Rnh][2];
+          dz = Gxyz[Gc_AN][3] - Gxyz[Gh_AN][3] - atv[Rnh][3];
+        }
+
+        xyz2spherical(dx,dy,dz,0.0,0.0,0.0,S_co);
+        r = S_co[0];
+        theta = S_co[1];
+        phi = S_co[2];
+        if (r<1.0e-10) r = 1.0e-10;
+
+        pr_r[pp] = r;
+        pr_siT[pp] = sin(theta);
+        pr_coT[pp] = cos(theta);
+        pr_siP[pp] = sin(phi);
+        pr_coP[pp] = cos(phi);
+        pr_spe[pp] = spe_pao;
+        pr_vspe[pp] = spe_vna;
+        pr_h0[pp] = (h_AN==0);
+
+        for (LLh=0; LLh<=sp_lfi[spe_pao]; LLh++){
+          for (mh=-LLh; mh<=LLh; mh++){
+            size_t off = ((size_t)pp*nsh + (size_t)LLh*LLh + (mh+LLh))*6;
+
+            ComplexSH(LLh,mh,theta,phi,SH,dSHt,dSHp);
+            sh_tab[off+0] = SH[0];
+            sh_tab[off+1] = SH[1];
+            sh_tab[off+2] = dSHt[0];
+            sh_tab[off+3] = dSHt[1];
+            sh_tab[off+4] = dSHp[0];
+            sh_tab[off+5] = dSHp[1];
+          }
+        }
+      }
+
+      SetProVNA23CapacityParameters parameters={GL_Mesh,g->l0max,g->lfi_max,g->cmb_max,g->mn_max,g->tno_max,Dk};
+      OpenMXGpuTask task={0};task.count=np;task.inputs=20;task.outputs=1;task.scratch=5;
+      task.parameters=&parameters;task.parameter_bytes=sizeof(parameters);task.kernel=SetPro_VNA23_capacity_kernel;
+      task.view[0]=(OpenMXGpuTaskView){crude,(crude_len)*sizeof(double),0};
+      task.view[1]=(OpenMXGpuTaskView){prod,(prod_len)*sizeof(double),0};
+      task.view[2]=(OpenMXGpuTaskView){gnt2,(gnt2_len)*sizeof(double),0};
+      task.view[3]=(OpenMXGpuTaskView){c2r,(c2r_len)*sizeof(double),0};
+      task.view[4]=(OpenMXGpuTaskView){c2r_off,(l0max+2)*sizeof(int),0};
+      task.view[5]=(OpenMXGpuTaskView){sp_lfi,(SpeciesNum)*sizeof(int),0};
+      task.view[6]=(OpenMXGpuTaskView){sp_ncmb,(SpeciesNum)*sizeof(int),0};
+      task.view[7]=(OpenMXGpuTaskView){cmb_L0,((size_t)SpeciesNum*cmb_max)*sizeof(int),0};
+      task.view[8]=(OpenMXGpuTaskView){cmb_num0,((size_t)SpeciesNum*cmb_max)*sizeof(int),0};
+      task.view[9]=(OpenMXGpuTaskView){GL_NormK,(GL_Mesh)*sizeof(double),0};
+      task.view[10]=(OpenMXGpuTaskView){GL_Weight,(GL_Mesh)*sizeof(double),0};
+      task.view[11]=(OpenMXGpuTaskView){pr_r,0,(1)*sizeof(double)};
+      task.view[12]=(OpenMXGpuTaskView){pr_siT,0,(1)*sizeof(double)};
+      task.view[13]=(OpenMXGpuTaskView){pr_coT,0,(1)*sizeof(double)};
+      task.view[14]=(OpenMXGpuTaskView){pr_siP,0,(1)*sizeof(double)};
+      task.view[15]=(OpenMXGpuTaskView){pr_coP,0,(1)*sizeof(double)};
+      task.view[16]=(OpenMXGpuTaskView){pr_spe,0,(1)*sizeof(int)};
+      task.view[17]=(OpenMXGpuTaskView){pr_vspe,0,(1)*sizeof(int)};
+      task.view[18]=(OpenMXGpuTaskView){pr_h0,0,(1)*sizeof(int)};
+      task.view[19]=(OpenMXGpuTaskView){sh_tab,0,((size_t)nsh*6)*sizeof(double)};
+      task.view[20]=(OpenMXGpuTaskView){outbuf,0,4*(size_t)mn_max*sizeof(double)};
+      task.view[21]=(OpenMXGpuTaskView){NULL,0,((size_t)nLL*GL_Mesh)*sizeof(double)};
+      task.view[22]=(OpenMXGpuTaskView){NULL,0,((size_t)nLL*GL_Mesh)*sizeof(double)};
+      task.view[23]=(OpenMXGpuTaskView){NULL,0,((size_t)nLL*cmb_max*cmb_max)*sizeof(double)};
+      task.view[24]=(OpenMXGpuTaskView){NULL,0,((size_t)nLL*cmb_max*cmb_max)*sizeof(double)};
+      task.view[25]=(OpenMXGpuTaskView){NULL,0,(elem_per_pair*8)*sizeof(double)};
+      openmx_gpu_task_execute(mpi_comm_level1,&task,1,"SetPro_VNA23");
+
 
       if (np > 0) SetPro_gpu_used = 1;
 
       /* host: scatter into HVNA2 or HVNA3 */
 
-#pragma omp parallel for schedule(dynamic)
+#pragma omp parallel for if(!omp_in_parallel()) schedule(dynamic)
       for (pp=0; pp<np; pp++){
         int Mc_AN = OneD2Mc_AN[chunk_start+pp];
         int h_AN = OneD2h_AN[chunk_start+pp];
@@ -2534,6 +3319,9 @@ static void SetPro_VNA23_GpuRun(double *****HVNA23, int mirror, int OneD_Nloop,
   free(pr_siT);
   free(pr_r);
 }
+static void SetPro_VNA23_GpuRun(double *****matrix,int mirror,int count,int *mc,int *h)
+{SetPro_VNA23_GpuRun_Part(matrix,mirror,count,mc,h,&SetPro_gpu3);}
+
 
 double Set_ProExpn(double ****HVNA, Type_DS_VNA *****DS_VNA)
 {
@@ -3398,7 +4186,7 @@ double Set_ProExpn(double ****HVNA, Type_DS_VNA *****DS_VNA)
 
   /* batched device path for the HVNA traces */
 
-  setpro_gpu = SetPro_HVNA_GpuBegin(DS_VNA, VNA_List, VNA_List2, Num_RVNA);
+  setpro_gpu = SetPro_HVNA_DispatchBegin(DS_VNA, VNA_List, VNA_List2, Num_RVNA);
 
   /* allocation of array */
 
@@ -3553,7 +4341,7 @@ double Set_ProExpn(double ****HVNA, Type_DS_VNA *****DS_VNA)
 	free(tmp_array2);
 
 	if (setpro_gpu){
-	  SetPro_HVNA_GpuArchiveHalo(DS_VNA, Original_Mc_AN, Gc_AN);
+	  SetPro_HVNA_DispatchArchive(DS_VNA, Original_Mc_AN, Gc_AN);
 	}
 
 	/*****************************************
@@ -3837,11 +4625,7 @@ double Set_ProExpn(double ****HVNA, Type_DS_VNA *****DS_VNA)
   } /* if (!setpro_gpu) */
 
   if (setpro_gpu){
-    for (int turn=0; turn<SetPro_gpu.turns; ++turn) {
-      if (turn==SetPro_gpu.turn) SetPro_HVNA_GpuRun(HVNA);
-      if (SetPro_gpu.turns>1) MPI_Barrier(mpi_comm_level1);
-    }
-    SetPro_HVNA_GpuEnd();
+    SetPro_HVNA_DispatchRun(HVNA);
     setpro_gpu = 0;
   }
 

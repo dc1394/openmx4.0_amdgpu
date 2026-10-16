@@ -17,10 +17,91 @@
 #include <string.h>
 #include <time.h>
 #include "openmx_common.h"
+#include "openmx_gpu_task.h"
 #include "mpi.h"
 #include <omp.h>
 #include "set_hip_default_device_from_local_rank.h"
 
+
+
+typedef struct {
+  int grid_dim,grid_last,combo_count,h_AN,Lmax_Four_Int;
+  size_t rf_cache_elems,sph_valid_elems,sum_valid_elems;
+  double h;
+  double *norm,*rf0,*rf1,*sph,*sphp,*out[4];
+  int *off0,*off1;
+} OLPKinRadialWork;
+typedef struct {int grid_dim,grid_last,combo_count,h_AN;double h;} OLPKinRadialParameters;
+static void OLPKin_Radial_Kernel(size_t first,size_t count,const void *parameters,void *const v[],int use_gpu)
+{
+  const OLPKinRadialParameters *p=parameters;
+  int grid_dim=p->grid_dim,grid_last=p->grid_last,combo_count=p->combo_count,h_AN=p->h_AN;
+  double h=p->h,*Normk_grid=v[0],*RF_BesselCache0=v[1],*RF_BesselCache1=v[2];
+  double *SphB_flat=v[3],*SphBp_flat=v[4];int *combo_rf0_offset=v[5],*combo_rf1_offset=v[6];
+  double *sumS0_flat=v[7],*sumK0_flat=v[8],*sumSr0_flat=v[9],*sumKr0_flat=v[10];
+#pragma omp target teams distribute parallel for if(use_gpu) is_device_ptr(Normk_grid,RF_BesselCache0,RF_BesselCache1,SphB_flat,SphBp_flat,combo_rf0_offset,combo_rf1_offset,sumS0_flat,sumK0_flat,sumSr0_flat,sumKr0_flat)
+                  for (size_t ix=0;ix<count;ix++) {
+                    int l=(int)((first+ix)/(size_t)combo_count);
+                    int combo=(int)((first+ix)%(size_t)combo_count);
+	              int rf0_offset,rf1_offset;
+	              double local_sumS0,local_sumK0,local_sumSr0,local_sumKr0;
+
+	              rf0_offset = combo_rf0_offset[combo];
+	              rf1_offset = combo_rf1_offset[combo];
+	              local_sumS0 = 0.0;
+	              local_sumK0 = 0.0;
+	              local_sumSr0 = 0.0;
+	              local_sumKr0 = 0.0;
+
+
+	              for (int i=0; i<grid_dim; i++){
+	                double acc_coe0,acc_Normk,acc_Normk2;
+	                double acc_sj,acc_sjp,acc_tmp0,acc_tmp1,acc_tmp2,acc_tmp3,acc_tmp4;
+
+	                if (i==0 || i==grid_last) acc_coe0 = 0.50;
+	                else                      acc_coe0 = 1.00;
+
+	                acc_Normk = Normk_grid[i];
+	                acc_Normk2 = acc_Normk*acc_Normk;
+	                acc_sj  = SphB_flat[l*grid_dim + i];
+	                acc_sjp = SphBp_flat[l*grid_dim + i];
+	                acc_tmp0 = acc_coe0*h*acc_Normk2*RF_BesselCache0[rf0_offset + i];
+	                acc_tmp1 = acc_tmp0*acc_sj;
+	                acc_tmp2 = acc_tmp0*acc_Normk*acc_sjp;
+	                acc_tmp3 = acc_tmp1*RF_BesselCache1[rf1_offset + i];
+	                acc_tmp4 = acc_tmp2*RF_BesselCache1[rf1_offset + i];
+	                local_sumS0 += acc_tmp3;
+	                local_sumK0 += acc_tmp3*acc_Normk2;
+	                local_sumSr0 += acc_tmp4;
+	                local_sumKr0 += acc_tmp4*acc_Normk2;
+	              }
+
+	              if (h_AN==0){
+	                local_sumSr0 = 0.0;
+	                local_sumKr0 = 0.0;
+	              }
+
+	              sumS0_flat[ix] = local_sumS0;
+	              sumK0_flat[ix] = local_sumK0;
+	              sumSr0_flat[ix] = local_sumSr0;
+	              sumKr0_flat[ix] = local_sumKr0;
+                  }
+}
+static void OLPKin_Radial_Distribute(OLPKinRadialWork *w)
+{
+  OLPKinRadialParameters p={w->grid_dim,w->grid_last,w->combo_count,w->h_AN,w->h};
+  OpenMXGpuTask t={0};t.count=w->sum_valid_elems;t.parameters=&p;t.parameter_bytes=sizeof(p);
+  t.inputs=7;t.outputs=4;t.kernel=OLPKin_Radial_Kernel;
+  t.view[0]=(OpenMXGpuTaskView){w->norm,(size_t)w->grid_dim*sizeof(double),0};
+  t.view[1]=(OpenMXGpuTaskView){w->rf0,w->rf_cache_elems*sizeof(double),0};
+  t.view[2]=(OpenMXGpuTaskView){w->rf1,w->rf_cache_elems*sizeof(double),0};
+  t.view[3]=(OpenMXGpuTaskView){w->sph,w->sph_valid_elems*sizeof(double),0};
+  t.view[4]=(OpenMXGpuTaskView){w->sphp,w->sph_valid_elems*sizeof(double),0};
+  t.view[5]=(OpenMXGpuTaskView){w->off0,(size_t)w->combo_count*sizeof(int),0};
+  t.view[6]=(OpenMXGpuTaskView){w->off1,(size_t)w->combo_count*sizeof(int),0};
+  for(int c=0;c<4;c++)t.view[7+c]=(OpenMXGpuTaskView){w->out[c],0,sizeof(double)};
+  openmx_gpu_task_execute(mpi_comm_level1,&t,1,"overlap-kinetic-radial");
+}
 
 static int SetOLPKinUseOpenMP(void);
 
@@ -45,7 +126,7 @@ void Free2D_dcomplex(dcomplex** buffer);
 
 static int SetOLPKinUseOpenMP(void)
 {
-  return (scf_eigen_lib_flag == GPUSOLVER && gpu_rank_device_usable());
+  return (scf_eigen_lib_flag == GPUSOLVER);
 }
 
 static int SetOLPKinRadialGpuEnabled(void)
@@ -264,6 +345,13 @@ double Set_OLP_Kin(double *****OLP, double *****H0)
   }
 
 
+  /* The optional radial offload is called only by the MPI main thread.
+     Empty ranks enter the same number of recovery phases as busy ranks. */
+  int radial_capacity=omp_get_max_threads()==1 && SetOLPKinRadialGpuEnabled() && SetOLPKinUseOpenMP();
+  MPI_Allreduce(MPI_IN_PLACE,&radial_capacity,1,MPI_INT,MPI_MIN,mpi_comm_level1);
+  int radial_rounds=OneD_Nloop;
+  if(radial_capacity)MPI_Allreduce(MPI_IN_PLACE,&radial_rounds,1,MPI_INT,MPI_MAX,mpi_comm_level1);
+
   /* OpenMP */
 
 #pragma omp parallel
@@ -398,14 +486,15 @@ double Set_OLP_Kin(double *****OLP, double *****H0)
 	    OMPID = omp_get_thread_num();
 	    Nthrds = omp_get_num_threads();
 	    Nprocs = omp_get_num_procs();
-	    use_openmp_radial = (Nthrds==1 && SetOLPKinRadialGpuEnabled() && SetOLPKinUseOpenMP());
+	    use_openmp_radial = radial_capacity;
 	    use_bessel_cache = (0 < bessel_cache_max);
 	    bessel_cache.lmax = max_Lmax_Four_Int;
 	    bessel_cache.gdim = grid_dim;
 
     /* one-dimensionalized loop */
 
-    for (Nloop=OMPID*OneD_Nloop/Nthrds; Nloop<(OMPID+1)*OneD_Nloop/Nthrds; Nloop++){
+    for (Nloop=OMPID*radial_rounds/Nthrds; Nloop<(OMPID+1)*radial_rounds/Nthrds; Nloop++){
+      if(Nloop>=OneD_Nloop){OLPKinRadialWork empty={0};OLPKin_Radial_Distribute(&empty);continue;}
 
       dtime(&Stime_atom);
 
@@ -607,60 +696,20 @@ double Set_OLP_Kin(double *****OLP, double *****H0)
 		combo_cached_Hwan = Hwan;
 	      }
 
-	      if (use_openmp_radial && 0<combo_count){
+	      if (use_openmp_radial){
 	        size_t sph_valid_elems,sum_valid_elems;
 
 	        sph_valid_elems = (size_t)(Lmax_Four_Int+1)*(size_t)grid_dim;
 	        sum_valid_elems = (size_t)(Lmax_Four_Int+1)*(size_t)combo_count;
 
-	        {
-#pragma omp parallel for collapse(2)
-	          for (l=0; l<=Lmax_Four_Int; l++){
-	            for (combo=0; combo<combo_count; combo++){
-	              int rf0_offset,rf1_offset;
-	              double local_sumS0,local_sumK0,local_sumSr0,local_sumKr0;
-
-	              rf0_offset = combo_rf0_offset[combo];
-	              rf1_offset = combo_rf1_offset[combo];
-	              local_sumS0 = 0.0;
-	              local_sumK0 = 0.0;
-	              local_sumSr0 = 0.0;
-	              local_sumKr0 = 0.0;
-
-	              for (int i=0; i<grid_dim; i++){
-	                double acc_coe0,acc_Normk,acc_Normk2;
-	                double acc_sj,acc_sjp,acc_tmp0,acc_tmp1,acc_tmp2,acc_tmp3,acc_tmp4;
-
-	                if (i==0 || i==grid_last) acc_coe0 = 0.50;
-	                else                      acc_coe0 = 1.00;
-
-	                acc_Normk = Normk_grid[i];
-	                acc_Normk2 = acc_Normk*acc_Normk;
-	                acc_sj  = SphB_flat[l*grid_dim + i];
-	                acc_sjp = SphBp_flat[l*grid_dim + i];
-	                acc_tmp0 = acc_coe0*h*acc_Normk2*RF_BesselCache0[rf0_offset + i];
-	                acc_tmp1 = acc_tmp0*acc_sj;
-	                acc_tmp2 = acc_tmp0*acc_Normk*acc_sjp;
-	                acc_tmp3 = acc_tmp1*RF_BesselCache1[rf1_offset + i];
-	                acc_tmp4 = acc_tmp2*RF_BesselCache1[rf1_offset + i];
-	                local_sumS0 += acc_tmp3;
-	                local_sumK0 += acc_tmp3*acc_Normk2;
-	                local_sumSr0 += acc_tmp4;
-	                local_sumKr0 += acc_tmp4*acc_Normk2;
-	              }
-
-	              if (h_AN==0){
-	                local_sumSr0 = 0.0;
-	                local_sumKr0 = 0.0;
-	              }
-
-	              sumS0_flat[l*combo_count + combo] = local_sumS0;
-	              sumK0_flat[l*combo_count + combo] = local_sumK0;
-	              sumSr0_flat[l*combo_count + combo] = local_sumSr0;
-	              sumKr0_flat[l*combo_count + combo] = local_sumKr0;
-	            }
-	          }
-	        }
+                OLPKinRadialWork radial={0};
+                radial.grid_dim=grid_dim;radial.grid_last=grid_last;radial.combo_count=combo_count;
+                radial.h_AN=h_AN;radial.Lmax_Four_Int=Lmax_Four_Int;radial.rf_cache_elems=rf_cache_elems;
+                radial.sph_valid_elems=sph_valid_elems;radial.sum_valid_elems=sum_valid_elems;radial.h=h;
+                radial.norm=Normk_grid;radial.rf0=RF_BesselCache0;radial.rf1=RF_BesselCache1;
+                radial.sph=SphB_flat;radial.sphp=SphBp_flat;radial.off0=combo_rf0_offset;radial.off1=combo_rf1_offset;
+                radial.out[0]=sumS0_flat;radial.out[1]=sumK0_flat;radial.out[2]=sumSr0_flat;radial.out[3]=sumKr0_flat;
+                OLPKin_Radial_Distribute(&radial);
 	      }
 	      else{
 	        for(l=0; l<=Lmax_Four_Int; l++){

@@ -1,3 +1,4 @@
+#include "openmx_target.h"
 /**********************************************************************
   Force.c:
 
@@ -12,6 +13,11 @@
 
 #include "mpi.h"
 #include "openmx_common.h"
+#include "openmx_gpu_workers.h"
+#include "openmx_gpu_views.h"
+#include "openmx_gpu_task.h"
+#include "openmx_gpu_bilinear.h"
+#include "openmx_host_memory.h"
 #include "openmx_precision.h"
 #include "set_hip_default_device_from_local_rank.h"
 #include <math.h>
@@ -79,6 +85,7 @@ static void* Force_checked_malloc(size_t size, const char* file, int line)
     fprintf(stderr, "Force.c: failed to allocate %zu bytes at %s:%d\n", size, file, line);
     fflush(stderr);
 
+    if (openmx_gpu_worker_device()>=0) exit(EXIT_FAILURE);
     if (MPI_Initialized(&mpi_initialized) == MPI_SUCCESS && mpi_initialized) {
         MPI_Abort(MPI_COMM_WORLD, EXIT_FAILURE);
     }
@@ -272,172 +279,39 @@ static void* Force_gpu_arena_try(size_t bytes)
     return arena;
 }
 
-/* mandatory claim: wait out the peers' transient spikes (they release on
-   their own, so this always makes progress) and only give up when the
-   device stays full for minutes */
-static void* Force_gpu_arena_wait(size_t bytes, const char* what)
+static void Force_Reduction_Kernel(size_t first,size_t n,const void *parameters,void *const v[],int gpu)
 {
-    const int max_wait_ms = 180000;
-    int waited_ms = 0, warned = 0;
+    (void)first;(void)parameters;
+    const size_t *offsets=v[0];
+    const double *weights=openmx_gpu_task_ragged_data(v[0],n);
+    const double *vx=openmx_gpu_task_ragged_data(v[1],n);
+    const double *vy=openmx_gpu_task_ragged_data(v[2],n);
+    const double *vz=openmx_gpu_task_ragged_data(v[3],n);
+    double *Fx=v[4],*Fy=v[5],*Fz=v[6];
+#pragma omp target teams distribute parallel for is_device_ptr(offsets,weights,vx,vy,vz,Fx,Fy,Fz) if(gpu)
+    for (size_t atom=0;atom<n;atom++) {
+        double sx=0,sy=0,sz=0;
 
-    for (;;) {
-        void* arena = ForceHipMalloc(bytes);
-
-        if (arena != NULL) return arena;
-        Force_gpu_pool_flush();
-
-        if (!warned && 2000 <= waited_ms && 2 <= level_stdout) {
-            warned = 1;
-            fprintf(stderr,
-                "Force %s: waiting for %.1f MiB of device memory held by peer ranks...\n",
-                what, (double)bytes / (1024.0 * 1024.0));
-            fflush(stderr);
+        for (size_t i=offsets[atom];i<offsets[atom+1];i++) {
+            sx+=weights[i]*vx[i];sy+=weights[i]*vy[i];sz+=weights[i]*vz[i];
         }
-        if (max_wait_ms <= waited_ms) {
-            size_t free_b = 0, total_b = 0;
-
-            (void)OpenMX_GpuMemGetInfo(&free_b, &total_b);
-            fprintf(stderr,
-                "Force %s: %.1f MiB of device memory did not free up within %d s (%.1f MiB free); "
-                "reduce the MPI ranks sharing the device.\n",
-                what, (double)bytes / (1024.0 * 1024.0), max_wait_ms / 1000,
-                (double)free_b / (1024.0 * 1024.0));
-            fflush(stderr);
-            MPI_Abort(mpi_comm_level1, 1);
-        }
-        {
-            struct timespec ts = { 0, 50 * 1000 * 1000 };
-
-            nanosleep(&ts, NULL);
-        }
-        waited_ms += 50;
+        Fx[atom]=sx;Fy[atom]=sy;Fz[atom]=sz;
     }
 }
 
-static void Force_gpu_reduce_fallback_notice(size_t bytes)
+static void Force_openmp_reduce_xyz(int num_atoms,const size_t *offsets,size_t total_terms,
+    const double *weights,const double *vx,const double *vy,const double *vz,
+    double *Fx,double *Fy,double *Fz)
 {
-    static int printed = 0;
-    size_t free_b = 0, total_b = 0;
-
-    if (printed || level_stdout < 2) return;
-    printed = 1;
-    (void)OpenMX_GpuMemGetInfo(&free_b, &total_b);
-    fprintf(stderr,
-        "Force: a %.1f MiB GPU reduction buffer does not fit (%.1f MiB free); using the host for this reduction.\n",
-        (double)bytes / (1024.0 * 1024.0), (double)free_b / (1024.0 * 1024.0));
-    fflush(stderr);
+    (void)total_terms;
+    OpenMXGpuTask t={0};t.count=(size_t)num_atoms;t.inputs=4;t.outputs=3;t.kernel=Force_Reduction_Kernel;
+    const double *input[]={weights,vx,vy,vz};double *output[]={Fx,Fy,Fz};
+    for (int i=0;i<4;i++) t.view[i]=(OpenMXGpuTaskView){(void*)input[i],0,0,offsets,sizeof(double)};
+    for (int i=0;i<3;i++) {output[i][0]=0;t.view[4+i]=(OpenMXGpuTaskView){output[i]+1,0,sizeof(double)};}
+    /* Force #2/#4/#5 enter this phase on every rank, including empty ones. */
+    openmx_gpu_task_execute(mpi_comm_level1,&t,1,"force-atom-reduction");
 }
 
-static void Force_openacc_reduce_xyz(int num_atoms,
-    const size_t* atom_offsets,
-    size_t total_terms,
-    const double* weights,
-    const double* vx,
-    const double* vy,
-    const double* vz,
-    double* Fx,
-    double* Fy,
-    double* Fz)
-{
-    int Mc_AN;
-    size_t nvec, asz = 0;
-    size_t o_off, o_w, o_vx, o_vy, o_vz, o_fx, o_fy, o_fz;
-    char* arena;
-
-    for (Mc_AN = 0; Mc_AN <= num_atoms; Mc_AN++) {
-        Fx[Mc_AN] = 0.0;
-        Fy[Mc_AN] = 0.0;
-        Fz[Mc_AN] = 0.0;
-    }
-
-    if (total_terms == 0) {
-        return;
-    }
-
-    nvec = (size_t)num_atoms + 1;
-    o_off = Force_gpu_arena_off(&asz, sizeof(size_t) * nvec);
-    o_w = Force_gpu_arena_off(&asz, sizeof(double) * total_terms);
-    o_vx = Force_gpu_arena_off(&asz, sizeof(double) * total_terms);
-    o_vy = Force_gpu_arena_off(&asz, sizeof(double) * total_terms);
-    o_vz = Force_gpu_arena_off(&asz, sizeof(double) * total_terms);
-    o_fx = Force_gpu_arena_off(&asz, sizeof(double) * nvec);
-    o_fy = Force_gpu_arena_off(&asz, sizeof(double) * nvec);
-    o_fz = Force_gpu_arena_off(&asz, sizeof(double) * nvec);
-
-    arena = (char*)Force_gpu_arena_try(asz);
-
-    if (arena != NULL) {
-        ForceHipMemcpyToDevice(arena + o_off, (void*)atom_offsets, sizeof(size_t) * nvec);
-        ForceHipMemcpyToDevice(arena + o_w, (void*)weights, sizeof(double) * total_terms);
-        ForceHipMemcpyToDevice(arena + o_vx, (void*)vx, sizeof(double) * total_terms);
-        ForceHipMemcpyToDevice(arena + o_vy, (void*)vy, sizeof(double) * total_terms);
-        ForceHipMemcpyToDevice(arena + o_vz, (void*)vz, sizeof(double) * total_terms);
-
-        {
-            const size_t* atom_offsets = (const size_t*)(void*)(arena + o_off);
-            const double* weights = (const double*)(void*)(arena + o_w);
-            const double* vx = (const double*)(void*)(arena + o_vx);
-            const double* vy = (const double*)(void*)(arena + o_vy);
-            const double* vz = (const double*)(void*)(arena + o_vz);
-            double* Fx = (double*)(void*)(arena + o_fx);
-            double* Fy = (double*)(void*)(arena + o_fy);
-            double* Fz = (double*)(void*)(arena + o_fz);
-
-#pragma omp target teams distribute parallel for is_device_ptr(atom_offsets, weights, vx, vy, vz, Fx, Fy, Fz)
-            for (Mc_AN = 0; Mc_AN <= num_atoms; Mc_AN++) {
-                double sumx = 0.0;
-                double sumy = 0.0;
-                double sumz = 0.0;
-
-                if (Mc_AN != 0) {
-                    size_t start = atom_offsets[Mc_AN - 1];
-                    size_t end = atom_offsets[Mc_AN];
-                    size_t idx;
-
-                    for (idx = start; idx < end; idx++) {
-                        double weight = weights[idx];
-                        sumx += weight * vx[idx];
-                        sumy += weight * vy[idx];
-                        sumz += weight * vz[idx];
-                    }
-                }
-
-                Fx[Mc_AN] = sumx;
-                Fy[Mc_AN] = sumy;
-                Fz[Mc_AN] = sumz;
-            }
-        }
-
-        ForceHipMemcpyFromDevice(Fx, arena + o_fx, sizeof(double) * nvec);
-        ForceHipMemcpyFromDevice(Fy, arena + o_fy, sizeof(double) * nvec);
-        ForceHipMemcpyFromDevice(Fz, arena + o_fz, sizeof(double) * nvec);
-        hipFree(arena);
-        Force_gpu_pool_flush();
-    } else {
-        Force_gpu_reduce_fallback_notice(asz);
-
-#pragma omp parallel for schedule(dynamic)
-        for (Mc_AN = 1; Mc_AN <= num_atoms; Mc_AN++) {
-            double sumx = 0.0;
-            double sumy = 0.0;
-            double sumz = 0.0;
-            size_t start = atom_offsets[Mc_AN - 1];
-            size_t end = atom_offsets[Mc_AN];
-            size_t idx;
-
-            for (idx = start; idx < end; idx++) {
-                double weight = weights[idx];
-                sumx += weight * vx[idx];
-                sumy += weight * vy[idx];
-                sumz += weight * vz[idx];
-            }
-
-            Fx[Mc_AN] = sumx;
-            Fy[Mc_AN] = sumy;
-            Fz[Mc_AN] = sumz;
-        }
-    }
-}
 
 static size_t Force2_Kinetic_OpenACC(double***** H0_src,
     double***** CDM0,
@@ -494,7 +368,7 @@ static size_t Force2_Kinetic_OpenACC(double***** H0_src,
     }
 
     if (total_terms == 0) {
-        Force_openacc_reduce_xyz(Matomnum, atom_offsets, 0, NULL, NULL, NULL, NULL, Fx, Fy, Fz);
+        Force_openmp_reduce_xyz(Matomnum, atom_offsets, 0, NULL, NULL, NULL, NULL, Fx, Fy, Fz);
         free(atom_offsets);
         return 0;
     }
@@ -544,7 +418,7 @@ static size_t Force2_Kinetic_OpenACC(double***** H0_src,
         }
     }
 
-    Force_openacc_reduce_xyz(Matomnum, atom_offsets, total_terms, weights, hx, hy, hz, Fx, Fy, Fz);
+    Force_openmp_reduce_xyz(Matomnum, atom_offsets, total_terms, weights, hx, hy, hz, Fx, Fy, Fz);
 
     free(hz);
     free(hy);
@@ -601,7 +475,7 @@ static size_t Force5_OpenACC(double***** OLP1,
     }
 
     if (total_terms == 0) {
-        Force_openacc_reduce_xyz(Matomnum, atom_offsets, 0, NULL, NULL, NULL, NULL, Fx, Fy, Fz);
+        Force_openmp_reduce_xyz(Matomnum, atom_offsets, 0, NULL, NULL, NULL, NULL, Fx, Fy, Fz);
         free(atom_offsets);
         return 0;
     }
@@ -637,7 +511,7 @@ static size_t Force5_OpenACC(double***** OLP1,
         }
     }
 
-    Force_openacc_reduce_xyz(Matomnum, atom_offsets, total_terms, weights, hx, hy, hz, Fx, Fy, Fz);
+    Force_openmp_reduce_xyz(Matomnum, atom_offsets, total_terms, weights, hx, hy, hz, Fx, Fy, Fz);
 
     free(hz);
     free(hy);
@@ -681,7 +555,7 @@ static size_t Force4_OpenACC(double* Fx,
     }
 
     if (total_terms == 0) {
-        Force_openacc_reduce_xyz(Matomnum, atom_offsets, 0, NULL, NULL, NULL, NULL, Fx, Fy, Fz);
+        Force_openmp_reduce_xyz(Matomnum, atom_offsets, 0, NULL, NULL, NULL, NULL, Fx, Fy, Fz);
         free(atom_offsets);
         return 0;
     }
@@ -740,7 +614,7 @@ static size_t Force4_OpenACC(double* Fx,
         }
     }
 
-    Force_openacc_reduce_xyz(Matomnum, atom_offsets, total_terms, weights, vx, vy, vz, Fx, Fy, Fz);
+    Force_openmp_reduce_xyz(Matomnum, atom_offsets, total_terms, weights, vx, vy, vz, Fx, Fy, Fz);
 
     free(vz);
     free(vy);
@@ -751,88 +625,30 @@ static size_t Force4_OpenACC(double* Fx,
     return total_terms;
 }
 
-static void Force_openacc_reduce_terms(size_t total_terms,
-    const double* weights,
-    const double* vx,
-    const double* vy,
-    const double* vz,
-    double* sumx,
-    double* sumy,
-    double* sumz)
+static void Force_Term_Kernel(size_t first,size_t n,const void *parameters,void *const v[],int gpu)
 {
-    double sx = 0.0;
-    double sy = 0.0;
-    double sz = 0.0;
-    size_t idx;
-
-    if (sumx != NULL) {
-        *sumx = 0.0;
-    }
-    if (sumy != NULL) {
-        *sumy = 0.0;
-    }
-    if (sumz != NULL) {
-        *sumz = 0.0;
-    }
-
-    if (total_terms == 0) {
-        return;
-    }
-
-    {
-        size_t asz = 0;
-        const size_t o_w = Force_gpu_arena_off(&asz, sizeof(double) * total_terms);
-        const size_t o_vx = Force_gpu_arena_off(&asz, sizeof(double) * total_terms);
-        const size_t o_vy = Force_gpu_arena_off(&asz, sizeof(double) * total_terms);
-        const size_t o_vz = Force_gpu_arena_off(&asz, sizeof(double) * total_terms);
-        char* arena = (char*)Force_gpu_arena_try(asz);
-
-        if (arena != NULL) {
-            ForceHipMemcpyToDevice(arena + o_w, (void*)weights, sizeof(double) * total_terms);
-            ForceHipMemcpyToDevice(arena + o_vx, (void*)vx, sizeof(double) * total_terms);
-            ForceHipMemcpyToDevice(arena + o_vy, (void*)vy, sizeof(double) * total_terms);
-            ForceHipMemcpyToDevice(arena + o_vz, (void*)vz, sizeof(double) * total_terms);
-
-            {
-                const double* weights = (const double*)(void*)(arena + o_w);
-                const double* vx = (const double*)(void*)(arena + o_vx);
-                const double* vy = (const double*)(void*)(arena + o_vy);
-                const double* vz = (const double*)(void*)(arena + o_vz);
-
-#pragma omp target teams distribute parallel for reduction(+:sx, sy, sz) is_device_ptr(weights, vx, vy, vz)
-                for (idx = 0; idx < total_terms; idx++) {
-                    double weight = weights[idx];
-                    sx += weight * vx[idx];
-                    sy += weight * vy[idx];
-                    sz += weight * vz[idx];
-                }
-            }
-
-            /* no pool flush here: these reductions repeat with the same
-               few arena sizes (per-pair calls), so freelist reuse matters */
-            hipFree(arena);
-        } else {
-            Force_gpu_reduce_fallback_notice(asz);
-
-            for (idx = 0; idx < total_terms; idx++) {
-                double weight = weights[idx];
-                sx += weight * vx[idx];
-                sy += weight * vy[idx];
-                sz += weight * vz[idx];
-            }
-        }
-    }
-
-    if (sumx != NULL) {
-        *sumx = sx;
-    }
-    if (sumy != NULL) {
-        *sumy = sy;
-    }
-    if (sumz != NULL) {
-        *sumz = sz;
-    }
+    (void)first;(void)parameters;
+    const double *w=v[0],*x=v[1],*y=v[2],*z=v[3];double *out=v[4];
+    double sx=0,sy=0,sz=0;
+#pragma omp target teams distribute parallel for reduction(+:sx,sy,sz) is_device_ptr(w,x,y,z) if(gpu)
+    for (size_t i=0;i<n;i++) {sx+=w[i]*x[i];sy+=w[i]*y[i];sz+=w[i]*z[i];}
+#pragma omp target is_device_ptr(out) if(gpu)
+    {out[0]=sx;out[1]=sy;out[2]=sz;}
 }
+
+static void Force_openmp_reduce_terms(size_t n,const double *w,const double *x,
+    const double *y,const double *z,double *sx,double *sy,double *sz)
+{
+    double sums[3];const double *inputs[]={w,x,y,z};
+    OpenMXGpuTask t={0};t.count=n;t.inputs=4;t.outputs=1;t.kernel=Force_Term_Kernel;
+    for (int i=0;i<4;i++) t.view[i]=(OpenMXGpuTaskView){(void*)inputs[i],0,sizeof(double)};
+    t.view[4]=(OpenMXGpuTaskView){sums,sizeof(sums),0};
+    /* This is inside rank-specific pair loops; MPI is handled at their
+       enclosing phase, never from this leaf reduction. */
+    openmx_gpu_task_execute(MPI_COMM_NULL,&t,1,"force-term-reduction");
+    if (sx) *sx=sums[0];if (sy) *sy=sums[1];if (sz) *sz=sums[2];
+}
+
 
 static size_t Force4B_pack_trace_terms(double***** CDM0,
     int Mh_AN,
@@ -885,6 +701,7 @@ static void Force3_gpu_abort(const char* message)
 {
     fprintf(stderr, "%s\n", message);
     fflush(stderr);
+    if (openmx_gpu_worker_device()>=0) exit(EXIT_FAILURE);
     MPI_Abort(mpi_comm_level1, 1);
 }
 
@@ -927,9 +744,11 @@ static size_t Force3_GpuChunkBudget(void)
     size_t reserve;
     MPI_Comm node_comm = MPI_COMM_NULL;
 
-    if (scf_eigen_lib_flag != GPUSOLVER) return 0;
-    if (!Force_collective_env_flag("OPENMX_FORCE3_GPU", Force_gpu_stage_default(), mpi_comm_level1)) return 0;
+    int requested=scf_eigen_lib_flag==GPUSOLVER;
+    MPI_Allreduce(MPI_IN_PLACE,&requested,1,MPI_INT,MPI_MIN,mpi_comm_level1);
+    if (!requested || !Force_collective_env_flag("OPENMX_FORCE3_GPU", Force_gpu_stage_default(), mpi_comm_level1)) return 0;
 
+    if (openmx_gpu_capacity_test_recovery()) return 0;
     MPI_Comm_split_type(mpi_comm_level1, MPI_COMM_TYPE_SHARED, 0, MPI_INFO_NULL, &node_comm);
     MPI_Comm_size(node_comm, &node_ranks);
     MPI_Comm_free(&node_comm);
@@ -983,18 +802,19 @@ static int Force3_GpuDorbMode(void)
     return 1;
 }
 
-static void Force3_GpuTrace(const double* dchi_all, const size_t* dchi_off,
+static int Force3_GpuTrace_Part(int first,int last,int myid,double *forces,const SetHamiltonianMETables *shared_tables,const float *shared_orbs1,const double* dchi_all, const size_t* dchi_off,
     double* vpot_dev_full, const size_t* vpot_off,
     double* xyz_dev_full, const size_t* xyz_off, int dorb_mode,
     size_t chunk_budget)
 {
-    int Mc_AN, h_AN, myid;
+    int Mc_AN, h_AN;
     size_t orbs_local_count = 0;
     size_t* orb_off;
     float* orbs_dev;
     float* orb_stage;
     int chunk_lo;
     const int spins = SpinP_switch + 1;
+    int success=0;
 
     /* per-species PAO tables of the on-device orbital derivatives */
     double* pao_rv = NULL;
@@ -1006,7 +826,6 @@ static void Force3_GpuTrace(const double* dchi_all, const size_t* dchi_off,
     int* sp_nb = NULL;
     size_t pao_rv_count = 0, pao_rwf_count = 0;
 
-    MPI_Comm_rank(mpi_comm_level1, &myid);
 
     /* ---- flatten the local orbital table (float) into a device-resident
             buffer, one atom block at a time through a staging buffer ---- */
@@ -1023,9 +842,8 @@ static void Force3_GpuTrace(const double* dchi_all, const size_t* dchi_off,
     }
     orb_off[Matomnum + 1] = orbs_local_count;
 
-    orbs_dev = (float*)Force_gpu_arena_wait(
-        sizeof(float) * (orbs_local_count == 0 ? 1 : orbs_local_count),
-        "GPU trace orbital table");
+    orbs_dev = (float*)Force_gpu_arena_try(sizeof(float) * (orbs_local_count == 0 ? 1 : orbs_local_count));
+    if(!orbs_dev){free(orb_off);return 0;}
     {
         size_t maxorb = 0;
 
@@ -1043,7 +861,7 @@ static void Force3_GpuTrace(const double* dchi_all, const size_t* dchi_off,
         size_t cnt = orb_off[Mc_AN + 1] - orb_off[Mc_AN];
         int Nc;
 
-#pragma omp parallel for schedule(dynamic)
+#pragma omp parallel for if(!omp_in_parallel()) schedule(dynamic)
         for (Nc = 0; Nc < GridN_Atom[Gc_AN]; Nc++) {
             const Type_Orbs_Grid* src = Orbs_Grid[Mc_AN][Nc];
             float* dst = orb_stage + (size_t)Nc * (size_t)NO0;
@@ -1140,12 +958,8 @@ static void Force3_GpuTrace(const double* dchi_all, const size_t* dchi_off,
         int f3_use_seth_orbs1 = 0;
         int* seth_pair_base = (int*)Force_checked_malloc(sizeof(int) * (size_t)(Matomnum + 2), __FILE__, __LINE__);
         {
-            const int f3_cnt_kind = (Cnt_switch == 1) ? 1 : 0;
-
-            if (Set_Hamiltonian_MatrixElementsTables_Ready(f3_cnt_kind) &&
-                Set_Hamiltonian_GetMatrixElementsTables(f3_cnt_kind, &f3_seth) &&
-                f3_seth.orbs1_resident &&
-                omp_get_mapped_ptr((void*)f3_seth.orbs1buf, omp_get_default_device()) != NULL) {
+            if (shared_tables && shared_orbs1) {
+                f3_seth=*shared_tables;
                 int base = 0;
                 int mc0;
 
@@ -1180,9 +994,9 @@ static void Force3_GpuTrace(const double* dchi_all, const size_t* dchi_off,
            for and used to abort the run on memory-tight nodes */
         size_t max_tf = 0;
 
-        chunk_bound[0] = 1;
-        chunk_lo = 1;
-        while (chunk_lo <= Matomnum) {
+        chunk_bound[0] = first;
+        chunk_lo = first;
+        while (chunk_lo < last) {
 
             /* ---- grow a chunk of consecutive atoms under the budget ---- */
 
@@ -1191,7 +1005,7 @@ static void Force3_GpuTrace(const double* dchi_all, const size_t* dchi_off,
             size_t gl_count = 0, fn_count = 0, dm_count = 0;
             size_t chunk_maxolg = 0;
 
-            while (chunk_hi <= Matomnum) {
+            while (chunk_hi < last) {
                 int Gc_AN = M2G[chunk_hi];
                 int NO0 = Spe_Total_CNO[WhatSpecies[Gc_AN]];
                 size_t a_gl = 0, a_fn = 0, a_dm = 0, a_maxolg = 0, cand_maxolg;
@@ -1303,7 +1117,9 @@ static void Force3_GpuTrace(const double* dchi_all, const size_t* dchi_off,
             const size_t o_adchi = Force_gpu_arena_off(&arena_pos, sizeof(size_t) * am_n);
             const size_t o_apt0 = Force_gpu_arena_off(&arena_pos, sizeof(size_t) * am_n);
             unsigned char* chunk_arena =
-                (unsigned char*)Force_gpu_arena_wait(arena_pos, "GPU trace chunk buffers");
+                (unsigned char*)Force_gpu_arena_try(arena_pos);
+
+            if(!chunk_arena)goto f3_chunk_cleanup;
 
             /* the radial tables are read-only for the whole chunk loop */
             ForceHipMemcpyToDevice(chunk_arena + o_rv,  rv_p,  sizeof(*rv_p) * rv_map);
@@ -1384,7 +1200,7 @@ static void Force3_GpuTrace(const double* dchi_all, const size_t* dchi_off,
                     Force3_gpu_abort("Force3 GPU trace: inconsistent chunk assembly.");
                 }
 
-#pragma omp parallel for schedule(dynamic)
+#pragma omp parallel for if(!omp_in_parallel()) schedule(dynamic)
                 for (p = 0; p < npairs; p++) {
                     const int mc2 = pm[p].atom;
                     const int h2 = pm_h[p];
@@ -1827,7 +1643,7 @@ static void Force3_GpuTrace(const double* dchi_all, const size_t* dchi_off,
                            read from the resident orbs1buf device copy; the
                            pair orb1_base offsets were rewritten accordingly */
                         const float* fn_buf = f3_use_seth_orbs1
-                            ? (const float*)omp_get_mapped_ptr((void*)f3_seth.orbs1buf, omp_get_default_device())
+                            ? shared_orbs1
                             : (const float*)(const void*)(chunk_arena + o_fn);
                         const double* dm_buf = (const double*)(const void*)(chunk_arena + o_dm);
 
@@ -1923,9 +1739,15 @@ static void Force3_GpuTrace(const double* dchi_all, const size_t* dchi_off,
                                 q++;
                             }
 
+                            if (forces) {
+                                forces[3*(size_t)Gc_AN]+=ax*GridVol;
+                                forces[3*(size_t)Gc_AN+1]+=ay*GridVol;
+                                forces[3*(size_t)Gc_AN+2]+=az*GridVol;
+                            } else {
                             Gxyz[Gc_AN][17] += ax * GridVol;
                             Gxyz[Gc_AN][18] += ay * GridVol;
                             Gxyz[Gc_AN][19] += az * GridVol;
+                            }
 
                             if (2 <= level_stdout) {
                                 printf("<Force>  force(3) myid=%2d  Mc_AN=%2d Gc_AN=%2d  %15.12f %15.12f %15.12f\n",
@@ -1940,8 +1762,9 @@ static void Force3_GpuTrace(const double* dchi_all, const size_t* dchi_off,
         }
     }
 
-            hipFree(chunk_arena);
-
+            success=1;
+            openmx_target_free(chunk_arena);
+f3_chunk_cleanup:
             free(a_pt0);
             free(a_dchi);
             free(a_no0);
@@ -1981,6 +1804,143 @@ static void Force3_GpuTrace(const double* dchi_all, const size_t* dchi_off,
     if (hipDeviceSynchronize() == hipSuccess) {
         ((void)0);
     }
+    return success;
+}
+
+static int Force3_GpuTrace(const double *dchi,const size_t *dchi_off,
+    double *potential,const size_t *vpot_off,double *xyz,const size_t *xyz_off,int dorb,size_t budget)
+{
+    SetHamiltonianMETables tables;const float *orbs1=NULL;int rank;
+    MPI_Comm_rank(mpi_comm_level1,&rank);int kind=Cnt_switch==1;
+    int have=Set_Hamiltonian_MatrixElementsTables_Ready(kind) && Set_Hamiltonian_GetMatrixElementsTables(kind,&tables) && tables.orbs1_resident;
+    if(have){orbs1=openmx_target_deviceptr((void*)tables.orbs1buf);if(!orbs1)have=0;}
+    return Force3_GpuTrace_Part(1,Matomnum+1,rank,NULL,have?&tables:NULL,orbs1,dchi,dchi_off,potential,vpot_off,xyz,xyz_off,dorb,budget);
+}
+
+typedef struct {
+    int mc,rank,points,no;double ***derivative,**potential;
+    size_t *offset;int *neighbor,*point;double force[3];
+} Force3Capacity;
+static int Force3_capacity_visit(void *context,size_t row,OpenMXBilinearEmit emit,void *target)
+{
+    Force3Capacity *c=context;int axis=row/c->points,nc=row%c->points;
+    for(size_t k=c->offset[nc];k<c->offset[nc+1];k++){
+        int h=c->neighbor[k],nog=c->point[k],gh=natn[M2G[c->mc]][h],no1=Spe_Total_CNO[WhatSpecies[gh]];
+        int nh=GListTAtoms2[c->mc][h][nog],mh=F_G2M[gh];
+        const Type_Orbs_Grid *orb=G2ID[gh]==c->rank?Orbs_Grid[mh][nh]:Orbs_Grid_FNAN[c->mc][h][nog];
+        for(int spin=0;spin<=SpinP_switch;spin++){
+            OpenMXBilinearTerm t={0};t.left=(OpenMXBilinearSpan){NULL,c->derivative[nc],axis,0,c->no,sizeof(double)};
+            t.right=(OpenMXBilinearSpan){orb,NULL,0,1,no1,sizeof(Type_Orbs_Grid)};
+            t.matrix_rows[0]=DM[0][spin][c->mc][h];t.scaled=1;t.scale[0]=c->potential[spin][nc];
+            if(!emit(target,&t))return 0;
+        }
+    }
+    return 1;
+}
+static void Force3_capacity_commit(void *context,size_t first,size_t last,const double *values)
+{
+    Force3Capacity *c=context;
+    for(size_t row=first;row<last;row++)c->force[row/c->points]+=values[row-first];
+}
+static int Force3_capacity_atom(int mc,int rank,double ***derivative,double **potential,int enabled)
+{
+    Force3Capacity c={0};c.mc=mc;c.rank=rank;c.derivative=derivative;c.potential=potential;
+    size_t terms=0;int valid=1;
+    if(mc){
+        int gc=M2G[mc];c.points=GridN_Atom[gc];c.no=Spe_Total_CNO[WhatSpecies[gc]];
+        for(int h=0;h<=FNAN[gc];h++)terms+=NumOLG[mc][h];
+        c.offset=calloc((size_t)c.points+1,sizeof(size_t));
+        c.neighbor=(malloc)((terms?terms:1)*sizeof(int));c.point=(malloc)((terms?terms:1)*sizeof(int));
+        size_t *cursor=(malloc)(((size_t)c.points+1)*sizeof(size_t));
+        valid=c.offset && c.neighbor && c.point && cursor;
+        if(valid){
+            for(int h=0;h<=FNAN[gc];h++)for(int k=0;k<NumOLG[mc][h];k++)c.offset[GListTAtoms1[mc][h][k]+1]++;
+            for(int i=0;i<c.points;i++)c.offset[i+1]+=c.offset[i];
+            memcpy(cursor,c.offset,((size_t)c.points+1)*sizeof(size_t));
+            for(int h=0;h<=FNAN[gc];h++)for(int k=0;k<NumOLG[mc][h];k++){
+                size_t at=cursor[GListTAtoms1[mc][h][k]]++;c.neighbor[at]=h;c.point[at]=k;
+            }
+        }
+        free(cursor);
+    }
+    OpenMXBilinearSource source={(size_t)3*c.points,1,0,&c,Force3_capacity_visit,Force3_capacity_commit};
+    int ok=openmx_gpu_bilinear_execute(mpi_comm_level1,&source,valid?0:-1,enabled,"force-grid-capacity");
+    if(ok && mc)for(int axis=0;axis<3;axis++)Gxyz[M2G[mc]][17+axis]+=c.force[axis]*GridVol;
+    free(c.offset);free(c.neighbor);free(c.point);return ok;
+}
+
+static void Force3_capacity_cpu(int Mc_AN,int myid,double ***dChi0,double **Vpot_grid)
+{
+    int Gc_AN=M2G[Mc_AN],NO0=Spe_Total_CNO[WhatSpecies[Gc_AN]];
+    double sumx=0,sumy=0,sumz=0;
+            int h_AN;
+#pragma omp parallel for schedule(static) reduction(+:sumx,sumy,sumz)
+            for (h_AN = 0; h_AN <= FNAN[Gc_AN]; h_AN++) {
+                double orbs1[List_YOUSO[7]];
+
+                int Gh_AN = natn[Gc_AN][h_AN];
+                int Mh_AN = F_G2M[Gh_AN];
+                int Hwan = WhatSpecies[Gh_AN];
+                int NO1 = Spe_Total_CNO[Hwan];
+
+                int Nog;
+
+                for (Nog = 0; Nog < NumOLG[Mc_AN][h_AN]; Nog++) {
+
+                    int Nc = GListTAtoms1[Mc_AN][h_AN][Nog];
+                    int Nh = GListTAtoms2[Mc_AN][h_AN][Nog];
+
+                    double** const ai_dorbs0 = dChi0[Nc];
+
+                    /* set orbs1 */
+
+                    const Type_Orbs_Grid* restrict orbs1_source;
+                    if (G2ID[Gh_AN] == myid) {
+                        orbs1_source = Orbs_Grid[Mh_AN][Nh];
+                    } else {
+                        orbs1_source = Orbs_Grid_FNAN[Mc_AN][h_AN][Nog];
+                    }
+                    int j;
+#pragma omp simd
+                    for (j = 0; j < NO1; j++) {
+                        orbs1[j] = (double)orbs1_source[j];
+                    }
+
+                    int spin;
+                    for (spin = 0; spin <= SpinP_switch; spin++) {
+                        double** dm = DM[0][spin][Mc_AN][h_AN];
+
+                        double tmpx = 0.0;
+                        double tmpy = 0.0;
+                        double tmpz = 0.0;
+
+                        int i;
+                        for (i = 0; i < NO0; i++) {
+                            double tmp0 = 0.0;
+                            const double* restrict dm_row = dm[i];
+                            int j;
+#pragma omp simd reduction(+:tmp0)
+                            for (j = 0; j < NO1; j++) {
+                                tmp0 += orbs1[j] * dm_row[j];
+                            }
+
+                            tmpx += ai_dorbs0[i][0] * tmp0;
+                            tmpy += ai_dorbs0[i][1] * tmp0;
+                            tmpz += ai_dorbs0[i][2] * tmp0;
+                        }
+
+                        /* due to difference in the definition between density matrix and density */
+                        double Vpt = Vpot_grid[spin][Nc];
+                        sumx += tmpx * Vpt;
+                        sumy += tmpy * Vpt;
+                        sumz += tmpz * Vpt;
+
+                    } /* spin */
+                } /* Nog */
+
+            } /* h_AN, here omp barrier is called implicitly because of end of for loop  */
+
+    Gxyz[Gc_AN][17]+=sumx*GridVol;Gxyz[Gc_AN][18]+=sumy*GridVol;Gxyz[Gc_AN][19]+=sumz*GridVol;
 }
 
 /* Keep the established float tables.  The precision switch controls whether
@@ -4623,8 +4583,7 @@ void Force3()
         if (f3_dorb) {
             xyz_stage = (double*)Force_checked_malloc(
                 sizeof(double) * 3 * (maxgrid == 0 ? 1 : maxgrid), __FILE__, __LINE__);
-            xyz_dev_full = (double*)Force_gpu_arena_wait(
-                sizeof(double) * (xpos == 0 ? 1 : xpos), "GPU trace grid coordinates");
+            xyz_dev_full = (double*)Force_gpu_arena_try(sizeof(double) * (xpos == 0 ? 1 : xpos));
         } else {
             dchi_all = (double*)Force_checked_malloc(sizeof(double) * (dpos == 0 ? 1 : dpos),
                 __FILE__, __LINE__);
@@ -4632,10 +4591,17 @@ void Force3()
         vpot_stage = (double*)Force_checked_malloc(
             sizeof(double) * (size_t)(SpinP_switch + 1) * (maxgrid == 0 ? 1 : maxgrid),
             __FILE__, __LINE__);
-        vpot_dev_full = (double*)Force_gpu_arena_wait(
-            sizeof(double) * (vpos == 0 ? 1 : vpos), "GPU trace grid potentials");
-        use_gpu_trace = 1;
+        vpot_dev_full = (double*)Force_gpu_arena_try(sizeof(double) * (vpos == 0 ? 1 : vpos));
+        use_gpu_trace=vpot_dev_full && (!f3_dorb || xyz_dev_full);
+        if(!use_gpu_trace){f3_dorb=0;if(xyz_dev_full)openmx_target_free(xyz_dev_full);if(vpot_dev_full)openmx_target_free(vpot_dev_full);xyz_dev_full=vpot_dev_full=NULL;}
     }
+
+    int capacity_enabled=scf_eigen_lib_flag==GPUSOLVER;
+    MPI_Allreduce(MPI_IN_PLACE,&capacity_enabled,1,MPI_INT,MPI_MIN,mpi_comm_level1);
+    capacity_enabled=capacity_enabled && Force_collective_env_flag("OPENMX_FORCE3_GPU",Force_gpu_stage_default(),mpi_comm_level1);
+    int recover=capacity_enabled && !use_gpu_trace,steps=Matomnum,recovered=0;
+    MPI_Allreduce(MPI_IN_PLACE,&recover,1,MPI_INT,MPI_MAX,mpi_comm_level1);
+    if(recover)MPI_Allreduce(MPI_IN_PLACE,&steps,1,MPI_INT,MPI_MAX,mpi_comm_level1);
 
 #pragma omp parallel
     {
@@ -4662,7 +4628,9 @@ void Force3()
 #endif
 
         int Mc_AN;
-        for (Mc_AN = 1; Mc_AN <= Matomnum; Mc_AN++) {
+        for (Mc_AN = 1; Mc_AN <= steps; Mc_AN++) {
+
+            if(Mc_AN<=Matomnum){
 
             int Gc_AN = M2G[Mc_AN];
             int Cwan = WhatSpecies[Gc_AN];
@@ -5253,7 +5221,16 @@ void Force3()
             last_time = current_time;
 #endif
 
-            if (!use_gpu_trace) {
+            } /* real atom; empty ranks still enter the recovery phase */
+            if(recover){
+#pragma omp barrier
+#pragma omp master
+                {recovered=Force3_capacity_atom(!use_gpu_trace && Mc_AN<=Matomnum?Mc_AN:0,myid,dChi0,Vpot_grid,capacity_enabled);}
+#pragma omp barrier
+            }
+            if(Mc_AN<=Matomnum){
+            int Gc_AN=M2G[Mc_AN],NO0=Spe_Total_CNO[WhatSpecies[Gc_AN]];
+            if (!use_gpu_trace && !recovered) {
 
             int h_AN;
 #pragma omp for schedule(static) reduction(+:sumx, sumy, sumz)
@@ -5350,7 +5327,8 @@ void Force3()
                 */
             }
 
-            } /* if (!use_gpu_trace) */
+            } /* CPU recovery */
+            } /* real atom */
 
         } /* Mc_AN */
 
@@ -5373,10 +5351,34 @@ void Force3()
 
     } /* #pragma omp parallel */
 
-    /* batched device evaluation of the skipped part-2 traces */
-    if (use_gpu_trace) {
-        Force3_GpuTrace(dchi_all, dchi_off, vpot_dev_full, vpot_off,
-            xyz_dev_full, xyz_off, f3_dorb, f3_chunk_budget);
+    int late=use_gpu_trace && !Force3_GpuTrace(dchi_all,dchi_off,vpot_dev_full,vpot_off,xyz_dev_full,xyz_off,f3_dorb,f3_chunk_budget);
+    int late_any=late;MPI_Allreduce(MPI_IN_PLACE,&late_any,1,MPI_INT,MPI_MAX,mpi_comm_level1);
+    if(late_any){
+        int max_atoms=Matomnum;MPI_Allreduce(MPI_IN_PLACE,&max_atoms,1,MPI_INT,MPI_MAX,mpi_comm_level1);
+        for(int mc=1;mc<=max_atoms;mc++){
+            if(late && mc<=Matomnum){
+                int gc=M2G[mc],no=Spe_Total_CNO[WhatSpecies[gc]],ng=GridN_Atom[gc];
+                openmx_target_download(vpot_stage,vpot_dev_full+vpot_off[mc],(size_t)(SpinP_switch+1)*ng*sizeof(double));
+                for(int spin=0;spin<=SpinP_switch;spin++)memcpy(Vpot_grid[spin],vpot_stage+(size_t)spin*ng,(size_t)ng*sizeof(double));
+                if(f3_dorb){
+                    openmx_target_download(xyz_stage,xyz_dev_full+xyz_off[mc],3*(size_t)ng*sizeof(double));
+#pragma omp parallel
+                    {
+                        struct WORK_DORBITAL work;Get_dOrbitals_init(&work);
+                        double storage[4][List_YOUSO[7]],*dorbs[4]={storage[0],storage[1],storage[2],storage[3]};
+#pragma omp for
+                        for(int nc=0;nc<ng;nc++){
+                            Get_dOrbitals_work(WhatSpecies[gc],xyz_stage[3*(size_t)nc],xyz_stage[3*(size_t)nc+1],xyz_stage[3*(size_t)nc+2],dorbs,work);
+                            for(int i=0;i<no;i++)for(int axis=0;axis<3;axis++)dChi0[nc][i][axis]=dorbs[axis+1][i];
+                        }
+                        Get_dOrbitals_free(work);
+                    }
+                }else for(int nc=0;nc<ng;nc++)for(int i=0;i<no;i++)memcpy(dChi0[nc][i],dchi_all+dchi_off[mc]+3*((size_t)nc*no+i),3*sizeof(double));
+            }
+            int mc_work=late && mc<=Matomnum?mc:0;
+            if(!Force3_capacity_atom(mc_work,myid,dChi0,Vpot_grid,capacity_enabled) && mc_work)
+                Force3_capacity_cpu(mc_work,myid,dChi0,Vpot_grid);
+        }
     }
 
     /* free */
@@ -7344,6 +7346,7 @@ void Force_HNL(double***** CDM0, double***** iDM0)
 
 typedef struct {
     int enabled;
+    float *flat_host,*halo_host,*c2_host;
     int num_proj;
 
     /* local DS_VNA rows, direction-major: flat[dir*stride + block]    */
@@ -7375,6 +7378,7 @@ static void Force4B_gpu_abort(const char* message)
 {
     fprintf(stderr, "%s\n", message);
     fflush(stderr);
+    if (openmx_gpu_worker_device()>=0) exit(EXIT_FAILURE);
     MPI_Abort(mpi_comm_level1, 1);
 }
 
@@ -7527,7 +7531,9 @@ static int Force4B_GpuBegin(Type_DS_VNA***** DS_VNA, int stream_case1, int strea
     memset(g, 0, sizeof(*g));
     g->num_proj = (List_YOUSO[35] + 1) * (List_YOUSO[35] + 1) * List_YOUSO[34];
 
-    if (scf_eigen_lib_flag != GPUSOLVER) return 0;
+    int requested=scf_eigen_lib_flag==GPUSOLVER;
+    MPI_Allreduce(MPI_IN_PLACE,&requested,1,MPI_INT,MPI_MIN,mpi_comm_level1);
+    if (!requested) return 0;
     if (!Force_collective_env_flag("OPENMX_FORCE4B_GPU", Force_gpu_stage_default(), mpi_comm_level1)) return 0;
     if (stream_case1 && stream_case2) return 0;
 
@@ -7538,9 +7544,9 @@ static int Force4B_GpuBegin(Type_DS_VNA***** DS_VNA, int stream_case1, int strea
 
     /* return every rank's OpenACC freelist (e.g. the Force3 buffers) to CUDA
        before anyone measures the shared free memory */
-    hipDeviceSynchronize();
-    if (hipDeviceSynchronize() == hipSuccess) {
-        ((void)0);
+    if(gpu_rank_device_usable()) openmx_target_wait();
+    if (gpu_rank_device_usable() && hipDeviceSynchronize() == hipSuccess) {
+        openmx_target_clear_freelists();
     }
     MPI_Barrier(node_comm);
     MPI_Comm_free(&node_comm);
@@ -7579,7 +7585,7 @@ static int Force4B_GpuBegin(Type_DS_VNA***** DS_VNA, int stream_case1, int strea
 
     /* feasibility against the device memory shared by the node ranks */
 
-    if (OpenMX_GpuMemGetInfo(&free_bytes, &total_bytes) != hipSuccess) return 0;
+    int resident=!openmx_gpu_capacity_test_recovery() && gpu_rank_device_usable() && OpenMX_GpuMemGetInfo(&free_bytes,&total_bytes)==hipSuccess;
     {
         const size_t reserve = Force_gpu_node_reserve(node_ranks);
         /* WorkspaceSizes counts both complete aligned device workspaces.
@@ -7606,26 +7612,11 @@ static int Force4B_GpuBegin(Type_DS_VNA***** DS_VNA, int stream_case1, int strea
             if (need < legacy) need = legacy;
         }
 
-        if (free_bytes <= reserve) return 0;
-        if ((free_bytes - reserve) / (size_t)node_ranks <= need) {
-            if (3 <= level_stdout) {
-                fprintf(stderr,
-                    "Force4B GPU: %.2f GiB free for %d rank(s) but %.2f GiB needed per rank; CPU fallback.\n",
-                    (double)free_bytes / (1024.0 * 1024.0 * 1024.0), node_ranks,
-                    (double)need / (1024.0 * 1024.0 * 1024.0));
-                fflush(stderr);
-            }
-            else if (node_rank == 0 && 2 <= level_stdout) {
-                fprintf(stderr,
-                    "Force4B GPU: not enough free device memory "
-                    "(%.3f GiB needed, %.3f GiB per rank); CPU fallback.\n",
-                    (double)need / (1024.0 * 1024.0 * 1024.0),
-                    (double)((free_bytes - reserve) / (size_t)node_ranks)
-                        / (1024.0 * 1024.0 * 1024.0));
-                fflush(stderr);
-            }
-            return 0;
-        }
+        resident=resident && free_bytes>reserve && (free_bytes-reserve)/(size_t)node_ranks>need;
+        size_t archive1=(4U*g->flat_stride+g->halo_count)*sizeof(float),archive2=4U*g->c2_stride*sizeof(float);
+        unsigned long long room=openmx_host_mem_available();
+        int fit=resident || !room || (archive1>archive2?archive1:archive2)<=room/(2ULL*node_ranks),all_fit;
+        MPI_Allreduce(&fit,&all_fit,1,MPI_INT,MPI_MIN,mpi_comm_level1);if(!all_fit)return 0;
     }
 
     g->mck_base = (int*)Force_checked_malloc(sizeof(int) * (size_t)(Matomnum + 2), __FILE__, __LINE__);
@@ -7673,25 +7664,21 @@ static int Force4B_GpuBegin(Type_DS_VNA***** DS_VNA, int stream_case1, int strea
     /* Case-1 device archives.  Case 2 does not receive any rows until
        Force4B_GpuCase1Run has completed, so do not allocate it yet. */
 
-    if (!stream_case1) {
-        g->flat_dev = (float*)ForceHipMalloc(sizeof(float) * (g->flat_stride == 0 ? 4 : 4U * g->flat_stride));
-        g->halo_dev = (float*)ForceHipMalloc(sizeof(float) * (g->halo_count == 0 ? 1 : g->halo_count));
+    if(resident && !stream_case1){
+        g->flat_dev=Force_gpu_arena_try((g->flat_stride?4U*g->flat_stride:4)*sizeof(float));
+        g->halo_dev=Force_gpu_arena_try((g->halo_count?g->halo_count:1)*sizeof(float));
     }
-    if (!stream_case1 && (g->flat_dev == NULL || g->halo_dev == NULL)) {
-        if (g->flat_dev != NULL) hipFree(g->flat_dev);
-        if (g->halo_dev != NULL) hipFree(g->halo_dev);
-        free(g->stage);
-        free(g->c2_off);
-        free(g->halo_off);
-        free(g->halo_base);
-        free(g->mck_off);
-        free(g->mck_base);
-        memset(g, 0, sizeof(*g));
-        if (2 <= level_stdout) {
-            fprintf(stderr, "Force4B GPU: device allocation failed; CPU fallback.\n");
-            fflush(stderr);
-        }
-        return 0;
+    int allocated=1,all_allocated;
+    if(!stream_case1 && (!g->flat_dev || !g->halo_dev)){
+        if(g->flat_dev)openmx_target_free(g->flat_dev);if(g->halo_dev)openmx_target_free(g->halo_dev);g->flat_dev=g->halo_dev=NULL;
+        g->flat_host=(malloc)((g->flat_stride?4U*g->flat_stride:4)*sizeof(float));
+        g->halo_host=(malloc)((g->halo_count?g->halo_count:1)*sizeof(float));
+        allocated=g->flat_host && g->halo_host;
+    }
+    MPI_Allreduce(&allocated,&all_allocated,1,MPI_INT,MPI_MIN,mpi_comm_level1);
+    if(!all_allocated){
+        if(g->flat_dev)openmx_target_free(g->flat_dev);if(g->halo_dev)openmx_target_free(g->halo_dev);
+        free(g->flat_host);free(g->halo_host);free(g->stage);free(g->c2_off);free(g->halo_off);free(g->halo_base);free(g->mck_off);free(g->mck_base);memset(g,0,sizeof(*g));return 0;
     }
 
     /* upload the (premultiplied) local DS_VNA rows one atom block at a
@@ -7722,7 +7709,8 @@ static int Force4B_GpuBegin(Type_DS_VNA***** DS_VNA, int stream_case1, int strea
                 }
 
                 if (blk != 0) {
-                    ForceHipMemcpyToDevice(g->flat_dev + (size_t)kk * g->flat_stride + base,
+                    if(g->flat_host)memcpy(g->flat_host+(size_t)kk*g->flat_stride+base,g->stage,sizeof(float)*blk);
+                    else openmx_target_upload(g->flat_dev + (size_t)kk * g->flat_stride + base,
                         g->stage, sizeof(float) * blk);
                 }
             }
@@ -7744,6 +7732,7 @@ static void Force4B_GpuEnd(void)
     if (g->c2_dev != NULL) hipFree(g->c2_dev);
     ((void)0);
 
+    free(g->flat_host);free(g->halo_host);free(g->c2_host);
     free(g->stage);
     free(g->c2_off);
     free(g->halo_off);
@@ -7755,37 +7744,21 @@ static void Force4B_GpuEnd(void)
 
 /* End the first archive lifetime before claiming the second.  In
    particular, a rank with no case-1 pairs returns early from Case1Run
-   and can still own its initial archives here.  Returns 1 when the
-   case-2 archive is resident.  The admission counted it, so a failed
-   claim is unexpected; that rank then streams case 2 or traces it on
-   the host instead of aborting. */
+   and can still own its initial archives here. */
 static int Force4B_GpuCase2Begin(int full_batch)
 {
-    Force4BGpuContext* g = &F4B_gpu;
-
-    if (!g->enabled) return 0;
-
-    if (g->flat_dev != NULL) {
-        hipFree(g->flat_dev);
-        g->flat_dev = NULL;
-    }
-    if (g->halo_dev != NULL) {
-        hipFree(g->halo_dev);
-        g->halo_dev = NULL;
-    }
-    Force_gpu_pool_flush();
-    if (!full_batch) return 0;
-
-    g->c2_dev = (float*)Force_gpu_arena_try(
-        sizeof(float) * (g->c2_stride == 0 ? 4 : 4U * g->c2_stride));
-    if (g->c2_dev == NULL) {
-        fprintf(stderr,
-            "Force4B GPU: case-2 archive allocation failed (%.1f MiB); "
-            "case 2 streams or uses the CPU on this rank.\n",
-            (double)(sizeof(float) * 4U * g->c2_stride) / (1024.0 * 1024.0));
-        fflush(stderr);
-        return 0;
-    }
+    Force4BGpuContext *g=&F4B_gpu;
+    if(!g->enabled)return 0;
+    if(g->flat_dev)openmx_target_free(g->flat_dev);if(g->halo_dev)openmx_target_free(g->halo_dev);g->flat_dev=g->halo_dev=NULL;
+    free(g->flat_host);free(g->halo_host);g->flat_host=g->halo_host=NULL;
+    if(gpu_rank_device_usable())Force_gpu_pool_flush();
+    if(!full_batch)return 0;
+    size_t bytes=(g->c2_stride?4U*g->c2_stride:4)*sizeof(float);
+    if(!openmx_gpu_capacity_test_recovery() && gpu_rank_device_usable())g->c2_dev=Force_gpu_arena_try(bytes);
+    if(!g->c2_dev)g->c2_host=(malloc)(bytes);
+    int allocated=g->c2_dev || g->c2_host,all_allocated;
+    MPI_Allreduce(&allocated,&all_allocated,1,MPI_INT,MPI_MIN,mpi_comm_level1);
+    if(!all_allocated){Force4B_GpuEnd();return 0;}
     return 1;
 }
 
@@ -7819,7 +7792,8 @@ static void Force4B_GpuArchiveHalo(Type_DS_VNA***** DS_VNA, int Original_Mc_AN, 
     }
 
     if (blk != 0) {
-        ForceHipMemcpyToDevice(g->halo_dev + base, g->stage, sizeof(float) * blk);
+        if(g->halo_host)memcpy(g->halo_host+base,g->stage,sizeof(float)*blk);
+        else openmx_target_upload(g->halo_dev + base, g->stage, sizeof(float) * blk);
     }
 }
 
@@ -7853,16 +7827,15 @@ static void Force4B_GpuArchiveCase2(Type_DS_VNA***** DS_VNA, int Mc_AN, int Gc_A
         }
 
         if (blk != 0) {
-            ForceHipMemcpyToDevice(g->c2_dev + (size_t)kk * g->c2_stride + base,
+            if(g->c2_host)memcpy(g->c2_host+(size_t)kk*g->c2_stride+base,g->stage,sizeof(float)*blk);
+            else openmx_target_upload(g->c2_dev + (size_t)kk * g->c2_stride + base,
                 g->stage, sizeof(float) * blk);
         }
     }
 }
 
-/* Shared by the resident, rank-turn and streamed case-1 batches: one
-   kernel (float products, double sums, the CPU trace's k order per (m,n)),
-   so every GPU path gives the same forces. */
-static void Force4B_GpuCase1Kernel(int num_proj, float* flat, float* halo,
+/* Shared by the resident and bounded case-1 batches. */
+static void Force4B_GpuCase1Kernel_Single(int num_proj, float* flat, float* halo,
     size_t flat_stride, int nitems_c, const Force4BGpuItem* items,
     const size_t* krowA, const size_t* krowB, const int* krow_halo,
     const double* cdm_pref, double* item_f)
@@ -7916,9 +7889,116 @@ static void Force4B_GpuCase1Kernel(int num_proj, float* flat, float* halo,
     }
 }
 
-/* Damping tail and accumulation of one completed case-1 item (host, same
-   math as the fused trace).  Every GPU path calls it in mc,q order, so the
-   additions to Gxyz happen in the same order as well. */
+
+static void Force4B_GpuCase2Kernel_Single(int num_proj, float* c2,
+    size_t flat_stride, int nitems_c, const Force4BGpuItem* items,
+    const size_t* pair_h_off, const size_t* pair_q_off,
+    const double* cdm_scale, double* item_f);
+
+typedef struct {
+    OpenMXGpuWorkers workers;
+    int kind,num_proj;
+    size_t stride;
+    const void *source[7];
+    size_t bytes[7];
+    double *output;
+    OpenMXGpuReadView views[OPENMX_GPU_WORKERS_MAX][7];
+    double *private_output[OPENMX_GPU_WORKERS_MAX];
+} Force4B_PairWork;
+
+static int Force4B_PairWorker(void *opaque,int worker,int phase)
+{
+    Force4B_PairWork *work=(Force4B_PairWork*)opaque;
+    const int first=(int)openmx_gpu_worker_cut(work->workers.items,worker,work->workers.count);
+    const int last=(int)openmx_gpu_worker_cut(work->workers.items,worker+1,work->workers.count);
+    OpenMXGpuReadView *v=work->views[worker];
+    if (phase==OPENMX_GPU_WORKER_PREPARE) {
+        for (int i=0;i<7;i++) if (!openmx_gpu_read_view(v+i,work->source[i],work->bytes[i])) return 0;
+        if (hipMalloc((void**)&work->private_output[worker],3*(size_t)(last-first)*sizeof(double))!=hipSuccess) {
+            (void)hipGetLastError();return 0;
+        }
+    } else if (phase==OPENMX_GPU_WORKER_EXECUTE) {
+        if (work->kind==1)
+            Force4B_GpuCase1Kernel_Single(work->num_proj,(float*)v[0].pointer,(float*)v[1].pointer,
+                work->stride,last-first,(const Force4BGpuItem*)v[2].pointer+first,
+                (const size_t*)v[3].pointer,(const size_t*)v[4].pointer,(const int*)v[5].pointer,
+                (const double*)v[6].pointer,work->private_output[worker]);
+        else
+            Force4B_GpuCase2Kernel_Single(work->num_proj,(float*)v[0].pointer,work->stride,last-first,
+                (const Force4BGpuItem*)v[2].pointer+first,(const size_t*)v[3].pointer+first,
+                (const size_t*)v[4].pointer+first,(const double*)v[6].pointer,work->private_output[worker]);
+    } else if (phase==OPENMX_GPU_WORKER_COMMIT) {
+        return openmx_gpu_copy_device(work->output+3*(size_t)first,work->private_output[worker],
+                                      3*(size_t)(last-first)*sizeof(double));
+    } else if (phase==OPENMX_GPU_WORKER_RELEASE) {
+        if (work->private_output[worker]) (void)hipFree(work->private_output[worker]);
+        for (int i=0;i<7;i++) openmx_gpu_read_view_release(v+i);
+    }
+    return 1;
+}
+
+/* The same splitter covers resident, streamed and rank-turn batches. All
+   inputs are read-only peer views or device copies; each worker contracts
+   disjoint items into private outputs. Existing host accumulation keeps its
+   original order after every worker completes, including atom collisions. */
+static int Force4B_PairDistribute(int kind,int num_proj,float *flat,float *halo,size_t stride,
+    int nitems,const Force4BGpuItem *items,const size_t *a,const size_t *b,const int *is_halo,
+    const double *cdm,double *output)
+{
+    Force4B_PairWork work={0};
+    openmx_gpu_workers_local(&work.workers,(size_t)nitems);
+    if (work.workers.count<2) return 0;
+    Force4BGpuItem *host=(Force4BGpuItem*)malloc((size_t)nitems*sizeof(*host));
+    size_t *row_b=NULL,rows=kind==2?(size_t)nitems:0,cdm_count=0,halo_count=0;
+    int *row_halo=NULL,ok=0;
+    if (!host || hipDeviceSynchronize()!=hipSuccess ||
+        hipMemcpy(host,items,(size_t)nitems*sizeof(*host),hipMemcpyDeviceToHost)!=hipSuccess) goto cleanup;
+    for (int i=0;i<nitems;i++) {
+        const size_t end=host[i].cdm_off+(size_t)host[i].ian*(size_t)host[i].jan;
+        if (end>cdm_count) cdm_count=end;
+        if (kind==1) {
+            const size_t r=(size_t)host[i].k_off+(size_t)host[i].k_n;
+            if (r>rows) rows=r;
+        }
+    }
+    if (kind==1 && rows) {
+        row_b=(size_t*)malloc(rows*sizeof(size_t));row_halo=(int*)malloc(rows*sizeof(int));
+        if (!row_b || !row_halo || hipMemcpy(row_b,b,rows*sizeof(size_t),hipMemcpyDeviceToHost)!=hipSuccess ||
+            hipMemcpy(row_halo,is_halo,rows*sizeof(int),hipMemcpyDeviceToHost)!=hipSuccess) goto cleanup;
+        for (int i=0;i<nitems;i++) for (int k=0;k<host[i].k_n;k++) {
+            const int r=host[i].k_off+k;
+            if (row_halo[r]) {
+                const size_t end=row_b[r]+(size_t)host[i].jan*(size_t)num_proj;
+                if (end>halo_count) halo_count=end;
+            }
+        }
+    }
+    work.kind=kind;work.num_proj=num_proj;work.stride=stride;work.output=output;
+    work.source[0]=flat;work.bytes[0]=4*stride*sizeof(float);
+    work.source[1]=halo;work.bytes[1]=halo_count*sizeof(float);
+    work.source[2]=items;work.bytes[2]=(size_t)nitems*sizeof(*items);
+    work.source[3]=a;work.bytes[3]=rows*sizeof(size_t);
+    work.source[4]=b;work.bytes[4]=rows*sizeof(size_t);
+    work.source[5]=is_halo;work.bytes[5]=kind==1?rows*sizeof(int):0;
+    work.source[6]=cdm;work.bytes[6]=cdm_count*sizeof(double);
+    ok=openmx_gpu_workers_run(&work.workers,Force4B_PairWorker,&work,
+                              kind==1?"force-VNA-pairs-1":"force-VNA-pairs-2");
+cleanup:
+    free(host);free(row_b);free(row_halo);
+    return ok;
+}
+
+static void Force4B_GpuCase1Kernel(int num_proj, float* flat, float* halo,
+    size_t flat_stride, int nitems_c, const Force4BGpuItem* items,
+    const size_t* krowA, const size_t* krowB, const int* krow_halo,
+    const double* cdm_pref, double* item_f)
+{
+        Force4B_GpuCase1Kernel_Single(num_proj,flat,halo,flat_stride,nitems_c,items,krowA,krowB,krow_halo,cdm_pref,item_f);
+}
+
+
+
+/* Apply each completed item in the same mc/q order for either GPU path. */
 static void Force4B_GpuCase1Accumulate(double***** CDM0, int mc, int q_AN,
     int ian, int jan, const double* force)
 {
@@ -8876,6 +8956,85 @@ static void Force4B_GpuCase1TurnsRun(double***** CDM0, Type_DS_VNA***** DS_VNA)
 
 /* the unified case-1 batch: for every local atom, all q_AN != 0 pairs
    (local q reads the flat table, halo q reads the halo archive) */
+typedef struct {int kind,num_proj,fp32;} Force4BCapacityParameters;
+static void Force4B_capacity_kernel(size_t first,size_t count,const void *parameters,void *const v[],int gpu)
+{
+    const Force4BCapacityParameters *p=parameters;const int kind=p->kind,np=p->num_proj,fp32=p->fp32;
+    const Force4BGpuItem *items=v[0];const size_t *offset=v[1],*cdm_off=v[2];
+    const float *packed=openmx_gpu_task_ragged_data(v[1],count);const double *cdm=openmx_gpu_task_ragged_data(v[2],count);double *out=v[3];
+    (void)first;
+#pragma omp target teams distribute parallel for thread_limit(128) is_device_ptr(items,offset,cdm_off,packed,cdm,out) if(gpu)
+    for(size_t row=0;row<count;row++){
+        Force4BGpuItem pr=items[row];const float *data=packed+offset[row];double fx=0,fy=0,fz=0;
+
+        for(int idx=0;idx<pr.ian*pr.jan;idx++){
+            int m=idx/pr.jan,n=idx%pr.jan;double sx=0,sy=0,sz=0;
+            if(kind==1){
+                for(int k=0;k<pr.k_n;k++){
+                    const float *a1=data+(size_t)k*np*(3*pr.ian+pr.jan)+(size_t)m*np,*a2=a1+(size_t)pr.ian*np,*a3=a2+(size_t)pr.ian*np;
+                    const float *b=data+(size_t)k*np*(3*pr.ian+pr.jan)+3*(size_t)pr.ian*np+(size_t)n*np;
+                    double tx=0,ty=0,tz=0;
+                    for(int l=0;l<np;l++){tx+=fp32?(double)(a1[l]*b[l]):(double)a1[l]*b[l];ty+=fp32?(double)(a2[l]*b[l]):(double)a2[l]*b[l];tz+=fp32?(double)(a3[l]*b[l]):(double)a3[l]*b[l];}
+                    sx+=tx;sy+=ty;sz+=tz;
+                }
+            }else{
+                const float *a0=data+(size_t)m*np,*a1=a0+(size_t)pr.ian*np,*a2=a1+(size_t)pr.ian*np,*a3=a2+(size_t)pr.ian*np;
+                const float *b0=data+4*(size_t)pr.ian*np+(size_t)n*np,*b1=b0+(size_t)pr.jan*np,*b2=b1+(size_t)pr.jan*np,*b3=b2+(size_t)pr.jan*np;
+                for(int l=0;l<np;l++){
+                    sx-=(fp32?(double)(a1[l]*b0[l]):(double)a1[l]*b0[l])+(fp32?(double)(a0[l]*b1[l]):(double)a0[l]*b1[l]);
+                    sy-=(fp32?(double)(a2[l]*b0[l]):(double)a2[l]*b0[l])+(fp32?(double)(a0[l]*b2[l]):(double)a0[l]*b2[l]);
+                    sz-=(fp32?(double)(a3[l]*b0[l]):(double)a3[l]*b0[l])+(fp32?(double)(a0[l]*b3[l]):(double)a0[l]*b3[l]);
+                }
+            }
+            double w=cdm[cdm_off[row]+idx];fx+=w*sx;fy+=w*sy;fz+=w*sz;
+        }
+        out[3*row]=fx;out[3*row+1]=fy;out[3*row+2]=fz;
+    }
+}
+static void Force4B_capacity_copy(float *dest,const float *host,const float *device,size_t offset,size_t count)
+{
+    if(!count)return;
+    if(host)memcpy(dest,host+offset,count*sizeof(float));
+    else if(hipMemcpy(dest,device+offset,count*sizeof(float),hipMemcpyDeviceToHost)!=hipSuccess)
+        Force4B_gpu_abort("Force4B: cannot read an existing projector archive.");
+}
+static void Force4B_capacity(int kind,Force4BGpuContext *g,int nitems,Force4BGpuItem *items,
+    size_t *a,size_t *b,int *halo,double *cdm,double *output,int done)
+{
+    size_t first=done?(size_t)nitems:0;Force4BCapacityParameters p={kind,g->num_proj,openmx_fp32_enabled()};
+    for(;;){
+        int remaining=first<(size_t)nitems,any;MPI_Allreduce(&remaining,&any,1,MPI_INT,MPI_MAX,mpi_comm_level1);if(!any)break;
+        size_t n=0,values=0,cdms=0;
+        while(first+n<(size_t)nitems && n<256){
+            Force4BGpuItem it=items[first+n];size_t add=(size_t)p.num_proj*(kind==1?(size_t)it.k_n*(3*it.ian+it.jan):4*(size_t)(it.ian+it.jan));
+            if(n && values+add>16777216)break;
+            values+=add;cdms+=(size_t)it.ian*it.jan;n++;
+        }
+        size_t *offset=malloc((n+1)*sizeof(size_t)),*coff=malloc((n+1)*sizeof(size_t));
+        float *data=malloc((values?values:1)*sizeof(float));double *weights=malloc((cdms?cdms:1)*sizeof(double));
+        if (!offset || !coff || !data || !weights)
+            Force4B_gpu_abort("Force4B: cannot allocate a bounded host recovery packet.");
+        size_t at=0,ct=0;offset[0]=coff[0]=0;
+        for(size_t i=0;i<n;i++){
+            size_t q=first+i;Force4BGpuItem it=items[q];size_t mn=(size_t)it.ian*it.jan;
+            memcpy(weights+ct,cdm+it.cdm_off,mn*sizeof(double));ct+=mn;
+            if(kind==1)for(int k=it.k_off;k<it.k_off+it.k_n;k++){
+                for(int dir=1;dir<4;dir++){size_t num=(size_t)it.ian*p.num_proj;Force4B_capacity_copy(data+at,g->flat_host,g->flat_dev,dir*g->flat_stride+a[k],num);at+=num;}
+                size_t num=(size_t)it.jan*p.num_proj;Force4B_capacity_copy(data+at,halo[k]?g->halo_host:g->flat_host,halo[k]?g->halo_dev:g->flat_dev,b[k],num);at+=num;
+            }else{
+                for(int dir=0;dir<4;dir++){size_t num=(size_t)it.ian*p.num_proj;Force4B_capacity_copy(data+at,g->c2_host,g->c2_dev,dir*g->c2_stride+a[q],num);at+=num;}
+                for(int dir=0;dir<4;dir++){size_t num=(size_t)it.jan*p.num_proj;Force4B_capacity_copy(data+at,g->c2_host,g->c2_dev,dir*g->c2_stride+b[q],num);at+=num;}
+            }
+            offset[i+1]=at;coff[i+1]=ct;
+        }
+        OpenMXGpuTask task={0};task.count=n;task.inputs=3;task.outputs=1;task.kernel=Force4B_capacity_kernel;task.parameters=&p;task.parameter_bytes=sizeof(p);
+        task.view[0]=(OpenMXGpuTaskView){items+first,0,sizeof(*items)};task.view[1]=(OpenMXGpuTaskView){data,0,0,offset,sizeof(float)};
+        task.view[2]=(OpenMXGpuTaskView){weights,0,0,coff,sizeof(double)};task.view[3]=(OpenMXGpuTaskView){output+3*first,0,3*sizeof(double)};
+        openmx_gpu_task_execute(mpi_comm_level1,&task,1,kind==1?"force-VNA1-capacity":"force-VNA2-capacity");
+        free(offset);free(coff);free(data);free(weights);first+=n;
+    }
+}
+
 static void Force4B_GpuCase1Run(double***** CDM0)
 {
     Force4BGpuContext* g = &F4B_gpu;
@@ -8911,7 +9070,7 @@ static void Force4B_GpuCase1Run(double***** CDM0)
         }
     }
 
-    if (nitems == 0) return;
+    int gpu_done=nitems==0;
 
     items = (Force4BGpuItem*)Force_checked_malloc(sizeof(Force4BGpuItem) * (size_t)nitems, __FILE__, __LINE__);
     item_atom = (int*)Force_checked_malloc(sizeof(int) * (size_t)nitems, __FILE__, __LINE__);
@@ -8975,7 +9134,10 @@ static void Force4B_GpuCase1Run(double***** CDM0)
         Force4B_gpu_abort("Force4B GPU: inconsistent case-1 batch.");
     }
 
-    {
+    if(nitems && g->flat_dev && g->halo_dev){
+        float* flat = g->flat_dev;
+        float* halo = g->halo_dev;
+        size_t flat_stride = g->flat_stride;
         const int nitems_c = nitems;
         const size_t kslots_c = (kslots == 0 ? 1 : (size_t)kslots);
         const size_t cdm_c = (cdm_count == 0 ? 1 : cdm_count);
@@ -8986,28 +9148,37 @@ static void Force4B_GpuCase1Run(double***** CDM0)
         const size_t o_khalo = Force_gpu_arena_off(&asz, sizeof(int) * kslots_c);
         const size_t o_cdm = Force_gpu_arena_off(&asz, sizeof(double) * cdm_c);
         const size_t o_itemf = Force_gpu_arena_off(&asz, sizeof(double) * 3U * (size_t)nitems_c);
-        char* arena = (char*)Force_gpu_arena_wait(asz, "4B first-case batch");
+        char* arena = (char*)Force_gpu_arena_try(asz);
 
-        ForceHipMemcpyToDevice(arena + o_items, items, sizeof(Force4BGpuItem) * (size_t)nitems_c);
-        ForceHipMemcpyToDevice(arena + o_krowA, krowA, sizeof(size_t) * kslots_c);
-        ForceHipMemcpyToDevice(arena + o_krowB, krowB, sizeof(size_t) * kslots_c);
-        ForceHipMemcpyToDevice(arena + o_khalo, krow_halo, sizeof(int) * kslots_c);
-        ForceHipMemcpyToDevice(arena + o_cdm, cdm_pref, sizeof(double) * cdm_c);
+        if(!arena)goto f4b_capacity;
+        openmx_target_upload(arena + o_items, items, sizeof(Force4BGpuItem) * (size_t)nitems_c);
+        openmx_target_upload(arena + o_krowA, krowA, sizeof(size_t) * kslots_c);
+        openmx_target_upload(arena + o_krowB, krowB, sizeof(size_t) * kslots_c);
+        openmx_target_upload(arena + o_khalo, krow_halo, sizeof(int) * kslots_c);
+        openmx_target_upload(arena + o_cdm, cdm_pref, sizeof(double) * cdm_c);
 
-        Force4B_GpuCase1Kernel(num_proj, g->flat_dev, g->halo_dev, g->flat_stride, nitems_c,
-            (const Force4BGpuItem*)(const void*)(arena + o_items),
-            (const size_t*)(const void*)(arena + o_krowA),
-            (const size_t*)(const void*)(arena + o_krowB),
-            (const int*)(const void*)(arena + o_khalo),
-            (const double*)(const void*)(arena + o_cdm),
-            (double*)(void*)(arena + o_itemf));
+        {
+            const Force4BGpuItem* items = (const Force4BGpuItem*)(void*)(arena + o_items);
+            const size_t* krowA = (const size_t*)(void*)(arena + o_krowA);
+            const size_t* krowB = (const size_t*)(void*)(arena + o_krowB);
+            const int* krow_halo = (const int*)(void*)(arena + o_khalo);
+            const double* cdm_pref = (const double*)(void*)(arena + o_cdm);
+            double* item_f = (double*)(void*)(arena + o_itemf);
 
-        ForceHipMemcpyFromDevice(item_f, arena + o_itemf, sizeof(double) * 3U * (size_t)nitems_c);
-        hipFree(arena);
+            Force4B_GpuCase1Kernel(num_proj, flat, halo, flat_stride, nitems_c,
+                items, krowA, krowB, krow_halo, cdm_pref, item_f);
+        }
+
+        openmx_target_download(item_f, arena + o_itemf, sizeof(double) * 3U * (size_t)nitems_c);
+        gpu_done=1;
+        openmx_target_free(arena);
         Force_gpu_pool_flush();
     }
 
     /* damping tail and accumulation (host, same math as the fused trace) */
+
+f4b_capacity:
+    Force4B_capacity(1,g,nitems,items,krowA,krowB,krow_halo,cdm_pref,item_f,gpu_done);
 
     for (p = 0; p < nitems; p++) {
         Force4B_GpuCase1Accumulate(CDM0, item_atom[p], item_q[p],
@@ -9027,8 +9198,8 @@ static void Force4B_GpuCase1Run(double***** CDM0)
        the case-2 storage, also when the zero-item path above returns. */
 }
 
-/* Both the full and the one-centre case-2 batches use this contraction. */
-static void Force4B_GpuCase2Kernel(int num_proj, float* c2,
+/* Both full and one-centre batches use this identical contraction. */
+static void Force4B_GpuCase2Kernel_Single(int num_proj, float* c2,
     size_t flat_stride, int nitems_c, const Force4BGpuItem* items,
     const size_t* pair_h_off, const size_t* pair_q_off,
     const double* cdm_scale, double* item_f)
@@ -9076,12 +9247,15 @@ static void Force4B_GpuCase2Kernel(int num_proj, float* c2,
     }
 }
 
-/* ------------------------------------------------------------------ */
-/* Per-centre case-2 streaming: when the case-2 archive of every centre
-   does not stay resident, each rank independently claims one arena for
-   its largest centre and evaluates every centre inside the case-2
-   communication loop, right after its 4-direction slot is staged.      */
-/* ------------------------------------------------------------------ */
+static void Force4B_GpuCase2Kernel(int num_proj, float* c2,
+    size_t flat_stride, int nitems_c, const Force4BGpuItem* items,
+    const size_t* pair_h_off, const size_t* pair_q_off,
+    const double* cdm_scale, double* item_f)
+{
+        Force4B_GpuCase2Kernel_Single(num_proj,c2,flat_stride,nitems_c,items,pair_h_off,pair_q_off,cdm_scale,item_f);
+}
+
+
 
 typedef struct {
     size_t stride, bytes, cdm_count;
@@ -9388,7 +9562,7 @@ static void Force4B_GpuCase2Run(double***** CDM0)
         }
     }
 
-    if (nitems == 0) return;
+    int gpu_done=nitems==0;
 
     items = (Force4BGpuItem*)Force_checked_malloc(sizeof(Force4BGpuItem) * (size_t)nitems, __FILE__, __LINE__);
     pair_h_off = (size_t*)Force_checked_malloc(sizeof(size_t) * (size_t)nitems, __FILE__, __LINE__);
@@ -9454,7 +9628,9 @@ static void Force4B_GpuCase2Run(double***** CDM0)
         Force4B_gpu_abort("Force4B GPU: inconsistent case-2 batch.");
     }
 
-    {
+    if(nitems && g->c2_dev){
+        float* c2 = g->c2_dev;
+        size_t flat_stride = g->c2_stride;
         const int nitems_c = nitems;
         const size_t cdm_c = (cdm_count == 0 ? 1 : cdm_count);
         size_t asz = 0;
@@ -9463,12 +9639,13 @@ static void Force4B_GpuCase2Run(double***** CDM0)
         const size_t o_qoff = Force_gpu_arena_off(&asz, sizeof(size_t) * (size_t)nitems_c);
         const size_t o_cdm = Force_gpu_arena_off(&asz, sizeof(double) * cdm_c);
         const size_t o_itemf = Force_gpu_arena_off(&asz, sizeof(double) * 3U * (size_t)nitems_c);
-        char* arena = (char*)Force_gpu_arena_wait(asz, "4B second-case batch");
+        char* arena = (char*)Force_gpu_arena_try(asz);
 
-        ForceHipMemcpyToDevice(arena + o_items, items, sizeof(Force4BGpuItem) * (size_t)nitems_c);
-        ForceHipMemcpyToDevice(arena + o_hoff, pair_h_off, sizeof(size_t) * (size_t)nitems_c);
-        ForceHipMemcpyToDevice(arena + o_qoff, pair_q_off, sizeof(size_t) * (size_t)nitems_c);
-        ForceHipMemcpyToDevice(arena + o_cdm, cdm_scale, sizeof(double) * cdm_c);
+        if(!arena)goto f4b_capacity;
+        openmx_target_upload(arena + o_items, items, sizeof(Force4BGpuItem) * (size_t)nitems_c);
+        openmx_target_upload(arena + o_hoff, pair_h_off, sizeof(size_t) * (size_t)nitems_c);
+        openmx_target_upload(arena + o_qoff, pair_q_off, sizeof(size_t) * (size_t)nitems_c);
+        openmx_target_upload(arena + o_cdm, cdm_scale, sizeof(double) * cdm_c);
 
         Force4B_GpuCase2Kernel(num_proj, g->c2_dev, g->c2_stride, nitems_c,
             (const Force4BGpuItem*)(const void*)(arena + o_items),
@@ -9477,10 +9654,14 @@ static void Force4B_GpuCase2Run(double***** CDM0)
             (const double*)(const void*)(arena + o_cdm),
             (double*)(void*)(arena + o_itemf));
 
-        ForceHipMemcpyFromDevice(item_f, arena + o_itemf, sizeof(double) * 3U * (size_t)nitems_c);
-        hipFree(arena);
+        openmx_target_download(item_f, arena + o_itemf, sizeof(double) * 3U * (size_t)nitems_c);
+        gpu_done=1;
+        openmx_target_free(arena);
         Force_gpu_pool_flush();
     }
+
+f4b_capacity:
+    Force4B_capacity(2,g,nitems,items,pair_h_off,pair_q_off,NULL,cdm_scale,item_f,gpu_done);
 
     for (p = 0; p < nitems; p++) {
         int Gc_AN = M2G[item_atom[p]];
@@ -9554,7 +9735,9 @@ static int Force_HNL_GpuBegin(double****** DS_NL)
 
     memset(g, 0, sizeof(*g));
 
-    if (scf_eigen_lib_flag != GPUSOLVER) return 0;
+    int requested=scf_eigen_lib_flag==GPUSOLVER;
+    MPI_Allreduce(MPI_IN_PLACE,&requested,1,MPI_INT,MPI_MIN,mpi_comm_level1);
+    if (!requested) return 0;
     if (!Force_collective_env_flag("OPENMX_FORCEHNL_GPU", Force_gpu_stage_default(), mpi_comm_level1)) return 0;
     if (F_NL_flag != 1) return 0;
 
@@ -9572,9 +9755,9 @@ static int Force_HNL_GpuBegin(double****** DS_NL)
     MPI_Comm_size(node_comm, &node_ranks);
     MPI_Comm_rank(node_comm, &node_rank);
     if (node_ranks < 1) node_ranks = 1;
-    hipDeviceSynchronize();
-    if (hipDeviceSynchronize() == hipSuccess) {
-        ((void)0);
+    if (gpu_rank_device_usable()) openmx_target_wait();
+    if (gpu_rank_device_usable() && hipDeviceSynchronize() == hipSuccess) {
+        openmx_target_clear_freelists();
     }
     MPI_Barrier(node_comm);
     MPI_Comm_free(&node_comm);
@@ -9632,11 +9815,7 @@ static int Force_HNL_GpuBegin(double****** DS_NL)
         }
     }
 
-    if (OpenMX_GpuMemGetInfo(&free_bytes, &total_bytes) != hipSuccess) {
-        free(g->ene); free(g->sp_nlp); free(g->ene_off);
-        memset(g, 0, sizeof(*g));
-        return 0;
-    }
+    int resident=!openmx_gpu_capacity_test_recovery() && gpu_rank_device_usable() && OpenMX_GpuMemGetInfo(&free_bytes,&total_bytes)==hipSuccess;
 
     g->mck_base = (int*)Force_checked_malloc(sizeof(int) * (size_t)(Matomnum + 2), __FILE__, __LINE__);
     g->mck_off = (size_t*)Force_checked_malloc(sizeof(size_t) * (slots == 0 ? 1 : slots), __FILE__, __LINE__);
@@ -9666,32 +9845,19 @@ static int Force_HNL_GpuBegin(double****** DS_NL)
         g->c2_stride = c2pos;
     }
 
-    /* feasibility: everything is resident at once (tens of MB) */
+    /* Host archives are required for remote and CPU recovery. Device
+       residency is only an optimization, not admission to the phase. */
     {
-        const size_t reserve = Force_gpu_node_reserve(node_ranks);
-        const size_t transients = (size_t)128 * 1024 * 1024;
-        size_t need = (4U * g->flat_stride + g->halo_count + 4U * g->c2_stride) * sizeof(double)
-            + transients;
-
-        if (free_bytes <= reserve ||
-            (free_bytes - reserve) / (size_t)node_ranks <= need) {
-            if (3 <= level_stdout) {
-                fprintf(stderr,
-                    "Force_HNL GPU: %.2f GiB free for %d rank(s) but %.2f GiB needed per rank; CPU fallback.\n",
-                    (double)free_bytes / (1024.0 * 1024.0 * 1024.0), node_ranks,
-                    (double)need / (1024.0 * 1024.0 * 1024.0));
-                fflush(stderr);
-            }
-            else if (node_rank == 0 && 2 <= level_stdout) {
-                fprintf(stderr,
-                    "Force_HNL GPU: not enough free device memory; CPU fallback.\n");
-                fflush(stderr);
-            }
-            free(g->c2_off); free(g->mck_off); free(g->mck_base);
-            free(g->ene); free(g->sp_nlp); free(g->ene_off);
-            memset(g, 0, sizeof(*g));
-            return 0;
+        size_t need=(4U*g->flat_stride+g->halo_count+4U*g->c2_stride)*sizeof(double);
+        unsigned long long room=openmx_host_mem_available();
+        int fit=!room || need<=room/(2ULL*node_ranks),all_fit;
+        MPI_Allreduce(&fit,&all_fit,1,MPI_INT,MPI_MIN,mpi_comm_level1);
+        if(!all_fit){
+            free(g->c2_off);free(g->mck_off);free(g->mck_base);
+            free(g->ene);free(g->sp_nlp);free(g->ene_off);memset(g,0,sizeof(*g));return 0;
         }
+        size_t reserve=Force_gpu_node_reserve(node_ranks);
+        resident=resident && free_bytes>reserve && (free_bytes-reserve)/(size_t)node_ranks>need+134217728;
     }
 
     g->flat = (double*)Force_checked_malloc(sizeof(double) * (g->flat_stride == 0 ? 4 : 4U * g->flat_stride),
@@ -9741,11 +9907,10 @@ static int Force_HNL_GpuBegin(double****** DS_NL)
         }
     }
 
-    {
-        size_t flat_len = (g->flat_stride == 0 ? 4 : 4U * g->flat_stride);
-
-        g->flat_dev = (double*)Force_gpu_arena_wait(flat_len * sizeof(double), "HNL flat archive");
-        ForceHipMemcpyToDevice(g->flat_dev, g->flat, flat_len * sizeof(double));
+    if(resident){
+        size_t flat_len=g->flat_stride?4U*g->flat_stride:4;
+        g->flat_dev=Force_gpu_arena_try(flat_len*sizeof(double));
+        if(g->flat_dev)openmx_target_upload(g->flat_dev,g->flat,flat_len*sizeof(double));
     }
 
     g->enabled = 1;
@@ -9827,11 +9992,103 @@ static void Force_HNL_GpuArchiveCase2(double****** DS_NL, int Mc_AN, int Gc_AN)
     }
 }
 
+typedef struct {int kind,ian,jan,kn,h0,nlp;} ForceHNLCapacityItem;
+static void Force_HNL_capacity_kernel(size_t first,size_t count,const void *parameters,void *const v[],int gpu)
+{
+    const ForceHNLCapacityItem *items=v[0];const size_t *offset=v[1],*nlp_offset=v[2];
+    const double *packed=openmx_gpu_task_ragged_data(v[1],count);
+    const int *nlps=openmx_gpu_task_ragged_data(v[2],count);double *out=v[3];
+    (void)first;(void)parameters;
+#pragma omp target teams distribute parallel for thread_limit(128) is_device_ptr(items,offset,nlp_offset,packed,nlps,out) if(gpu)
+    for(size_t row=0;row<count;row++){
+        ForceHNLCapacityItem pr=items[row];const int mn=pr.ian*pr.jan;
+        const double *data=packed+offset[row];double fx=0,fy=0,fz=0;
+
+        for(int idx=0;idx<mn;idx++){
+            const int m=idx/pr.jan,n=idx%pr.jan;size_t at=mn;
+            double sx=0,sy=0,sz=0;
+            if(pr.kind==1){
+                for(int k=0;k<pr.kn;k++){
+                    int np=nlps[nlp_offset[row]+k];const double *ene=data+at;
+                    const double *a1=ene+np+(size_t)m*np,*a2=a1+(size_t)pr.ian*np,*a3=a2+(size_t)pr.ian*np;
+                    const double *b=ene+np+3*(size_t)pr.ian*np+(size_t)n*np;
+                    double tx=0,ty=0,tz=0;
+                    for(int l=0;l<np;l++){tx+=ene[l]*a1[l]*b[l];ty+=ene[l]*a2[l]*b[l];tz+=ene[l]*a3[l]*b[l];}
+                    sx+=tx;sy+=ty;sz+=tz;at+=(size_t)np*(1+3*pr.ian+pr.jan);
+                }
+            }else{
+                const int np=pr.nlp;const double *ene=data+at;
+                const double *a0=ene+np+(size_t)m*np,*a1=a0+(size_t)pr.ian*np,*a2=a1+(size_t)pr.ian*np,*a3=a2+(size_t)pr.ian*np;
+                const double *b0=ene+np+4*(size_t)pr.ian*np+(size_t)n*np,*b1=b0+(size_t)pr.jan*np,*b2=b1+(size_t)pr.jan*np,*b3=b2+(size_t)pr.jan*np;
+                if(pr.h0==1){for(int l=0;l<np;l++){sx-=ene[l]*a0[l]*b1[l];sy-=ene[l]*a0[l]*b2[l];sz-=ene[l]*a0[l]*b3[l];}}
+                else{
+                    for(int l=0;l<np;l++){sx-=ene[l]*a1[l]*b0[l];sy-=ene[l]*a2[l]*b0[l];sz-=ene[l]*a3[l]*b0[l];}
+                    if(pr.h0==0)for(int l=0;l<np;l++){sx-=ene[l]*a0[l]*b1[l];sy-=ene[l]*a0[l]*b2[l];sz-=ene[l]*a0[l]*b3[l];}
+                }
+            }
+            fx+=data[idx]*sx;fy+=data[idx]*sy;fz+=data[idx]*sz;
+        }
+        out[3*row]=fx;out[3*row+1]=fy;out[3*row+2]=fz;
+    }
+}
+
+static void Force_HNL_capacity(int kind,ForceHNLGpuContext *g,int nitems,const Force4BGpuItem *items,
+    const size_t *a,const size_t *b,const int *halo,const int *ene,const int *nlp,const int *h0,
+    const double *cdm,double *output,int done)
+{
+    size_t first=done?(size_t)nitems:0;
+    for(;;){
+        int remaining=first<(size_t)nitems,any;
+        MPI_Allreduce(&remaining,&any,1,MPI_INT,MPI_MAX,mpi_comm_level1);if(!any)break;
+        size_t n=0,values=0,nk=0;
+        while(first+n<(size_t)nitems && n<256){
+            const Force4BGpuItem *it=items+first+n;size_t add=(size_t)it->ian*it->jan;
+            if(kind==1)for(int k=it->k_off;k<it->k_off+it->k_n;k++)add+=(size_t)nlp[k]*(1+3*it->ian+it->jan);
+            else add+=(size_t)nlp[first+n]*(1+4*it->ian+4*it->jan);
+            if(n && values+add>8388608)break;
+            values+=add;nk+=kind==1?it->k_n:0;n++;
+        }
+        ForceHNLCapacityItem *prs=malloc((n?n:1)*sizeof(*prs));
+        size_t *offset=malloc((n+1)*sizeof(size_t)),*nlp_offset=malloc((n+1)*sizeof(size_t));
+        double *data=malloc((values?values:1)*sizeof(double));int *length=malloc((nk?nk:1)*sizeof(int));
+        if (!prs || !offset || !nlp_offset || !data || !length)
+            Force4B_gpu_abort("Force_HNL: cannot allocate a bounded host recovery packet.");
+        size_t at=0,ki=0;offset[0]=nlp_offset[0]=0;
+        for(size_t i=0;i<n;i++){
+            size_t p=first+i;const Force4BGpuItem *it=items+p;
+            prs[i]=(ForceHNLCapacityItem){kind,it->ian,it->jan,it->k_n,kind==2?h0[p]:0,kind==2?nlp[p]:0};
+            size_t mn=(size_t)it->ian*it->jan;memcpy(data+at,cdm+it->cdm_off,mn*sizeof(double));at+=mn;
+            if(kind==1){
+                for(int k=it->k_off;k<it->k_off+it->k_n;k++){
+                    int np=nlp[k];length[ki++]=np;memcpy(data+at,g->ene+ene[k],(size_t)np*sizeof(double));at+=np;
+                    for(int dir=1;dir<=3;dir++){size_t num=(size_t)it->ian*np;memcpy(data+at,g->flat+dir*g->flat_stride+a[k],num*sizeof(double));at+=num;}
+                    size_t num=(size_t)it->jan*np;memcpy(data+at,(halo[k]?g->halo:g->flat)+b[k],num*sizeof(double));at+=num;
+                }
+            }else{
+                int np=nlp[p];memcpy(data+at,g->ene+ene[p],(size_t)np*sizeof(double));at+=np;
+                for(int dir=0;dir<4;dir++){
+                    size_t num=(size_t)it->ian*np;
+                    if(h0[p]==1){if(dir==0)memcpy(data+at,g->flat+a[p],num*sizeof(double));else memset(data+at,0,num*sizeof(double));}
+                    else memcpy(data+at,g->c2+dir*g->c2_stride+a[p],num*sizeof(double));at+=num;
+                }
+                for(int dir=0;dir<4;dir++){size_t num=(size_t)it->jan*np;memcpy(data+at,g->c2+dir*g->c2_stride+b[p],num*sizeof(double));at+=num;}
+            }
+            offset[i+1]=at;nlp_offset[i+1]=ki;
+        }
+        OpenMXGpuTask task={0};task.count=n;task.inputs=3;task.outputs=1;task.kernel=Force_HNL_capacity_kernel;
+        task.view[0]=(OpenMXGpuTaskView){prs,0,sizeof(*prs)};
+        task.view[1]=(OpenMXGpuTaskView){data,0,0,offset,sizeof(double)};
+        task.view[2]=(OpenMXGpuTaskView){length,0,0,nlp_offset,sizeof(int)};
+        task.view[3]=(OpenMXGpuTaskView){output+3*first,0,3*sizeof(double)};
+        openmx_gpu_task_execute(mpi_comm_level1,&task,1,kind==1?"force-nonlocal1-capacity":"force-nonlocal2-capacity");
+        free(prs);free(offset);free(nlp_offset);free(data);free(length);first+=n;
+    }
+}
+
 /* the unified first-case batch: every (local atom, q_AN != 0) pair;
    local q reads the flat table, halo q reads the halo archive */
-static void Force_HNL_GpuCase1Run(double***** CDM0)
+static void Force_HNL_GpuCase1Run_Part(int first,int last,ForceHNLGpuContext *g,double *forces,int myid_p,double***** CDM0)
 {
-    ForceHNLGpuContext* g = &FHNL_gpu;
     int Mc_AN, q_AN, k;
     int nitems = 0, kslots = 0;
     size_t cdm_count = 0;
@@ -9850,7 +10107,7 @@ static void Force_HNL_GpuCase1Run(double***** CDM0)
     int kpos = 0;
 
     /* count */
-    for (Mc_AN = 1; Mc_AN <= Matomnum; Mc_AN++) {
+    for (Mc_AN = first; Mc_AN < last; Mc_AN++) {
         int Gc_AN = M2G[Mc_AN];
         int ian = Spe_Total_CNO[WhatSpecies[Gc_AN]];
 
@@ -9864,7 +10121,7 @@ static void Force_HNL_GpuCase1Run(double***** CDM0)
         }
     }
 
-    if (nitems == 0) return;
+    int gpu_done=nitems==0;
 
     items = (Force4BGpuItem*)Force_checked_malloc(sizeof(Force4BGpuItem) * (size_t)nitems, __FILE__, __LINE__);
     item_atom = (int*)Force_checked_malloc(sizeof(int) * (size_t)nitems, __FILE__, __LINE__);
@@ -9879,7 +10136,7 @@ static void Force_HNL_GpuCase1Run(double***** CDM0)
 
     /* build */
     p = 0;
-    for (Mc_AN = 1; Mc_AN <= Matomnum; Mc_AN++) {
+    for (Mc_AN = first; Mc_AN < last; Mc_AN++) {
         int Gc_AN = M2G[Mc_AN];
         int ian = Spe_Total_CNO[WhatSpecies[Gc_AN]];
 
@@ -9937,7 +10194,7 @@ static void Force_HNL_GpuCase1Run(double***** CDM0)
         Force4B_gpu_abort("Force_HNL GPU: inconsistent first-case batch.");
     }
 
-    {
+    if(nitems && g->flat_dev){
         const double* flat = g->flat_dev;
         size_t halo_len = (g->halo_count == 0 ? 1 : g->halo_count);
         size_t ene_len = (g->ene_off[SpeciesNum] == 0 ? 1 : g->ene_off[SpeciesNum]);
@@ -9956,17 +10213,18 @@ static void Force_HNL_GpuCase1Run(double***** CDM0)
         const size_t o_halo = Force_gpu_arena_off(&asz, sizeof(double) * halo_len);
         const size_t o_ene = Force_gpu_arena_off(&asz, sizeof(double) * ene_len);
         const size_t o_itemf = Force_gpu_arena_off(&asz, sizeof(double) * 3U * (size_t)nitems_c);
-        char* arena = (char*)Force_gpu_arena_wait(asz, "HNL first-case batch");
+        char* arena = (char*)Force_gpu_arena_try(asz);
 
-        ForceHipMemcpyToDevice(arena + o_items, items, sizeof(Force4BGpuItem) * (size_t)nitems_c);
-        ForceHipMemcpyToDevice(arena + o_krowA, krowA, sizeof(size_t) * kslots_c);
-        ForceHipMemcpyToDevice(arena + o_krowB, krowB, sizeof(size_t) * kslots_c);
-        ForceHipMemcpyToDevice(arena + o_khalo, krow_halo, sizeof(int) * kslots_c);
-        ForceHipMemcpyToDevice(arena + o_kene, krow_ene, sizeof(int) * kslots_c);
-        ForceHipMemcpyToDevice(arena + o_knlp, krow_nlp, sizeof(int) * kslots_c);
-        ForceHipMemcpyToDevice(arena + o_cdm, cdm_pref, sizeof(double) * cdm_c);
-        ForceHipMemcpyToDevice(arena + o_halo, g->halo, sizeof(double) * halo_len);
-        ForceHipMemcpyToDevice(arena + o_ene, g->ene, sizeof(double) * ene_len);
+        if(!arena)goto hnl_capacity;
+        openmx_target_upload(arena + o_items, items, sizeof(Force4BGpuItem) * (size_t)nitems_c);
+        openmx_target_upload(arena + o_krowA, krowA, sizeof(size_t) * kslots_c);
+        openmx_target_upload(arena + o_krowB, krowB, sizeof(size_t) * kslots_c);
+        openmx_target_upload(arena + o_khalo, krow_halo, sizeof(int) * kslots_c);
+        openmx_target_upload(arena + o_kene, krow_ene, sizeof(int) * kslots_c);
+        openmx_target_upload(arena + o_knlp, krow_nlp, sizeof(int) * kslots_c);
+        openmx_target_upload(arena + o_cdm, cdm_pref, sizeof(double) * cdm_c);
+        openmx_target_upload(arena + o_halo, g->halo, sizeof(double) * halo_len);
+        openmx_target_upload(arena + o_ene, g->ene, sizeof(double) * ene_len);
 
         {
             const Force4BGpuItem* items = (const Force4BGpuItem*)(void*)(arena + o_items);
@@ -10032,10 +10290,14 @@ static void Force_HNL_GpuCase1Run(double***** CDM0)
             }
         }
 
-        ForceHipMemcpyFromDevice(item_f, arena + o_itemf, sizeof(double) * 3U * (size_t)nitems_c);
-        hipFree(arena);
+        openmx_target_download(item_f, arena + o_itemf, sizeof(double) * 3U * (size_t)nitems_c);
+        gpu_done=1;
+        openmx_target_free(arena);
         Force_gpu_pool_flush();
     }
+
+hnl_capacity:
+    Force_HNL_capacity(1,g,nitems,items,krowA,krowB,krow_halo,krow_ene,krow_nlp,NULL,cdm_pref,item_f,gpu_done);
 
     /* damping tail (dmp scaling plus the dQ/dx * HNL term) and the
        per-atom accumulation, exactly as the host dHNL applies them */
@@ -10091,9 +10353,13 @@ static void Force_HNL_GpuCase1Run(double***** CDM0)
             fz += trace * dzv;
         }
 
+        if (forces) {
+            forces[3*(size_t)Gc_AN]+=fx;forces[3*(size_t)Gc_AN+1]+=fy;forces[3*(size_t)Gc_AN+2]+=fz;
+        } else {
         Gxyz[Gc_AN][41] += fx;
         Gxyz[Gc_AN][42] += fy;
         Gxyz[Gc_AN][43] += fz;
+        }
     }
 
     free(item_f);
@@ -10111,9 +10377,8 @@ static void Force_HNL_GpuCase1Run(double***** CDM0)
 /* the second-case batch: all (h,q) pairs of every centre, reading the
    archived 4-direction stagings (the centre's own k=0 row serves as the
    value side of the h_AN==0 pairs) */
-static void Force_HNL_GpuCase2Run(double***** CDM0)
+static void Force_HNL_GpuCase2Run_Part(int first,int last,ForceHNLGpuContext *g,double *forces,int myid_p,double***** CDM0)
 {
-    ForceHNLGpuContext* g = &FHNL_gpu;
     const int solver_flat = (Solver == 5 || Solver == 8 || Solver == 11);
     int Mc_AN, h_AN, q_AN;
     int nitems = 0;
@@ -10137,7 +10402,7 @@ static void Force_HNL_GpuCase2Run(double***** CDM0)
 
     if (hnl_prof) dtime(&hnl_t0);
     /* count */
-    for (Mc_AN = 1; Mc_AN <= Matomnum; Mc_AN++) {
+    for (Mc_AN = first; Mc_AN < last; Mc_AN++) {
         int Gc_AN = M2G[Mc_AN];
 
         for (h_AN = 0; h_AN <= FNAN[Gc_AN]; h_AN++) {
@@ -10153,7 +10418,7 @@ static void Force_HNL_GpuCase2Run(double***** CDM0)
         }
     }
 
-    if (nitems == 0) return;
+    int gpu_done=nitems==0;
 
     items = (Force4BGpuItem*)Force_checked_malloc(sizeof(Force4BGpuItem) * (size_t)nitems, __FILE__, __LINE__);
     item_atom = (int*)Force_checked_malloc(sizeof(int) * (size_t)nitems, __FILE__, __LINE__);
@@ -10169,7 +10434,7 @@ static void Force_HNL_GpuCase2Run(double***** CDM0)
 
     /* build */
     p = 0;
-    for (Mc_AN = 1; Mc_AN <= Matomnum; Mc_AN++) {
+    for (Mc_AN = first; Mc_AN < last; Mc_AN++) {
         int Gc_AN = M2G[Mc_AN];
         int Cwan = WhatSpecies[Gc_AN];
 
@@ -10240,7 +10505,7 @@ static void Force_HNL_GpuCase2Run(double***** CDM0)
     }
 
     if (hnl_prof) dtime(&hnl_t1);
-    {
+    if(nitems && g->flat_dev){
         const double* flat = g->flat_dev;
         size_t c2_len = (g->c2_stride == 0 ? 4 : 4U * g->c2_stride);
         size_t ene_len = (g->ene_off[SpeciesNum] == 0 ? 1 : g->ene_off[SpeciesNum]);
@@ -10258,17 +10523,18 @@ static void Force_HNL_GpuCase2Run(double***** CDM0)
         const size_t o_c2 = Force_gpu_arena_off(&asz, sizeof(double) * c2_len);
         const size_t o_ene = Force_gpu_arena_off(&asz, sizeof(double) * ene_len);
         const size_t o_itemf = Force_gpu_arena_off(&asz, sizeof(double) * 3U * (size_t)nitems_c);
-        char* arena = (char*)Force_gpu_arena_wait(asz, "HNL second-case batch");
+        char* arena = (char*)Force_gpu_arena_try(asz);
 
-        ForceHipMemcpyToDevice(arena + o_items, items, sizeof(Force4BGpuItem) * (size_t)nitems_c);
-        ForceHipMemcpyToDevice(arena + o_ih0, item_h0, sizeof(int) * (size_t)nitems_c);
-        ForceHipMemcpyToDevice(arena + o_inlp, item_nlp, sizeof(int) * (size_t)nitems_c);
-        ForceHipMemcpyToDevice(arena + o_iene, item_ene, sizeof(int) * (size_t)nitems_c);
-        ForceHipMemcpyToDevice(arena + o_ia, item_a, sizeof(size_t) * (size_t)nitems_c);
-        ForceHipMemcpyToDevice(arena + o_ib, item_b, sizeof(size_t) * (size_t)nitems_c);
-        ForceHipMemcpyToDevice(arena + o_cdm, cdm_pref, sizeof(double) * cdm_c);
-        ForceHipMemcpyToDevice(arena + o_c2, g->c2, sizeof(double) * c2_len);
-        ForceHipMemcpyToDevice(arena + o_ene, g->ene, sizeof(double) * ene_len);
+        if(!arena)goto hnl_capacity;
+        openmx_target_upload(arena + o_items, items, sizeof(Force4BGpuItem) * (size_t)nitems_c);
+        openmx_target_upload(arena + o_ih0, item_h0, sizeof(int) * (size_t)nitems_c);
+        openmx_target_upload(arena + o_inlp, item_nlp, sizeof(int) * (size_t)nitems_c);
+        openmx_target_upload(arena + o_iene, item_ene, sizeof(int) * (size_t)nitems_c);
+        openmx_target_upload(arena + o_ia, item_a, sizeof(size_t) * (size_t)nitems_c);
+        openmx_target_upload(arena + o_ib, item_b, sizeof(size_t) * (size_t)nitems_c);
+        openmx_target_upload(arena + o_cdm, cdm_pref, sizeof(double) * cdm_c);
+        openmx_target_upload(arena + o_c2, g->c2, sizeof(double) * c2_len);
+        openmx_target_upload(arena + o_ene, g->ene, sizeof(double) * ene_len);
 
         {
             const Force4BGpuItem* items = (const Force4BGpuItem*)(void*)(arena + o_items);
@@ -10355,9 +10621,13 @@ static void Force_HNL_GpuCase2Run(double***** CDM0)
 
         ForceHipMemcpyFromDevice(item_f, arena + o_itemf, sizeof(double) * 3U * (size_t)nitems_c);
         if (hnl_prof) dtime(&hnl_t2);
-        hipFree(arena);
+        gpu_done=1;
+        openmx_target_free(arena);
         Force_gpu_pool_flush();
     }
+
+hnl_capacity:
+    Force_HNL_capacity(2,g,nitems,items,item_a,item_b,NULL,item_ene,item_nlp,item_h0,cdm_pref,item_f,gpu_done);
 
     /* damping tail and per-centre accumulation */
 
@@ -10436,9 +10706,13 @@ static void Force_HNL_GpuCase2Run(double***** CDM0)
             }
         }
 
+        if (forces) {
+            forces[3*(size_t)Gc_AN]+=fx;forces[3*(size_t)Gc_AN+1]+=fy;forces[3*(size_t)Gc_AN+2]+=fz;
+        } else {
         Gxyz[Gc_AN][41] += fx;
         Gxyz[Gc_AN][42] += fy;
         Gxyz[Gc_AN][43] += fz;
+        }
     }
 
     free(item_f);
@@ -10452,15 +10726,24 @@ static void Force_HNL_GpuCase2Run(double***** CDM0)
     free(item_h);
     free(item_atom);
     if (hnl_prof) {
-        int myid_p = 0;
 
         dtime(&hnl_t3);
-        MPI_Comm_rank(mpi_comm_level1, &myid_p);
         fprintf(stderr, "FORCEHNL2PROF id=%d items=%d build=%.3f device=%.3f post=%.3f\n", myid_p, nitems,
             hnl_t1 - hnl_t0, hnl_t2 - hnl_t1, hnl_t3 - hnl_t2);
         fflush(stderr);
     }
     free(items);
+}
+
+static void Force_HNL_GpuCase1Run(double *****CDM0)
+{
+    int rank;MPI_Comm_rank(mpi_comm_level1,&rank);
+    Force_HNL_GpuCase1Run_Part(1,Matomnum+1,&FHNL_gpu,NULL,rank,CDM0);
+}
+static void Force_HNL_GpuCase2Run(double *****CDM0)
+{
+    int rank;MPI_Comm_rank(mpi_comm_level1,&rank);
+    Force_HNL_GpuCase2Run_Part(1,Matomnum+1,&FHNL_gpu,NULL,rank,CDM0);
 }
 
 void Force4B(double***** CDM0)
@@ -10734,7 +11017,7 @@ void Force4B(double***** CDM0)
 
     if (use_force4b_fused) {
         /* Auto priorities: case 1 resident > rank turns > streaming > CPU.
-           Resident admission is per rank, so TurnsBegin and StreamBegin
+           Device residency is per rank, so TurnsBegin and StreamBegin
            (collective) run on every fused rank. */
         const int force_case1_deferred = f4b_stream1_mode == 1 || f4b_turns1_mode == 1;
         f4b_gpu = f4b_host_only ? 0 : Force4B_GpuBegin(DS_VNA, force_case1_deferred, f4b_stream_mode == 1,
@@ -11411,6 +11694,8 @@ void Force4B(double***** CDM0)
         Force4B_GpuCase1StreamEnd();
     }
     /* Release every concurrent case-1 allocation before admitting a
+       cached-halo rank turn, and keep case 2 out of the turn lifetime. */
+    /* Release every concurrent case-1 allocation before admitting a
        cached-halo rank turn, and keep case 2 out of the turn lifetime.
        TurnsRun is collective on the ranks of one GPU, so every fused rank
        calls it whatever its own resident decision was. */
@@ -11419,6 +11704,7 @@ void Force4B(double***** CDM0)
     if (f4b_gpu) {
         f4b_case2_resident = Force4B_GpuCase2Begin(f4b_stream_mode != 1);
     }
+
 
     dtime(&etime);
     if (force_profile) {
@@ -11447,10 +11733,6 @@ void Force4B(double***** CDM0)
     for (ID = 0; ID < numprocs; ID++)
         Indicator[ID] = 0;
 
-    /* auto priorities for case 2: resident > per-centre streaming > CPU */
-    if (use_force4b_fused) {
-        f4b_stream = Force4B_GpuCase2StreamBegin(f4b_case2_resident, f4b_stream_mode);
-    }
 
     max_ODNloop = 1;
     for (Mc_AN = 1; Mc_AN <= Matomnum; Mc_AN++) {
@@ -11459,6 +11741,10 @@ void Force4B(double***** CDM0)
         if (max_ODNloop < i) {
             max_ODNloop = i;
         }
+    }
+
+    if (use_force4b_fused) {
+        f4b_stream = Force4B_GpuCase2StreamBegin(f4b_case2_resident, f4b_stream_mode);
     }
 
     OneD2h_AN = (int*)malloc(sizeof(int) * max_ODNloop);

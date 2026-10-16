@@ -1,5 +1,6 @@
 #include "openmx_common.h"
 #include "set_hip_default_device_from_local_rank.h"
+#include "openmx_gpu_workers.h"
 #include "hip_runtime_compat.h"
 #include <mpi.h>
 #include <omp.h>
@@ -151,6 +152,7 @@ static size_t gpu_probe_reserve_bytes(void)
    initialized.  OPENMX_GPU=0 disables GPU use for the whole run. */
 int gpu_rank_device_usable(void)
 {
+    if (openmx_gpu_worker_device()>=0) return 1;
     static int checked = 0, usable = 0;
     int hip_devices = 0, omp_devices = 0, device_count, dev;
     int lock_fd = -1, devices_seen = 0;
@@ -272,6 +274,12 @@ int set_hip_default_device_from_local_rank()
 
 int set_hip_default_device_from_local_rank_noncollective(void)
 {
+    const int worker=openmx_gpu_worker_device();
+    if (worker>=0) {
+        wait_hipfunc(hipSetDevice(worker));
+        omp_set_default_device(worker);
+        return worker;
+    }
     int deviceCount;
     int local_rank;
     int dev = -1;

@@ -176,6 +176,7 @@ MAGMA_LIB ?= $(MAGMA_DIR)/lib/libmagma.a
 MAGMA_GPU_TARGET ?= $(ARCH)
 MAGMA_MAKE_INC ?= third_party/magma.openmx.make.inc
 MAGMA_STAMP ?= $(MAGMA_DIR)/.openmx-magma-$(MAGMA_VERSION).stamp
+MAGMA_DEVICE_MAP_STAMP = $(MAGMA_DIR)/.openmx-magma-device-map-v1.stamp
 MAGMA_EXTRA_GFXS ?= 1200
 HIPCC_MAGMA_FLAGS = $(HIPCC_GEMMUL8_FLAGS) -I$(MAGMA_DIR)/include -I$(MAGMA_DIR)/control
 
@@ -384,6 +385,38 @@ $(FFTW3_USERS): | $(FFTW3_LIB)
 .DEFAULT_GOAL := openmx
 .DELETE_ON_ERROR:
 
+# Capacity recovery and bounded multi-device execution. C kernels use
+# OpenMP target; the explicit device kernels and runtime use HIP.
+MGPU_C_OBJECTS = openmx_cluster_capacity.o openmx_dense_cpu.o \
+ openmx_gpu_bilinear.o openmx_gpu_collective.o openmx_gpu_dm_collective.o \
+ openmx_gpu_task.o openmx_gpu_vector.o openmx_gpu_workers.o openmx_host_memory.o
+MGPU_HIP_OBJECTS = openmx_gpu_dm.o openmx_gpu_transform.o \
+ openmx_mgpu_gemm.o openmx_mgpu_runtime.o
+OBJS += $(MGPU_C_OBJECTS) $(MGPU_HIP_OBJECTS) openmx_gpu_views.o \
+ openmx_gpu_bilinear_pack.o openmx_magma_mgpu.o elpa_cosma_memory.o
+MGPU_HEADERS = $(wildcard openmx_gpu_*.h openmx_mgpu_*.h) \
+ openmx_magma_mgpu.h openmx_magma_lock.h openmx_target.h openmx_host_memory.h \
+ openmx_cluster_capacity.h openmx_dense_cpu.h
+
+$(MGPU_C_OBJECTS): %.o: %.c $(MGPU_HEADERS)
+	$(CC) -c $< -o $@
+$(MGPU_HIP_OBJECTS): %.o: %.cu $(MGPU_HEADERS)
+	$(HIPCC) $(HIPCC_GEMMUL8_FLAGS) $(MPI_CFLAGS) -c $< -o $@
+openmx_gpu_views.o: openmx_gpu_views.c openmx_gpu_views.h hip_runtime_compat.h
+	$(HIPCC) $(HIPCC_GEMMUL8_FLAGS) -fopenmp -x hip -c $< -o $@
+openmx_gpu_bilinear_pack.o: openmx_gpu_bilinear_pack.cpp openmx_gpu_bilinear.h
+	$(CPPLANG) -O3 -std=c++17 $(MPI_CFLAGS) -c $< -o $@
+openmx_magma_mgpu.o: openmx_magma_mgpu.cpp openmx_magma_mgpu.h openmx_magma_lock.h $(MAGMA_LIB)
+	$(HIPCC) $(HIPCC_MAGMA_FLAGS) -DOPENMX_HAVE_MAGMA=1 -c $< -o $@
+elpa_cosma_memory.o: elpa_cosma_memory.cpp $(GPUSOLVER2_STAMP)
+	$(GPUSOLVER2_HOST_CXX) -O2 -std=c++17 $(MPI_CFLAGS) -I$(GPUSOLVER2_PREFIX)/include -c $< -o $@
+Input_std.o DFT.o Cluster_DFT_Col.o Cluster_DFT_NonCol.o Band_DFT_Col.o \
+ Band_DFT_NonCol.o Set_Hamiltonian.o Set_Density_Grid_GPU.o Set_Orbitals_Grid.o \
+ Set_Nonlocal.o Set_OLP_Kin.o Set_ProExpn_VNA.o Set_XC_Grid.o Force.o \
+ Total_Energy_GPU.o Mixing_H.o truncation.o gemmul8_bridge.o magma_openmx.o \
+ set_hip_default_device_from_local_rank.o set_openmp_device_from_local_rank.o \
+ Cluster_DFT_Col_dm_hip.o Cluster_DFT_NonCol_dm_hip.o: $(MGPU_HEADERS)
+
 openmx:	$(FFTW3_LIB) $(GEMMUL8_LIB) $(MAGMA_LIB) $(OBJS)
 	$(CC) $(OBJS) $(STACK) $(MAGMA_LIB) $(GEMMUL8_LIB) $(LIB) -lm -o openmx
 	
@@ -478,7 +511,7 @@ Cluster_DFT_Col.o: Cluster_DFT_Col.c openmx_common.h eigen_refine_gpu.h eigen_re
 	$(CC) -c Cluster_DFT_Col.c
 Cluster_DFT_Col_dm_hip.o: Cluster_DFT_Col_dm_hip.cu
 	$(HIPCC) $(HIPCC_GEMMUL8_FLAGS) -c Cluster_DFT_Col_dm_hip.cu -o Cluster_DFT_Col_dm_hip.o
-magma_openmx.o: magma_openmx.cu openmx_common.h $(MAGMA_LIB) openmx_stdout_level.h openmx_gpu_arch_policy.h
+magma_openmx.o: magma_openmx.cu openmx_common.h $(MAGMA_LIB) openmx_stdout_level.h openmx_gpu_arch_policy.h openmx_magma_lock.h
 	$(HIPCC) $(HIPCC_MAGMA_FLAGS) -c magma_openmx.cu -o magma_openmx.o
 Cluster_DFT_NonCol.o: Cluster_DFT_NonCol.c openmx_common.h eigen_refine_gpu.h eigen_refine_hooks.h openmx_precision.h
 	$(CC) -c Cluster_DFT_NonCol.c
@@ -856,8 +889,12 @@ $(MAGMA_STAMP): $(MAGMA_ARCHIVE) $(MAGMA_MAKE_INC)
 
 $(MAGMA_DIR)/Makefile $(MAGMA_DIR)/make.inc: $(MAGMA_STAMP)
 
-$(MAGMA_LIB): $(MAGMA_STAMP)
-	$(MAKE) -C "$(MAGMA_DIR)" BACKEND=hip ROCM_PATH="$(ROCM)" GPU_TARGET="$(MAGMA_GPU_TARGET)" lib/libmagma.a
+$(MAGMA_DEVICE_MAP_STAMP): $(MAGMA_STAMP) third_party/apply_magma_device_map.py third_party/magma_device_map.h
+	python3 third_party/apply_magma_device_map.py "$(MAGMA_DIR)"
+	touch "$@"
+
+$(MAGMA_LIB): $(MAGMA_STAMP) $(MAGMA_DEVICE_MAP_STAMP)
+	$(MAKE) -C "$(MAGMA_DIR)" BACKEND=hip ROCM_PATH="$(ROCM)" GPU_TARGET="$(MAGMA_GPU_TARGET)" ARCH=ar lib/libmagma.a
 Divide_Conquer_Dosout.o: Divide_Conquer_Dosout.c openmx_common.h
 	$(CC) -c Divide_Conquer_Dosout.c
 Krylov.o: Krylov.c openmx_common.h

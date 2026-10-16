@@ -1,3 +1,4 @@
+#include "openmx_target.h"
 /**********************************************************************
   truncation.c:
 
@@ -16,6 +17,9 @@
 #include <math.h>
 #include <time.h>
 #include "openmx_common.h"
+#include "openmx_gpu_workers.h"
+#include "openmx_gpu_task.h"
+#include "openmx_host_memory.h"
 #include "mpi.h"
 #include "omp.h"
 #include "set_hip_default_device_from_local_rank.h"
@@ -4299,7 +4303,7 @@ static void *OLG_arena_try(size_t bytes)
   (void)hipMalloc(&ptr, bytes);
   if (ptr == NULL) {
     /* Let outstanding work release its transient allocations before the
-       one retry.  Unlike OpenACC acc_free, hipFree has no process-local
+       one retry.  Unlike OpenACC openmx_target_free, hipFree has no process-local
        freelist that needs an explicit purge. */
     if (hipDeviceSynchronize() == hipSuccess) (void)0;
     (void)hipMalloc(&ptr, bytes);
@@ -4370,11 +4374,11 @@ static void OLG_gpu_eval(int npair, const OLG_GpuPair *prs, const int *gl, const
 /* Returns 1 when the overlap-grid lists were built on the device; on any
    ineligibility or allocation failure it returns 0 without side effects
    and the caller runs the untouched host loop. */
-static int UCellBox_OLG_GPU(int estimate_switch, int CpyCell,
+static int UCellBox_OLG_GPU_Part(int first,int last,int myid,int estimate_switch, int CpyCell,
                             int **Tmp_GridListAtom, int **Tmp_CellListAtom,
                             int *size_GListTAtoms1)
 {
-  int myid, Mc_AN, Gc_AN, h_AN, Gh_AN, Mh_AN, Rh, Nh, m, k, npair, npair_cap = 0;
+  int Mc_AN, Gc_AN, h_AN, Gh_AN, Mh_AN, Rh, Nh, m, k, npair, npair_cap = 0;
   int mc_total = Matomnum + MatomnumF;
   int rdim = 2*CpyCell + 1;
   size_t total_pts = 0, out_cap = 0, arena_bytes = 0, run;
@@ -4387,9 +4391,7 @@ static int UCellBox_OLG_GPU(int estimate_switch, int CpyCell,
   OLG_GpuPair *d_prs;
   double Stime_atom, Etime_atom;
 
-  if (!OLG_gpu_ready()) return 0;
 
-  MPI_Comm_rank(mpi_comm_level1, &myid);
 
   /* sizes of the flattened grid/cell lists and of the result buffer */
 
@@ -4403,7 +4405,7 @@ static int UCellBox_OLG_GPU(int estimate_switch, int CpyCell,
     total_pts += (size_t)GridN_Atom[Gc_AN];
   }
 
-  for (Mc_AN = 1; Mc_AN <= Matomnum; Mc_AN++) {
+  for (Mc_AN = first; Mc_AN < last; Mc_AN++) {
     size_t atom_out = 0;
     Gc_AN = M2G[Mc_AN];
     for (h_AN = 0; h_AN <= FNAN[Gc_AN]; h_AN++) {
@@ -4449,11 +4451,11 @@ static int UCellBox_OLG_GPU(int estimate_switch, int CpyCell,
 
   arena = OLG_arena_try(arena_bytes);
   if (arena == NULL) {
-    static int notice_done = 0;
+    static _Thread_local int notice_done = 0;
     if (!notice_done && 2<=level_stdout) {
       notice_done = 1;
       fprintf(stderr,
-              "UCell_Box: %.1f MiB of device staging unavailable; using the host path.\n",
+              "UCell_Box: %.1f MiB of device staging unavailable; trying capacity recovery.\n",
               (double)arena_bytes/(1024.0*1024.0));
     }
     free(pair_host); free(out_host); free(ratv_flat); free(atv_flat); free(mh_base);
@@ -4483,24 +4485,14 @@ static int UCellBox_OLG_GPU(int estimate_switch, int CpyCell,
                   hipMemcpyHostToDevice);
 
   if (OLG_env_flag("OPENMX_UCELL_OLG_GPU_VERBOSE", 0)) {
-    static int active_done = 0;
+    static _Thread_local int active_done = 0;
     if (!active_done && myid == Host_ID) {
       active_done = 1;
       fprintf(stderr, "UCell_Box: GPU overlap-grid path active\n");
     }
   }
 
-  /* the Mc_AN==0 bookkeeping of the legacy loop */
-
-  FNAN[0] = 0;
-  if (estimate_switch == 0) {
-    GListTAtoms1[0] = (int**)malloc(sizeof(int*)*1);
-    GListTAtoms2[0] = (int**)malloc(sizeof(int*)*1);
-    GListTAtoms1[0][0] = (int*)malloc(sizeof(int)*1);
-    GListTAtoms2[0][0] = (int*)malloc(sizeof(int)*1);
-  }
-
-  for (Mc_AN = 1; Mc_AN <= Matomnum; Mc_AN++) {
+  for (Mc_AN = first; Mc_AN < last; Mc_AN++) {
 
     dtime(&Stime_atom);
 
@@ -4527,7 +4519,7 @@ static int UCellBox_OLG_GPU(int estimate_switch, int CpyCell,
                     hipMemcpyHostToDevice);
 
     OLG_gpu_eval(npair, d_prs, d_gl, d_cl, d_atv, d_ratv, mh_base[Mc_AN],
-                 GridN_Atom[Gc_AN], Tmp_GridListAtom[Mc_AN][0], CpyCell, run, d_out);
+                 GridN_Atom[Gc_AN], GridN_Atom[Gc_AN]?Tmp_GridListAtom[Mc_AN][0]:0, CpyCell, run, d_out);
 
     (void)hipMemcpy(out_host, d_out, sizeof(int)*run, hipMemcpyDeviceToHost);
 
@@ -4536,7 +4528,7 @@ static int UCellBox_OLG_GPU(int estimate_switch, int CpyCell,
       GListTAtoms2[Mc_AN] = (int**)malloc(sizeof(int*)*(size_t)npair);
     }
 
-#pragma omp parallel for private(Nh)
+#pragma omp parallel for if(!omp_in_parallel()) private(Nh)
     for (h_AN = 0; h_AN < npair; h_AN++) {
       const int *row = out_host + pair_host[h_AN].out_off;
       int cnt = 0;
@@ -4550,7 +4542,7 @@ static int UCellBox_OLG_GPU(int estimate_switch, int CpyCell,
 
       if (List_YOUSO[12] < NumOLG[Mc_AN][h_AN] && estimate_switch == 0) {
         printf("YOUSO12<(Nog+1)\n");
-        MPI_Finalize();
+        if (openmx_gpu_worker_device()<0) MPI_Finalize();
         exit(1);
       }
 
@@ -4567,7 +4559,7 @@ static int UCellBox_OLG_GPU(int estimate_switch, int CpyCell,
     }
 
     if (estimate_switch == 0) {
-#pragma omp parallel for private(Nh)
+#pragma omp parallel for if(!omp_in_parallel()) private(Nh)
       for (h_AN = 0; h_AN < npair; h_AN++) {
         const int *row = out_host + pair_host[h_AN].out_off;
         int n = 0;
@@ -4587,11 +4579,104 @@ static int UCellBox_OLG_GPU(int estimate_switch, int CpyCell,
 
   /* Synchronize before hipFree so other ranks sharing this device can
      immediately observe the returned arena.  hipFree is the HIP analogue
-     of acc_free plus acc_clear_freelists: there is no OpenACC freelist. */
+     of openmx_target_free plus openmx_target_clear_freelists: there is no OpenACC freelist. */
   (void)hipDeviceSynchronize();
   (void)hipFree(arena);
   free(pair_host); free(out_host); free(ratv_flat); free(atv_flat); free(mh_base);
 
+  return 1;
+}
+
+typedef struct {int grid,cell,l1,l2,l3;} OLGCapacityQuery;
+typedef struct {int nc,cpy;} OLGCapacityParameters;
+static void OLG_capacity_kernel(size_t first,size_t count,const void *parameters,void *const v[],int gpu)
+{
+  const OLGCapacityParameters *p=parameters;const int nc=p->nc,cpy=p->cpy,rdim=2*cpy+1;
+  const int *grid=v[0],*cell=v[1],*atv=v[2],*ratv=v[3];
+  const OLGCapacityQuery *queries=v[4];int *out=v[5];(void)first;
+#pragma omp target teams distribute parallel for is_device_ptr(grid,cell,atv,ratv,queries,out) if(gpu)
+  for(size_t i=0;i<count;i++){
+    OLGCapacityQuery q=queries[i];int found=-1;
+    const int l1=q.l1+atv[3*q.cell],l2=q.l2+atv[3*q.cell+1],l3=q.l3+atv[3*q.cell+2];
+    if(nc && l1>=-cpy && l1<=cpy && l2>=-cpy && l2<=cpy && l3>=-cpy && l3<=cpy){
+      const int target=ratv[((size_t)(l1+cpy)*rdim+(l2+cpy))*rdim+(l3+cpy)];
+      int lo=0,hi=nc;
+      while(lo<hi){int mid=lo+(hi-lo)/2;if(grid[mid]<q.grid)lo=mid+1;else hi=mid;}
+      while(lo<nc && grid[lo]==q.grid){if(cell[lo]==target){found=lo;break;}lo++;}
+    }
+    out[i]=found;
+  }
+}
+
+static int UCellBox_OLG_GPU(int estimate_switch,int CpyCell,int **grid,int **cell,int *size_GListTAtoms1)
+{
+  int requested=scf_eigen_lib_flag==GPUSOLVER && OLG_env_flag("OPENMX_UCELL_OLG_GPU",1)!=0;
+  MPI_Allreduce(MPI_IN_PLACE,&requested,1,MPI_INT,MPI_MIN,mpi_comm_level1);
+  if(!requested)return 0;
+  int myid;MPI_Comm_rank(mpi_comm_level1,&myid);
+  int done=!Matomnum || (!openmx_gpu_capacity_test_recovery() && OLG_gpu_ready() && UCellBox_OLG_GPU_Part(1,Matomnum+1,myid,estimate_switch,CpyCell,grid,cell,size_GListTAtoms1));
+  int mc=done?Matomnum+1:1,h=0;size_t point=0;
+  int *atvf=NULL,*ratvf=NULL,*result=NULL,rdim=2*CpyCell+1;
+  /* These small translation tables are also sent to helper nodes. */
+  atvf=malloc(3*(size_t)(TCpyCell+1)*sizeof(int));
+  ratvf=malloc((size_t)rdim*rdim*rdim*sizeof(int));
+  int tables=atvf && ratvf,all_tables;
+  MPI_Allreduce(&tables,&all_tables,1,MPI_INT,MPI_MIN,mpi_comm_level1);
+  if(!all_tables){
+    free(atvf);free(ratvf);
+    if(done && !estimate_switch)for(int m=1;m<=Matomnum;m++){
+      for(int j=0;j<=FNAN[M2G[m]];j++){free(GListTAtoms1[m][j]);free(GListTAtoms2[m][j]);}
+      free(GListTAtoms1[m]);free(GListTAtoms2[m]);GListTAtoms1[m]=GListTAtoms2[m]=NULL;
+    }
+    if(done)*size_GListTAtoms1=0;
+    return 0;
+  }
+  for(int i=0;i<=TCpyCell;i++)for(int a=0;a<3;a++)atvf[3*i+a]=atv_ijk[i][a+1];
+  for(int a=0;a<rdim;a++)for(int b=0;b<rdim;b++)for(int c=0;c<rdim;c++)ratvf[((size_t)a*rdim+b)*rdim+c]=ratv[a][b][c];
+  for(;;){
+    int pending=mc<=Matomnum,any;
+    MPI_Allreduce(&pending,&any,1,MPI_INT,MPI_MAX,mpi_comm_level1);if(!any)break;
+    OLGCapacityQuery *queries=NULL;size_t n=0;int gc=0,gh=0,mh=0,nh=0;
+    OLGCapacityParameters parameters={0,CpyCell};
+    if(pending){
+      gc=M2G[mc];gh=natn[gc][h];mh=F_G2M[gh];nh=GridN_Atom[gh];parameters.nc=GridN_Atom[gc];
+      if(point==0){
+        if(h==0 && !estimate_switch){
+          GListTAtoms1[mc]=malloc((size_t)(FNAN[gc]+1)*sizeof(int*));GListTAtoms2[mc]=malloc((size_t)(FNAN[gc]+1)*sizeof(int*));
+          if(!GListTAtoms1[mc] || !GListTAtoms2[mc])MPI_Abort(mpi_comm_level1,1);
+        }
+        result=malloc((nh?(size_t)nh:1)*sizeof(int));if(!result)MPI_Abort(mpi_comm_level1,1);
+      }
+      n=(size_t)nh-point;if(n>65536)n=65536;
+      for(;;){queries=malloc((n?n:1)*sizeof(*queries));if(queries)break;if(n<=1)MPI_Abort(mpi_comm_level1,1);n=(n+1)/2;}
+      int cell_shift=ncn[gc][h];
+      for(size_t i=0;i<n;i++)queries[i]=(OLGCapacityQuery){grid[mh][point+i],cell[mh][point+i],atv_ijk[cell_shift][1],atv_ijk[cell_shift][2],atv_ijk[cell_shift][3]};
+    }
+    OpenMXGpuTask task={0};task.count=n;task.parameters=&parameters;task.parameter_bytes=sizeof(parameters);task.inputs=5;task.outputs=1;task.kernel=OLG_capacity_kernel;
+    task.view[0]=(OpenMXGpuTaskView){pending?grid[mc]:NULL,(size_t)parameters.nc*sizeof(int),0};
+    task.view[1]=(OpenMXGpuTaskView){pending?cell[mc]:NULL,(size_t)parameters.nc*sizeof(int),0};
+    task.view[2]=(OpenMXGpuTaskView){atvf,3*(size_t)(TCpyCell+1)*sizeof(int),0};task.view[3]=(OpenMXGpuTaskView){ratvf,(size_t)rdim*rdim*rdim*sizeof(int),0};
+    task.view[4]=(OpenMXGpuTaskView){queries,0,sizeof(*queries)};task.view[5]=(OpenMXGpuTaskView){pending?result+point:NULL,0,sizeof(int)};
+    openmx_gpu_task_execute(mpi_comm_level1,&task,1,"overlap-grid-capacity");free(queries);
+    if(pending){
+      point+=n;
+      if(point==(size_t)nh){
+        int count=0;for(int i=0;i<nh;i++)if(result[i]>=0)count++;
+        NumOLG[mc][h]=count;
+        if(!estimate_switch){
+          if(count>List_YOUSO[12]){fprintf(stderr,"UCell_Box: overlap-grid list exceeds YOUSO12.\n");MPI_Abort(mpi_comm_level1,1);}
+          GListTAtoms1[mc][h]=malloc((count?(size_t)count:1)*sizeof(int));GListTAtoms2[mc][h]=malloc((count?(size_t)count:1)*sizeof(int));
+          if(!GListTAtoms1[mc][h] || !GListTAtoms2[mc][h])MPI_Abort(mpi_comm_level1,1);
+          int at=0;for(int i=0;i<nh;i++)if(result[i]>=0){GListTAtoms1[mc][h][at]=result[i];GListTAtoms2[mc][h][at++]=i;}
+          *size_GListTAtoms1+=count;
+        }
+        free(result);result=NULL;point=0;if(++h>FNAN[gc]){h=0;mc++;}
+      }
+    }
+  }
+  free(atvf);free(ratvf);
+  FNAN[0]=0;
+  if(!estimate_switch){GListTAtoms1[0]=malloc(sizeof(int*));GListTAtoms2[0]=malloc(sizeof(int*));GListTAtoms1[0][0]=malloc(sizeof(int));GListTAtoms2[0][0]=malloc(sizeof(int));}
   return 1;
 }
 

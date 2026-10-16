@@ -36,7 +36,99 @@ At level 1 or higher, the nonlocal matrix, VNA projector and Hamiltonian progres
 The NVIDIA synchronization and regression checks are recorded in [nvidia_sync_20261012.txt](nvidia_sync_20261012.txt).
 
 ## Distributed multi-GPU cluster diagonalization (gpusolver2)
-With `gpusolver` a cluster calculation (one k-point) diagonalizes on a single GPU. `scf.eigen.lib gpusolver2` (cluster solver only) replaces that diagonalization with [ELPA](https://elpa.mpcdf.mpg.de/) 2026.02 (AMD GPU kernels) + [COSMA](https://github.com/eth-cscs/COSMA) (ROCm backend), engaging every rank and every GPU across nodes. A solve that does not fit in GPU memory falls back to the ELPA CPU kernels / ScaLAPACK; solves below n=256 stay on the CPU kernels. `OPENMX_GS2_ELPA_GPU` and `OPENMX_GS2_GEMM_GPU` (1 = GPU, 0 = CPU, unset = decide from free memory) override the two decisions; on a VRAM-limited card shared by many ranks use `OPENMX_GS2_GEMM_GPU=0`. ELPA, COSMA, COSTA and Tiled-MM are bundled as source archives under `source/third_party/dist/` and built by the first `make` (no network needed; autoconf, automake, libtool, m4 and python3 required). The `elpa1`/`elpa2` paths keep the ELPA 2018.05 embedded in OpenMX.
+With `gpusolver` a cluster calculation normally diagonalizes on its owner's GPU when the matrix fits. The capacity recovery described below can use additional GPUs or distributed CPU storage. `scf.eigen.lib gpusolver2` (cluster solver only) explicitly selects [ELPA](https://elpa.mpcdf.mpg.de/) 2026.02 (AMD GPU kernels) + [COSMA](https://github.com/eth-cscs/COSMA) (ROCm backend), engaging every rank and every GPU across nodes. A solve that does not fit in GPU memory falls back to the ELPA CPU kernels / ScaLAPACK; solves below n=256 stay on the CPU kernels. `OPENMX_GS2_ELPA_GPU` and `OPENMX_GS2_GEMM_GPU` (1 = GPU, 0 = CPU, unset = decide from free memory) override the two decisions; on a VRAM-limited card shared by many ranks use `OPENMX_GS2_GEMM_GPU=0`. ELPA, COSMA, COSTA and Tiled-MM are bundled as source archives under `source/third_party/dist/` and built by the first `make` (no network needed; autoconf, automake, libtool, m4 and python3 required). The `elpa1`/`elpa2` paths keep the ELPA 2018.05 embedded in OpenMX.
+
+## Multi-GPU capacity recovery imported from NVIDIA main
+
+The NVIDIA changes after `475566134142d6b5653efe769f360dd0152c9618`, through
+main commit `d90882e929478e7bbaa737db097957c07ff65b8a`, are adapted to HIP and
+OpenMP target. They add MAGMA solves with host matrix storage, cooperative
+matrix products and transforms, Band GPU groups, and bounded GPU/MPI/CPU recovery for
+work outside the eigensolver. The AMD starting point is
+`1ee275a5fa007a22eb4c0a9962dd272c3009fbd2`.
+
+For ordinary collinear and noncollinear Cluster calculations, a dense
+problem that exceeds the owner's GPU memory first considers MAGMA on
+2–8 GPUs of the owner's node. Host-memory admission includes the scheduler's
+cgroup limit. When that plan cannot fit, a multi-node run can select
+distributed ELPA/COSMA; the remaining CPU path preserves the existing MPI
+layout. Numerical errors and failed result transfers are reported as
+errors, rather than being accepted as successful capacity recovery.
+
+Ordinary Band calculations can form disjoint groups within one node. For
+`G` permitted GPUs and `K` computed k-points, each group has
+`q=floor(G/K)` GPUs; groups of 2–8 are supported and only `q*K` GPUs are
+used. The pool is trimmed before device caches are created. Every path
+respects HIP visibility and `scf.Gpu.Num`. MAGMA's LP64 implementation
+limits matrix order to 32766. Spin-spiral Band calculations retain their
+existing path.
+
+The non-eigensolver recovery covers density matrices, Hamiltonian and
+orbital grids, XC, overlap-grid searches, projector/radial integrals,
+forces, total energy and Hamiltonian mixing. Work is split into bounded
+packets: the owner GPU is tried first, followed by permitted local GPUs,
+remote MPI helpers and CPU execution. Worker callbacks use no MPI; result
+publication follows successful preparation and execution. Physical GPU
+UUID locks coordinate ranks, and the caller's HIP/OpenMP device bindings
+are restored. DC, DC-LNO and Krylov benefit from these shared phases while
+keeping their existing projected eigensolvers.
+
+The existing MI300A FP64 policy, native grid kernels, cached workspaces,
+Radeon GEMMul8 paths and refined eigensolvers are retained. In particular,
+capacity recovery does not enable the APU force/projector stages that
+were disabled by the measured AMD defaults.
+
+| Control | Default | Purpose |
+|---|---|---|
+| `scf.mgpu.enable` | auto | Permit cooperative GPU pools; `off` disables them |
+| `scf.Gpu.Num` | 30 | Upper bound on the visible GPU pool |
+| `OPENMX_MGPU_NUM_GPUS` | visible pool | Additional pool cap |
+| `OPENMX_MGPU_SOLVER` | `single` | `auto` measures native and MAGMA candidates; `magma` requests MAGMA |
+| `OPENMX_MGPU_SOLVER_MIN_N` | 4096 | Minimum order for solver performance calibration |
+| `OPENMX_MGPU_TUNE_TRIALS` | 2 | Successful measurements per candidate, limited to 1–3 |
+| `OPENMX_MGPU_GEMM` | off | `auto` or `1` enables cooperative matrix products |
+| `OPENMX_MGPU_GEMM_MIN_N` | 8192 | Size threshold for automatic cooperative GEMM |
+| `OPENMX_MGPU_MEMORY` | automatic admission | `host` requests the host-storage capacity path |
+| `OPENMX_GPU_WORKERS` | capacity recovery | `1` requests distribution even when the owner fits; `0` disables worker pools |
+| `OPENMX_CLUSTER_GS2_FALLBACK` | `auto` | Allow distributed recovery on multiple nodes; also accepts `on`, `off`, `force` |
+| `OPENMX_MGPU_VERBOSE` | 0 | Report group selection, backend and worker activity |
+
+`scf.eigen.lib gpusolver3` requests host-storage MAGMA and cooperative
+products for ordinary Cluster/Band. If a permitted MAGMA group cannot be
+formed, the capacity decision reports the reason and selects CPU storage.
+This selector rejects unsupported solvers and noncollinear Cluster
+MO/XANES/partial-charge/DOS outputs. Performance calibration is separate
+from capacity admission: its automatic device filter targets Instinct
+GPUs, while capacity recovery remains available to Radeon.
+
+The MAGMA build applies a versioned HIP device-map patch so arbitrary
+permitted device groups work with the existing Ozaki-II patch. The native
+and cooperative MAGMA adapters share one process-wide lock.
+
+Validation of this import is recorded in
+[nvidia_main_port_20261016.txt](nvidia_main_port_20261016.txt). The gfx942
+application build, 41 changed-source compilations for gfx1200, and 34 host
+test suites passed. Short runs cover collinear/noncollinear Cluster and
+Band, DC, DC-LNO and Krylov on one MI300A APU with 24 CPU cores. Hardware
+validation of multiple GPUs/nodes and Radeon remains outstanding; the
+host tests use simulated GPU layouts and real MPI with simulated nodes.
+The report distinguishes shortened SCF checks, forced recovery checks
+and the supplied noncollinear Cluster input.
+The hardware campaign completed all 36 conditions with 27 passing
+numerical comparisons. After the requested deadline was extended, the
+forced NC Band capacity-recovery case completed with a fresh CPU reference
+using the same final executable. Its energy difference was 6.1e-11 Ha and
+maximum force-component difference was 2.28e-10 Ha/bohr. These forced
+recovery runs validate correctness rather than ordinary-run performance.
+The resulting build is installed as `work/openmx`; the previous executable is backed up
+under `work/codex_nvidia_port_20261016/before.work.openmx`.
+
+For `work/sidia333_nc_cluster/sidia333_nc_cluster.dat`, the original
+25-SCF limit on one MI300A (8 MPI ranks × 3 threads) took 109.111 s with
+the GPU and 691.238 s with `OPENMX_GPU=0` (6.34×). The energy difference
+was 1.71e-10 Ha and the maximum force-component difference was 1.09e-10
+Ha/bohr. Both runs reached the iteration limit without meeting the SCF
+convergence criterion; these numbers compare the same 25 iterations.
 
 ## GEMMul8
 The large dense matrix multiplications of the GPU eigensolver path use a bridge to [GEMMul8](https://github.com/RIKEN-RCCS/GEMMul8) [v3.5.2](https://github.com/RIKEN-RCCS/GEMMul8/releases/tag/v3.5.2), pinned to commit `603b52363715796a0af5e4aa1ed8d386349b4251`. It emulates FP64 GEMM on the INT8 matrix cores (Ozaki scheme II), supporting consumer GPUs with limited FP64 throughput. The bridge defaults to native hipBLAS FP64 on MI300A and GEMMul8 on other GPUs. An explicit `scf.gemmul8.enable on` or `off` selects GEMMul8 or native FP64, respectively; the existing environment disable settings still apply. GEMMul8's memory-saving mode is on by default with a 256 MiB per-rank workspace cap (`OPENMX_GEMMUL8_MAX_WORKSPACE_MB`; 0 = uncapped).
@@ -222,7 +314,7 @@ The four sidia333 cases of the sections above, ZrB2 2x2 and CG15c-DC-LNO, agains
 | `OPENMX_GEMMUL8_TIMING` | 0 | 1 reports the bridge GEMMs per rank at the end of the SCF |
 
 ## Multi-GPU parallelization and MPI
-The ranks are split into one group per k-point and each group's eigenproblem is solved on one GPU, so the eigensolver keeps at most as many GPUs busy as there are k-points (`scf.Gpu.Num`, default 30, is only an upper bound). A cluster calculation therefore uses one GPU for the diagonalization however many the node has. Flat MPI with one thread per rank is the measured Radeon configuration below:
+The ordinary device-resident path splits ranks into k-point groups and solves each group's eigenproblem on its owner GPU. Capacity recovery, optional cooperative products and `gpusolver2` can use additional GPUs as described above; `scf.Gpu.Num` remains an upper bound. Flat MPI with one thread per rank is the measured Radeon configuration below:
 
 ```sh
 mpirun -np 16 ./openmx input.dat -nt 1

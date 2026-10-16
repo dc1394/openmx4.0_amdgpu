@@ -8,7 +8,7 @@ stubs of run_force4b_stream_cpu.py.  Checks:
     workspace floors) against the earlier summed bound kept for the O(N)
     solvers in auto mode, and the deferred-case variants;
   - the lifetime split: case-1 archives only at Begin, the case-2 archive
-    only after Case2Begin(1), a failed case-2 claim reported, not fatal;
+    only after Case2Begin(1), a failed device claim uses host archives;
   - Force4B_GpuWorkspaceSizes equals the arenas Case1Run/Case2Run request;
   - forces against the CPU fused traces, and bit-identical forces between
     the resident and the streamed paths of both cases.
@@ -26,7 +26,24 @@ import run_force4b_stream_cpu as common
 
 
 RESIDENT_STUBS = r'''
-static size_t last_wait_bytes;
+#define hipMemcpyDeviceToHost 1
+static int hipMemcpy(void *a,const void *b,size_t n,int mode) {(void)mode;memcpy(a,b,n);return hipSuccess;}
+#define MPI_MIN 0
+#define MPI_IN_PLACE ((void*)1)
+static int MPI_Allreduce(const void *a,void *b,int n,int type,int op,MPI_Comm comm) {
+    (void)op;(void)comm;
+    if (a!=MPI_IN_PLACE) memcpy(b,a,n*(type==MPI_INT?sizeof(int):sizeof(unsigned long long)));
+    return 0;
+}
+static int gpu_rank_device_usable(void) {return 1;}
+static int openmx_gpu_capacity_test_recovery(void) {return 0;}
+static unsigned long long openmx_host_mem_available(void) {return 1ULL<<40;}
+static void openmx_target_wait(void) {}
+static void openmx_target_clear_freelists(void) {}
+static void openmx_target_free(void *p) {hipFree(p);}
+static void openmx_target_upload(void *a,const void *b,size_t n) {memcpy(a,b,n);}
+static void openmx_target_download(void *a,const void *b,size_t n) {memcpy(a,b,n);}
+
 static int hipDeviceSynchronize(void) { return hipSuccess; }
 static void* Force_checked_malloc(size_t size, const char* file, int line)
 {
@@ -86,10 +103,14 @@ static void check_admission(void)
     CHECK(Force4B_GpuBegin(ds, 0, 0, 0));
     CHECK(F4B_gpu.flat_dev != NULL && F4B_gpu.halo_dev != NULL && F4B_gpu.c2_dev == NULL);
     Force4B_GpuEnd();
-    CHECK(!Force4B_GpuBegin(ds, 0, 0, 1));
+    CHECK(Force4B_GpuBegin(ds, 0, 0, 1));
+    CHECK(F4B_gpu.flat_host && F4B_gpu.halo_host);
+    Force4B_GpuEnd();
     CHECK(device_live == 0);
     free_override = 256 * MiB + 60 * MiB;
-    CHECK(!Force4B_GpuBegin(ds, 0, 0, 0));
+    CHECK(Force4B_GpuBegin(ds, 0, 0, 0));
+    CHECK(F4B_gpu.flat_host && F4B_gpu.halo_host);
+    Force4B_GpuEnd();
     free_override = 256 * MiB + 400 * MiB;
     CHECK(Force4B_GpuBegin(ds, 0, 0, 1));
     Force4B_GpuEnd();
@@ -110,17 +131,22 @@ static void check_admission(void)
     /* a failed case-2 claim is reported and leaves case 2 to the caller */
     CHECK(Force4B_GpuBegin(ds, 0, 0, 0));
     allocation_fail = 1;
-    CHECK(!Force4B_GpuCase2Begin(1));
+    CHECK(Force4B_GpuCase2Begin(1));
+    CHECK(F4B_gpu.c2_host != NULL);
     allocation_fail = 0;
     CHECK(F4B_gpu.c2_dev == NULL);
     Force4B_GpuEnd();
     /* device allocation failure at Begin: CPU fallback, nothing leaked */
     allocation_fail = 1;
-    CHECK(!Force4B_GpuBegin(ds, 0, 0, 0));
+    CHECK(Force4B_GpuBegin(ds, 0, 0, 0));
+    CHECK(F4B_gpu.flat_host && F4B_gpu.halo_host);
+    Force4B_GpuEnd();
     allocation_fail = 0;
     /* low memory, umbrella/APU gate and non-GPU solver */
     low_memory = 1;
-    CHECK(!Force4B_GpuBegin(ds, 0, 0, 0));
+    CHECK(Force4B_GpuBegin(ds, 0, 0, 0));
+    CHECK(F4B_gpu.flat_host && F4B_gpu.halo_host);
+    Force4B_GpuEnd();
     low_memory = 0;
     stage_default = 0;
     CHECK(!Force4B_GpuBegin(ds, 0, 0, 0));
@@ -143,11 +169,12 @@ int main(void)
     const char *precision = getenv("TEST_FP32_ENABLE");
     openmx_set_fp32_enabled(precision == NULL || atoi(precision));
     const int solvers[] = {3, 5, 8, 11};
-    int spin, solver, seed, mc, q, source, direction, atom, k, i, j, l, checks = 0, identical = 0;
+    int failure, spin, solver, seed, mc, q, source, direction, atom, k, i, j, l, checks = 0, identical = 0;
     double max_error = 0.0;
     unsetenv("OPENMX_FORCE4B_GPU");
     allocate_case1_fixture();
     check_admission();
+    for (failure = 0; failure < 2; failure++)
     for (spin = 0; spin < 3; spin++) {
         for (solver = 0; solver < 4; solver++) {
             for (seed = 0; seed < 3; seed++) {
@@ -174,6 +201,7 @@ int main(void)
 
                 /* resident case 1: archives at Begin, halo rows as received */
                 reset_forces();
+                allocation_fail = failure;
                 CHECK(Force4B_GpuBegin(ds, 0, 0, 0));
                 CHECK(F4B_gpu.c2_dev == NULL);
                 for (source = Matomnum + 1; source <= Matomnum + MatomnumF; source++) {
@@ -182,7 +210,7 @@ int main(void)
                 }
                 last_wait_bytes = 0;
                 Force4B_GpuCase1Run(cdm);
-                CHECK(last_wait_bytes == work1);
+                CHECK(failure || last_wait_bytes == work1);
                 for (mc = 1; mc <= Matomnum; mc++) {
                     for (i = 0; i < 3; i++) {
                         const double error = fabs(Gxyz[M2G[mc]][41 + i] - (0.37 + expected1[mc][i]));
@@ -197,7 +225,8 @@ int main(void)
                 CHECK(!Force4B_GpuCase2Begin(0));
                 CHECK(F4B_gpu.flat_dev == NULL && F4B_gpu.halo_dev == NULL && F4B_gpu.c2_dev == NULL);
                 CHECK(Force4B_GpuCase2Begin(1));
-                CHECK(F4B_gpu.c2_dev != NULL);
+                CHECK(failure ? F4B_gpu.c2_host != NULL : F4B_gpu.c2_dev != NULL);
+                allocation_fail = 0;
 
                 /* streamed case 1 over the same rows: identical bits */
                 reset_forces();
@@ -226,8 +255,10 @@ int main(void)
                 }
                 reset_forces();
                 last_wait_bytes = 0;
+                allocation_fail = failure;
                 Force4B_GpuCase2Run(cdm);
-                CHECK(last_wait_bytes == work2);
+                allocation_fail = 0;
+                CHECK(failure || last_wait_bytes == work2);
                 Force4B_GpuEnd();
                 CHECK(device_live == 0);
                 for (mc = 1; mc <= Matomnum; mc++) {
@@ -258,7 +289,7 @@ int main(void)
     }
     free_case1_fixture();
     printf("PASS: %d CPU resident-batch comparisons; max force error %.3g; %d resident/stream "
-        "results bit-identical; exact vs legacy admission, deferred cases, lifetime split, "
+        "results bit-identical; resident and capacity admission, deferred cases, lifetime split, "
         "workspace sizes, allocation failures and gates PASS\n", checks, max_error, identical);
     return 0;
 }
@@ -273,8 +304,15 @@ def make_harness(source: str) -> str:
         raise ValueError("free-memory stub changed; update the resident harness")
     stubs = stubs.replace("static int device_live, pinned_live, stage_default = 1;",
                           "static int device_live, pinned_live, stage_default = 1;\n"
-                          "static size_t free_override;")
-    parts = [stubs, case1.GLOBALS, RESIDENT_STUBS,
+                          "static size_t free_override, last_wait_bytes;")
+    stubs = stubs.replace("static void* Force_gpu_arena_try(size_t n)\n{",
+                          "static void* Force_gpu_arena_try(size_t n)\n{\n    last_wait_bytes = n;")
+    task_source = (common.ROOT / "source/openmx_gpu_task.c").read_text()
+    task_api = (common.ROOT / "source/openmx_gpu_task.h").read_text().replace("#include <mpi.h>", "")
+    cpu_task = task_api + "\n".join(common.extract_function(task_source,name) for name in
+        ("task_add","task_view_bytes","task_bytes","task_copy_view","task_cpu_bytes","task_cpu"))
+    cpu_task += "\nint openmx_gpu_task_execute(MPI_Comm c,OpenMXGpuTask *t,int e,const char *l) {(void)c;(void)e;(void)l;task_cpu(t);return 0;}\n"
+    parts = [stubs, cpu_task, case1.GLOBALS, RESIDENT_STUBS,
              common.extract_struct(source, "Force4BGpuItem"),
              common.extract_struct(source, "Force4BGpuContext"),
              "static Force4BGpuContext F4B_gpu = { 0 };\n"]
@@ -285,7 +323,11 @@ def make_harness(source: str) -> str:
         "Force4B_GpuArchiveHalo", "Force4B_GpuArchiveCase2", "Force4B_GpuCase1Kernel",
         "Force4B_GpuCase1Accumulate",
     ):
-        parts.append(common.extract_function(source, name))
+        actual = name + "_Single" if name in ("Force4B_GpuCase1Kernel","Force4B_GpuCase2Kernel") else name
+        parts.append(common.extract_function(source, actual).replace(actual,name))
+    parts.append(common.extract_struct(source,"Force4BCapacityParameters"))
+    for name in ("Force4B_capacity_kernel","Force4B_capacity_copy","Force4B_capacity"):
+        parts.append(common.extract_function(source,name))
     for name in ("Force4BCase1Plan", "Force4BCase1Stream"):
         parts.append(common.extract_struct(source, name))
     parts.append("static Force4BCase1Stream F4B_stream1 = { 0 };\n")
@@ -295,7 +337,8 @@ def make_harness(source: str) -> str:
         "Force4B_GpuCase1PlanAdd", "Force4B_GpuCase1StreamBegin", "Force4B_GpuCase1StreamSource",
         "Force4B_GpuCase1StreamAccumulate", "Force4B_GpuCase1Run", "Force4B_GpuCase2Kernel",
     ):
-        parts.append(common.extract_function(source, name))
+        actual = name + "_Single" if name in ("Force4B_GpuCase1Kernel","Force4B_GpuCase2Kernel") else name
+        parts.append(common.extract_function(source, actual).replace(actual,name))
     for name in ("Force4BCase2Plan", "Force4BCase2Stream"):
         parts.append(common.extract_struct(source, name))
     parts.append("static Force4BCase2Stream F4B_stream = { 0 };\n")
@@ -303,7 +346,8 @@ def make_harness(source: str) -> str:
         "Force4B_GpuCase2Plan", "Force4B_GpuCase2StreamEnd", "Force4B_GpuCase2StreamBegin",
         "Force4B_GpuCase2StreamRun", "Force4B_GpuCase2StreamAccumulate", "Force4B_GpuCase2Run",
     ):
-        parts.append(common.extract_function(source, name))
+        actual = name + "_Single" if name in ("Force4B_GpuCase1Kernel","Force4B_GpuCase2Kernel") else name
+        parts.append(common.extract_function(source, actual).replace(actual,name))
     # Case 2 reads CDM0 of halo atoms too (F_G2M of the case-1 fixture maps
     # them to 4..6), so every CDM slot up to Matomnum+MatomnumF exists.
     fixture = common.FIXTURE.split("/* AMD auto policy", 1)[0]

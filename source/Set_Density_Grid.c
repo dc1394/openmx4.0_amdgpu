@@ -18,6 +18,7 @@
 #include <time.h>
 #include <math.h>
 #include "openmx_common.h"
+#include "openmx_gpu_workers.h"
 #include "mpi.h"
 #include <omp.h>
 
@@ -533,6 +534,7 @@ static inline void SDG_accumulate_nc1(int no0, int no1,
 int Set_Density_Grid_GPU_Local_Prepare(int Cnt_kind, int Calc_CntOrbital_ON);
 int Set_Density_Grid_GPU_Local_Run(double *****CDM, double ***Tmp_Den_Grid);
 int Set_Density_Grid_GPU_Local_OnTheFly(void);
+int Set_Density_Grid_GPU_Capacity(int,int,double *****,double ***);
 void Set_Density_Grid_GPU_Local_Report(int path, int failed);
 int Set_Density_Grid_OTF_Prepare(int Cnt_kind, size_t *need_bytes, size_t *available_bytes);
 int openmx_grid_precision_df(void);
@@ -654,6 +656,7 @@ double Set_Density_Grid(int Cnt_kind, int Calc_CntOrbital_ON, double *****CDM, d
   {
     int flags[2], reduced[2];
     local_ok=Set_Density_Grid_GPU_Local_Prepare(Cnt_kind,Calc_CntOrbital_ON);
+    if ((openmx_gpu_capacity_test_recovery() || openmx_gpu_workers_requested())) local_ok=0;
     flags[0] = local_ok;
     flags[1] = -local_ok;
     MPI_Allreduce(flags,reduced,2,MPI_INT,MPI_MIN,mpi_comm_level1);
@@ -687,7 +690,7 @@ double Set_Density_Grid(int Cnt_kind, int Calc_CntOrbital_ON, double *****CDM, d
     MPI_Allreduce(&otf_ok,&use_otf_gpu,1,MPI_INT,MPI_MIN,mpi_comm_level1);
   }
 
-  if (!use_local_gpu && !use_otf_gpu){
+  if (!use_local_gpu && !use_otf_gpu && !(openmx_gpu_capacity_test_recovery() || openmx_gpu_workers_requested())){
     if (Set_Density_Grid_GPU_Service(Cnt_kind,Calc_CntOrbital_ON,CDM,Density_Grid_B0,&time0)){
       if (local_any) Set_Density_Grid_GPU_Local_Report(1,0);
       return time0;
@@ -976,7 +979,7 @@ double Set_Density_Grid(int Cnt_kind, int Calc_CntOrbital_ON, double *****CDM, d
      rank by rank, before the CPU loop */
   {
     extern int Set_Density_Grid_OTF_Run(int Cnt_kind, double *****CDM, double ***Tmp_Den_Grid);
-    if (!use_local_gpu && use_otf_gpu){
+    if (!use_local_gpu && use_otf_gpu && !(openmx_gpu_capacity_test_recovery() || openmx_gpu_workers_requested())){
       if (Set_Density_Grid_OTF_Run(Cnt_kind,CDM,Tmp_Den_Grid)) {
         use_local_gpu=1;
         local_failed=0;
@@ -984,6 +987,11 @@ double Set_Density_Grid(int Cnt_kind, int Calc_CntOrbital_ON, double *****CDM, d
       }
       else local_failed=1;
     }
+  }
+
+  if (Set_Density_Grid_GPU_Capacity(Cnt_kind,use_local_gpu,CDM,Tmp_Den_Grid)) {
+    if (!use_local_gpu) sd_mode="gpu-capacity";
+    use_local_gpu=1;
   }
 
   if (!use_local_gpu){

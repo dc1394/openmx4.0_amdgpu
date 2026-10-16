@@ -12,6 +12,7 @@
 #include <unordered_map>
 
 #include "gemmul8.hpp"
+#include "openmx_mgpu_runtime.h"
 #include "openmx_stdout_level.h"
 #include "openmx_gpu_arch_policy.h"
 
@@ -575,6 +576,10 @@ extern "C" hipblasStatus_t openmx_gemmul8Dgemm(hipblasHandle_t handle, hipblasOp
                                                double *C, int ldc)
 {
     if (m <= 0 || n <= 0 || k <= 0) return HIPBLAS_STATUS_SUCCESS;
+    hipblasStatus_t mgpu_status;
+    if (openmx_mgpu_dispatch_dgemm && openmx_mgpu_dispatch_dgemm(handle,
+            transa,transb,m,n,k,alpha,A,lda,B,ldb,beta,C,ldc,&mgpu_status))
+        return mgpu_status;
     return timed_general_gemm(handle, 0, 2.0 * m * n * k, [&](bool *native) {
         return dgemm_capped(handle, transa, transb, m, n, k, alpha, A, lda, B, ldb, beta, C, ldc, general_reserve(),
                             native);
@@ -699,6 +704,10 @@ extern "C" hipblasStatus_t openmx_gemmul8Zgemm(hipblasHandle_t handle, hipblasOp
                                                hipDoubleComplex *C, int ldc)
 {
     if (m <= 0 || n <= 0 || k <= 0) return HIPBLAS_STATUS_SUCCESS;
+    hipblasStatus_t mgpu_status;
+    if (openmx_mgpu_dispatch_zgemm && openmx_mgpu_dispatch_zgemm(handle,
+            transa,transb,m,n,k,alpha,A,lda,B,ldb,beta,C,ldc,&mgpu_status))
+        return mgpu_status;
     return timed_general_gemm(handle, 1, 8.0 * m * n * k, [&](bool *native) {
         return zgemm_capped(handle, transa, transb, m, n, k, alpha, A, lda, B, ldb, beta, C, ldc, general_reserve(),
                             native);
@@ -754,6 +763,10 @@ extern "C" hipblasStatus_t openmx_gemmul8ZgemmSolve(hipblasHandle_t handle, hipb
                                                     hipDoubleComplex *C, int ldc)
 {
     if (m <= 0 || n <= 0 || k <= 0) return HIPBLAS_STATUS_SUCCESS;
+    hipblasStatus_t mgpu_status;
+    if (openmx_mgpu_dispatch_zgemm && openmx_mgpu_dispatch_zgemm(handle,
+            transa,transb,m,n,k,alpha,A,lda,B,ldb,beta,C,ldc,&mgpu_status))
+        return mgpu_status;
     return timed_general_gemm(handle, 1, 8.0 * m * n * k, [&](bool *native) {
         return zgemm_capped(handle, transa, transb, m, n, k, alpha, A, lda, B, ldb, beta, C, ldc, solve_reserve(),
                             native);
@@ -767,6 +780,10 @@ extern "C" hipblasStatus_t openmx_gemmul8DgemmSolve(hipblasHandle_t handle, hipb
                                                     const double *beta, double *C, int ldc)
 {
     if (m <= 0 || n <= 0 || k <= 0) return HIPBLAS_STATUS_SUCCESS;
+    hipblasStatus_t mgpu_status;
+    if (openmx_mgpu_dispatch_dgemm && openmx_mgpu_dispatch_dgemm(handle,
+            transa,transb,m,n,k,alpha,A,lda,B,ldb,beta,C,ldc,&mgpu_status))
+        return mgpu_status;
     return timed_general_gemm(handle, 0, 2.0 * m * n * k, [&](bool *native) {
         return dgemm_capped(handle, transa, transb, m, n, k, alpha, A, lda, B, ldb, beta, C, ldc, solve_reserve(),
                             native);
@@ -789,6 +806,10 @@ extern "C" hipblasStatus_t openmx_gemmul8ZgemmUnblocked(hipblasHandle_t handle, 
                                                         const hipDoubleComplex *beta, hipDoubleComplex *C, int ldc)
 {
     if (m <= 0 || n <= 0 || k <= 0) return HIPBLAS_STATUS_SUCCESS;
+    hipblasStatus_t mgpu_status;
+    if (openmx_mgpu_dispatch_zgemm && openmx_mgpu_dispatch_zgemm(handle,
+            transa,transb,m,n,k,alpha,A,lda,B,ldb,beta,C,ldc,&mgpu_status))
+        return mgpu_status;
     if (!g_input_enabled || gemmul8_disabled("OPENMX_GEMMUL8_DISABLE_Z", "GEMMUL8_DISABLE_Z"))
         return openmx_gemmul8Zgemm(handle, transa, transb, m, n, k, alpha, A, lda, B, ldb, beta, C, ldc);
 
@@ -821,6 +842,10 @@ extern "C" hipblasStatus_t openmx_gemmul8DgemmUnblocked(hipblasHandle_t handle, 
                                                         int ldc)
 {
     if (m <= 0 || n <= 0 || k <= 0) return HIPBLAS_STATUS_SUCCESS;
+    hipblasStatus_t mgpu_status;
+    if (openmx_mgpu_dispatch_dgemm && openmx_mgpu_dispatch_dgemm(handle,
+            transa,transb,m,n,k,alpha,A,lda,B,ldb,beta,C,ldc,&mgpu_status))
+        return mgpu_status;
     if (!g_input_enabled || gemmul8_disabled("OPENMX_GEMMUL8_DISABLE_D", "GEMMUL8_DISABLE_D"))
         return openmx_gemmul8Dgemm(handle, transa, transb, m, n, k, alpha, A, lda, B, ldb, beta, C, ldc);
 

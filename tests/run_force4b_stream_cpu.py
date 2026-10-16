@@ -31,11 +31,11 @@ ROOT = Path(__file__).resolve().parents[1]
 
 def extract_function(source: str, name: str) -> str:
     """Extract a static definition, ignoring braces in comments and literals."""
-    match = re.search(r"^static [^\n]*\b" + re.escape(name) + r"\(", source, re.M)
+    match = re.search(r"^static [^\n]*\b" + re.escape(name) + r"\([^;{}]*\)\s*\{", source, re.M)
     if match is None:
         raise ValueError(f"missing production function: {name}")
     start = match.start()
-    opening = source.index("{", match.end())
+    opening = match.end()-1
     # This scanner also fails explicitly if a declaration replaces a definition.
     if ";" in source[match.end():opening]:
         raise ValueError(f"expected definition, found declaration: {name}")
@@ -431,14 +431,14 @@ def make_harness(source: str) -> str:
     parts = [STUBS, extract_struct(source, "Force4BGpuItem")]
     for name in ("Force_gpu_node_reserve", "Force_gpu_arena_off", "Force_host_arena_alloc", "Force_host_arena_free",
                  "Force4B_GpuOrderNLegacy", "Force4B_case2_trace_fused", "Force4B_GpuCase2Kernel"):
-        parts.append(extract_function(source, name))
+        parts.append(extract_function(source, name+"_Single" if name in ("Force4B_GpuCase1Kernel","Force4B_GpuCase2Kernel") else name).replace(name+"_Single",name))
     parts.extend(extract_struct(source, name) for name in ("Force4BCase2Plan", "Force4BCase2Stream"))
     parts.append("static Force4BCase2Stream F4B_stream = { 0 };\n")
     for name in (
         "Force4B_GpuCase2StreamMode", "Force4B_GpuCase2Plan", "Force4B_GpuCase2StreamEnd",
         "Force4B_GpuCase2StreamBegin", "Force4B_GpuCase2StreamRun", "Force4B_GpuCase2StreamAccumulate",
     ):
-        parts.append(extract_function(source, name))
+        parts.append(extract_function(source, name+"_Single" if name in ("Force4B_GpuCase1Kernel","Force4B_GpuCase2Kernel") else name).replace(name+"_Single",name))
     parts.append(FIXTURE)
     return "\n".join(parts)
 

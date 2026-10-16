@@ -15,6 +15,11 @@
   bridge estimates the per-rank device demand and falls back to the CPU
   side (ELPA CPU kernels / ScaLAPACK p?gemm — same distributed
   algorithms on host BLAS) when the GPU cannot hold it.
+  Sharing is counted by physical GPU UUID within each node and bounded
+  below by the common rank map with scf.Gpu.Num applied, including ranks
+  of concurrently running spin worlds. A failed census uses a conservative
+  node-rank bound. Forced kernel modes must agree across the grid; mixed
+  settings terminate collectively instead of entering mismatched calls.
   Environment knobs:
     OPENMX_GS2_ELPA_GPU        eigensolver: 1 = always GPU (skip the
                                preflight), 0 = always CPU; unset =
@@ -47,8 +52,18 @@ int openmx_gs2_eigen_complex(int n, int nev, void *a, int *desca, double *w, voi
                              int *descz);
 
 /* Release the cached ELPA handles bound to a BLACS context; call right
-   before Cblacs_gridexit. */
+   before Cblacs_gridexit (a no-op for a context that has none). */
 void openmx_gs2_grid_free(int ictxt);
+
+/* Automatic capacity fallback of scf.eigen.lib=gpusolver (cluster solvers):
+   collective admission of a distributed solve of order n on the grid of
+   ictxt (1 = fits on the GPU kernels, 0 = does not, -1 = the kernel side is
+   fixed by OPENMX_GS2_ELPA_GPU), and the switch that reports solves and
+   transforms the GPU cannot hold at level.of.stdout 1. */
+int openmx_gs2_gpu_fits(int ictxt, int n, int nblk, int is_complex,
+                        unsigned long long *need_mb, unsigned long long *free_mb,
+                        int *ranks);
+void openmx_gs2_set_fallback_report(int on);
 
 /* Shut the ELPA library down (idempotent; called once at program end). */
 void openmx_gs2_finalize(void);

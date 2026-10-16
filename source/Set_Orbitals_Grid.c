@@ -16,6 +16,10 @@
 #include <time.h>
 #include <math.h>
 #include "openmx_common.h"
+#include "openmx_gpu_workers.h"
+#include "openmx_gpu_task.h"
+#include "openmx_host_memory.h"
+#include <stdint.h>
 #include "mpi.h"
 #include <omp.h>
 #include "set_hip_default_device_from_local_rank.h"
@@ -51,10 +55,11 @@ static int SOG_env_flag(const char *name, int default_value)
   return atoi(value) != 0;
 }
 
-static int SOG_gpu_eligible(int Cnt_kind)
+static int SOG_gpu_requested(int Cnt_kind)
 {
-  static int device_checked = 0, device_ok = 0;
   int w, L0;
+  const char *gpu=getenv("OPENMX_GPU");
+  if (scf_eigen_lib_flag!=GPUSOLVER || (gpu && atoi(gpu)==0)) return 0;
 
   if (Cnt_kind != 0) return 0;
   if (!SOG_env_flag("OPENMX_ORBS_GRID_GPU", 1)) return 0;
@@ -70,14 +75,13 @@ static int SOG_gpu_eligible(int Cnt_kind)
     if (Spe_Num_Mesh_PAO[w] < 6) return 0;
   }
 
-  if (!device_checked) {
-    device_checked = 1;
-    /* Probe the context and OpenMP target module, not just the HIP device
-       count: a rank that cannot finish initialization must use the host. */
-    device_ok = gpu_rank_device_usable();
-  }
-  return device_ok;
+  return 1;
 }
+static int SOG_gpu_eligible(int Cnt_kind)
+{
+    return SOG_gpu_requested(Cnt_kind) && gpu_rank_device_usable();
+}
+
 
 static size_t SOG_arena_off(size_t *pos, size_t bytes)
 {
@@ -515,6 +519,354 @@ done:
 }
 
 
+#pragma omp declare target
+static void SOG_point_eval(int wan, int no, double gx, double gy, double gz,
+                           double ax, double ay, double az, int GNc, int GRc,
+                           const double *atvf, const double *rv_all, const double *rwf_all,
+                           const size_t *rv_off, const size_t *rwf_base,
+                           const int *sp_mesh, const int *sp_maxl, const int *sp_nb,
+                           int ng23, int ng3,
+                           double g11, double g12, double g13,
+                           double g21, double g22, double g23,
+                           double g31, double g32, double g33,
+                           double org1, double org2, double org3,
+                           float *out)
+{
+    /* Get_Grid_XYZ */
+    const int n1 = GNc / ng23;
+    const int n2 = (GNc - n1 * ng23) / ng3;
+    const int n3 = GNc - n1 * ng23 - n2 * ng3;
+
+    const double x = ((double)n1 * g11 + (double)n2 * g21 + (double)n3 * g31 + org1)
+                     + atvf[3 * (size_t)GRc + 0] - gx - ax;
+    const double y = ((double)n1 * g12 + (double)n2 * g22 + (double)n3 * g32 + org2)
+                     + atvf[3 * (size_t)GRc + 1] - gy - ay;
+    const double z = ((double)n1 * g13 + (double)n2 * g23 + (double)n3 * g33 + org3)
+                     + atvf[3 * (size_t)GRc + 2] - gz - az;
+
+    const int mesh = sp_mesh[wan];
+    const int maxl = sp_maxl[wan];
+    const double *rv = rv_all + rv_off[wan];
+
+    double RF[SOG_L0MAX + 1][SOG_MULMAX];
+    double AF[SOG_L0MAX + 1][2 * SOG_L0MAX + 1];
+    double R, Q, P;
+    int po = 0;
+    int L0, Mul0, M0, i1;
+
+    /* xyz2spherical, without the angles: the real harmonics below need
+       only cos/sin of theta and phi, which are z/r, r1/r, x/r1, y/r1 (the
+       host path goes through acos/asin and sin/cos, which agrees with this
+       to the last bits of the double value) */
+    double siQ, coQ, siP, coP;
+    {
+      const double Min_r = 10e-15;
+      double dum = x * x + y * y;
+      double r = sqrt(dum + z * z);
+      double r1 = sqrt(dum);
+
+      if (Min_r <= r) {
+        if (r < fabs(z)) { coQ = (z < 0.0 ? -1.0 : 1.0); siQ = 0.0; }
+        else { coQ = z / r; siQ = r1 / r; }
+        if (Min_r <= r1) {
+          if (r1 < fabs(y)) { siP = (y < 0.0 ? -1.0 : 1.0); coP = 0.0; }
+          else { siP = y / r1; coP = x / r1; }
+        }
+        else {
+          siP = 0.0;
+          coP = 1.0;
+        }
+      }
+      else {
+        coQ = 0.0;
+        siQ = 1.0;
+        siP = 0.0;
+        coP = 1.0;
+      }
+      R = r;
+      Q = 0.0;
+      P = 0.0;
+    }
+
+    /* radial spline of every (L0, Mul0) */
+    if (rv[mesh - 1] < R) {
+      /* outside the PAO mesh: every RF is zero, so every orbital is zero */
+      po = 1;
+    }
+    else {
+
+      const int below = (R < rv[0]);
+      double h1, h2, h3, x1, x2, y1, y2, y12, y22;
+      double dum, dum1, dum2, dum3, dum4;
+      double rm = 0.0;
+      size_t rrow = rwf_base[wan];
+      int m;
+
+      if (below) {
+        m = 4;
+        rm = rv[m];
+
+        h1 = (m == 1) ? rv[m - 1] - rv[m + 1] : rv[m - 1] - rv[m - 2];
+        h2 = rv[m] - rv[m - 1];
+        h3 = (m == mesh - 1) ? rv[m - 2] - rv[m] : rv[m + 1] - rv[m];
+
+        x1 = rm - rv[m - 1];
+        x2 = rm - rv[m];
+      }
+      else {
+        /* the first mesh index with rv[m] >= R (what the bisection of the
+           host path finds): an estimate from the logarithmic mesh, then
+           the exact neighbours */
+        const double x0 = log(rv[0]);
+        const double dx = (log(rv[mesh - 1]) - x0) / (double)(mesh - 1);
+        m = (int)((log(R) - x0) / dx) + 1;
+        if (m < 1) m = 1;
+        if (mesh - 1 < m) m = mesh - 1;
+        while (1 < m && R <= rv[m - 1]) m--;
+        while (m < mesh - 1 && rv[m] < R) m++;
+
+        h1 = (m == 1) ? rv[m - 1] - rv[m + 1] : rv[m - 1] - rv[m - 2];
+        h2 = rv[m] - rv[m - 1];
+        h3 = (m == mesh - 1) ? rv[m - 2] - rv[m] : rv[m + 1] - rv[m];
+
+        x1 = R - rv[m - 1];
+        x2 = R - rv[m];
+      }
+
+      y1 = x1 / h2;
+      y2 = x2 / h2;
+      y12 = y1 * y1;
+      y22 = y2 * y2;
+
+      dum = h1 + h2;
+      dum1 = h1 / h2 / dum;
+      dum2 = h2 / h1 / dum;
+      dum = h2 + h3;
+      dum3 = h2 / h3 / dum;
+      dum4 = h3 / h2 / dum;
+
+      for (L0 = 0; L0 <= maxl; L0++) {
+        const int nb = sp_nb[wan * (SOG_L0MAX + 1) + L0];
+
+        for (Mul0 = 0; Mul0 < nb; Mul0++) {
+
+          const double *rw = rwf_all + rrow;
+          double f1 = rw[m == 1 ? m + 1 : m - 2];
+          double f2 = rw[m - 1];
+          double f3 = rw[m];
+          double f4 = rw[m == mesh - 1 ? m - 2 : m + 1];
+          double g1, g2, f;
+
+          rrow += (size_t)mesh;
+
+          dum = f3 - f2;
+          g1 = dum * dum1 + (f2 - f1) * dum2;
+          g2 = (f4 - f3) * dum3 + dum * dum4;
+
+          f = y22 * (3.0 * f2 + h2 * g1 + (2.0 * f2 + h2 * g1) * y2)
+            + y12 * (3.0 * f3 - h2 * g2 - (2.0 * f3 - h2 * g2) * y1);
+
+          if (below) {
+
+            double df = 2.0 * y2 / h2 * (3.0 * f2 + h2 * g1 + (2.0 * f2 + h2 * g1) * y2)
+              + y22 * (2.0 * f2 + h2 * g1) / h2
+              + 2.0 * y1 / h2 * (3.0 * f3 - h2 * g2 - (2.0 * f3 - h2 * g2) * y1)
+              - y12 * (2.0 * f3 - h2 * g2) / h2;
+            double a, b, c, d;
+
+            if (L0 == 0) {
+              a = 0.0;
+              b = 0.5 * df / rm;
+              c = 0.0;
+              d = f - b * rm * rm;
+            }
+            else if (L0 == 1) {
+              a = (rm * df - f) / (2.0 * rm * rm * rm);
+              b = 0.0;
+              c = df - 3.0 * a * rm * rm;
+              d = 0.0;
+            }
+            else {
+              b = (3.0 * f - rm * df) / (rm * rm);
+              a = (f - b * rm * rm) / (rm * rm * rm);
+              c = 0.0;
+              d = 0.0;
+            }
+
+            RF[L0][Mul0] = a * R * R * R + b * R * R + c * R + d;
+          }
+          else {
+            RF[L0][Mul0] = f;
+          }
+        }
+      }
+    }
+
+    if (po == 0) {
+
+      /* Angular */
+      /* siQ, coQ, siP, coP: from the coordinates above */
+      double dum, dum1, dum2;
+
+      for (L0 = 0; L0 <= maxl; L0++) {
+
+        if (L0 == 0) {
+          AF[0][0] = 0.282094791773878;
+        }
+        else if (L0 == 1) {
+          dum = 0.48860251190292 * siQ;
+          AF[1][0] = dum * coP;
+          AF[1][1] = dum * siP;
+          AF[1][2] = 0.48860251190292 * coQ;
+        }
+        else if (L0 == 2) {
+          dum1 = siQ * siQ;
+          dum2 = 1.09254843059208 * siQ * coQ;
+          AF[2][0] = 0.94617469575756 * coQ * coQ - 0.31539156525252;
+          AF[2][1] = 0.54627421529604 * dum1 * (1.0 - 2.0 * siP * siP);
+          AF[2][2] = 1.09254843059208 * dum1 * siP * coP;
+          AF[2][3] = dum2 * coP;
+          AF[2][4] = dum2 * siP;
+        }
+        else if (L0 == 3) {
+          AF[3][0] = 0.373176332590116 * (5.0 * coQ * coQ * coQ - 3.0 * coQ);
+          AF[3][1] = 0.457045799464466 * coP * siQ * (5.0 * coQ * coQ - 1.0);
+          AF[3][2] = 0.457045799464466 * siP * siQ * (5.0 * coQ * coQ - 1.0);
+          AF[3][3] = 1.44530572132028 * siQ * siQ * coQ * (coP * coP - siP * siP);
+          AF[3][4] = 2.89061144264055 * siQ * siQ * coQ * siP * coP;
+          AF[3][5] = 0.590043589926644 * siQ * siQ * siQ * (4.0 * coP * coP * coP - 3.0 * coP);
+          AF[3][6] = 0.590043589926644 * siQ * siQ * siQ * (3.0 * siP - 4.0 * siP * siP * siP);
+        }
+      }
+
+      /* Chi */
+      i1 = -1;
+      for (L0 = 0; L0 <= maxl; L0++) {
+        const int nb = sp_nb[wan * (SOG_L0MAX + 1) + L0];
+
+        for (Mul0 = 0; Mul0 < nb; Mul0++) {
+          for (M0 = 0; M0 <= 2 * L0; M0++) {
+            i1++;
+            out[i1] = (float)(RF[L0][Mul0] * AF[L0][M0]);
+          }
+        }
+      }
+    }
+    else {
+      for (i1 = 0; i1 < no; i1++) out[i1] = 0.0f;
+    }
+}
+#pragma omp end declare target
+
+typedef struct {int wan,no,grid,cell;double xyz[3],shift[3];} SOG_CapacityPoint;
+typedef struct {int ng23,ng3,max_no;double frame[9],origin[3];} SOG_CapacityParameters;
+static void SOG_capacity_kernel(size_t first,size_t n,const void *parameters,void *const v[],int gpu)
+{
+  (void)first;const SOG_CapacityParameters *p=parameters;
+  const int ng23=p->ng23,ng3=p->ng3,max_no=p->max_no;
+  const double g11=p->frame[0],g12=p->frame[1],g13=p->frame[2];
+  const double g21=p->frame[3],g22=p->frame[4],g23=p->frame[5];
+  const double g31=p->frame[6],g32=p->frame[7],g33=p->frame[8];
+  const double org1=p->origin[0],org2=p->origin[1],org3=p->origin[2];
+  const SOG_CapacityPoint *points=v[0];
+  const double *rv=v[1],*rwf=v[2],*translations=v[3];
+  const size_t *rvo=v[4],*rwbo=v[5];const int *mesh=v[6],*maxl=v[7],*nb=v[8];
+  float *out=v[9];
+#pragma omp target teams distribute parallel for thread_limit(128) is_device_ptr(points,rv,rwf,translations,rvo,rwbo,mesh,maxl,nb,out) if(gpu)
+  for (size_t i=0;i<n;i++) {
+    SOG_CapacityPoint q=points[i];
+    for (int j=q.no;j<max_no;j++) out[i*max_no+j]=0;
+    SOG_point_eval(q.wan,q.no,q.xyz[0],q.xyz[1],q.xyz[2],q.shift[0],q.shift[1],q.shift[2],q.grid,q.cell,
+      translations,rv,rwf,rvo,rwbo,mesh,maxl,nb,ng23,ng3,
+      g11,g12,g13,g21,g22,g23,g31,g32,g33,org1,org2,org3,out+i*max_no);
+  }
+}
+
+/* Failed owner staging is retried as independent point tiles. The radial
+   tables are small, immutable lookups; no complete rank orbital table is
+   replicated on a helper GPU or sent to another node. */
+static int SOG_capacity_recover(int done,int rank,int requested)
+{
+  int pending=requested && !done,any=0;MPI_Allreduce(&pending,&any,1,MPI_INT,MPI_MAX,mpi_comm_level1);
+  if (!any) return done;
+  SOG_CapacityParameters p={0};p.ng23=Ngrid2*Ngrid3;p.ng3=Ngrid3;
+  for (int i=0;i<3;i++) {p.origin[i]=Grid_Origin[i+1];for(int j=0;j<3;j++)p.frame[3*i+j]=gtv[i+1][j+1];}
+  size_t rows=0,rvn=0,rwfn=0,tile=262144;
+  int ready=1;
+  for (int w=0;w<SpeciesNum;w++) if (p.max_no<Spe_Total_NO[w]) p.max_no=Spe_Total_NO[w];
+  size_t *rvo=NULL,*rwbo=NULL;int *mesh=NULL,*maxl=NULL,*nb=NULL;
+  double *rv=NULL,*rwf=NULL,*translations=NULL;
+  SOG_CapacityPoint *points=NULL;Type_Orbs_Grid **destination=NULL;float *out=NULL;
+  if (pending) {
+    rvo=malloc((size_t)SpeciesNum*sizeof(size_t));rwbo=malloc((size_t)SpeciesNum*sizeof(size_t));
+    mesh=malloc((size_t)SpeciesNum*sizeof(int));maxl=malloc((size_t)SpeciesNum*sizeof(int));
+    nb=calloc((size_t)SpeciesNum*(SOG_L0MAX+1),sizeof(int));
+    ready=rvo && rwbo && mesh && maxl && nb;
+    for (int w=0;ready && w<SpeciesNum;w++) {
+      rvo[w]=rvn;rwbo[w]=rwfn;mesh[w]=Spe_Num_Mesh_PAO[w];maxl[w]=Spe_MaxL_Basis[w];rvn+=mesh[w];
+      for(int l=0;l<=maxl[w];l++){nb[w*(SOG_L0MAX+1)+l]=Spe_Num_Basis[w][l];rwfn+=(size_t)mesh[w]*Spe_Num_Basis[w][l];}
+    }
+    if (ready) {
+      rv=malloc(rvn*sizeof(double));rwf=malloc(rwfn*sizeof(double));
+      translations=malloc(((size_t)TCpyCell+1)*3*sizeof(double));ready=rv && rwf && translations;
+    }
+    for(int w=0;ready && w<SpeciesNum;w++) {
+      memcpy(rv+rvo[w],Spe_PAO_RV[w],(size_t)mesh[w]*sizeof(double));size_t at=rwbo[w];
+      for(int l=0;l<=maxl[w];l++)for(int m=0;m<Spe_Num_Basis[w][l];m++) {
+        memcpy(rwf+at,Spe_PAO_RWF[w][l][m],(size_t)mesh[w]*sizeof(double));at+=mesh[w];
+      }
+    }
+    if(ready)for(int r=0;r<=TCpyCell;r++)for(int i=0;i<3;i++)translations[3*(size_t)r+i]=atv[r][i+1];
+    for(int mc=1;ready && mc<=Matomnum;mc++) {
+      int gc=M2G[mc];rows+=(size_t)GridN_Atom[gc];
+      for(int h=0;h<=FNAN[gc];h++)if(G2ID[natn[gc][h]]!=rank)rows+=(size_t)NumOLG[mc][h];
+    }
+    if (tile>rows) tile=rows;
+    size_t per=sizeof(*points)+sizeof(*destination)+(size_t)p.max_no*sizeof(float);
+    unsigned long long room=openmx_host_mem_available();int sharing=openmx_gpu_local_size_noncollective();if(sharing<1)sharing=1;
+    if(room && tile>room/(4ULL*sharing)/per)tile=(size_t)(room/(4ULL*sharing)/per);
+    if(rows && !tile)ready=0;
+    if(ready && tile){points=malloc(tile*sizeof(*points));destination=malloc(tile*sizeof(*destination));out=malloc(tile*(size_t)p.max_no*sizeof(float));ready=points && destination && out;}
+  }
+  if(!ready)rows=0;
+  uint64_t steps=tile?(rows/tile+(rows%tile!=0)):0,max_steps=0;
+  MPI_Allreduce(&steps,&max_steps,1,MPI_UINT64_T,MPI_MAX,mpi_comm_level1);
+  for(uint64_t step=0;step<max_steps;step++) {
+    size_t begin=step<steps?(size_t)step*tile:rows,end=begin;
+    if(step<steps){end=rows-begin<tile?rows:begin+tile;}
+    size_t cursor=0;
+    for(int mc=1;begin<end && mc<=Matomnum;mc++) {
+      int gc=M2G[mc];
+      for(int h=-1;h<=FNAN[gc];h++) {
+        int gh=h<0?gc:natn[gc][h];if(h>=0 && G2ID[gh]==rank)continue;
+        size_t length=h<0?(size_t)GridN_Atom[gc]:(size_t)NumOLG[mc][h],lo=cursor,hi=cursor+length;
+        cursor=hi;if(lo<begin)lo=begin;if(hi>end)hi=end;
+        for(size_t row=lo;row<hi;row++) {
+          size_t k=row-(cursor-length),i=row-begin;int nc=h<0?(int)k:GListTAtoms1[mc][h][k];
+          SOG_CapacityPoint *q=points+i;q->wan=WhatSpecies[gh];q->no=Spe_Total_NO[q->wan];
+          q->grid=GridListAtom[mc][nc];q->cell=CellListAtom[mc][nc];
+          for(int d=0;d<3;d++){q->xyz[d]=Gxyz[gh][d+1];q->shift[d]=h<0?0:atv[ncn[gc][h]][d+1];}
+          destination[i]=h<0?Orbs_Grid[mc][k]:Orbs_Grid_FNAN[mc][h][k];
+        }
+      }
+    }
+    OpenMXGpuTask t={0};t.count=end-begin;t.inputs=9;t.outputs=1;t.parameters=&p;t.parameter_bytes=sizeof(p);t.kernel=SOG_capacity_kernel;
+    t.view[0]=(OpenMXGpuTaskView){points,0,sizeof(*points)};
+    t.view[1]=(OpenMXGpuTaskView){rv,rvn*sizeof(double),0};t.view[2]=(OpenMXGpuTaskView){rwf,rwfn*sizeof(double),0};
+    t.view[3]=(OpenMXGpuTaskView){translations,translations?((size_t)TCpyCell+1)*3*sizeof(double):0,0};
+    t.view[4]=(OpenMXGpuTaskView){rvo,rvo?(size_t)SpeciesNum*sizeof(size_t):0,0};
+    t.view[5]=(OpenMXGpuTaskView){rwbo,rwbo?(size_t)SpeciesNum*sizeof(size_t):0,0};
+    t.view[6]=(OpenMXGpuTaskView){mesh,mesh?(size_t)SpeciesNum*sizeof(int):0,0};
+    t.view[7]=(OpenMXGpuTaskView){maxl,maxl?(size_t)SpeciesNum*sizeof(int):0,0};
+    t.view[8]=(OpenMXGpuTaskView){nb,nb?(size_t)SpeciesNum*(SOG_L0MAX+1)*sizeof(int):0,0};
+    t.view[9]=(OpenMXGpuTaskView){out,0,(size_t)p.max_no*sizeof(float)};
+    openmx_gpu_task_execute(mpi_comm_level1,&t,1,"orbital-capacity");
+    for(size_t i=0;i<t.count;i++)for(int j=0;j<points[i].no;j++)destination[i][j]=out[i*(size_t)p.max_no+j];
+  }
+  free(rvo);free(rwbo);free(mesh);free(maxl);free(nb);free(rv);free(rwf);free(translations);free(points);free(destination);free(out);
+  return done || (pending && ready);
+}
+
 double Set_Orbitals_Grid(int Cnt_kind)
 {
   int i,j,n,Mc_AN,Gc_AN,Cwan,NO0,GNc,GRc;
@@ -551,7 +903,8 @@ double Set_Orbitals_Grid(int Cnt_kind)
 
   /* device fast path; on any ineligibility or allocation failure the
      untouched host loops below produce the same values */
-  if (SOG_gpu_eligible(Cnt_kind) && Set_Orbitals_Grid_GPU()) {
+  int orbital_done=!(openmx_gpu_capacity_test_recovery() || openmx_gpu_workers_requested()) && SOG_gpu_eligible(Cnt_kind) && Set_Orbitals_Grid_GPU();
+  if (SOG_capacity_recover(orbital_done,myid,SOG_gpu_requested(Cnt_kind))) {
     dtime(&TEtime);
     return TEtime - TStime;
   }

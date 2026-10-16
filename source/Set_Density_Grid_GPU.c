@@ -9,6 +9,8 @@
 
 #include "mpi.h"
 #include "openmx_common.h"
+#include "openmx_gpu_bilinear.h"
+#include "openmx_gpu_workers.h"
 #include "set_hip_default_device_from_local_rank.h"
 #include <limits.h>
 #include <omp.h>
@@ -106,6 +108,108 @@ typedef struct {
 } SetDensityGpuCache;
 
 static SetDensityGpuCache SDG_cache = {0};
+
+typedef struct {int mc,h,point;} SDGRecoveryTerm;
+typedef struct {
+  int cnt_kind,rank,spins;
+  size_t rows,*atom_offset,*ptr;
+  SDGRecoveryTerm *terms;
+  double *****dm,***density;
+} SDGRecovery;
+
+static int SDG_recovery_visit(void *context,size_t row,OpenMXBilinearEmit emit,void *target)
+{
+  SDGRecovery *c=context;
+  for (size_t k=c->ptr[row];k<c->ptr[row+1];k++) {
+    SDGRecoveryTerm t=c->terms[k];
+    int gc=M2G[t.mc],gh=natn[gc][t.h],mh=F_G2M[gh];
+    int nc=GListTAtoms1[t.mc][t.h][t.point],nh=GListTAtoms2[t.mc][t.h][t.point];
+    int no0=Spe_Total_CNO[WhatSpecies[gc]],no1=Spe_Total_CNO[WhatSpecies[gh]];
+    OpenMXBilinearTerm term={0};
+    term.left=(OpenMXBilinearSpan){NULL,NULL,0,1,no0,sizeof(Type_Orbs_Grid)};
+    term.right=(OpenMXBilinearSpan){NULL,NULL,0,1,no1,sizeof(Type_Orbs_Grid)};
+    if (c->cnt_kind==0 && Cnt_switch==1) {
+      term.left.rows=COrbs_Grid[t.mc];term.left.offset=nc;
+      term.right.rows=COrbs_Grid[mh];term.right.offset=nh;
+    } else {
+      term.left.data=Orbs_Grid[t.mc][nc];
+      term.right.data=G2ID[gh]==c->rank?Orbs_Grid[mh][nh]:Orbs_Grid_FNAN[t.mc][t.h][t.point];
+    }
+    for (int spin=0;spin<c->spins;spin++) term.matrix_rows[spin]=c->dm[spin][t.mc][t.h];
+    if (!emit(target,&term)) return 0;
+  }
+  return 1;
+}
+
+static void SDG_recovery_commit(void *context,size_t first,size_t last,const double *result)
+{
+  SDGRecovery *c=context;
+  for (int mc=1;mc<=Matomnum;mc++) {
+    size_t lo=c->atom_offset[mc-1],hi=c->atom_offset[mc];
+    if (lo<first) lo=first;
+    if (hi>last) hi=last;
+    for (size_t row=lo;row<hi;row++) for (int spin=0;spin<c->spins;spin++)
+      c->density[spin][mc][row-c->atom_offset[mc-1]]=result[(row-first)*(size_t)c->spins+spin];
+  }
+}
+
+/* Recovery uses the host orbital tables already required by the CPU path.
+   Only CSR indices are added. Packing deduplicates the orbital vectors and
+   DM blocks needed by a shard, so no GPU holds the complete rank's tables. */
+int Set_Density_Grid_GPU_Capacity(int cnt_kind,int local_done,double *****dm,double ***density)
+{
+  SDGRecovery c={0};c.cnt_kind=cnt_kind;c.spins=SpinP_switch+1;c.dm=dm;c.density=density;
+  MPI_Comm_rank(mpi_comm_level1,&c.rank);
+  const char *control=getenv("OPENMX_DENSITY_GRID_GPU");
+  if (!control) control=getenv("OPENMX_SETDENSITY_GPU");
+  const char *gpu=getenv("OPENMX_GPU");
+  int enabled=(!gpu || atoi(gpu)!=0) && scf_eigen_lib_flag==GPUSOLVER && (!control || !*control || atoi(control)!=0);
+  int pending=enabled && !local_done,any=0;
+  MPI_Allreduce(&pending,&any,1,MPI_INT,MPI_MAX,mpi_comm_level1);
+  if (!any) return local_done;
+  int ready=1;
+  if (pending) {
+    c.atom_offset=calloc((size_t)Matomnum+1,sizeof(size_t));
+    ready=c.atom_offset!=NULL;
+    for (int mc=1;ready && mc<=Matomnum;mc++) {
+      size_t n=(size_t)GridN_Atom[M2G[mc]];
+      if (c.atom_offset[mc-1]>SIZE_MAX-n) ready=0;
+      else c.atom_offset[mc]=c.atom_offset[mc-1]+n;
+    }
+    if (ready) {
+      c.rows=c.atom_offset[Matomnum];
+      if (c.rows>SIZE_MAX/sizeof(size_t)-1) ready=0;
+      else {c.ptr=calloc(c.rows+1,sizeof(size_t));ready=c.ptr!=NULL;}
+    }
+    size_t terms=0;
+    for (int mc=1;ready && mc<=Matomnum;mc++) for (int h=0;ready && h<=FNAN[M2G[mc]];h++) {
+      size_t n=(size_t)NumOLG[mc][h];
+      if (terms>SIZE_MAX/sizeof(SDGRecoveryTerm)-n) {ready=0;break;}
+      terms+=n;
+      for (int point=0;point<NumOLG[mc][h];point++) {
+        size_t row=c.atom_offset[mc-1]+(size_t)GListTAtoms1[mc][h][point];
+        if (row>=c.atom_offset[mc]) {ready=0;break;}
+        c.ptr[row+1]++;
+      }
+    }
+    if (ready) {c.terms=malloc((terms?terms:1)*sizeof(SDGRecoveryTerm));ready=c.terms!=NULL;}
+    if (ready) {
+      for (size_t row=1;row<=c.rows;row++) c.ptr[row]+=c.ptr[row-1];
+      for (int mc=1;mc<=Matomnum;mc++) for (int h=0;h<=FNAN[M2G[mc]];h++)
+        for (int point=0;point<NumOLG[mc][h];point++) {
+          size_t row=c.atom_offset[mc-1]+(size_t)GListTAtoms1[mc][h][point];
+          c.terms[c.ptr[row]++]=(SDGRecoveryTerm){mc,h,point};
+        }
+      for (size_t row=c.rows;row>0;row--) c.ptr[row]=c.ptr[row-1];
+      c.ptr[0]=0;
+    }
+  }
+  OpenMXBilinearSource source={ready?c.rows:0,c.spins,0,&c,SDG_recovery_visit,SDG_recovery_commit};
+  int done=openmx_gpu_bilinear_execute(mpi_comm_level1,&source,
+      local_done?1:!enabled || !ready?-1:0,enabled,"density-capacity");
+  free(c.atom_offset);free(c.ptr);free(c.terms);
+  return local_done || (pending && ready && done);
+}
 
 static int SDG_env_bool(const char *name, int fallback)
 {

@@ -3,9 +3,17 @@
 #include <math.h>
 #include <time.h>
 #include "openmx_common.h"
+#include "openmx_target.h"
+#include "openmx_gpu_workers.h"
+#include "openmx_gpu_collective.h"
+#include <stdint.h>
+#include <limits.h>
+#include <string.h>
 #include "mpi.h"
 #include "lapack_prototypes.h"
 #include <omp.h>
+
+#define SXG_DEN_MIN 1.0e-14
 
 void Inverse(int n, double **a, double **ia);
 
@@ -40,7 +48,7 @@ static int SXG_gpu_enabled(void)
 
 /* 1 when the whole evaluation ran on the device (the outputs are in
    Vxc0..3 and, where the caller passed them, dDen_Grid / dEXC_dGD) */
-static int Set_XC_Grid_GPU(int XC_P_switch,
+static int Set_XC_Grid_GPU_Native(int XC_P_switch,
                            double *Den0, double *Den1, double *Den2, double *Den3,
                            double *Vxc0, double *Vxc1, double *Vxc2, double *Vxc3,
                            double ***dDen_Grid, double ***dEXC_dGD)
@@ -104,6 +112,754 @@ static int Set_XC_Grid_GPU(int XC_P_switch,
                          Vxc0, Vxc1, Vxc2, Vxc3,
                          (dDen_Grid != NULL) ? dden_out : NULL, (dEXC_dGD != NULL) ? dexc_out : NULL);
 }
+
+#pragma omp declare target
+static inline double SXG_largest(double a, double b)
+{
+  return (b <= a) ? a : b;
+}
+#pragma omp end declare target
+
+/* XC_EX with NSP == 1 */
+#pragma omp declare target
+static void SXG_XC_EX1(double DS0, double *EX, double *VX)
+{
+  const double TRD = 0.333333333333333;
+  const double COE1 = 0.6203504908994;
+  const double COE2 = 0.610887057710857;
+  double D, RS, VXP;
+
+  if (DS0 <= SXG_DEN_MIN) {
+    D = SXG_DEN_MIN;
+    RS = COE1 * pow(SXG_DEN_MIN, -1.0 / 3.0);
+  }
+  else {
+    D = DS0;
+    RS = COE1 * pow(D, -TRD);
+  }
+  (void)D;
+  VXP = -COE2 / RS;
+  *VX = VXP;
+  *EX = 0.750 * VXP;
+}
+#pragma omp end declare target
+
+/* XC_PW92C without the LDA+U cFLL branch; dens may be clamped as there */
+#pragma omp declare target
+static void SXG_XC_PW92C(double *dens, double *Ec, double *Vc)
+{
+  const double p0[3]     = {1.0000000,  1.0000000,  1.0000000};
+  const double A[3]      = {0.0310910,  0.0155450,  0.0168870};
+  const double alpha1[3] = {0.2137000,  0.2054800,  0.1112500};
+  const double beta1[3]  = {7.5957000, 14.1189000, 10.3570000};
+  const double beta2[3]  = {3.5876000,  6.1977000,  3.6231000};
+  const double beta3[3]  = {1.6382000,  3.3662000,  0.8802600};
+  const double beta4[3]  = {0.4929400,  0.6251700,  0.4967100};
+  int i;
+  double dtot, rs, srs, zeta, coe;
+  double dum, dum1, dum2, b, c, dbdrs, dcdrs;
+  double tmp0, tmp1, tmp2, tmp12, tmp14, tmp22, tmp24;
+  double fpp0, f, dfdz;
+  double G[3], dGdrs[3];
+  double dEcdd[2];
+  double dEcdrs, dEcdz;
+  double drsdd, dzdd[2];
+
+  (void)p0;
+  coe = 0.6203504908994;
+  dtot = dens[0] + dens[1];
+  if (dtot <= SXG_DEN_MIN) {
+    rs = 6203.504908994;
+    dens[0] = 0.5 * 1.0e-14;
+    dens[1] = 0.5 * 1.0e-14;
+    dtot = SXG_DEN_MIN;
+  }
+  else
+    rs = coe * pow(dtot, -0.33333333333333333333333);
+  tmp0 = 1.0 / dtot;
+  zeta = tmp0 * (dens[0] - dens[1]);
+  if (0.99 < zeta) zeta = 0.99;
+  if (zeta < -1.0) zeta = -0.99;
+  drsdd = -0.3333333333333333333333 * rs * tmp0;
+  dzdd[0] = tmp0 * (1.0 - zeta);
+  dzdd[1] = tmp0 * (-1.0 - zeta);
+  srs = sqrt(rs);
+  for (i = 0; i <= 2; i++) {
+    b = beta1[i] * srs + rs * (beta2[i] + beta3[i] * srs + beta4[i] * rs);
+    dbdrs = beta1[i] * 0.50 / srs + beta2[i] + beta3[i] * 1.50 * srs + beta4[i] * 2.0 * rs;
+    c = 1.0 + 1.0 / (2.0 * A[i] * b);
+    dcdrs = -(c - 1.0) * dbdrs / b;
+    dum = log(c);
+    dum1 = 1.0 + alpha1[i] * rs;
+    G[i] = -2.0 * A[i] * dum1 * dum;
+    dGdrs[i] = -2.0 * A[i] * (alpha1[i] * dum + dum1 * dcdrs / c);
+  }
+  c = 1.92366105093154;
+  fpp0 = 1.70992093416137;
+  dum1 = 1.0 + zeta;
+  dum2 = 1.0 - zeta;
+  tmp1 = pow(dum1, 0.333333333333333333);
+  tmp2 = pow(dum2, 0.333333333333333333);
+  tmp12 = tmp1 * tmp1;
+  tmp22 = tmp2 * tmp2;
+  tmp14 = tmp12 * tmp12;
+  tmp24 = tmp22 * tmp22;
+  f = (tmp14 + tmp24 - 2.0) * c;
+  dfdz = 1.333333333333333333 * (tmp1 - tmp2) * c;
+  dum1 = zeta * zeta * zeta;
+  dum = dum1 * zeta;
+  Ec[0] = G[0] - G[2] * f / fpp0 * (1.0 - dum) + (G[1] - G[0]) * f * dum;
+  dEcdrs = dGdrs[0] - dGdrs[2] * f / fpp0 * (1.0 - dum) + (dGdrs[1] - dGdrs[0]) * f * dum;
+  dEcdz = -G[2] / fpp0 * (dfdz * (1.0 - dum) - f * 4.0 * dum1) + (G[1] - G[0]) * (dfdz * dum + f * 4.0 * dum1);
+  dum = dEcdrs * drsdd;
+  dEcdd[0] = dum + dEcdz * dzdd[0];
+  dEcdd[1] = dum + dEcdz * dzdd[1];
+  Vc[0] = Ec[0] + dtot * dEcdd[0];
+  Vc[1] = Ec[0] + dtot * dEcdd[1];
+}
+#pragma omp end declare target
+
+/* XC_PBE without the LDA+U cFLL branch */
+#pragma omp declare target
+static void SXG_XC_PBE(double *dens, double GDENS[3][2], double *Exc, double *DEXDD, double *DECDD,
+                       double DEXDGD[3][2], double DECDGD[3][2])
+{
+  const double HALF = 0.50, THD = (1.0 / 3.0), TWO = 2.0, TWOTHD = (2.0 / 3.0);
+  const double beta = 0.06672455060314922, kappa = 0.8040;
+  int IS, IX;
+  double Ec_unif[1], Vc_unif[2];
+  double dt, rs, zeta;
+  double den_min, gd_min, phi, t, ks, kF, f1, f2, f3, f4;
+  double A, H, Fc, Fx;
+  double GDMT, GDT[3];
+  double DRSDD, DKFDD, DKSDD, DZDD[2], DPDZ;
+  double DECUDD, DPDD, DTDD, DF1DD, DF2DD, DF3DD, DF4DD, DADD;
+  double DHDD, DFCDD[2], DTDGD, DF3DGD, DF4DGD, DHDGD, DFCDGD[3][2];
+  double DS[2], GDMS, KFS, s, f, DFDD, DFXDD[2], Vx_unif[2], Ex_unif[1];
+  double GDS, DSDGD, DSDD, DF1DGD, DFDGD, DFXDGD[3][2];
+  double D[2], GD[3][2], GDM[2];
+  double gamma, mu;
+
+  (void)DRSDD;
+  gamma = (1.0 - log(TWO)) / (PI * PI);
+  mu = beta * PI * PI / 3.0;
+  den_min = 1.0e-14;
+  gd_min = 1.0e-14;
+  dens[0] = SXG_largest(0.5 * den_min, dens[0]);
+  dens[1] = SXG_largest(0.5 * den_min, dens[1]);
+  D[0] = dens[0];
+  D[1] = dens[1];
+  dt = dens[0] + dens[1];
+  for (IX = 0; IX <= 2; IX++) {
+    GD[IX][0] = GDENS[IX][0];
+    GD[IX][1] = GDENS[IX][1];
+    GDT[IX] = GDENS[IX][0] + GDENS[IX][1];
+  }
+  GDM[0] = sqrt(GD[0][0] * GD[0][0] + GD[1][0] * GD[1][0] + GD[2][0] * GD[2][0]);
+  GDM[1] = sqrt(GD[0][1] * GD[0][1] + GD[1][1] * GD[1][1] + GD[2][1] * GD[2][1]);
+  GDMT = sqrt(GDT[0] * GDT[0] + GDT[1] * GDT[1] + GDT[2] * GDT[2]);
+  GDMT = SXG_largest(gd_min, GDMT);
+  SXG_XC_PW92C(dens, Ec_unif, Vc_unif);
+  rs = pow(3.0 / (4.0 * PI * dt), THD);
+  kF = pow(3.0 * PI * PI * dt, THD);
+  ks = sqrt(4.0 * kF / PI);
+  zeta = (dens[0] - dens[1]) / dt;
+  if (0.99 < zeta) zeta = 0.99;
+  if (zeta < -1.0) zeta = -0.99;
+  phi = 0.50 * (pow(1.0 + zeta, TWOTHD) + pow(1.0 - zeta, TWOTHD));
+  t = GDMT / (2.0 * phi * ks * dt);
+  f1 = Ec_unif[0] / (gamma * phi * phi * phi);
+  f2 = exp(-f1);
+  A = beta / gamma / (f2 - 1.0);
+  f3 = t * t + A * t * t * t * t;
+  f4 = beta / gamma * f3 / (1.0 + A * f3);
+  H = gamma * phi * phi * phi * log(1.0 + f4);
+  Fc = Ec_unif[0] + H;
+  DRSDD = -(THD * rs / dt);
+  DKFDD = THD * kF / dt;
+  DKSDD = HALF * ks * DKFDD / kF;
+  DZDD[0] = 1.0 / dt - zeta / dt;
+  DZDD[1] = -(1.0 / dt) - zeta / dt;
+  DPDZ = HALF * TWOTHD * (1.0 / pow(1.0 + zeta, THD) - 1.0 / pow(1.0 - zeta, THD));
+  for (IS = 0; IS <= 1; IS++) {
+    DECUDD = (Vc_unif[IS] - Ec_unif[0]) / dt;
+    DPDD = DPDZ * DZDD[IS];
+    DTDD = (-t) * (DPDD / phi + DKSDD / ks + 1.0 / dt);
+    DF1DD = f1 * (DECUDD / Ec_unif[0] - 3.0 * DPDD / phi);
+    DF2DD = (-f2) * DF1DD;
+    DADD = (-A) * DF2DD / (f2 - 1.0);
+    DF3DD = (2.0 * t + 4.0 * A * t * t * t) * DTDD + DADD * t * t * t * t;
+    DF4DD = f4 * (DF3DD / f3 - (DADD * f3 + A * DF3DD) / (1.0 + A * f3));
+    DHDD = 3.0 * H * DPDD / phi;
+    DHDD = DHDD + gamma * phi * phi * phi * DF4DD / (1.0 + f4);
+    DFCDD[IS] = Vc_unif[IS] + H + dt * DHDD;
+    for (IX = 0; IX <= 2; IX++) {
+      DTDGD = (t / GDMT) * GDT[IX] / GDMT;
+      DF3DGD = DTDGD * (2.0 * t + 4.0 * A * t * t * t);
+      DF4DGD = f4 * DF3DGD * (1.0 / f3 - A / (1.0 + A * f3));
+      DHDGD = gamma * phi * phi * phi * DF4DGD / (1.0 + f4);
+      DFCDGD[IX][IS] = dt * DHDGD;
+    }
+  }
+  Fx = 0.0;
+  for (IS = 0; IS <= 1; IS++) {
+    DS[IS] = SXG_largest(den_min, 2.0 * D[IS]);
+    GDMS = SXG_largest(gd_min, 2.0 * GDM[IS]);
+    KFS = pow(3.0 * PI * PI * DS[IS], THD);
+    s = GDMS / (2.0 * KFS * DS[IS]);
+    f1 = 1.0 + mu * s * s / kappa;
+    f = 1.0 + kappa - kappa / f1;
+    SXG_XC_EX1(DS[IS], Ex_unif, Vx_unif);
+    Fx = Fx + DS[IS] * Ex_unif[0] * f;
+    DKFDD = THD * KFS / DS[IS];
+    DSDD = s * (-(DKFDD / KFS) - 1.0 / DS[IS]);
+    DF1DD = 2.0 * (f1 - 1.0) * DSDD / s;
+    DFDD = kappa * DF1DD / (f1 * f1);
+    DFXDD[IS] = Vx_unif[0] * f + DS[IS] * Ex_unif[0] * DFDD;
+    for (IX = 0; IX <= 2; IX++) {
+      GDS = 2.0 * GD[IX][IS];
+      DSDGD = (s / GDMS) * GDS / GDMS;
+      DF1DGD = 2.0 * mu * s * DSDGD / kappa;
+      DFDGD = kappa * DF1DGD / (f1 * f1);
+      DFXDGD[IX][IS] = DS[IS] * Ex_unif[0] * DFDGD;
+    }
+  }
+  Fx = HALF * Fx / dt;
+  Exc[0] = Fx;
+  Exc[1] = Fc;
+  for (IS = 0; IS <= 1; IS++) {
+    DEXDD[IS] = DFXDD[IS];
+    DECDD[IS] = DFCDD[IS];
+    for (IX = 0; IX <= 2; IX++) {
+      DEXDGD[IX][IS] = DFXDGD[IX][IS];
+      DECDGD[IX][IS] = DFCDGD[IX][IS];
+    }
+  }
+}
+#pragma omp end declare target
+
+
+
+static size_t SXG_arena_off(size_t *pos, size_t bytes)
+{
+  size_t off = *pos;
+
+  *pos = (off + bytes + 511U) & ~(size_t)511U;
+  return off;
+}
+
+/* returns 1 when the whole evaluation ran on the device (the outputs are
+   in Vxc0..3 and, when the caller passed them, dDen_Grid / dEXC_dGD) */
+typedef struct {
+  int n, Ng1, Ng2, Ng3, base, begin, end, eval_begin, eval_end;
+  unsigned char *arena;
+  double *d_den0;
+  double *d_den1;
+  double *d_den2;
+  double *d_den3;
+  double *d_pcc0;
+  double *d_pcc1;
+  double *d_dden;
+  double *d_dexc;
+  double *d_vxc0;
+  double *d_vxc1;
+  double *d_vxc2;
+  double *d_vxc3;
+  double *d_inv;
+} SXG_Slab;
+
+typedef struct {
+  int XC_P_switch, pcc, rotate;
+  int Ng1,Ng2,Ng3,first,last,input_base,output_base;
+  double *den[4], *vxc[4], *pcc_den[2];
+  double ***dden, ***dexc;
+  const double *inv;
+  SXG_Slab *slabs;
+} SXG_Work;
+
+/* Two input halo planes cover the composed gradient/PBE/divergence stencil.
+   Only the first halo is evaluated, and only owned planes are published.
+   All input slabs are prepared before any aliased output is downloaded. */
+static int SXG_slab_worker(void *opaque, int worker, int phase)
+{
+  SXG_Work *work = (SXG_Work*)opaque;
+  SXG_Slab *slab = work->slabs + worker;
+  const int n=slab->n, Ng1=slab->Ng1, Ng2=slab->Ng2, Ng3=slab->Ng3;
+  const int base=slab->base, begin=slab->begin, end=slab->end;
+  const int eval_begin=slab->eval_begin, eval_end=slab->eval_end;
+  const int XC_P_switch=work->XC_P_switch, pcc=work->pcc, rotate=work->rotate;
+  const int second=(XC_P_switch==1 || XC_P_switch==2);
+  const double den_min=SXG_DEN_MIN;
+  int MN, i;
+  double *d_den0=slab->d_den0;
+  double *d_den1=slab->d_den1;
+  double *d_den2=slab->d_den2;
+  double *d_den3=slab->d_den3;
+  double *d_pcc0=slab->d_pcc0;
+  double *d_pcc1=slab->d_pcc1;
+  double *d_dden=slab->d_dden;
+  double *d_dexc=slab->d_dexc;
+  double *d_vxc0=slab->d_vxc0;
+  double *d_vxc1=slab->d_vxc1;
+  double *d_vxc2=slab->d_vxc2;
+  double *d_vxc3=slab->d_vxc3;
+  double *d_inv=slab->d_inv;
+  if (phase == OPENMX_GPU_WORKER_PREPARE) {
+    unsigned char *arena;
+    size_t pos=0, nb=sizeof(double)*(size_t)n;
+    size_t o_den0,o_den1,o_den2,o_den3,o_pcc0,o_pcc1,o_dden,o_dexc,o_vxc0,o_vxc1,o_vxc2,o_vxc3,o_inv;
+  o_den0 = SXG_arena_off(&pos, nb);
+  o_den1 = SXG_arena_off(&pos, nb);
+  o_den2 = rotate ? SXG_arena_off(&pos, nb) : 0;
+  o_den3 = rotate ? SXG_arena_off(&pos, nb) : 0;
+  o_pcc0 = pcc ? SXG_arena_off(&pos, nb) : 0;
+  o_pcc1 = pcc ? SXG_arena_off(&pos, nb) : 0;
+  o_dden = SXG_arena_off(&pos, 6 * nb);
+  o_dexc = SXG_arena_off(&pos, 6 * nb);
+  o_vxc0 = SXG_arena_off(&pos, nb);
+  o_vxc1 = SXG_arena_off(&pos, nb);
+  o_vxc2 = rotate ? SXG_arena_off(&pos, nb) : 0;
+  o_vxc3 = rotate ? SXG_arena_off(&pos, nb) : 0;
+  o_inv = SXG_arena_off(&pos, sizeof(double) * 27 * 27);
+  arena = NULL;
+  if (hipMalloc((void**)&arena,pos)!=hipSuccess) (void)hipGetLastError();
+  if (arena == NULL) {
+    if (hipDeviceSynchronize() == hipSuccess) openmx_target_clear_freelists();
+    if (hipMalloc((void**)&arena,pos)!=hipSuccess) { arena=NULL; (void)hipGetLastError(); }
+  }
+  if (arena == NULL) return 0;
+  slab->arena=arena; /* release also handles a failed upload */
+  d_den0 = (double*)(void*)(arena + o_den0);
+  d_den1 = (double*)(void*)(arena + o_den1);
+  d_den2 = rotate ? (double*)(void*)(arena + o_den2) : NULL;
+  d_den3 = rotate ? (double*)(void*)(arena + o_den3) : NULL;
+  d_pcc0 = pcc ? (double*)(void*)(arena + o_pcc0) : NULL;
+  d_pcc1 = pcc ? (double*)(void*)(arena + o_pcc1) : NULL;
+  d_dden = (double*)(void*)(arena + o_dden);
+  d_dexc = (double*)(void*)(arena + o_dexc);
+  d_vxc0 = (double*)(void*)(arena + o_vxc0);
+  d_vxc1 = (double*)(void*)(arena + o_vxc1);
+  d_vxc2 = rotate ? (double*)(void*)(arena + o_vxc2) : NULL;
+  d_vxc3 = rotate ? (double*)(void*)(arena + o_vxc3) : NULL;
+  d_inv = (double*)(void*)(arena + o_inv);
+  if (hipMemcpy(d_den0, work->den[0] + base-work->input_base, nb,hipMemcpyHostToDevice)!=hipSuccess) return 0;
+  if (hipMemcpy(d_den1, work->den[1] + base-work->input_base, nb,hipMemcpyHostToDevice)!=hipSuccess) return 0;
+  if (rotate) {
+    if (hipMemcpy(d_den2, work->den[2] + base-work->input_base, nb,hipMemcpyHostToDevice)!=hipSuccess) return 0;
+    if (hipMemcpy(d_den3, work->den[3] + base-work->input_base, nb,hipMemcpyHostToDevice)!=hipSuccess) return 0;
+  }
+  if (pcc) {
+    if (hipMemcpy(d_pcc0, work->pcc_den[0] + base-work->input_base, nb,hipMemcpyHostToDevice)!=hipSuccess) return 0;
+    if (hipMemcpy(d_pcc1, work->pcc_den[1] + base-work->input_base, nb,hipMemcpyHostToDevice)!=hipSuccess) return 0;
+  }
+  if (hipMemcpy(d_inv, (void*)work->inv, sizeof(double) * 27 * 27,hipMemcpyHostToDevice)!=hipSuccess) return 0;
+
+  slab->arena=arena;
+  slab->d_den0=d_den0;
+  slab->d_den1=d_den1;
+  slab->d_den2=d_den2;
+  slab->d_den3=d_den3;
+  slab->d_pcc0=d_pcc0;
+  slab->d_pcc1=d_pcc1;
+  slab->d_dden=d_dden;
+  slab->d_dexc=d_dexc;
+  slab->d_vxc0=d_vxc0;
+  slab->d_vxc1=d_vxc1;
+  slab->d_vxc2=d_vxc2;
+  slab->d_vxc3=d_vxc3;
+  slab->d_inv=d_inv;
+  return 1;
+  }
+  if (phase == OPENMX_GPU_WORKER_EXECUTE) {
+  /* 1. dDen_Grid: the 27-point interpolation (dDen_Grid_calc_method 2) */
+#pragma omp target teams distribute parallel for thread_limit(128) is_device_ptr(d_den0, d_den1, d_pcc0, d_pcc1, d_dden, d_inv)
+  for (MN = eval_begin; MN < eval_end; MN++) {
+    double f0[27], f1[27];
+    int ii, jj, kk, pp, qq, dd;
+    double s0, s1;
+
+    if (den_min < (d_den0[MN] + d_den1[MN])) {
+      ii = (MN + base) / (Ng2 * Ng3);
+      jj = (MN + base - ii * Ng2 * Ng3) / Ng3;
+      kk = MN + base - ii * Ng2 * Ng3 - jj * Ng3;
+      if (ii == 0 || ii == (Ng1 - 1) || jj == 0 || jj == (Ng2 - 1) || kk == 0 || kk == (Ng3 - 1)) {
+        for (dd = 0; dd < 6; dd++) d_dden[(size_t)dd * n + MN] = 0.0;
+      }
+      else {
+        /* the 27 neighbours in the host's order (a, b, c = -1..1, c fastest);
+           nvc rejects the nested loops from -1 to 1 inside the region */
+
+        for (pp = 0; pp < 27; pp++) {
+          const int a = pp / 9 - 1, b = (pp / 3) % 3 - 1, c = pp % 3 - 1;
+          const int MN2 = (ii + a) * Ng2 * Ng3 + (jj + b) * Ng3 + (kk + c) - base;
+          if (pcc) {
+            f0[pp] = d_den0[MN2] + d_pcc0[MN2];
+            f1[pp] = d_den1[MN2] + d_pcc1[MN2];
+          }
+          else {
+            f0[pp] = d_den0[MN2];
+            f1[pp] = d_den1[MN2];
+          }
+        }
+        /* x: row 9, y: row 3, z: row 1 */
+        s0 = 0.0; s1 = 0.0;
+
+        for (qq = 0; qq < 27; qq++) { s0 += d_inv[9 * 27 + qq] * f0[qq]; s1 += d_inv[9 * 27 + qq] * f1[qq]; }
+        d_dden[(size_t)0 * n + MN] = s0;
+        d_dden[(size_t)3 * n + MN] = s1;
+        s0 = 0.0; s1 = 0.0;
+
+        for (qq = 0; qq < 27; qq++) { s0 += d_inv[3 * 27 + qq] * f0[qq]; s1 += d_inv[3 * 27 + qq] * f1[qq]; }
+        d_dden[(size_t)1 * n + MN] = s0;
+        d_dden[(size_t)4 * n + MN] = s1;
+        s0 = 0.0; s1 = 0.0;
+
+        for (qq = 0; qq < 27; qq++) { s0 += d_inv[1 * 27 + qq] * f0[qq]; s1 += d_inv[1 * 27 + qq] * f1[qq]; }
+        d_dden[(size_t)2 * n + MN] = s0;
+        d_dden[(size_t)5 * n + MN] = s1;
+      }
+    }
+    else {
+      for (dd = 0; dd < 6; dd++) d_dden[(size_t)dd * n + MN] = 0.0;
+    }
+  }
+
+  /* 2. the PBE functional at every point */
+#pragma omp target teams distribute parallel for thread_limit(128) is_device_ptr(d_den0, d_den1, d_pcc0, d_pcc1, d_dden, d_dexc, d_vxc0, d_vxc1)
+  for (MN = eval_begin; MN < eval_end; MN++) {
+    double ED[2], GDENS[3][2], Exc[2], DEXDD[2], DECDD[2], DEXDGD[3][2], DECDGD[3][2];
+    int dd;
+
+    ED[0] = d_den0[MN];
+    ED[1] = d_den1[MN];
+    if ((ED[0] + ED[1]) < den_min) {
+      d_vxc0[MN] = 0.0;
+      d_vxc1[MN] = 0.0;
+      if (XC_P_switch != 0) for (dd = 0; dd < 6; dd++) d_dexc[(size_t)dd * n + MN] = 0.0;
+    }
+    else {
+      GDENS[0][0] = d_dden[(size_t)0 * n + MN];
+      GDENS[1][0] = d_dden[(size_t)1 * n + MN];
+      GDENS[2][0] = d_dden[(size_t)2 * n + MN];
+      GDENS[0][1] = d_dden[(size_t)3 * n + MN];
+      GDENS[1][1] = d_dden[(size_t)4 * n + MN];
+      GDENS[2][1] = d_dden[(size_t)5 * n + MN];
+      if (pcc) {
+        ED[0] += d_pcc0[MN];
+        ED[1] += d_pcc1[MN];
+      }
+      SXG_XC_PBE(ED, GDENS, Exc, DEXDD, DECDD, DEXDGD, DECDGD);
+      if (XC_P_switch == 0) {
+        d_vxc0[MN] = Exc[0] + Exc[1];
+        d_vxc1[MN] = Exc[0] + Exc[1];
+      }
+      else if (XC_P_switch == 1) {
+        d_vxc0[MN] = DEXDD[0] + DECDD[0];
+        d_vxc1[MN] = DEXDD[1] + DECDD[1];
+      }
+      else {
+        d_vxc0[MN] = Exc[0] + Exc[1] - DEXDD[0] - DECDD[0];
+        d_vxc1[MN] = Exc[0] + Exc[1] - DEXDD[1] - DECDD[1];
+      }
+      if (XC_P_switch != 0) {
+        d_dexc[(size_t)0 * n + MN] = DEXDGD[0][0] + DECDGD[0][0];
+        d_dexc[(size_t)1 * n + MN] = DEXDGD[1][0] + DECDGD[1][0];
+        d_dexc[(size_t)2 * n + MN] = DEXDGD[2][0] + DECDGD[2][0];
+        d_dexc[(size_t)3 * n + MN] = DEXDGD[0][1] + DECDGD[0][1];
+        d_dexc[(size_t)4 * n + MN] = DEXDGD[1][1] + DECDGD[1][1];
+        d_dexc[(size_t)5 * n + MN] = DEXDGD[2][1] + DECDGD[2][1];
+      }
+    }
+  }
+
+  /* 3. the divergence of dEXC_dGD (second part of the GGA potential) */
+  if (second) {
+#pragma omp target teams distribute parallel for thread_limit(128) is_device_ptr(d_den0, d_den1, d_dden, d_dexc, d_vxc0, d_vxc1, d_inv)
+    for (MN = begin; MN < end; MN++) {
+      int ii, jj, kk, pp, dd;
+      double s0, s1;
+
+      if (den_min < (d_den0[MN] + d_den1[MN])) {
+        ii = (MN + base) / (Ng2 * Ng3);
+        jj = (MN + base - ii * Ng2 * Ng3) / Ng3;
+        kk = MN + base - ii * Ng2 * Ng3 - jj * Ng3;
+        if (ii <= 1 || (Ng1 - 2) <= ii || jj <= 1 || (Ng2 - 2) <= jj || kk <= 1 || (Ng3 - 2) <= kk) {
+          d_vxc0[MN] = 0.0;
+          d_vxc1[MN] = 0.0;
+        }
+        else {
+          /* d/dx of up_x, dn_x (row 9), then d/dy of up_y, dn_y (row 3),
+             then d/dz of up_z, dn_z (row 1), one running sum as on the host */
+          s0 = 0.0; s1 = 0.0;
+
+          for (dd = 0; dd < 3; dd++) {
+            const int row = (dd == 0) ? 9 : (dd == 1) ? 3 : 1;
+
+            for (pp = 0; pp < 27; pp++) {
+              const int a = pp / 9 - 1, b = (pp / 3) % 3 - 1, c = pp % 3 - 1;
+              const int MN2 = (ii + a) * Ng2 * Ng3 + (jj + b) * Ng3 + (kk + c) - base;
+              s0 += d_inv[row * 27 + pp] * d_dexc[(size_t)dd * n + MN2];
+              s1 += d_inv[row * 27 + pp] * d_dexc[(size_t)(dd + 3) * n + MN2];
+            }
+          }
+          if (XC_P_switch == 1) {
+            d_vxc0[MN] -= s0;
+            d_vxc1[MN] -= s1;
+          }
+          else {
+            d_vxc0[MN] += s0;
+            d_vxc1[MN] += s1;
+          }
+        }
+      }
+      else {
+        for (dd = 0; dd < 6; dd++) d_dden[(size_t)dd * n + MN] = 0.0;
+      }
+    }
+  }
+
+  /* 4. non-collinear: rotate (Vxc0, Vxc1) by (theta, phi) into the 2x2 form */
+  if (rotate) {
+#pragma omp target teams distribute parallel for thread_limit(128) is_device_ptr(d_den2, d_den3, d_vxc0, d_vxc1, d_vxc2, d_vxc3)
+    for (MN = begin; MN < end; MN++) {
+      const double tmp0 = 0.5 * (d_vxc0[MN] + d_vxc1[MN]);
+      const double tmp1 = 0.5 * (d_vxc0[MN] - d_vxc1[MN]);
+      const double theta = d_den2[MN];
+      const double phi = d_den3[MN];
+      const double sit = sin(theta), cot = cos(theta), sip = sin(phi), cop = cos(phi);
+
+      d_vxc3[MN] = -tmp1 * sit * sip;
+      d_vxc2[MN] = tmp1 * sit * cop;
+      d_vxc1[MN] = tmp0 - cot * tmp1;
+      d_vxc0[MN] = tmp0 + cot * tmp1;
+    }
+  }
+
+  return 1;
+  }
+  if (phase == OPENMX_GPU_WORKER_COMMIT) {
+  const size_t nb=sizeof(double)*(size_t)(end-begin);
+  const int output=base+begin-work->output_base;
+  /* Match the host rotation's store order: callers may alias the output
+     arrays, and in that case the diagonal Vxc0 must be written last. */
+  if (rotate) {
+    if (hipMemcpy(work->vxc[3] + output, d_vxc3 + begin, nb,hipMemcpyDeviceToHost)!=hipSuccess) return 0;
+    if (hipMemcpy(work->vxc[2] + output, d_vxc2 + begin, nb,hipMemcpyDeviceToHost)!=hipSuccess) return 0;
+    if (hipMemcpy(work->vxc[1] + output, d_vxc1 + begin, nb,hipMemcpyDeviceToHost)!=hipSuccess) return 0;
+    if (hipMemcpy(work->vxc[0] + output, d_vxc0 + begin, nb,hipMemcpyDeviceToHost)!=hipSuccess) return 0;
+  }
+  else {
+    if (hipMemcpy(work->vxc[0] + output, d_vxc0 + begin, nb,hipMemcpyDeviceToHost)!=hipSuccess) return 0;
+    if (hipMemcpy(work->vxc[1] + output, d_vxc1 + begin, nb,hipMemcpyDeviceToHost)!=hipSuccess) return 0;
+  }
+  if (work->dden != NULL) {
+    for (i = 0; i < 6; i++) if (hipMemcpy(work->dden[i / 3][i % 3] + output, d_dden + (size_t)i * n + begin, nb,hipMemcpyDeviceToHost)!=hipSuccess) return 0;
+  }
+  if (work->dexc != NULL && XC_P_switch != 0) {
+    for (i = 0; i < 6; i++) if (hipMemcpy(work->dexc[i / 3][i % 3] + output, d_dexc + (size_t)i * n + begin, nb,hipMemcpyDeviceToHost)!=hipSuccess) return 0;
+  }
+  return 1;
+  }
+  if (phase == OPENMX_GPU_WORKER_RELEASE && slab->arena != NULL) {
+    if (hipFree(slab->arena)!=hipSuccess) return 0;
+    slab->arena = NULL;
+    if (hipDeviceSynchronize() == hipSuccess) openmx_target_clear_freelists();
+  }
+  return 1;
+}
+
+static void SXG_layout(const SXG_Work *w,int worker,int count,SXG_Slab *slab)
+{
+  const size_t items=(size_t)(w->last-w->first);
+  const int first=w->first+(int)openmx_gpu_worker_cut(items,worker,count);
+  const int last=w->first+(int)openmx_gpu_worker_cut(items,worker+1,count);
+  const int lo=first<2?0:first-2,hi=last+2<w->Ng1?last+2:w->Ng1;
+  const int elo=first<1?0:first-1,ehi=last+1<w->Ng1?last+1:w->Ng1;
+  const int plane=w->Ng2*w->Ng3;
+  memset(slab,0,sizeof(*slab));
+  slab->Ng1=w->Ng1; slab->Ng2=w->Ng2; slab->Ng3=w->Ng3;
+  slab->base=lo*plane; slab->n=(hi-lo)*plane;
+  slab->begin=(first-lo)*plane; slab->end=(last-lo)*plane;
+  slab->eval_begin=(elo-lo)*plane; slab->eval_end=(ehi-lo)*plane;
+}
+
+static size_t SXG_cost(void *opaque,int worker,int count)
+{
+  SXG_Work *w=opaque; SXG_Slab slab;
+  SXG_layout(w,worker,count,&slab);
+  /* At most 13 independently aligned arena segments plus interpolation. */
+  return (size_t)slab.n*(size_t)(16+4*w->rotate+2*w->pcc)*sizeof(double)+
+         13*512+27*27*sizeof(double);
+}
+
+static int SXG_execute(SXG_Work *work)
+{
+  OpenMXGpuWorkers workers;
+  SXG_Slab slabs[OPENMX_GPU_WORKERS_MAX]={{0}};
+  OpenMXGpuWorkerRetry retry={SXG_cost,work,{0}};
+  work->slabs=slabs;
+  while (openmx_gpu_workers_capacity(&workers,(size_t)(work->last-work->first),1,openmx_gpu_worker_retry_cost,&retry)) {
+    for (int i=0;i<workers.count;i++) SXG_layout(work,i,workers.count,slabs+i);
+    if (openmx_gpu_workers_run(&workers,SXG_slab_worker,work,"XC-grid")) return 1;
+    retry.rejected[workers.count]=1;
+  }
+  return 0;
+}
+
+/* MPI packets contain just this slab's two-plane input halo and immutable
+   scalar geometry. No global rank-local grid pointers cross a process. */
+typedef struct {
+  int mode,pcc,rotate,dden,dexc,Ng1,Ng2,Ng3,first,last;
+  double inv[27*27];
+} SXG_Packet;
+
+static int SXG_pack(void *opaque,size_t first,size_t last,void **packet,size_t *bytes)
+{
+  SXG_Work *w=opaque;
+  const size_t lo=first<2?0:first-2,hi=last+2<(size_t)w->Ng1?last+2:(size_t)w->Ng1;
+  const size_t plane=(size_t)w->Ng2*w->Ng3,n=(hi-lo)*plane;
+  const int fields=(w->rotate?4:2)+2*w->pcc;
+  if (n>(SIZE_MAX-sizeof(SXG_Packet))/sizeof(double)/(size_t)fields) return 0;
+  *bytes=sizeof(SXG_Packet)+n*(size_t)fields*sizeof(double);
+  SXG_Packet *p=malloc(*bytes);
+  if (!p) return 0;
+  *packet=p;
+  p->mode=w->XC_P_switch;p->pcc=w->pcc;p->rotate=w->rotate;
+  p->dden=w->dden!=NULL;p->dexc=w->dexc!=NULL && w->XC_P_switch!=0;
+  p->Ng1=w->Ng1;p->Ng2=w->Ng2;p->Ng3=w->Ng3;p->first=(int)first;p->last=(int)last;
+  memcpy(p->inv,w->inv,sizeof(p->inv));
+  double *data=(double*)(p+1);
+  for (int i=0;i<(w->rotate?4:2);i++,data+=n) memcpy(data,w->den[i]+lo*plane,n*sizeof(double));
+  if (w->pcc) for (int i=0;i<2;i++,data+=n) memcpy(data,w->pcc_den[i]+lo*plane,n*sizeof(double));
+  return 1;
+}
+
+static int SXG_remote(void *context,const void *packet,size_t bytes,void **result,size_t *result_bytes)
+{
+    (void)context;
+  if (bytes<sizeof(SXG_Packet)) return 0;
+  const SXG_Packet *p=packet;
+  if (p->Ng1<=0 || p->Ng2<=0 || p->Ng3<=0 || p->first<0 || p->last<=p->first || p->last>p->Ng1 ||
+      (size_t)p->Ng1*p->Ng2>INT_MAX/(size_t)p->Ng3) return 0;
+  const int lo=p->first<2?0:p->first-2,hi=p->last+2<p->Ng1?p->last+2:p->Ng1;
+  const size_t plane=(size_t)p->Ng2*p->Ng3,n=(size_t)(hi-lo)*plane,owned=(p->last-p->first)*plane;
+  const int inputs=(p->rotate?4:2)+2*p->pcc,outputs=(p->rotate?4:2)+6*p->dden+6*p->dexc;
+  if (bytes!=sizeof(*p)+n*(size_t)inputs*sizeof(double)) return 0;
+  *result_bytes=owned*(size_t)outputs*sizeof(double);
+  double *out=malloc(*result_bytes);
+  if (!out) return 0;
+  *result=out;
+  SXG_Work w={0};
+  w.XC_P_switch=p->mode;w.pcc=p->pcc;w.rotate=p->rotate;w.inv=p->inv;
+  w.Ng1=p->Ng1;w.Ng2=p->Ng2;w.Ng3=p->Ng3;w.first=p->first;w.last=p->last;
+  w.input_base=lo*(int)plane;w.output_base=p->first*(int)plane;
+  const double *in=(const double*)(p+1);
+  for (int i=0;i<(p->rotate?4:2);i++,in+=n) w.den[i]=(double*)in;
+  if (p->pcc) for (int i=0;i<2;i++,in+=n) w.pcc_den[i]=(double*)in;
+  for (int i=0;i<(p->rotate?4:2);i++,out+=owned) w.vxc[i]=out;
+  double *dd[6],*dx[6],**ddp[2]={dd,dd+3},**dxp[2]={dx,dx+3};
+  if (p->dden) {
+    for (int i=0;i<6;i++,out+=owned) dd[i]=out;
+    w.dden=ddp;
+  }
+  if (p->dexc) {
+    for (int i=0;i<6;i++,out+=owned) dx[i]=out;
+    w.dexc=dxp;
+  }
+  return SXG_execute(&w);
+}
+
+static void SXG_commit(void *opaque,size_t first,size_t last,const void *result,size_t bytes)
+{
+  SXG_Work *w=opaque;
+  const size_t plane=(size_t)w->Ng2*w->Ng3,base=first*plane,n=(last-first)*plane;
+  const int nv=w->rotate?4:2;
+  const double *r=result;
+  (void)bytes;
+  /* Match the device/host store order when Vxc outputs alias. */
+  if (w->rotate) for (int i=3;i>=0;i--) memcpy(w->vxc[i]+base,r+(size_t)i*n,n*sizeof(double));
+  else for (int i=0;i<2;i++) memcpy(w->vxc[i]+base,r+(size_t)i*n,n*sizeof(double));
+  r+=(size_t)nv*n;
+  if (w->dden) for (int i=0;i<6;i++,r+=n) memcpy(w->dden[i/3][i%3]+base,r,n*sizeof(double));
+  if (w->dexc && w->XC_P_switch!=0)
+    for (int i=0;i<6;i++,r+=n) memcpy(w->dexc[i/3][i%3]+base,r,n*sizeof(double));
+}
+
+static int Set_XC_Grid_GPU(int XC_P_switch,
+                           double *Den0, double *Den1, double *Den2, double *Den3,
+                           double *Vxc0, double *Vxc1, double *Vxc2, double *Vxc3,
+                           double ***dDen_Grid, double ***dEXC_dGD)
+{
+  const int n = My_NumGridD;
+  const int Ng1 = Max_Grid_Index_D[1] - Min_Grid_Index_D[1] + 1;
+  const int Ng2 = Max_Grid_Index_D[2] - Min_Grid_Index_D[2] + 1;
+  const int Ng3 = Max_Grid_Index_D[3] - Min_Grid_Index_D[3] + 1;
+  const int pcc = (PCC_switch == 1);
+  const int rotate = (SpinP_switch == 3 && (XC_P_switch == 1 || XC_P_switch == 2));
+  double mat_storage[30][30], inv_storage[30][30];
+  double *Mat[30], *InvMat[30], inv[27 * 27];
+  SXG_Work work={0};
+  int i, i1, j1, k1, i2, j2, k2, p, q;
+  double x, y, z, x1, y1, z1;
+
+  if (!(XC_P_switch == 0 || XC_P_switch == 1 || XC_P_switch == 2)) return 0;
+  if (dc_Type == 3 || dc_Type == 4) return 0;
+  const char *control=getenv("OPENMX_XC_GRID_GPU"),*gpu=getenv("OPENMX_GPU");
+  const int enabled=scf_eigen_lib_flag==GPUSOLVER && (!gpu || atoi(gpu)!=0) && (!control || !*control || atoi(control)!=0);
+  int native_done=enabled && !(openmx_gpu_capacity_test_recovery() || openmx_gpu_workers_requested()) &&
+    Set_XC_Grid_GPU_Native(XC_P_switch,Den0,Den1,Den2,Den3,Vxc0,Vxc1,Vxc2,Vxc3,dDen_Grid,dEXC_dGD);
+  int pending=enabled && n>0 && !native_done,any_pending;
+  MPI_Allreduce(&pending,&any_pending,1,MPI_INT,MPI_MAX,mpi_comm_level1);
+  if (!any_pending) return native_done || (enabled && n<=0);
+  /* the 27-point interpolation matrix of the host path */
+  /* Fixed-size host scratch avoids 62 unchecked allocations per call. */
+  for (i = 0; i < 30; i++) {
+    Mat[i] = mat_storage[i];
+    InvMat[i] = inv_storage[i];
+  }
+  p = 0;
+  for (i1 = -1; i1 <= 1; i1++) {
+    for (j1 = -1; j1 <= 1; j1++) {
+      for (k1 = -1; k1 <= 1; k1++) {
+        x = (double)i1 * gtv[1][1] + (double)j1 * gtv[2][1] + (double)k1 * gtv[3][1];
+        y = (double)i1 * gtv[1][2] + (double)j1 * gtv[2][2] + (double)k1 * gtv[3][2];
+        z = (double)i1 * gtv[1][3] + (double)j1 * gtv[2][3] + (double)k1 * gtv[3][3];
+        q = 0;
+        for (i2 = 0; i2 <= 2; i2++) {
+          x1 = pow(x, (double)i2);
+          for (j2 = 0; j2 <= 2; j2++) {
+            y1 = pow(y, (double)j2);
+            for (k2 = 0; k2 <= 2; k2++) {
+              z1 = pow(z, (double)k2);
+              Mat[p][q] = x1 * y1 * z1;
+              q++;
+            }
+          }
+        }
+        p++;
+      }
+    }
+  }
+  Inverse(26, Mat, InvMat);
+  for (p = 0; p < 27; p++)
+    for (q = 0; q < 27; q++) inv[p * 27 + q] = InvMat[p][q];
+
+  work.XC_P_switch=XC_P_switch; work.pcc=pcc; work.rotate=rotate;
+  work.den[0]=Den0; work.den[1]=Den1; work.den[2]=Den2; work.den[3]=Den3;
+  work.vxc[0]=Vxc0; work.vxc[1]=Vxc1; work.vxc[2]=Vxc2; work.vxc[3]=Vxc3;
+  work.pcc_den[0]=PCCDensity_Grid_D[0]; work.pcc_den[1]=PCCDensity_Grid_D[1];
+  work.dden=dDen_Grid; work.dexc=dEXC_dGD; work.inv=inv;
+  work.Ng1=Ng1;work.Ng2=Ng2;work.Ng3=Ng3;work.first=0;work.last=Ng1;
+  const int borrow=enabled && openmx_gpu_workers_capacity_enabled();
+  const int usable=enabled && (gpu_rank_device_usable() || borrow);
+  int done=native_done || n<=0 ? 1 : usable && SXG_execute(&work);
+  static const OpenMXGpuCollectiveOps ops={SXG_pack,SXG_remote,SXG_commit};
+  /* Every rank participates, including disabled/empty/completed ranks. */
+  return openmx_gpu_collective_retry(mpi_comm_level1,&ops,&work,n>0?(size_t)Ng1:0,
+                                    done?1:borrow?0:-1,borrow && usable,"XC-grid");
+}
+
+
 
 /* input argument "SCF_iter" was added by S.Ryee for LDA+U. 
  * This was added so that spin-density XC energy is ignored

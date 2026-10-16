@@ -1,4 +1,5 @@
 #include <hip/hip_runtime.h>
+#include "openmx_gpu_transform.h"
 #include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -104,6 +105,9 @@ extern "C" int ClusterCol_BuildDeviceDenseFromPacked_HIP(const double *H1, const
     if (ClusterColDMReportHipError("hipMemcpy(dense H1)", err)) goto cleanup_failed;
     err = hipMemcpy(d_dense_index, dense_index, index_bytes, hipMemcpyHostToDevice);
     if (ClusterColDMReportHipError("hipMemcpy(dense index)", err)) goto cleanup_failed;
+
+    if (openmx_gpu_scatter &&
+        openmx_gpu_scatter(n,tnum,0,d_dense_index,tnum,d_H1,0,NULL,NULL,0,d_H)) goto cleanup;
 
     err = hipMemset(d_H, 0, dense_bytes);
     if (ClusterColDMReportHipError("hipMemset(dense matrix)", err)) goto cleanup_failed;
@@ -266,6 +270,13 @@ extern "C" int BandCol_BuildDenseCsHs_HIP(int need_s, int count, int h_count, in
     if (BandColReportHipError("hipMemcpy(phase_r)", err)) goto cleanup_failed;
     err = hipMemcpy(d_phase_i, phase_i, phase_bytes, hipMemcpyHostToDevice);
     if (BandColReportHipError("hipMemcpy(phase_i)", err)) goto cleanup_failed;
+
+    static_assert(sizeof(BandColHipConstructEntry)==7*sizeof(int), "cooperative scatter entry layout");
+    if (openmx_gpu_scatter) {
+        int done=openmx_gpu_scatter(n,count,7,(const int*)d_entries,h_count,d_H1,phase_count,d_phase_r,d_phase_i,0,d_H);
+        if (done && need_s) done=openmx_gpu_scatter(n,count,7,(const int*)d_entries,h_count,d_S1,phase_count,d_phase_r,d_phase_i,0,d_S);
+        if (done) goto cleanup;
+    }
 
     err = hipMemset(d_H, 0, dense_bytes);
     if (BandColReportHipError("hipMemset(H)", err)) goto cleanup_failed;

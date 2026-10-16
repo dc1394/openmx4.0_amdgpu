@@ -254,7 +254,7 @@ def make_harness(source: str) -> str:
         "Force4B_GpuCase1TurnsAccumulate", "Force4B_GpuCase1TurnsConcurrency",
         "Force4B_GpuCase1TurnsRun",
     ):
-        parts.append(common.extract_function(source, name))
+        parts.append(common.extract_function(source, name+"_Single" if name in ("Force4B_GpuCase1Kernel","Force4B_GpuCase2Kernel") else name).replace(name+"_Single",name))
     parts.append(TURN_MAIN)
     return "\n".join(parts)
 

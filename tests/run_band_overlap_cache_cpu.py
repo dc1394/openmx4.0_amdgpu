@@ -62,6 +62,9 @@ typedef int hipError_t;
 enum { hipSuccess = 0, hipMemcpyHostToDevice = 1, hipMemcpyDeviceToHost = 2 };
 #define wait_hipfunc(call) CHECK((call) == hipSuccess)
 
+static int BandCol_mgpu_host_dense=0;
+static dcomplex *BandCol_host_s;
+static void BandCol_HostEnsure(int n){(void)n;CHECK(0);}
 static int memcpy_h2d, memcpy_d2h;
 static hipError_t hipMemcpy(void *dst, const void *src, size_t bytes, int kind)
 {

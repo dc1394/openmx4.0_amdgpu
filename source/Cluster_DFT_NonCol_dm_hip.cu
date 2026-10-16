@@ -1,4 +1,5 @@
 #include <hip/hip_runtime.h>
+#include "openmx_gpu_transform.h"
 #include <hipblas/hipblas.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -400,6 +401,8 @@ extern "C" int ClusterNonCol_BackTransformDevice_HIP(hipblasHandle_t handle, int
 
     if (status != HIPBLAS_STATUS_SUCCESS) return 1;
     if (blocks > 65535u * 16u) blocks = 65535u * 16u;
+    if (!openmx_gpu_transform ||
+        !openmx_gpu_transform(OPENMX_GPU_TRANSPOSE,1,maxn,n2,d_A,n2,NULL,0,d_vt,maxn,0,0.0))
     hipLaunchKernelGGL(ClusterNonColTransposeKernel, dim3((unsigned)blocks), dim3(256), 0, stream,
                        (const dcomplex *)d_A, n2, (dcomplex *)d_vt, maxn, n2, maxn);
     err = hipGetLastError();
@@ -458,6 +461,8 @@ extern "C" int ClusterNonCol_ScatterDense_HIP(hipblasHandle_t handle, int tnum, 
     }
     err = hipMemcpyAsync(d_values, values, (size_t)tnum * sizeof(double), hipMemcpyHostToDevice, stream);
     if (ClusterNonColSolveReportHipError("gathered matrix upload", err)) return 1;
+    if (openmx_gpu_scatter &&
+        openmx_gpu_scatter(n,tnum,0,d_index,tnum,d_values,0,NULL,NULL,0,d_H)) return 0;
     err = hipMemsetAsync(d_H, 0, (size_t)n * (size_t)n * sizeof(double), stream);
     if (ClusterNonColSolveReportHipError("dense matrix clear", err)) return 1;
     if (0 < tnum) {
@@ -486,6 +491,8 @@ extern "C" int ClusterNonCol_AddDense_HIP(hipblasHandle_t handle, size_t count, 
     hipError_t  err;
 
     if (count == 0) return 0;
+    if (count<=INT32_MAX && openmx_gpu_transform &&
+        openmx_gpu_transform(OPENMX_GPU_ADD,0,1,(int)count,d_y,1,d_x,1,d_y,1,0,0.0)) return 0;
     hipLaunchKernelGGL(ClusterNonColAddKernel, dim3(ClusterNonColGrid(count, 256)), dim3(256), 0, stream, count, d_y,
                        d_x);
     err = hipGetLastError();
@@ -587,6 +594,7 @@ extern "C" int ClusterNonCol_AssembleHs2_HIP(hipblasHandle_t handle, int n, cons
     dcomplex      *A = (dcomplex *)d_A;
     hipError_t     err;
 
+    if (openmx_gpu_spinor && openmx_gpu_spinor(n,1,r11,r22,r12,i11,i22,i12,d_A)) return 0;
     hipLaunchKernelGGL(ClusterNonColAssembleRightKernel, dim3(ClusterNonColGrid(2 * nn, 256)), dim3(256), 0, stream,
                        n, r12, i12, r22, i22, A);
     err = hipGetLastError();
@@ -922,6 +930,12 @@ extern "C" int BandNonCol_BuildDenseMs_HIP(int cpx_flag, int count, int h_count,
     if (BandNonColReportHipError("hipMemcpy(dense phase_r)", err)) goto cleanup_failed;
     err = hipMemcpy(d_phase_i, phase_i, phase_bytes, hipMemcpyHostToDevice);
     if (BandNonColReportHipError("hipMemcpy(dense phase_i)", err)) goto cleanup_failed;
+    static_assert(sizeof(BandNonColHipConstructEntry)==3*sizeof(int), "cooperative scatter entry layout");
+    if (count>0 && count<=entry_chunk && openmx_gpu_scatter) {
+        err=hipMemcpy(d_entries,entries,entry_bytes,hipMemcpyHostToDevice);
+        if (BandNonColReportHipError("cooperative dense entries upload",err)) goto cleanup_failed;
+        if (openmx_gpu_scatter(n,count,3,(const int*)d_entries,h_count,d_M1,phase_count,d_phase_r,d_phase_i,cpx_flag,d_M)) goto cleanup;
+    }
     err = hipMemset(d_M, 0, dense_bytes);
     if (BandNonColReportHipError("hipMemset(dense matrix)", err)) goto cleanup_failed;
 
@@ -985,6 +999,8 @@ extern "C" int BandNonCol_AddDense_HIP(int count, dcomplex *d_dst, const dcomple
         return 0;
     }
 
+    if (openmx_gpu_transform &&
+        openmx_gpu_transform(OPENMX_GPU_ADD,1,1,count,d_dst,1,d_src,1,d_dst,1,0,0.0)) return 0;
     hipLaunchKernelGGL(BandNonColAddDenseKernel, grid, block, 0, 0, count, d_dst, d_src);
     err = hipGetLastError();
     if (BandNonColReportHipError("BandNonColAddDenseKernel launch", err)) return 1;
@@ -1031,6 +1047,8 @@ extern "C" int BandNonCol_SymmetrizeDenseHermitian_HIP(int n, dcomplex *d_A)
         return 1;
     }
 
+    if (openmx_gpu_transform &&
+        openmx_gpu_transform(OPENMX_GPU_HERMITIAN,1,n,n,d_A,n,NULL,0,d_A,n,0,0.0)) return 0;
     hipLaunchKernelGGL(BandNonColSymmetrizeHermitianKernel, grid, block, 0, 0, n, d_A);
     err = hipGetLastError();
     if (BandNonColReportHipError("BandNonColSymmetrizeHermitianKernel launch", err)) return 1;
@@ -1088,6 +1106,8 @@ extern "C" int BandNonCol_BuildDenseHs2_HIP(int n, int n2, const dcomplex *d_H11
         return 1;
     }
 
+    if (n2==2*n && openmx_gpu_spinor &&
+        openmx_gpu_spinor(n,0,d_H11,d_H22,d_H12,NULL,NULL,NULL,d_H2)) return 0;
     hipLaunchKernelGGL(BandNonColBuildHs2Kernel, grid, block, 0, 0, n, n2, d_H11, d_H22, d_H12, d_H2);
     err = hipGetLastError();
     if (BandNonColReportHipError("BandNonColBuildHs2Kernel launch", err)) return 1;
